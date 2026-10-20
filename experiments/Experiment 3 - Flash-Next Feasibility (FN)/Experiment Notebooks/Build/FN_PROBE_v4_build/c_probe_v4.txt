@@ -1,0 +1,114 @@
+C_ARC = r'''# ==================================================================== CELL 7 — stages 5-7: sanity, throughput (eager), throughput (CUDA graphs)
+import urllib.request, concurrent.futures as cf
+BASELINE_TOK_S = 373.0          # Qwen3.8-27B-FP8 (vLLM 0.19, fp8 KV, MTP3), 16 running, Q27-XHIGH v1.4 run 4 (2026-10-06)
+DECODE_TOKENS = int(os.environ.get("FN_PROBE_DECODE", 1536))   # forced decode length per request (ignore_eos)
+LEVELS = [1, 4, 8]
+
+def _grid(g): return "\n".join(" ".join(str(v) for v in r) for r in g)
+def arc_prompt(task):
+    parts = ["You are solving an abstract reasoning puzzle. Infer the rule that maps every INPUT grid to its OUTPUT grid, "
+             "then give the output grid for the FINAL INPUT.\n"]
+    for i, ex in enumerate(task["train"]):
+        parts.append(f"Example {i + 1} INPUT:\n{_grid(ex['input'])}\nExample {i + 1} OUTPUT:\n{_grid(ex['output'])}\n")
+    parts.append(f"FINAL INPUT:\n{_grid(task['test'][0]['input'])}\n")
+    return "\n".join(parts)
+
+def chat(messages, max_tokens, thinking, temperature=0.0, ignore_eos=False, timeout=1800):
+    body = {"model": "flashnext", "messages": messages, "max_tokens": max_tokens, "temperature": temperature,
+            "top_p": 0.95, "top_k": 20, "chat_template_kwargs": {"enable_thinking": thinking}}
+    if ignore_eos:
+        body["ignore_eos"] = True
+    t = time.time()
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    resp = json.loads(urllib.request.urlopen(req, timeout=clamp(timeout)).read())
+    return resp, time.time() - t
+
+def sanity():
+    resp, sec = chat([{"role": "user", "content": "Reply with the numbers 1 to 20 separated by single spaces, nothing else."}],
+                     96, False)
+    text = resp["choices"][0]["message"].get("content") or ""
+    return re.findall(r"\d+", text)[:20] == [str(i) for i in range(1, 21)], text[:300], sec
+
+def measure(level):
+    msgs = [[{"role": "user", "content": arc_prompt(EVAL[t])}] for t in TASKS[:level]]
+    t = time.time()
+    with cf.ThreadPoolExecutor(max_workers=level) as ex:
+        res = list(ex.map(lambda m: chat(m, DECODE_TOKENS, True, temperature=0.6, ignore_eos=True), msgs))
+    wall = time.time() - t
+    toks = [(r[0].get("usage") or {}).get("completion_tokens") or 0 for r in res]
+    return {"concurrency": level, "wall_sec": round(wall, 1), "completion_tokens": toks,
+            "prompt_tokens": [(r[0].get("usage") or {}).get("prompt_tokens") for r in res],
+            "aggregate_tok_s": round(sum(toks) / max(wall, 1e-6), 1),
+            "per_request_tok_s": [round(x / max(r[1], 1e-6), 1) for x, r in zip(toks, res)]}
+
+def run_levels(tag):
+    rows = []
+    for lv in LEVELS:
+        if remaining() < 6 * 60 + SAFETY_SEC:
+            rows.append({"concurrency": lv, "skipped": "budget"}); break
+        try:
+            rows.append(measure(lv))
+        except Exception as e:
+            rows.append({"concurrency": lv, "error": f"{type(e).__name__}: {e}"[:600]}); break
+        print(f"[{tag}] {rows[-1]}", flush=True)
+    return rows
+
+def kv_lines():
+    try:
+        return [l[-300:] for l in LOG.read_text(errors="replace").splitlines()
+                if re.search(r"max_total_num_tokens|KV Cache is allocated|Mamba Cache is allocated|Capture cuda graph|cuda graph", l)][-12:]
+    except Exception as e:
+        return [repr(e)]
+
+def launch_once(args, name):
+    """same procedure as stage 4 for one extra launch; returns (ready, info)"""
+    global SERVER
+    off = LOG.stat().st_size if LOG.exists() else 0
+    with open(LOG, "ab", buffering=0) as lf:
+        lf.write(f"\n\n===== ATTEMPT {name}: {shlex.join(map(str, args))}\n".encode())
+        SERVER = subprocess.Popen(list(map(str, args)), env=SERVE_ENV, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+    t = time.time(); ready = False
+    while time.time() - t < clamp(SERVER_ATTEMPT_TIMEOUT):
+        if SERVER.poll() is not None: break
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=5) as r:
+                if r.status == 200: ready = True; break
+        except Exception: pass
+        time.sleep(5)
+    return ready, {"attempt": name, "ready": ready, "sec": round(time.time() - t, 1), "exit_code": SERVER.poll(),
+                   "log_tail": LOG.read_bytes()[off:][-4000:].decode(errors="replace")}
+
+if go() and not RERUN:
+    EVAL = json.load(open(Path(COMP_DIR) / "arc-agi_evaluation_challenges.json"))
+    TASKS = sorted(EVAL)[:8]
+    try:
+        _ok, _text, _sec = sanity()
+        stage("5_sanity", _ok, text=_text, sec=round(_sec, 1))
+    except Exception as e:
+        stage("5_sanity", False, error=f"{type(e).__name__}: {e}"[:2000], log_tail=LOG.read_bytes()[-4000:].decode(errors="replace"))
+if go() and not RERUN:
+    _rows = run_levels("eager")
+    _best = max([r.get("aggregate_tok_s", 0) for r in _rows] or [0])
+    stage("6_throughput_eager", any("aggregate_tok_s" in r for r in _rows), rows=_rows, best_aggregate_tok_s=_best,
+          decode_tokens=DECODE_TOKENS, kv=kv_lines())
+# stage 7 (optional, never fatal): CUDA graphs on - only after eager worked and with time for a reload + probe
+REPORT["graphs"] = {"ran": False}
+if go() and not RERUN and remaining() > 25 * 60:
+    kill_server()
+    _args = [a for a in base_args() if a != "--disable-cuda-graph"] + list(LAUNCHED_EXTRA) + ["--cuda-graph-max-bs", "8"]
+    _ready, _info = launch_once(_args, "graphs_on")
+    REPORT["graphs"] = {"ran": True, "launch": {k: v for k, v in _info.items() if k != "log_tail"}}
+    if _ready:
+        try:
+            _ok, _text, _ = sanity()
+        except Exception as e:
+            _ok, _text = False, repr(e)[:300]
+        _rows = run_levels("graphs") if _ok else []
+        REPORT["graphs"].update({"sanity_ok": _ok, "sanity_text": _text, "rows": _rows, "kv": kv_lines(),
+                                 "best_aggregate_tok_s": max([r.get("aggregate_tok_s", 0) for r in _rows] or [0])})
+    else:
+        REPORT["graphs"]["log_tail"] = _info["log_tail"]
+    (OUT / "fn_smoke_report.json").write_text(json.dumps(REPORT, indent=2, default=str))
+    print("graphs:", json.dumps({k: v for k, v in REPORT["graphs"].items() if k != "log_tail"}, default=str)[:3000], flush=True)
+'''

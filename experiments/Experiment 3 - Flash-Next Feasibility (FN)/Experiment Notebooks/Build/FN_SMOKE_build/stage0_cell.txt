@@ -1,0 +1,36 @@
+C_ENV = r'''# ==================================================================== CELL 2 — stage 0: environment gates
+def stage0_check(smi, gpu_csv, meminfo_text, tmp_free_gb):
+    m_drv = re.search(r"Driver Version:\s*([\d.]+)", smi or ""); m_cuda = re.search(r"CUDA Version:\s*([\d.]+)", smi or "")
+    driver = m_drv.group(1) if m_drv else None; driver_cuda = m_cuda.group(1) if m_cuda else None
+    gpus = [g.strip() for g in (gpu_csv or "").strip().splitlines() if g.strip() and "," in g]
+    names = [g.split(",")[0].strip() for g in gpus]; ccs = [g.split(",")[-1].strip() for g in gpus]
+    mem = {}
+    for line in (meminfo_text or "").splitlines():
+        k, _, rest = line.partition(":"); p = rest.split()
+        if p and p[0].isdigit(): mem[k] = int(p[0]) * 1024
+    ram_total = round(mem.get("MemTotal", 0) / 1e9, 1); ram_avail = round(mem.get("MemAvailable", 0) / 1e9, 1)
+    checks = {
+        "four_gpus": len(gpus) == 4,
+        "all_l4": bool(names) and all("L4" in n for n in names),
+        "all_sm89": bool(ccs) and all(c == "8.9" for c in ccs),
+        "driver_r580_plus": driver is not None and int(driver.split(".")[0]) >= 580,
+        "driver_cuda13_plus": driver_cuda is not None and float(driver_cuda.split(".")[0]) >= 13,
+        "ram_available_enough": ram_avail >= MIN_RAM_AVAILABLE_GB,
+        "tmp_free_enough": tmp_free_gb >= MIN_TMP_FREE_GB,
+    }
+    info = {"driver": driver, "driver_max_cuda": driver_cuda, "gpus": gpus, "ram_total_gb": ram_total,
+            "ram_available_gb": ram_avail, "tmp_free_gb": round(tmp_free_gb, 1), "checks": checks}
+    return all(checks.values()), info
+
+if go():
+    smi = os.environ.get("FN_SMOKE_FAKE_SMI") or sh("nvidia-smi")
+    gpu_csv = os.environ.get("FN_SMOKE_FAKE_GPUS") or sh("nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader")
+    try:
+        meminfo = os.environ.get("FN_SMOKE_FAKE_MEMINFO") or open("/proc/meminfo").read()
+    except OSError:
+        meminfo = ""
+    tmp_free = float(os.environ.get("FN_SMOKE_FAKE_TMPFREE") or shutil.disk_usage("/tmp" if os.path.isdir("/tmp") else ".").free / 1e9)
+    ok0, info0 = stage0_check(smi, gpu_csv, meminfo, tmp_free)
+    stage("0_environment", ok0, **info0, python=sys.version.split()[0], cpu_count=os.cpu_count(),
+          memlock=sh("ulimit -l").strip(), disk_working=sh("df -h /kaggle/working | tail -1").strip())
+'''

@@ -1,0 +1,130 @@
+### arg_groups/overrides.py 1570-1660 (Qwen4Exp overrides: QSA page_size 64, ple offload default)
+
+@_register_for(
+    "Qwen3NextForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
+)
+def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if not is_sm100_supported() or cfg.attention_backend is not None:
+        return {}
+    sm100_default_attn_backend = "triton"
+    # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
+    # _get_default_attn_backend handles the eagle_topk check.
+    # There is only one case where page_size=1 is required,
+    # which is when radix cache is enabled and both extra_buffer
+    # and spec decoding are disabled.
+    default_attn_backend = server_args._get_default_attn_backend(
+        use_mla_backend=server_args.use_mla_backend(),
+        model_config=server_args.get_model_config(),
+    )
+    # The mamba radix-cache pass runs before this dispatch: read the
+    # declared strategy through the view (the legacy branch observed the
+    # already-written field here).
+    if default_attn_backend == "trtllm_mha" and not (
+        not mamba_extra_buffer_of(resolved_view(server_args))
+        and not cfg.disable_radix_cache
+        and cfg.speculative_algorithm is None
+    ):
+        sm100_default_attn_backend = "trtllm_mha"
+    return {
+        "attention_backend": sm100_default_attn_backend,
+        "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
+    }
+
+
+@_register_for("Qwen4ExpForConditionalGeneration")
+def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
+    """Qwen4-Exp keeps the MoE config under ``text_config``; every layer is
+    sparse, so a dense-MLP TP size of 1 only stalls the DP MoE path.
+
+    Compressed QSA additionally pins page_size=64 (overriding the hybrid
+    family's triton default of 1, last-writer-wins): its compressed cache is
+    addressed as ``full_slot // compress_ratio`` (the DSV4 scheme), which
+    requires page-aligned full-KV allocation with the page a multiple of the
+    compress ratio, and page-granular prefix sharing so shared pages share
+    their compressed slots. MambaRadixCache supports page_size > 1 only with
+    the mamba extra-buffer strategy, so fall back to the family default when
+    neither that nor --disable-radix-cache holds (the QSA pool then fails
+    fast at boot).
+    """
+    overrides: Dict[str, Any] = {}
+    if server_args.ple_offload_embedding is None:
+        import torch
+
+        overrides["ple_offload_embedding"] = (
+            is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
+        )
+
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if (
+        getattr(text_config, "num_experts", None) is not None
+        and server_args.moe_dense_tp_size == 1
+    ):
+        overrides["moe_dense_tp_size"] = None
+
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_VARIANT_COMPRESSED,
+        parse_qsa_profile,
+    )
+
+    profile = parse_qsa_profile(hf_config)
+    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
+        # Unconditional, like DeepSeek-V4's page-256 declaration: compressed
+        # addressing is full_slot // ratio and requires page-aligned
+        # allocation on every backend. Do not gate this on
+        # mamba_radix_cache_strategy — that field resolves in a later pass
+        # (mid-resolution it still holds the unresolved default, which made
+        # this declaration silently skip on non-SM100 boxes); if the finally
+        # resolved strategy cannot support page > 1, MambaRadixCache's own
+        # boot assertion reports it.
+        overrides["page_size"] = 64
+        logger.info(
+            "Setting page size to 64 for compressed QSA "
+            "(full//ratio compressed addressing)."
+        )
+    return overrides
+
+
+
+### arg_groups/overrides.py 1840-1875 (extra_buffer archs, requires linear_attn_backend triton)
+# Single source of truth: ServerArgs._support_mamba_cache_extra_buffer
+# delegates here.
+_MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
+    {
+        "KimiLinearForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        # Text-only entries of the same hybrid stack (models/qwen3_5_text.py);
+        # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
+        "MiniCPMV4_6ForConditionalGeneration",
+        "BailingMoeV2_5ForCausalLM",
+        "FalconH1ForCausalLM",
+        "GraniteMoeHybridForCausalLM",
+        "NemotronHForCausalLM",
+        "NemotronHPuzzleForCausalLM",
+        # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
+        # KDA backend's track-snapshot writes (decode + extend) so donated
+        # slots hold real states for prefix-cache restores.
+        "KimiK3ForConditionalGeneration",
+    }
+)
+
+
+def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
+    """Whether ``model_arch`` supports the extra_buffer strategy on the
+    configured linear-attention backend (pure read)."""
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
+        return view.linear_attn_backend == "triton"
+    return False
+
+

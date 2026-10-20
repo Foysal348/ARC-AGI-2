@@ -1,0 +1,92 @@
+C_INPUTS = r'''# ==================================================================== CELL 3 — stage 1: inputs, merged model folder
+# expected values from the pinned Hugging Face commits (albucino c6af9fe / Intel 4c67bf6):
+# shard -> [bytes, sha256 of the safetensors header (8-byte length + JSON), header length]; small files -> [bytes, sha256]
+EXPECT = __EXPECT__
+INTEL_SKIP = {"config.json", "model.safetensors.index.json", "ple_reshard_manifest.json", "README.md", ".gitattributes"}
+
+def _link(src, dst):
+    if os.environ.get("FN_SMOKE_LINK") == "copy":   # local tests only (no symlink privilege on Windows)
+        shutil.copyfile(src, dst)
+    else:
+        os.symlink(src, dst)
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(8 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def build_model_dir(intel_dir, overlay_dir, dest, expect):
+    # symlink Intel's main shards + tokenizer files and the overlay's FP8 PLE shards + config + index into dest.
+    # Only files named in the overlay index are linked as weights (Intel's BF16 PLE and MTP files are left out).
+    problems = []
+    dest = Path(dest)
+    shutil.rmtree(dest, ignore_errors=True); dest.mkdir(parents=True)
+    for name, (size, sha) in expect["files"].items():
+        p = Path(overlay_dir, name)
+        if not p.is_file():
+            problems.append(f"overlay missing {name}")
+        elif p.stat().st_size != size or _sha256(p) != sha:
+            problems.append(f"overlay {name} differs from albucino c6af9fe")
+    if problems:
+        return False, {"problems": problems}
+    index = json.loads(Path(overlay_dir, "model.safetensors.index.json").read_text())
+    weights = sorted(set(index["weight_map"].values()))
+    for name in ("config.json", "model.safetensors.index.json"):
+        _link(str(Path(overlay_dir, name)), str(dest / name))
+    for p in sorted(Path(intel_dir).iterdir()):                  # tokenizer / processor / chat template, ...
+        if p.is_file() and not p.name.endswith(".safetensors") and p.name not in INTEL_SKIP:
+            _link(str(p), str(dest / p.name))
+    sources = {}
+    for name in weights:
+        in_overlay = Path(overlay_dir, name).is_file()
+        src = Path(overlay_dir if in_overlay else intel_dir, name)
+        sources[name] = "overlay" if in_overlay else "intel"
+        if not src.is_file():
+            problems.append(f"missing weight file {name}")
+            continue
+        _link(str(src), str(dest / name))
+        exp = expect["shards"].get(name)
+        if exp is None:
+            problems.append(f"unexpected weight file {name}")
+            continue
+        size, head_sha, head_len = exp
+        if src.stat().st_size != size:
+            problems.append(f"{name}: {src.stat().st_size} bytes, expected {size}")
+            continue
+        with open(src, "rb") as f:
+            head = f.read(8 + head_len)
+        if hashlib.sha256(head).hexdigest() != head_sha:
+            problems.append(f"{name}: safetensors header differs from the pinned commit")
+    if set(weights) != set(expect["shards"]):
+        problems.append(f"index names {len(weights)} weight files, expected {len(expect['shards'])}")
+    cfg = json.loads((dest / "config.json").read_text())
+    ple_dtype = cfg.get("text_config", {}).get("ple_embedding_dtype")
+    if ple_dtype != "float8_e4m3fn":
+        problems.append(f"config ple_embedding_dtype={ple_dtype!r}")
+    q = cfg.get("quantization_config", {})
+    info = {"weight_files": len(weights), "from_intel": sum(v == "intel" for v in sources.values()),
+            "from_overlay": sum(v == "overlay" for v in sources.values()),
+            "weights_gb": round(sum(Path(dest, n).stat().st_size for n in weights if Path(dest, n).exists()) / 1e9, 1),
+            "ple_embedding_dtype": ple_dtype, "model_type": cfg.get("model_type"),
+            "quant": {k: q.get(k) for k in ("quant_method", "bits", "group_size")},
+            "linked_other": sorted(p.name for p in dest.iterdir() if not p.name.endswith(".safetensors")),
+            "problems": problems}
+    return not problems, info
+
+if go():
+    ok = all([COMP_DIR, WHEELHOUSE_DIR, INTEL_DIR, OVERLAY_DIR])
+    info = {"missing_inputs": [k for k, v in {"competition": COMP_DIR, "wheelhouse": WHEELHOUSE_DIR,
+                                              "intel": INTEL_DIR, "overlay": OVERLAY_DIR}.items() if not v]}
+    if ok:
+        try:
+            t = time.time()
+            ok, merged = build_model_dir(INTEL_DIR, OVERLAY_DIR, MODEL_DIR, EXPECT)
+            info.update(merged, merge_sec=round(time.time() - t, 1))
+        except Exception as e:
+            ok = False; info["error"] = f"{type(e).__name__}: {e}"[:2000]
+    if WHEELHOUSE_DIR:
+        info["sglang_wheels"] = [p.name for p in Path(WHEELHOUSE_DIR).rglob("sglang-*.whl")]
+    stage("1_inputs", ok, **info)
+'''

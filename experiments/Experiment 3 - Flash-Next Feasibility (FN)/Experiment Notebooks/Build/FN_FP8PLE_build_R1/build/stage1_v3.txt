@@ -1,0 +1,111 @@
+C_INPUTS = r'''# ==================================================================== CELL 3 — stage 1: inputs, merged model folder
+# expected values from the pinned Hugging Face commits (albucino c6af9fe / Intel 4c67bf6):
+#   shards: name -> [bytes, full sha256, sha256 of the safetensors header (8-byte length + JSON), header length]
+#   files:  every small overlay file -> [bytes, sha256]
+EXPECT = __EXPECT__
+FULL_HASH = os.environ.get("FN_SMOKE_FULL_HASH", "1") == "1"   # full SHA256 of all 25 shards (also warms the page cache)
+
+def _link(src, dst):
+    if os.environ.get("FN_SMOKE_LINK") == "copy":   # local tests only (no symlink privilege on Windows)
+        shutil.copyfile(src, dst)
+    else:
+        os.symlink(src, dst)
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(16 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def build_model_dir(intel_dir, overlay_dir, dest, expect, full_hash=True, hash_timeout=1800):
+    # The overlay is authoritative for every file except weights: config, index, tokenizer, chat template, generation /
+    # preprocessor configs (all SHA256-checked). From Intel's mount only the weight files named in the overlay index and
+    # absent from the overlay are linked: the 15 main shards. Intel's BF16 PLE, MTP file, quantization_config.json and
+    # other metadata are never linked.
+    problems = []
+    dest = Path(dest)
+    shutil.rmtree(dest, ignore_errors=True); dest.mkdir(parents=True)
+    for name, (size, sha) in expect["files"].items():
+        p = Path(overlay_dir, name)
+        if not p.is_file():
+            problems.append(f"overlay missing {name}")
+        elif p.stat().st_size != size or _sha256(p) != sha:
+            problems.append(f"overlay {name} differs from albucino c6af9fe")
+    if problems:
+        return False, {"problems": problems}
+    for name in expect["files"]:
+        _link(str(Path(overlay_dir, name)), str(dest / name))
+    index = json.loads((dest / "model.safetensors.index.json").read_text())
+    weights = sorted(set(index["weight_map"].values()))
+    sources = {}
+    for name in weights:
+        in_overlay = Path(overlay_dir, name).is_file()
+        src = Path(overlay_dir if in_overlay else intel_dir, name)
+        if not src.is_file():
+            problems.append(f"missing weight file {name}")
+            continue
+        sources[name] = src
+        _link(str(src), str(dest / name))
+        exp = expect["shards"].get(name)
+        if exp is None:
+            problems.append(f"unexpected weight file {name}")
+            continue
+        size, _, head_sha, head_len = exp
+        if src.stat().st_size != size:
+            problems.append(f"{name}: {src.stat().st_size} bytes, expected {size}")
+            continue
+        with open(src, "rb") as f:
+            head = f.read(8 + head_len)
+        if hashlib.sha256(head).hexdigest() != head_sha:
+            problems.append(f"{name}: safetensors header differs from the pinned commit")
+    if set(weights) != set(expect["shards"]):
+        problems.append(f"index names {len(weights)} weight files, expected {len(expect['shards'])}")
+    hash_info = {"full_hash": bool(full_hash)}
+    if full_hash and not problems:
+        import concurrent.futures as cf
+        t = time.time()
+        ex = cf.ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
+        futs = {ex.submit(_sha256, src): name for name, src in sources.items()}
+        try:
+            for fut in cf.as_completed(futs, timeout=hash_timeout):
+                name = futs[fut]
+                if fut.result() != expect["shards"][name][1]:
+                    problems.append(f"{name}: full SHA256 differs from the pinned commit")
+        except cf.TimeoutError:
+            problems.append(f"full SHA256 did not finish within {round(hash_timeout)} s")
+        ex.shutdown(wait=False, cancel_futures=True)
+        gb = sum(src.stat().st_size for src in sources.values()) / 1e9
+        hash_info.update(hash_sec=round(time.time() - t, 1), hashed_gb=round(gb, 1),
+                         hash_gb_per_sec=round(gb / max(time.time() - t, 1e-6), 2))
+    cfg = json.loads((dest / "config.json").read_text())
+    ple_dtype = cfg.get("text_config", {}).get("ple_embedding_dtype")
+    if ple_dtype != "float8_e4m3fn":
+        problems.append(f"config ple_embedding_dtype={ple_dtype!r}")
+    q = cfg.get("quantization_config", {})
+    info = {"weight_files": len(weights),
+            "from_intel": sum(src.parent == Path(intel_dir) for src in sources.values()),
+            "from_overlay": sum(src.parent == Path(overlay_dir) for src in sources.values()),
+            "weights_gb": round(sum(src.stat().st_size for src in sources.values()) / 1e9, 1),
+            "ple_embedding_dtype": ple_dtype, "model_type": cfg.get("model_type"),
+            "quant": {k: q.get(k) for k in ("quant_method", "bits", "group_size")},
+            "linked_other": sorted(p.name for p in dest.iterdir() if not p.name.endswith(".safetensors")),
+            **hash_info, "problems": problems}
+    return not problems, info
+
+if go():
+    ok = all([COMP_DIR, WHEELHOUSE_DIR, INTEL_DIR, OVERLAY_DIR])
+    info = {"missing_inputs": [k for k, v in {"competition": COMP_DIR, "wheelhouse": WHEELHOUSE_DIR,
+                                              "intel": INTEL_DIR, "overlay": OVERLAY_DIR}.items() if not v]}
+    if ok:
+        try:
+            t = time.time()
+            ok, merged = build_model_dir(INTEL_DIR, OVERLAY_DIR, MODEL_DIR, EXPECT, full_hash=FULL_HASH,
+                                         hash_timeout=clamp(30 * 60))
+            info.update(merged, merge_sec=round(time.time() - t, 1))
+        except Exception as e:
+            ok = False; info["error"] = f"{type(e).__name__}: {e}"[:2000]
+    if WHEELHOUSE_DIR:
+        info["sglang_wheels"] = [p.name for p in Path(WHEELHOUSE_DIR).rglob("sglang-*.whl")]
+    stage("1_inputs", ok, **info)
+'''

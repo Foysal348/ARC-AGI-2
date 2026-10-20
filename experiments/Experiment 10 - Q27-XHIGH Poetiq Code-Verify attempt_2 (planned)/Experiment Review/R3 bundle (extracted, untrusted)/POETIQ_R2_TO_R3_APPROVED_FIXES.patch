@@ -1,0 +1,193 @@
+--- R2/poetiq_core.py
++++ R3/poetiq_core.py
+@@ -65,48 +65,68 @@
+     except (ValueError, TypeError): pass
+     return None
+ 
+-# Based on Poetiq's subprocess executor. Generated Python is never exec'd in the notebook kernel.
+-_POETIQ_SUBPROCESS = r'''
+-import sys, json
+-import numpy as np
+-import scipy
+-__POETIQ_USER_PROGRAM__
+-if __name__ == '__main__':
+-    payload=json.load(sys.stdin)
+-    res=transform(np.array(payload['input'],dtype=int))
+-    if hasattr(res,'tolist'): res=res.tolist()
+-    print('__E10_PROGRAM_RESULT__'+json.dumps({'ok': True,'result':res}))
+-'''
++# Poetiq-derived subprocess execution with real Linux mount/network/PID namespace
++# isolation. The user-generated program runs ONLY in the private chroot after
++# seccomp, CPU/memory/output/process limits. No silent unsandboxed fallback.
++# Embedded at build time: no notebook runtime downloads or extra source files.
++_POETIQ_TRUSTED_RUNNER = '"""Trusted inner runner inside a private chroot + mount/network/PID namespace.\n\nThis is embedded in E10 notebook by build_e10.py, never fetched at Kaggle runtime.\nUser-provided text runs only AFTER OS limits and seccomp are active.\n"""\nimport os\nimport sys\nimport json\nimport errno\nimport ctypes\nimport resource\nimport traceback\n\n# Import allowed computational libraries before the syscall filter is installed.\nimport numpy as np\nimport scipy\n\n_RESULT_MARKER = \'__E10_PROGRAM_RESULT__\'\n\n\ndef _install_seccomp():\n    """Block process creation, process control, network sockets and namespaces.\n\n    Chroot & isolated read-only bind mounts enforce filesystem boundaries.\n    The filter prevents model-generated code from undoing those boundaries.\n    """\n    lib = ctypes.CDLL(\'libseccomp.so.2\', use_errno=True)\n    lib.seccomp_init.argtypes = [ctypes.c_uint32]\n    lib.seccomp_init.restype = ctypes.c_void_p\n    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]\n    lib.seccomp_syscall_resolve_name.restype = ctypes.c_int\n    lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]\n    lib.seccomp_rule_add.restype = ctypes.c_int\n    lib.seccomp_load.argtypes = [ctypes.c_void_p]\n    lib.seccomp_load.restype = ctypes.c_int\n    lib.seccomp_release.argtypes = [ctypes.c_void_p]\n    lib.seccomp_release.restype = None\n    SCMP_ACT_ALLOW = 0x7FFF0000\n    SCMP_ACT_ERRNO = 0x00050000 | errno.EPERM\n    ctx = lib.seccomp_init(SCMP_ACT_ALLOW)\n    if not ctx:\n        raise RuntimeError(\'seccomp_init failed\')\n    try:\n        blocked = (\n            \'execve\', \'execveat\', \'fork\', \'vfork\', \'clone\', \'clone3\',\n            \'socket\', \'socketpair\', \'connect\', \'bind\', \'listen\', \'accept\', \'accept4\',\n            \'mount\', \'umount2\', \'pivot_root\', \'chroot\', \'unshare\', \'setns\',\n            \'ptrace\', \'process_vm_readv\', \'process_vm_writev\', \'open_by_handle_at\',\n            \'kill\', \'tkill\', \'tgkill\', \'reboot\', \'bpf\', \'keyctl\',\n        )\n        for name in blocked:\n            nr = lib.seccomp_syscall_resolve_name(name.encode())\n            if nr < 0: continue\n            rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ERRNO, nr, 0)\n            if rc != 0: raise RuntimeError(f\'seccomp_rule_add {name}: {rc}\')\n        rc = lib.seccomp_load(ctx)\n        if rc != 0: raise RuntimeError(f\'seccomp_load: {rc}\')\n    finally:\n        lib.seccomp_release(ctx)\n\n\ndef _set_limits():\n    cpu = max(2, min(120, int(os.environ.get(\'POETIQ_CHILD_CPU_SEC\', \'10\'))))\n    mem_mb = max(256, min(8192, int(os.environ.get(\'POETIQ_CHILD_MEM_MB\', \'4096\'))))\n    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))\n    resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024 * 1024,) * 2)\n    resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024,) * 2)\n    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))\n    # NPROC does not protect uid=0, but seccomp blocks clone/fork/execve.\n    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))\n\n\ndef main():\n    # The only data accepted from the parent is code and the puzzle\'s input grid.\n    with open(\'/run/program.py\', encoding=\'utf-8\') as f:\n        source = f.read()\n    input_grid = json.load(sys.stdin)[\'input\']\n    _set_limits()\n\n    # Privileges cannot be regained after leaving the trusted launcher.\n    libc = ctypes.CDLL(None, use_errno=True)\n    PR_SET_NO_NEW_PRIVS = 38\n    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:\n        raise RuntimeError(\'no_new_privs failed\')\n\n    _install_seccomp()\n    # All imports done by untrusted code must come from the isolated filesystem.\n    namespace = {\'__name__\': \'poetiq_candidate\', \'__builtins__\': __builtins__, \'np\': np}\n    try:\n        exec(compile(source, \'/run/program.py\', \'exec\'), namespace)\n        result = namespace[\'transform\'](np.array(input_grid, dtype=int))\n        if hasattr(result, \'tolist\'):\n            result = result.tolist()\n        payload = {\'ok\': True, \'result\': result}\n    except BaseException as exc:\n        payload = {\'ok\': False, \'error\': f\'{type(exc).__name__}: {exc}\'[:1200]}\n    try:\n        # Debug prints may precede this trusted final marker.\n        print(_RESULT_MARKER + json.dumps(payload, separators=(\',\', \':\')), flush=True)\n    except BaseException as exc:\n        print(_RESULT_MARKER + json.dumps({\'ok\': False, \'error\': f\'JSON output error: {exc}\'[:500]}), flush=True)\n\n\nif __name__ == \'__main__\':\n    try:\n        main()\n    except BaseException as exc:\n        sys.stderr.write(\'E10_SECURE_RUNNER_INIT_ERROR: \' + repr(exc) + \'\\n\')\n        sys.exit(110)\n'
++_POETIQ_NAMESPACE_BOOTSTRAP = '"""Trusted launcher: run from util-linux unshare -Urnmpf with private mounts.\n\nThe launcher only binds the host\'s Python runtime read-only. Kaggle inputs,\nnotebook, model artifacts and outside writable directories are NOT mounted.\n"""\nimport os\nimport sys\nimport shutil\nimport subprocess\n\n\ndef check(cmd):\n    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL,\n                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=12)\n\n\ndef main():\n    rootfs = sys.argv[1]\n    # Prevent any mount propagation into the parent mount namespace.\n    check([\'mount\', \'--make-rprivate\', \'/\'])\n    # Host imports must be read-only. None of the notebook/data directories are shared.\n    roots = [\'/usr\', \'/lib\', \'/lib64\', \'/opt/conda\', \'/opt/venv\',\n             sys.prefix, sys.base_prefix, os.path.dirname(sys.executable)]\n    for host_path in dict.fromkeys(roots):\n        if not os.path.exists(host_path):\n            continue\n        inner_path = os.path.join(rootfs, host_path.lstrip(\'/\'))\n        if os.path.islink(host_path):\n            os.makedirs(os.path.dirname(inner_path), exist_ok=True)\n            if not os.path.lexists(inner_path):\n                os.symlink(os.readlink(host_path), inner_path)\n            continue\n        os.makedirs(inner_path, exist_ok=True)\n        check([\'mount\', \'--bind\', host_path, inner_path])\n        check([\'mount\', \'-o\', \'remount,bind,ro\', inner_path])\n    # Dynamic linker configuration, not general host /etc.\n    etcdir = os.path.join(rootfs, \'etc\')\n    os.makedirs(etcdir, exist_ok=True)\n    if os.path.exists(\'/etc/ld.so.cache\'):\n        shutil.copyfile(\'/etc/ld.so.cache\', os.path.join(etcdir, \'ld.so.cache\'))\n    # In this namespace /run, /tmp and /dev are private to each candidate.\n    os.makedirs(os.path.join(rootfs, \'dev\'), exist_ok=True)\n    with open(os.path.join(rootfs, \'dev\', \'null\'), \'wb\'):\n        pass\n    os.chroot(rootfs)\n    os.chdir(\'/run\')\n    executable = os.path.realpath(sys.executable)\n    if not os.path.exists(executable):\n        # In a few environments sys.executable points through a symlink.\n        executable = sys.executable\n    os.execv(executable, [executable, \'-B\', \'-I\', \'/run/poetiq_secure_child.py\'])\n\n\nif __name__ == \'__main__\':\n    try:\n        main()\n    except BaseException as exc:\n        import traceback;sys.stderr.write(\'E10_SANDBOX_BOOTSTRAP_ERROR: \'+traceback.format_exc()+\'\\n\')\n        sys.exit(111)\n'
++
+ def poetiq_sandbox_run(code, grid, timeout_s=5.0):
+-    src=_POETIQ_SUBPROCESS.replace('__POETIQ_USER_PROGRAM__',str(code))
+-    with tempfile.TemporaryDirectory(prefix='e10_poetiq_') as td:
+-        path=Path(td)/'u.py';path.write_text(src,encoding='utf-8')
+-        # Match Poetiq's minimal child environment rather than copying Kaggle
+-        # account variables or tokens into model-generated Python programs.
+-        env={'PYTHONHASHSEED':'0','CUDA_VISIBLE_DEVICES':'',
+-             'OMP_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1',
+-             'MKL_NUM_THREADS':'1'}
++    import shutil, signal
++    if not shutil.which('unshare') or not shutil.which('mount'):
++        return False, 'sandbox unavailable: unshare/mount binary missing'
++    timeout_s = max(0.1, float(timeout_s))
++    with tempfile.TemporaryDirectory(prefix='e10_poetiq_secure_') as td:
++        # The rootfs and all generated content are disposable. No notebook,
++        # checkpoint, data input, model or host /tmp mounts are present inside.
++        root = Path(td)/'rootfs'
++        run = root/'run'; run.mkdir(parents=True)
++        (root/'tmp').mkdir()
++        (run/'poetiq_secure_child.py').write_text(_POETIQ_TRUSTED_RUNNER,encoding='utf-8')
++        (run/'program.py').write_text(str(code),encoding='utf-8')
++        bootstrap = Path(td)/'namespace_bootstrap.py'
++        bootstrap.write_text(_POETIQ_NAMESPACE_BOOTSTRAP,encoding='utf-8')
++        output = Path(td)/'stdout.log'
++        errors = Path(td)/'stderr.log'
++        env = {'PYTHONHASHSEED':'0','PYTHONDONTWRITEBYTECODE':'1',
++               'CUDA_VISIBLE_DEVICES':'', 'OMP_NUM_THREADS':'1',
++               'OPENBLAS_NUM_THREADS':'1','MKL_NUM_THREADS':'1',
++               'POETIQ_CHILD_CPU_SEC':str(max(2,min(120,math.ceil(timeout_s)+1))),
++               'POETIQ_CHILD_MEM_MB':'4096'}
++        # util-linux unshare: user=root in *new* userns, private mount/net/PID ns;
++        # --fork is needed for PID namespace. Parent holds timeout/kill authority.
++        cmd=['unshare','--user','--map-root-user','--mount','--net','--pid',
++             '--fork',sys.executable,str(bootstrap),str(root)]
+         try:
+-            proc=subprocess.run([sys.executable,str(path)], input=json.dumps({'input':grid}),
+-                capture_output=True,text=True,timeout=float(timeout_s),cwd=td,env=env)
++            with output.open('wb') as out, errors.open('wb') as err:
++                proc = subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=out,stderr=err,
++                    cwd=td,env=env,start_new_session=True,close_fds=True)
++                try:
++                    proc.communicate(input=json.dumps({'input':grid}).encode(), timeout=timeout_s)
++                except subprocess.TimeoutExpired:
++                    # Kill the complete namespace launcher/process group, not
++                    # only the direct child. No untrusted process can escape.
++                    try:os.killpg(proc.pid,signal.SIGKILL)
++                    except ProcessLookupError:pass
++                    proc.communicate(timeout=2)
++                    return False,'sandbox timeout'
++            if output.stat().st_size > 1024 * 1024 or errors.stat().st_size > 1024 * 1024:
++                return False,'sandbox output limit exceeded'
++            sout=output.read_text(encoding='utf-8',errors='replace')
++            serr=errors.read_text(encoding='utf-8',errors='replace')
+             if proc.returncode:
+-                return False, (proc.stderr or proc.stdout)[-1500:]
+-            # Generated code may log via print(), as Poetiq prompts suggest.
+-            # Read only the runner's tagged final response, not arbitrary stdout.
++                return False, ('sandbox process failure '+str(proc.returncode)+': '+(serr or sout))[-1500:]
+             marker='__E10_PROGRAM_RESULT__'
+-            pos=proc.stdout.rfind(marker)
+-            if pos < 0:
+-                return False, 'Program did not return a result: '+proc.stdout[-1000:]
+-            try:
+-                payload=json.loads(proc.stdout[pos+len(marker):].strip())
+-            except ValueError:
+-                return False, 'Malformed program result: '+proc.stdout[-1000:]
+-            if not payload.get('ok'): return False, 'Program reported failure'
+-            return True, json.dumps(payload.get('result'))
+-        except subprocess.TimeoutExpired:
+-            return False, 'sandbox timeout'
+-        except Exception as e:
+-            return False, f'{type(e).__name__}: {e}'[:1000]
++            pos=sout.rfind(marker)
++            if pos<0:return False,'sandbox missing result: '+sout[-800:]
++            try: payload=json.loads(sout[pos+len(marker):].strip())
++            except ValueError:return False,'sandbox malformed result: '+sout[-800:]
++            if not payload.get('ok'):
++                return False,str(payload.get('error','program error'))[:1200]
++            return True,json.dumps(payload.get('result'))
++        except Exception as exc:
++            return False, ('sandbox startup failure '+type(exc).__name__+': '+str(exc))[:1000]
+ 
+ def poetiq_array_diff(pred, truth):
+     return '\n'.join(' '.join(str(int(a)) if a==b else f'{int(a)}/{int(b)}' for a,b in zip(pr,tr))
+@@ -142,10 +162,20 @@
+         ok,payload=poetiq_sandbox_run(code,ex['input'],timeout_s)
+         grid=poetiq_grid_from_output(payload) if ok else None
+         test_results.append({'grid':grid,'error':None if grid is not None else payload[-600:]})
++    passed=all(r['success'] for r in train_results)
++    test_usable=all(poetiq_valid_grid(r.get('grid')) for r in test_results)
++    feedback='\n\n'.join(r['feedback'] for r in train_results)
++    # Test-input truth is NEVER consulted: only runtime/format diagnostics.
++    if not test_usable:
++        problems=[f'Challenge #{i+1}: {r.get("error") or "invalid grid shape/palette"}'
++                  for i,r in enumerate(test_results) if not poetiq_valid_grid(r.get('grid'))]
++        feedback += '\n\nTEST EXECUTION / FORMAT ERRORS (no test answers are known):\n'+\
++                    '\n'.join(problems)
+     return {'train_results':train_results,'test_results':test_results,
+-            'passed':all(r['success'] for r in train_results),
++            'passed':passed,'test_usable':test_usable,
++            'verified_usable':bool(passed and test_usable),
+             'score':float(sum(per)/len(per)) if per else 0.0,
+-            'feedback':'\n\n'.join(r['feedback'] for r in train_results)}
++            'feedback':feedback}
+ 
+ def poetiq_test_key(test_results):
+     return json.dumps([r.get('grid') for r in test_results],separators=(',',':'))
+
+--- R2/poetiq_scheduler.py
++++ R3/poetiq_scheduler.py
+@@ -20,7 +20,7 @@
+     for _expert in range(POETIQ_NUM_EXPERTS):
+         _key=(_tid,_expert)
+         E10_STATES[_key] = {'task_id':_tid,'expert':_expert,'task_index':_task_idx,
+-                            'iteration':0,'finished':False,'history':[], 'best':None,
++                            'iteration':0,'finished':False,'history':[], 'candidate_history':[], 'best':None,
+                             'best_score':-1.0,'last_error':None,'status':'queued'}
+         E10_QUEUE.append(_key)
+ 
+@@ -123,11 +123,17 @@
+                        'iteration':st['iteration']+1,'code':code})
+         feedback=result['feedback'];score=result['score']
+         st['history'].append({'code':code,'feedback':feedback,'score':score})
+-        if score >= st['best_score']:
++        # All executed programs stay available for a second diverse attempt.
++        # Best/expert voting remains the original primary selection mechanism.
++        st['candidate_history'].append(result)
++        usable=bool(result.get('test_usable',False))
++        if usable and score >= st['best_score']:
+             st['best_score']=score;st['best']=result
+-        if result['passed']:
++        if result['passed'] and usable:
+             st['finished']=True;st['status']='train_verified'
+             E10_SCHED['train_passed']+=1
++        elif result['passed'] and not usable:
++            st['status']='train_pass_test_unusable'
+     base_rec['score']=result['score'] if result else None
+     base_rec['train_passed']=bool(result and result['passed'])
+     E10_RECORDS.append(base_rec)
+@@ -153,10 +159,26 @@
+         e10_commit_iteration(key,code,result,rec)
+ 
+ def e10_rank_task(tid):
++    # Preserve Poetiq's main expert-best voting ranking. Append earlier valid
++    # (possibly partial-train) program histories only as extra distinct
++    # candidates for attempt_2, never ahead of the donor's top experts.
+     expert_bests=[s['best'] for (task,_),s in E10_STATES.items() if task==tid and s['best']]
+-    return poetiq_vote(expert_bests,use_new_voting=POETIQ_USE_NEW_VOTING,
++    voted=poetiq_vote(expert_bests,use_new_voting=POETIQ_USE_NEW_VOTING,
+           count_failed_matches=POETIQ_COUNT_FAILED_MATCHES,
+-          iters_tiebreak=POETIQ_ITERS_TIEBREAK,low_to_high_iters=POETIQ_LOW_TO_HIGH_ITERS)
++          iters_tiebreak=POETIQ_ITERS_TIEBREAK,
++          low_to_high_iters=POETIQ_LOW_TO_HIGH_ITERS)
++    already={id(r) for r in voted}
++    history=[r for (task,_),s in E10_STATES.items() if task==tid
++             for r in s['candidate_history']
++             if id(r) not in already and r.get('test_usable')]
++    if history:
++        # Same donor voting/soft-score semantics for historical candidates;
++        # no synthetic identity/mirror candidates are introduced.
++        voted.extend(poetiq_vote(history,use_new_voting=POETIQ_USE_NEW_VOTING,
++            count_failed_matches=POETIQ_COUNT_FAILED_MATCHES,
++            iters_tiebreak=POETIQ_ITERS_TIEBREAK,
++            low_to_high_iters=POETIQ_LOW_TO_HIGH_ITERS))
++    return voted
+ 
+ def e10_update_task_submission(tid):
+     ranked=e10_rank_task(tid)

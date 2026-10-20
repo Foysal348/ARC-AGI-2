@@ -1,0 +1,37 @@
+--- BASE_E7_CELL1_TO_E8_CONFIG.patch:original
++++ BASE_E7_CELL1_TO_E8_CONFIG.patch:updated
+@@ -69,6 +69,24 @@
+ if "drain_margin_sec" in P:   # v1.4.4 (RERUN): fixed offsets from the hard stop, so the slots stay full until the drain
+     DRAIN_DEADLINE = HARD_STOP - P["drain_margin_sec"]
+     ADMIT_DEADLINE = DRAIN_DEADLINE - P["admit_margin_sec"]
++# E8 architecture: guarantee a RESERVED post-primary window (not leftover runtime).
++# Experimental allocation: 30 minutes before the original E7 hard stop; change explicitly when approved.
++E8_RESERVED_SEC = float(os.environ.get("Q27X_E8_RESERVED_SEC", "1800"))
++E8_FINALIZE_SEC = float(os.environ.get("Q27X_E8_FINALIZE_SEC", "120"))
++assert 0 < E8_FINALIZE_SEC < E8_RESERVED_SEC
++E8_GLOBAL_HARD_STOP = HARD_STOP
++E8_STAGE_DEADLINE = E8_GLOBAL_HARD_STOP - E8_FINALIZE_SEC
++PRIMARY_HARD_STOP = E8_GLOBAL_HARD_STOP - E8_RESERVED_SEC
++assert NOTEBOOK_T0 < PRIMARY_HARD_STOP < E8_STAGE_DEADLINE < E8_GLOBAL_HARD_STOP < VERIFY_DEADLINE
++HARD_STOP = PRIMARY_HARD_STOP  # Existing E7 scheduler uses HARD_STOP unchanged.
++# Adjust only admission/drain windows, preserving each profile's original internal buffers.
++if "drain_margin_sec" in P:
++    DRAIN_DEADLINE = HARD_STOP - P["drain_margin_sec"]
++    ADMIT_DEADLINE = DRAIN_DEADLINE - P["admit_margin_sec"]
++else:
++    DRAIN_DEADLINE = min(DRAIN_DEADLINE, HARD_STOP - 8 * 60)
++    ADMIT_DEADLINE = min(ADMIT_DEADLINE, DRAIN_DEADLINE - 7 * 60)
++
+ assert NOTEBOOK_T0 < ADMIT_DEADLINE < DRAIN_DEADLINE < HARD_STOP < VERIFY_DEADLINE < NOTEBOOK_T0 + TOTAL_BUDGET_SEC
+ 
+ # v1.3.5 (run 2 OOM): CUDA-graph memory is taken out of the KV budget (vLLM 0.19 envs.py 1654, v1/worker/gpu_worker.py
+@@ -80,6 +98,9 @@
+           "TOTAL_BUDGET_SEC", "MIN_THINK_BUDGET"]}
+ CONFIG["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"]
+ CONFIG["profile_row"] = P
++CONFIG["e8_reserved_sec"] = E8_RESERVED_SEC
++CONFIG["e8_finalize_sec"] = E8_FINALIZE_SEC
++CONFIG["e8_stage_deadline_min"] = round((E8_STAGE_DEADLINE-NOTEBOOK_T0)/60,1)
+ print(json.dumps(CONFIG, indent=1, default=str))
+ 
+ os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")

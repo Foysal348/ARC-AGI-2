@@ -1,0 +1,297 @@
+### end_reason=forced_close mode=forced_close
+### THINKING TAIL
+asterizing 4 steps: (4,5),(3,4),(2,3),(1,? ). The line after 4 steps: param t=4/3 beyond target? x? If target point (2,4), direction per step (-0.75,-0.667). At step4: (5-3,6-2.667)=(2,3.333) not (1,3). If choose target point (1,4), direction per step (-1,-0.5); step4: (1,4) occupied; avoid to (1,3). Output. So target point maybe top/center of target line, not nearest.
+
+What determines which point on target? Maybe the target object's "anchor" or closest cell to the snake's original free endpoint? Ex2 target 4 line rows0-2; snake free endpoint input (8,3). The target point that aligns with free endpoint column? Free endpoint col3, target line c4; choose target cell same row as? Output endpoint (1,3) col3, row1. Maybe it aims at the target cell in the same column offset as free endpoint? Not.
+
+Let's examine original snake orientation and target. In ex2, input snake from A(5,6) to F(8,3). The vector A->F is down-left. The target 4 line is up-left. The output path is as if the snake is "reflected" across a horizontal axis through A? Original F (8,3) reflected over row5 gives (2,3). Output endpoint (1,3), one step further up. The path from A to reflected F with length L? A to (2,3) distance3, L-1=4, so one extra step up -> (1,3). This is interesting! Ex5: A=(5,4), original F=(8,0). Reflect F across row A (row5): (2,8). Output endpoint (0,4), not. Reflect across vertical col A? (8,8) no. Rotate? No.
+
+Ex3: A=(6,7), original F=(2,13). Reflect across row A: (10,13). Output F'=(14,7), not. Reflect across vertical col A: (2,1) no. But output is roughly reflect across vertical axis through target? no.
+
+Maybe output endpoint is the result of "folding" the original snake at the anchor and target? Hmm.
+
+Let's look at the original snake shape as a path; output path might be the original path *rotated* so that its endpoint at target direction, but preserving length and maybe local turns? For ex2, original path from A to F: (5,6)->(6,5)->(7,5)->(8,4)->(8,3). If we rotate this path 90 degrees around A? 90 ccw: relative (0,0),(1,-1),(2,-1),(3,-3),(3,-2) -> rotate ccw (x=dc,y=dr?) Let's use vector (dr,dc) rotate 90 ccw: (dr,dc)->(-dc,dr). (1,-1)->(1,1); (2,-1)->(1,2); (3,-3)->(3,3); (3,-2)->(2,3). Absolute: (5,6),(6,7),(7,8),(9,9),(8,9) not. Rotate 180: (-1,1),(-2,1),(-3,3),(-3,2) -> up-right, not.
+Output path relative: (-1,-1),(-2,-2),(-3,-3),(-4,-3). This is not rotation.
+
+Could the rule be "move the snake to the shortest path between the two *endpoint cells* that are adjacent to non-background colors"? In ex2, input snake endpoints: A adjacent to 2 line, F not adjacent? F=(8,3) not adjacent to any other? It is near 4 line? distance to 4 line (2,4) 6. Output endpoints: A same, F' adjacent to 4 line. So yes it changes free endpoint to nearest cell adjacent to the other object. In ex1, input snake endpoints: A=(3,4) adjacent to 8 line, F=(6,1) not adjacent to 2. Output endpoints: A same, F'=(0,4) not adjacent to 2? It is adjacent? F' (0,4) to 2 (1,5) diagonal, yes adjacent! It is the cell beyond 2? It is adjacent to 2. In ex5, input F=(8,0) not adjacent to 3; output F'=(0,4) is not adjacent to 3? (0,4) to (2,3) Cheb2, not adjacent. But output path has cells (2,2),(3,2) adjacent to 3. Endpoint not adjacent. So not.
+
+Maybe output endpoint is the cell at distance original length-1 from A along the shortest path to the target object, where target object is considered an obstacle that the path can pass adjacent to but not enter, and if the shortest path to the target is shorter than length, it continues straight beyond the target in the same direction. This is the ray idea.
+
+Let's define a precise algorithm that reproduces training and likely intended:
+- Identify the moving snake component: the non-background connected component (8-connected) that is not a straight line and has maximum size? Or the one that is "not a line" and has an endpoint adjacent to a different non-background component (anchor). In training, exactly one.
+- Identify anchor endpoint: the endpoint of the snake (degree 1 in 8-neighbor graph) that is 8-adjacent to a non-background cell of another color (anchor object). In ex2, endpoint (5,6) adjacent to 2 line. Ex3 (6,7) adjacent to 2 line. Ex4 (4,3) adjacent to 5 line. Ex5 (5,4) adjacent to 6 line. Ex1 (3,4) adjacent to 8 line.
+- Identify target object: the other non-background component (not the anchor object, not the snake) that is nearest to the snake/anchor? In training there are exactly two other components; one is anchor object (adjacent to snake endpoint), the other is target. In ex1, other components: 8 line (anchor), 2 point (target). Ex2: 2 line anchor, 4 line target. Ex3: 2 line anchor, 9 line target. Ex4: 5 line anchor, 3 object target. Ex5: 6 line anchor, 3 line target.
+- Let L
+
+Considering the limited time by the user, I have to give the solution based on the thinking directly now.
+
+### ANSWER
+
+
+```python
+def solution(grid: list[list[int]]) -> list[list[int]]:
+    import numpy as np
+    from collections import deque
+
+    g = np.array(grid, dtype=int)
+    H, W = g.shape
+
+    # background is the border color in these puzzles
+    bg = int(g[0, 0])
+
+    def neighbors8(r, c):
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < H and 0 <= nc < W:
+                    yield nr, nc
+
+    def components(mask):
+        seen = np.zeros((H, W), bool)
+        comps = []
+        for i in range(H):
+            for j in range(W):
+                if mask[i, j] and not seen[i, j]:
+                    q = deque([(i, j)])
+                    seen[i, j] = True
+                    cells = []
+                    while q:
+                        r, c = q.popleft()
+                        cells.append((r, c))
+                        for nr, nc in neighbors8(r, c):
+                            if mask[nr, nc] and not seen[nr, nc]:
+                                seen[nr, nc] = True
+                                q.append((nr, nc))
+                    comps.append(cells)
+        return comps
+
+    def degree_in(cells):
+        s = set(cells)
+        deg = {}
+        for r, c in cells:
+            d = 0
+            for nr, nc in neighbors8(r, c):
+                if (nr, nc) in s:
+                    d += 1
+            deg[(r, c)] = d
+        return deg
+
+    def is_line(cells):
+        if len(cells) < 2:
+            return False
+        rs = [r for r, c in cells]
+        cs = [c for r, c in cells]
+        if max(rs) - min(rs) <= 1 and max(cs) - min(cs) <= 1:
+            return False
+        vertical = len(set(cs)) == 1
+        horizontal = len(set(rs)) == 1
+        diagonal = len(set(r - c for r, c in cells)) == 1
+        antidiagonal = len(set(r + c for r, c in cells)) == 1
+        if not (vertical or horizontal or diagonal or antidiagonal):
+            return False
+        if vertical:
+            c = cs[0]
+            return all((r, c) in set(cells) for r in range(min(rs), max(rs) + 1))
+        if horizontal:
+            r = rs[0]
+            return all((r, c) in set(cells) for c in range(min(cs), max(cs) + 1))
+        if diagonal:
+            return all((r, r - min(rs) + min(cs)) in set(cells) for r in range(min(rs), max(rs) + 1))
+        if antidiagonal:
+            k = min(rs) + min(cs)
+            return all((r, k - r) in set(cells) for r in range(min(rs), max(rs) + 1))
+        return False
+
+    nonbg_mask = g != bg
+    comps = components(nonbg_mask)
+
+    # choose the moving snake: largest non-line component with an endpoint
+    # adjacent to another component
+    best = None
+    for cells in comps:
+        if len(cells) < 3:
+            continue
+        if is_line(cells):
+            continue
+        deg = degree_in(cells)
+        ends = [p for p, d in deg.items() if d == 1]
+        if not ends:
+            continue
+        s = set(cells)
+        anchor = None
+        for p in ends:
+            r, c = p
+            for nr, nc in neighbors8(r, c):
+                if g[nr, nc] != bg and (nr, nc) not in s:
+                    anchor = p
+                    break
+            if anchor:
+                break
+        if anchor is None:
+            continue
+        score = len(cells)
+        if best is None or score > best[0]:
+            best = (score, cells, anchor)
+
+    if best is None:
+        return [list(map(int, row)) for row in g]
+
+    _, snake_cells, anchor = best
+    snake_set = set(snake_cells)
+    L = len(snake_cells)
+
+    # occupied cells are all non-background cells except the snake itself
+    occupied = nonbg_mask.copy()
+    for r, c in snake_set:
+        occupied[r, c] = False
+
+    # target object: non-snake non-bg component not adjacent to anchor?
+    # In training, it is simply the other object in the same local scene.
+    # Use the non-snake component whose centroid is closest to the anchor.
+    target_cells = []
+    min_dist = None
+    for cells in comps:
+        s = set(cells)
+        if s <= snake_set:
+            continue
+        # skip the anchor object: has a cell adjacent to anchor endpoint
+        adj_anchor = False
+        ar, ac = anchor
+        for r, c in s:
+            if abs(r - ar) <= 1 and abs(c - ac) <= 1:
+                adj_anchor = True
+                break
+        if adj_anchor:
+            continue
+        cr = sum(r for r, c in cells) / len(cells)
+        cc = sum(c for r, c in cells) / len(cells)
+        d = abs(cr - ar) + abs(cc - ac)
+        if min_dist is None or d < min_dist:
+            min_dist = d
+            target_cells = cells
+
+    if not target_cells:
+        return [list(map(int, row)) for row in g]
+
+    tr = sum(r for r, c in target_cells) / len(target_cells)
+    tc = sum(c for r, c in target_cells) / len(target_cells)
+
+    # Build a path of at most L cells from anchor toward target.
+    # It is a greedy 8-neighbor walk that minimizes remaining Chebyshev
+    # distance to the target centroid, avoids occupied cells, and continues
+    # in the last direction if target has been passed or no closer move exists.
+    def cheb(a, b):
+        return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+    path = [anchor]
+    cur = anchor
+    last_dir = (0, 0)
+    target_pos = (tr, tc)
+
+    for _ in range(L - 1):
+        candidates = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = cur[0] + dr, cur[1] + dc
+                if not (0 <= nr < H and 0 <= nc < W):
+                    continue
+                if occupied[nr, nc]:
+                    continue
+                if (nr, nc) in path[:-1]:
+                    continue
+                # Prefer moves that reduce distance to target. If target is
+                # already at/behind, prefer continuing previous direction.
+                d_before = cheb(cur, target_pos)
+                d_after = max(abs(nr - tr), abs(nc - tc))
+                score = d_after
+                if last_dir != (0, 0):
+                    if (dr, dc) == last_dir:
+                        score -= 0.1
+                    elif dr * last_dir[0] < 0 or dc * last_dir[1] < 0:
+                        score += 0.1
+                candidates.append((score, d_after, abs(dr - last_dir[0]) + abs(dc - last_dir[1]), dr, dc, nr, nc))
+        if not candidates:
+            break
+        candidates.sort()
+        _, _, _, dr, dc, nr, nc = candidates[0]
+        path.append((nr, nc))
+        last_dir = (dr, dc)
+        cur = (nr, nc)
+
+        # If we are beyond the target in both relevant senses, continue straight
+        # to fill the original length until boundary/blocked.
+        if (cur[0] - tr) * (anchor[0] - tr) >= 0 and abs(cur[0] - tr) >= abs(anchor[0] - tr) + 1:
+            pass
+
+    out = g.copy()
+    out[snake_set] = bg
+    color = int(g[anchor[0], anchor[1]]) if g[anchor[0], anchor[1]] != bg else int(next(iter({int(g[r,c]) for r,c in snake_cells})))
+    for r, c in path:
+        out[r, c] = color
+
+    return [list(map(int, row)) for row in out]
+```
+
+```json
+{
+  "test_outputs": [
+    [
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [3, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 4, 4, 1, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 4, 4, 4, 5, 5, 5, 1, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 4, 5, 5, 5, 5, 5, 1, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+      [5, 5, 5, 5, 5, 5, 5, 5, 1, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
+    ],
+    [
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 1, 1, 1, 8, 8, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 8, 8, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 1, 1, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 3, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 2, 2, 2, 2, 2, 2],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 5, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 6, 6, 8, 8, 8, 5, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 6, 6, 8, 8, 5, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 5, 5, 8, 8, 8, 8],
+      [8, 8, 8, 8, 5, 5, 5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 5, 5, 8, 8, 8, 8],
+      [8, 8, 8, 8, 5, 5, 5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 4, 4, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 4, 4, 4, 8, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 4, 8, 8, 8, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+      [8, 8, 8, 8, 8, 8, 1, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+    ]
+  ]
+}
+```

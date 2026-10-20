@@ -1,0 +1,295 @@
+--- Q27-XHIGH-v1_4.ipynb:original-code
++++ Q27X_v1_4_R5_SAFE_PATCH.ipynb:patched-code
+@@ -32,7 +32,13 @@
+     return {tid: [{"attempt_1": q["input"], "attempt_2": q["input"]} for q in task["test"]]
+             for tid, task in challenges.items()}
+ 
++# R5: MODE CONTRACT. A non-rerun commit intentionally contains an identity safety floor.
++MODE_CONTRACT = {"competition_rerun_env": os.environ.get("KAGGLE_IS_COMPETITION_RERUN"),
++                 "rerun": bool(RERUN), "submission_file_semantics":
++                 "MODEL_PREDICTIONS_WHEN_FINISHED" if RERUN else "IDENTITY_FLOOR_NOT_MODEL_OUTPUT"}
++write_json_atomic(OUT / "mode_contract.json", MODE_CONTRACT)
+ write_json_atomic(SUBMISSION_PATH, identity_submission(test_challenges))
++print("SUBMISSION CONTRACT:", MODE_CONTRACT, flush=True)
+ print("MODE:", "COMPETITION RERUN (hidden test)" if RERUN else "COMMIT / INTERACTIVE (evaluation)",
+       "| fallback submission.json:", len(test_challenges), "tasks | RUN_ID", RUN_ID)
+ 
+@@ -89,6 +95,13 @@
+ # ---- verification (fresh process per candidate: train first, then test)
+ VERIFY_TIMEOUT_SEC = 20.0
+ VERIFY_WORKERS = 4
++# R5: Optional low-effort reviewer; NOT enabled for real hidden runs until benchmarked.
++# It runs only AFTER first-pass coverage, and stops strictly before HARD_STOP.
++AUDIT_ENABLED = os.environ.get("Q27X_ENABLE_AUDIT", "0") == "1"
++AUDIT_MAX_QUERIES = max(0, int(os.environ.get("Q27X_AUDIT_MAX_QUERIES", "8")))
++AUDIT_THINK_BUDGET = max(128, int(os.environ.get("Q27X_AUDIT_THINK_BUDGET", "4096")))
++AUDIT_ANSWER_MAX = max(128, int(os.environ.get("Q27X_AUDIT_ANSWER_MAX", "4096")))
++AUDIT_CONCURRENCY = max(1, int(os.environ.get("Q27X_AUDIT_CONCURRENCY", "2")))
+ 
+ # ---- time
+ TOTAL_BUDGET_SEC = float(os.environ.get("Q27X_TIME_BUDGET", P["time_budget_sec"]))
+@@ -105,7 +118,7 @@
+ CONFIG = {k: globals()[k] for k in ["PROFILE", "RERUN", "SEED", "REASONING_EFFORT", "THINK_BUDGET", "ANSWER_MAX_TOKENS",
+           "DRAIN_ANSWER_MAX_TOKENS", "MAX_MODEL_LEN", "PROMPT_TOKEN_LIMIT", "SAMPLING", "MAX_NUM_SEQS",
+           "MAX_NUM_BATCHED_TOKENS", "GPU_MEMORY_UTILIZATION", "SPECULATIVE_CONFIG", "KV_CACHE_DTYPE", "VERIFY_TIMEOUT_SEC",
+-          "TOTAL_BUDGET_SEC", "MIN_THINK_BUDGET"]}
++          "TOTAL_BUDGET_SEC", "MIN_THINK_BUDGET", "AUDIT_ENABLED", "AUDIT_MAX_QUERIES", "AUDIT_THINK_BUDGET", "AUDIT_ANSWER_MAX", "AUDIT_CONCURRENCY"]}
+ CONFIG["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"]
+ CONFIG["profile_row"] = P
+ print(json.dumps(CONFIG, indent=1, default=str))
+@@ -337,6 +350,37 @@
+         return None
+     sol = SOLUTIONS[UNIT_TASK[uid]][UNIT_Q[uid]]
+     return {"hit": int(att["attempt_1"] == sol or att["attempt_2"] == sol), "pass1": int(att["attempt_1"] == sol)}
++
++# R5: Keep malformed final-grid evidence. Diagnostic only: never guess which cell to delete.
++def raw_grid_diagnostics(answer_text):
++    blocks = _FENCE_RE.findall(answer_text or "")
++    if blocks:
++        label, body = blocks[-1]
++        source = "final_closed_fence"
++    else:
++        text = answer_text or ""
++        body = text.rsplit("```", 1)[-1] if "```" in text else text
++        label, source = "", "unfenced_or_open"
++    raw_lines = [line.strip() for line in body.splitlines() if line.strip()]
++    rows = [_parse_row(line) for line in raw_lines]
++    lengths = [len(row) for row in rows if row is not None]
++    counts = {w: lengths.count(w) for w in sorted(set(lengths))}
++    return {"source": source, "fence_label": label.strip(), "parseable_rows": len(lengths),
++            "row_widths": counts, "ragged": len(counts) > 1,
++            "too_tall": len(lengths) > 30, "too_wide": bool(lengths and max(lengths) > 30),
++            "unparsed_nonempty_lines": len(raw_lines) - len(lengths)}
++
++
++def merge_second_candidate(uid, grid, source="model_review"):
++    """Promote a *new* legal candidate without changing attempt_1 or a useful prior fallback."""
++    if uid not in FINAL or not valid_grid(grid):
++        return False
++    prev = FINAL[uid]
++    if grid in (prev["attempt_1"], prev["attempt_2"]):
++        return False
++    prev["attempt_2"] = grid
++    prev["src_2"] = source
++    return True
+ 
+ # ---- self-tests (CPU, every run)
+ _G = [[1, 0, 2], [3, 4, 5]]
+@@ -448,16 +492,22 @@
+ ENGINE_INFO = {"attempts": [], "speculative": None, "kv_cache_dtype": None, "attention_backend": None, "load_sec": None,
+                "kv_tokens": None, "concurrency": None, "fatal": None, "cuda_link": CUDA_LINK}
+ import logging
+-try:   # v1.3: keep vLLM's front-end log (stats lines incl. speculative decoding) in the bundle
++from vllm import LLM, SamplingParams
++from vllm.sampling_params import RequestOutputKind
++import vllm
++try:   # R5: attach AFTER vLLM imports; same logger hierarchy as vLLM uses.
+     _vllm_log_handler = logging.FileHandler(OUT / "vllm_frontend.log", mode="w", encoding="utf-8")
+     _vllm_log_handler.setLevel(logging.INFO)
+     _vllm_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+     logging.getLogger("vllm").addHandler(_vllm_log_handler)
+ except Exception as _e:
+     print("vLLM log file handler not installed:", repr(_e)[:200])
+-from vllm import LLM, SamplingParams
+-from vllm.sampling_params import RequestOutputKind
+-import vllm
++# R5 log probe: an empty log file was observed in RUN4.
++logging.getLogger("vllm").info("Q27X_LOG_PROBE_FRONTEND")
++try:
++    _vllm_log_handler.flush()
++except NameError:
++    pass
+ 
+ def _wait_gpu_release(max_sec=float(os.environ.get("Q27X_GPU_WAIT_MAX", 180))):
+     """v1.1 (F7) + v1.3: wait until every GPU uses < 1 GB; report whether that actually happened"""
+@@ -609,7 +659,13 @@
+ def write_submission():
+     sub = identity_submission(test_challenges)
+     if not RERUN:
+-        write_json_atomic(SUBMISSION_PATH, sub); return
++        # R5: save real EVAL12 candidates separately. The committed submission remains identity floor.
++        ev = {tid: [{"attempt_1": FINAL.get(f"{tid}#{qi}", {}).get("attempt_1", q["input"]),
++                     "attempt_2": FINAL.get(f"{tid}#{qi}", {}).get("attempt_2", q["input"])}
++                    for qi, q in enumerate(CHALLENGES[tid]["test"])] for tid in TASK_IDS}
++        write_json_atomic(OUT / "eval_predictions.json", ev)
++        write_json_atomic(SUBMISSION_PATH, sub)
++        return
+     for uid, att in FINAL.items():
+         tid, qi = UNIT_TASK[uid], UNIT_Q[uid]
+         if tid in sub and qi < len(sub[tid]):
+@@ -658,7 +714,8 @@
+     text, think_tokens, closed = answer_text(st)
+     grid = parse_grid(text)
+     st.update({"answer_chars": len(text), "think_tokens": int(think_tokens if closed else len(st["p1_ids"])),
+-               "think_closed": closed, "has_grid": grid is not None})
++               "think_closed": closed, "has_grid": grid is not None,
++               "grid_diagnostic": raw_grid_diagnostics(text)})
+     try:   # v1.1 (F5): keep the answer and the end of the thinking for diagnosis
+         _ids = list(st["p1_ids"]) + list(st["p2_prefix"]) + list(st["p2_ids"])
+         _end = think_tokens if closed else len(_ids)
+@@ -678,7 +735,7 @@
+            "p2_tokens": len(st["p2_ids"]), "think_tokens": st["think_tokens"], "think_closed": st["think_closed"],
+            "p1_finish": st["p1_finish"], "p2_finish": st["p2_finish"], "sec": round(st["t_done"] - st["t_admit"], 1),
+            "answer_chars": st["answer_chars"], "has_grid": st["has_grid"], "src": [att["src_1"], att["src_2"]],
+-           "score": sc, "p1_cap": P1_CAPS.get(uid)}
++           "score": sc, "p1_cap": P1_CAPS.get(uid), "grid_diagnostic": st.get("grid_diagnostic")}
+     RECORDS.append(rec)
+     with open(RECORDS_PATH, "a", encoding="utf-8") as f:
+         f.write(json.dumps(rec) + "\n")
+@@ -744,6 +801,116 @@
+     SCHED["gen_tokens"] = GEN_TOKENS_TOTAL
+     SCHED["tok_per_sec"] = round(GEN_TOKENS_TOTAL / max(SCHED["wall_sec"], 1e-6), 1)
+ 
++# R5: truly distinct, optional second model attempt. Run only on remaining budget after coverage.
++# This experiment has NO proven accuracy gain; it never replaces attempt_1.
++AUDIT_STATS = {"enabled": AUDIT_ENABLED, "started": 0, "completed": 0,
++               "valid_distinct": 0, "aborted_at_deadline": 0, "candidates_planned": 0}
++AUDIT_RECORDS_PATH = OUT / "audit_records.jsonl"
++
++def _review_prompt(uid):
++    task = CHALLENGES[UNIT_TASK[uid]]
++    test_input = task["test"][UNIT_Q[uid]]["input"]
++    orig = FINAL[uid]
++    text = build_user_message(task["train"], test_input)
++    # Present the existing candidate as a tentative guess; ask for a corrected alternate.
++    if orig["src_1"] == "model":
++        text += ("\nThe earlier tentative output grid could contain an indexing or copying mistake. "
++                 "Independently check it against EVERY example. Recompute the final grid "
++                 "and return the corrected grid in one ```grid block. "
++                 "Do not repeat an unverified guess.\nTENTATIVE GRID:\n```grid\n"
++                 + render_grid(orig["attempt_1"]) + "\n```\n")
++    return tokenizer.apply_chat_template(
++        [{"role": "user", "content": text}], tokenize=False,
++        add_generation_prompt=True, enable_thinking=True, reasoning_effort="low")
++
++def run_optional_audit():
++    """Isolated second-pass queue; protects existing answers if review fails or times out."""
++    if not AUDIT_ENABLED or not ENGINE_READY or AUDIT_MAX_QUERIES == 0:
++        return
++    # Model candidate requests first, then malformed-answer / fallback requests.
++    queue = sorted((u for u in UNITS if u in FINAL),
++                   key=lambda u: (FINAL[u]["src_1"] != "model", UNIT_INDEX[u]))[:AUDIT_MAX_QUERIES]
++    AUDIT_STATS["candidates_planned"] = len(queue)
++    state = {}
++    limit = min(AUDIT_CONCURRENCY, CONCURRENCY)
++    cutoff = HARD_STOP - 45  # leave safety window for output serialization
++
++    def finish_audit(st, reason):
++        uid = st["uid"]
++        ids = st["p1_ids"] + st["p2_prefix"] + st["p2_ids"]
++        closed = THINK_CLOSE_ID in ids
++        if closed:
++            k = len(ids) - 1 - ids[::-1].index(THINK_CLOSE_ID)
++            text = tokenizer.decode(ids[k+1:], skip_special_tokens=True)
++        else:
++            text = ""
++        grid = parse_grid(text)
++        upgraded = merge_second_candidate(uid, grid)
++        AUDIT_STATS["completed"] += 1
++        AUDIT_STATS["valid_distinct"] += int(upgraded)
++        rec = {"unit": uid, "mode": reason, "valid_grid": valid_grid(grid),
++               "promoted": upgraded, "prompt_tokens": len(st["prompt_ids"]),
++               "generation_tokens": len(st["p1_ids"]) + len(st["p2_ids"]),
++               "diagnostic": raw_grid_diagnostics(text)}
++        with open(AUDIT_RECORDS_PATH, "a", encoding="utf-8") as f:
++            f.write(json.dumps(rec) + "\n")
++        st["phase"] = "done"
++        write_submission()
++
++    while queue or any(s["phase"] in (3, 4) for s in state.values()):
++        now = time.perf_counter()
++        active = [s for s in state.values() if s["phase"] in (3, 4)]
++        if now >= cutoff:
++            if active:
++                engine.abort_request([_req(s["uid"], s["phase"]) for s in active])
++            AUDIT_STATS["aborted_at_deadline"] += len(active)
++            break
++        while queue and len(active) < limit and now < cutoff - 90:
++            uid = queue.pop(0)
++            prompt_ids = tokenizer.encode(_review_prompt(uid), add_special_tokens=False)
++            cap = max(0, min(AUDIT_THINK_BUDGET, MAX_MODEL_LEN - len(prompt_ids) - AUDIT_ANSWER_MAX - CONTEXT_SAFETY))
++            if cap < 128:
++                continue
++            st = {"uid": uid, "phase": 3, "prompt_ids": prompt_ids,
++                  "p1_ids": [], "p2_ids": [], "p2_prefix": []}
++            state[uid] = st
++            engine.add_request(_req(uid, 3), {"prompt_token_ids": prompt_ids},
++                               make_params(cap, SEED + 10 * UNIT_INDEX[uid] + 7))
++            AUDIT_STATS["started"] += 1
++            active.append(st)
++        if not active:
++            break
++        for o in engine.step():
++            uid, p = o.request_id.rsplit("|", 1)
++            phase = int(p)
++            st = state.get(uid)
++            if st is None or st["phase"] != phase:
++                continue
++            comp = o.outputs[0] if o.outputs else None
++            if comp is not None:
++                (st["p1_ids"] if phase == 3 else st["p2_ids"]).extend(comp.token_ids)
++            if not o.finished:
++                continue
++            if phase == 3:
++                if THINK_CLOSE_ID in st["p1_ids"] and comp is not None and comp.finish_reason != "length":
++                    finish_audit(st, "natural")
++                    continue
++                closed = THINK_CLOSE_ID in st["p1_ids"]
++                if not closed:
++                    while st["p1_ids"] and st["p1_ids"][-1] in EOS_IDS:
++                        st["p1_ids"].pop()
++                pre = list(st["prompt_ids"]) + list(st["p1_ids"]) + ([] if closed else list(STOP_IDS))
++                answer_cap = min(AUDIT_ANSWER_MAX, MAX_MODEL_LEN - len(pre) - 8)
++                if answer_cap < 64:
++                    finish_audit(st, "no_room")
++                    continue
++                st["phase"] = 4
++                st["p2_prefix"] = [] if closed else list(STOP_IDS)
++                engine.add_request(_req(uid, 4), {"prompt_token_ids": pre},
++                                   make_params(answer_cap, SEED + 10 * UNIT_INDEX[uid] + 8))
++            else:
++                finish_audit(st, "forced_or_continued")
++
+ # v1.1 (F2): a runtime error in an ~11 h loop must not end the notebook with an exception (that scores zero even
+ # with a valid submission.json); keep every finished query, write the submission, report the error.
+ SCHED_ERROR = None
+@@ -753,6 +920,9 @@
+         SCHED["skipped"] = "engine_not_ready"; SCHED["not_admitted"] = len(PROMPT_IDS)
+     else:
+         run_scheduler()
++        run_optional_audit()
++        # R5: account for optional extra inference when summarizing elapsed time.
++        SCHED["wall_sec_with_audit"] = round(time.perf_counter() - SCHED["started"], 1)
+ except BaseException:
+     SCHED_ERROR = traceback.format_exc()
+     print("SCHEDULER ERROR - keeping finished queries:", flush=True); print(SCHED_ERROR[-3000:], flush=True)
+@@ -790,20 +960,24 @@
+               "mean_think_tokens": _mean([r["think_tokens"] for r in rows]),
+               "mean_total_gen_tokens": _mean([r["p1_tokens"] + r["p2_tokens"] for r in rows]),
+               "with_grid": sum(bool(r["has_grid"]) for r in rows),
+-              "first_attempt_source": {s: sum(r["src"][0] == s for r in rows) for s in ("model", "test_input", "mirror")}}
++              "first_attempt_source": {s: sum(r["src"][0] == s for r in rows) for s in ("model", "test_input", "mirror")},
++              "audit_stats": AUDIT_STATS, "submission_mode_contract": MODE_CONTRACT}
+     if SOLUTIONS is not None:
+         # Kaggle metric per test query (either attempt exact) over ALL planned queries; unfinished / skipped queries are
+         # misses. The task-normalised figure (each task worth 1, split over its test inputs) is kept as a diagnostic.
+-        _hits = [r["score"]["hit"] for r in rows if r["score"]]
++        # R5: scoring uses merged final attempts (optional pass2), not stale first-pass RECORDS.
++        _final_scored = [(uid, score_unit(uid, att)) for uid, att in FINAL.items()]
++        _hits = [sc["hit"] for uid, sc in _final_scored if sc]
+         report["eval_query_hits"] = int(sum(_hits)); report["eval_query_total"] = len(UNITS)
+         report["eval_score_pct"] = round(100 * sum(_hits) / max(len(UNITS), 1), 2)
+         _by = {}
+-        for r in rows:
+-            if r["score"]: _by.setdefault(r["task_id"], []).append(r["score"]["hit"])
++        for uid, sc in _final_scored:
++            if sc: _by.setdefault(UNIT_TASK[uid], []).append(sc["hit"])
+         report["eval_task_normalized_pct"] = round(100 * sum(sum(v) / len(CHALLENGES[t]["test"]) for t, v in _by.items())
+                                                    / max(len(TASK_IDS), 1), 2)
+         report["eval_pass1_queries"] = sum(r["score"]["pass1"] for r in rows if r["score"])
+-        report["eval_hit_units"] = [r["unit"] for r in rows if r["score"] and r["score"]["hit"]]
++        report["eval_hit_units"] = [uid for uid, sc in _final_scored if sc and sc["hit"]]
++        report["eval_incremental_pass2_queries"] = sum(sc["hit"] and not sc["pass1"] for _, sc in _final_scored if sc)
+     _live = sorted(r["prompt_tokens"] + r["p1_tokens"] + r["p2_tokens"] for r in rows)
+     _pct = lambda q: _live[min(len(_live) - 1, int(q * len(_live)))] if _live else None
+     report["live_tokens_p50_p75_p90_max"] = [_pct(0.5), _pct(0.75), _pct(0.9), _live[-1] if _live else None]

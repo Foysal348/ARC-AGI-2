@@ -1,0 +1,63 @@
+--- BASE_E7_REPORT_TO_E8_FINAL.patch:original
++++ BASE_E7_REPORT_TO_E8_FINAL.patch:updated
+@@ -1,6 +1,21 @@
+-# ==================================================================== CELL 7 — report, projection, bundle
+-# v1.1 (F2): the report must never turn a finished run into a notebook exception
++
++# ==================================================================== CELL 7 — E8 stage + final validation, report, bundle
++# Exact architecture order:
++#   checkpoint baseline submission -> Stage 2A/2B/2C/2D -> final validation -> atomic submission -> reports/bundle
+ try:
++    E8_REPORT = e8_run_stage()
++    print('E8 stage:', json.dumps({k: v for k, v in E8_REPORT.items() if k != 'rows'}, default=str)[:1800])
++    # Final submission must be valid after E8 stage (whether changed or not).
++    e8_validate_submission_file(SUBMISSION_PATH)
++    if SOLUTIONS is not None:
++        # Validate actual final EVAL generated pairs, not the original E7 RECORDS scores.
++        E8_REPORT.update(e8_actual_eval_results())
++        E8_REPORT.setdefault('oracle_base_hits', sum(
++            r['score']['hit'] for r in RECORDS if r.get('score') is not None
++        ))
++        E8_REPORT['eval_e8_net_gain'] = E8_REPORT['eval_e8_hits'] - E8_REPORT['oracle_base_hits']
++        write_json_atomic(OUT / 'e8_eval_final_generated_submission.json',
++                          e8_make_eval_generated_submission())
+     rows = RECORDS
+     def _mean(xs): return round(sum(xs) / len(xs), 1) if xs else None
+     report = {"run_id": RUN_ID, "profile": PROFILE, "rerun": RERUN, "config": CONFIG, "engine": ENGINE_INFO, "scheduler": SCHED,
+@@ -12,8 +27,12 @@
+               "mean_think_tokens": _mean([r["think_tokens"] for r in rows]),
+               "mean_total_gen_tokens": _mean([r["p1_tokens"] + r["p2_tokens"] for r in rows]),
+               "with_grid": sum(bool(r["has_grid"]) for r in rows),
+-              "first_attempt_source": {s: sum(r["src"][0] == s for r in rows) for s in ("model", "test_input", "mirror")}}
++              "first_attempt_source": {s: sum(r["src"][0] == s for r in rows) for s in ("model", "test_input", "mirror")},
++              "e8": {k: v for k, v in E8_REPORT.items() if k != "rows"}}
+     if SOLUTIONS is not None:
++        report.update(e8_actual_eval_results())
++        report['eval_baseline_hits'] = E8_REPORT.get('oracle_base_hits')
++        report['eval_e8_net_gain'] = E8_REPORT.get('eval_e8_net_gain')
+         # Kaggle metric per test query (either attempt exact) over ALL planned queries; unfinished / skipped queries are
+         # misses. The task-normalised figure (each task worth 1, split over its test inputs) is kept as a diagnostic.
+         _hits = [r["score"]["hit"] for r in rows if r["score"]]
+@@ -61,7 +80,8 @@
+                                      "may differ (longer contexts, KV pressure, MTP acceptance) - this is not a guarantee"
+                                      % (SCHED["max_active"], CONCURRENCY))
+     report["deadlines_min"] = {k: round((v - NOTEBOOK_T0) / 60, 1) for k, v in
+-                               {"admit": ADMIT_DEADLINE, "drain": DRAIN_DEADLINE, "hard_stop": HARD_STOP, "verify": VERIFY_DEADLINE}.items()}
++                               {"admit": ADMIT_DEADLINE, "drain": DRAIN_DEADLINE, "hard_stop": HARD_STOP, "verify": VERIFY_DEADLINE, "e8_stage": E8_STAGE_DEADLINE,
++                                "e8_original_hard": E8_GLOBAL_HARD_STOP}.items()}
+     write_json_atomic(OUT / "run_report.json", report)
+     print(json.dumps({k: v for k, v in report.items() if k != "config"}, indent=1, default=str))
+     ZIP = WORKING / "Q27X_BUNDLE.zip"
+@@ -71,8 +91,10 @@
+         if SUBMISSION_PATH.exists(): z.write(SUBMISSION_PATH, "submission.json")
+     print("bundle:", ZIP, round(ZIP.stat().st_size / 1e6, 2), "MB")
+     if SOLUTIONS is not None:
+-        print(f"EVAL SCORE (Kaggle metric, per query): {report['eval_query_hits']} / {report['eval_query_total']} queries = "
+-              f"{report['eval_score_pct']}% | task-normalised {report['eval_task_normalized_pct']}% | grids parsed "
++        report['eval_e8_score_pct'] = round(100.0 * report['eval_e8_hits'] / max(len(UNITS), 1), 2)
++        print(f"E8 FINAL EVAL SCORE (per query): {report['eval_e8_hits']} / {report['eval_query_total']} = "
++              f"{report['eval_e8_score_pct']}% | baseline {report['eval_baseline_hits']} / {report['eval_query_total']} "
++              f"| E8 net gain {report['eval_e8_net_gain']} | task-normalised baseline {report['eval_task_normalized_pct']}% | grids parsed "
+               f"{report['with_grid']}/{report['queries_finished']} | throughput {SCHED['tok_per_sec']} tok/s | projected hidden-test "
+               f"({N_HIDDEN_UNITS} queries) end-to-end hours {report.get('projection_hidden_end_to_end_hours')}")
+ except BaseException:

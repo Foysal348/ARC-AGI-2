@@ -1,0 +1,76 @@
+--- E7/scheduler
++++ E8_R5/scheduler
+@@ -71,6 +71,11 @@
+     except Exception as e:
+         print("answer save failed:", uid, repr(e)[:200])
+     _record(uid, st, make_attempts(uid, grid))
++    # E8 per-unit: primary answer is committed before candidate mining/scoring.
++    if E8_ENABLED:
++        try: e8_on_primary_complete(uid, st, text)
++        except Exception as exc:
++            E8_REPORT['errors'].append({'uid':uid,'candidate_hook':repr(exc)[:300]})
+ 
+ def _record(uid, st, att):
+     FINAL[uid] = att
+@@ -104,6 +109,8 @@
+             if ids: engine.abort_request(ids)
+             for s in active:
+                 SCHED["aborted_at_hard_stop"] += 1; finish(s, "hard_stop")
++            # Scoring is lower-priority: abort it at original E7 hard stop.
++            e8_finish_pending()
+             break
+         if now >= DRAIN_DEADLINE and not drained:
+             drained = True
+@@ -113,15 +120,30 @@
+                 SCHED["drained"] += 1; s["p1_finish"] = "drained"
+                 if not start_phase2(s, DRAIN_ANSWER_MAX_TOKENS): finish(s, "drain_no_room")
+             active = [s for s in STATE.values() if s["phase"] in (1, 2)]
+-        while queue and len(active) < CONCURRENCY and now < ADMIT_DEADLINE and not drained:
++        # R5 primary-FIRST: admit waiting E7 requests before offering spare
++        # capacity to the E8 scorer. Model cost remains shared.
++        if E8_ENABLED and (E8_JOBS or E8_CURRENT is not None) and queue and now < ADMIT_DEADLINE and not drained:
++            SCHED['e8_primary_waiting_steps'] = SCHED.get('e8_primary_waiting_steps', 0) + 1
++        while queue and len(active) + int(E8_ACTIVE is not None) < CONCURRENCY and now < ADMIT_DEADLINE and not drained:
+             admit(queue.pop(0)); active = [s for s in STATE.values() if s["phase"] in (1, 2)]
++        if E8_ENABLED and (E8_JOBS or E8_CURRENT is not None):
++            e8_try_admit(len(active), now)
++        SCHED['e8_max_active'] = max(SCHED.get('e8_max_active', 0), int(E8_ACTIVE is not None))
++        if E8_ACTIVE is not None and active:
++            SCHED['e8_mixed_primary_scorer_steps'] = SCHED.get('e8_mixed_primary_scorer_steps', 0) + 1
+         SCHED["max_active"] = max(SCHED["max_active"], len(active))
+-        if not active:
+-            if not queue or now >= ADMIT_DEADLINE or drained:
+-                break
+-            continue
++        if not active and E8_ACTIVE is None:
++            if E8_ENABLED and (E8_JOBS or E8_CURRENT is not None):
++                e8_try_admit(0, time.perf_counter())
++            if E8_ACTIVE is None:
++                if not queue or now >= ADMIT_DEADLINE or drained:
++                    break
++                continue
+         outs = engine.step(); SCHED["steps"] += 1
+         for o in outs:
++            if o.request_id.startswith('e8|'):
++                e8_on_score_output(o)
++                continue
+             uid, phase = o.request_id.rsplit("|", 1); phase = int(phase); st = STATE[uid]
+             if st["phase"] != phase: continue
+             comp = o.outputs[0] if o.outputs else None
+@@ -144,6 +166,8 @@
+             print(f"  .. {el / 60:6.1f} min | active {len(active)} | queued {len(queue)} | done {len(FINAL)} | "
+                   f"gen {GEN_TOKENS_TOTAL} tok | {GEN_TOKENS_TOTAL / max(el, 1e-6):.0f} tok/s", flush=True)
+             METRICS_SNAPSHOTS.append({"t_min": round(el / 60, 1), "active": len(active), "metrics": metrics_snapshot()})
++    # Finalize incomplete scorer jobs without changing their baseline Attempt 2.
++    e8_finish_pending()
+     SCHED["not_admitted"] = len(queue)
+     SCHED["wall_sec"] = round(time.perf_counter() - SCHED["started"], 1)
+     SCHED["gen_tokens"] = GEN_TOKENS_TOTAL
+@@ -162,6 +186,7 @@
+     SCHED_ERROR = traceback.format_exc()
+     print("SCHEDULER ERROR - keeping finished queries:", flush=True); print(SCHED_ERROR[-3000:], flush=True)
+     try:
++        e8_finish_pending()
+         _act = [_req(s["uid"], s["phase"]) for s in STATE.values() if s["phase"] in (1, 2)]
+         if _act: engine.abort_request(_act)
+     except BaseException:

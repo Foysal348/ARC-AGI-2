@@ -1,0 +1,169 @@
+===== cell 2
+--- 
++++ 
+@@ -85,2 +85,8 @@
+ os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "1"
++# COVER-FIRST (2026-10-15): E9 (86k thinking for every unit) scored LB 22.92 < 26.94 at 49k - most likely the hidden run
++# could not finish every unit. Pass 1 gives every unit 49,152 thinking tokens (coverage). Once every unit has been
++# admitted, traces that reached 49,152 without closing are resumed from their own thinking up to THINK_BUDGET (depth),
++# ORDER2 rank first, while slots, time and KV allow. The pass-1 answer is kept as the other attempt.
++COVER_FIRST = os.environ.get("Q27X_COVER_FIRST", "1") == "1"
++PASS1_THINK = 49152
+ CONFIG = {k: globals()[k] for k in ["PROFILE", "RERUN", "SEED", "REASONING_EFFORT", "THINK_BUDGET", "ANSWER_MAX_TOKENS",
+@@ -88,3 +94,3 @@
+           "MAX_NUM_BATCHED_TOKENS", "GPU_MEMORY_UTILIZATION", "ENABLE_PREFIX_CACHING", "SPECULATIVE_CONFIG", "KV_CACHE_DTYPE", "VERIFY_TIMEOUT_SEC",
+-          "TOTAL_BUDGET_SEC", "MIN_THINK_BUDGET"]}
++          "TOTAL_BUDGET_SEC", "MIN_THINK_BUDGET", "COVER_FIRST", "PASS1_THINK"]}
+ CONFIG["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"]
+
+===== cell 7
+--- 
++++ 
+@@ -24,7 +24,8 @@
+ def admit(uid):
++    cap1 = min(PASS1_THINK, P1_CAPS[uid]) if COVER_FIRST else P1_CAPS[uid]     # COVER-FIRST: pass 1 = 49,152 thinking
+     st = {"uid": uid, "phase": 1, "prompt_ids": PROMPT_IDS[uid], "p1_ids": [], "p2_ids": [], "p2_prefix": [],
+-          "p1_finish": None, "p2_finish": None, "t_admit": time.perf_counter(), "t_done": None, "mode": None}
++          "p1_finish": None, "p2_finish": None, "t_admit": time.perf_counter(), "t_done": None, "mode": None, "cap1": cap1}
+     STATE[uid] = st
+     engine.add_request(_req(uid, 1), {"prompt_token_ids": list(st["prompt_ids"])},
+-                       make_params(P1_CAPS[uid], SEED + 10 * UNIT_INDEX[uid] + 1))
++                       make_params(cap1, SEED + 10 * UNIT_INDEX[uid] + 1))
+     SCHED["admitted"] += 1
+@@ -67,3 +68,3 @@
+         _tail = tokenizer.decode(_ids[max(0, _end - 1500):_end], skip_special_tokens=False)
+-        (ANSWERS_DIR / f"{UNIT_TASK[uid]}_q{UNIT_Q[uid]}.txt").write_text(
++        (ANSWERS_DIR / f"{UNIT_TASK[uid]}_q{UNIT_Q[uid]}{'_deep' if st.get('deepen_of') else ''}.txt").write_text(
+             "\n".join([f"### end_reason={reason} mode={st['mode']}", "### THINKING TAIL", _tail, "### ANSWER", text, ""]),
+@@ -72,3 +73,9 @@
+         print("answer save failed:", uid, repr(e)[:200])
++    if st.get("deepen_of"):
++        _record_deepen(uid, st, grid); return
+     _record(uid, st, make_attempts(uid, grid))
++    # COVER-FIRST: a pass-1 trace that reached its 49,152 cap without closing is a depth candidate
++    if (COVER_FIRST and reason == "forced_close" and st["p1_finish"] == "length"
++            and P1_CAPS[uid] - len(st["p1_ids"]) >= DEEPEN_MIN_TOKENS):
++        DEEPEN_CAND[uid] = list(st["p1_ids"]); SCHED["deepen_candidates"] += 1
+ 
+@@ -85,3 +92,4 @@
+            "t_done_min": round((st["t_done"] - NOTEBOOK_T0) / 60, 2),
+-           "order_score": ORDER_SCORE[UNIT_TASK[uid]], "admit_rank": ORDER_ADMIT_RANK[uid]}
++           "order_score": ORDER_SCORE[UNIT_TASK[uid]], "admit_rank": ORDER_ADMIT_RANK[uid],
++           "cap1": st.get("cap1")}
+     RECORDS.append(rec)
+@@ -92,2 +100,71 @@
+           flush=True)
++    write_submission()
++
++# ==================================================================== COVER-FIRST depth pass (2026-10-15)
++DEEPEN_MIN_TOKENS = 2048          # resume only when at least this much thinking budget is left after pass 1
++DEEPEN_SUFFIX = "~d"
++DEEPEN_CAND = {}                  # base uid -> pass-1 thinking ids (reached the pass-1 cap without closing)
++DEEP_RECORDS = []
++DEEP_RECORDS_PATH = OUT / "deep_records.jsonl"
++SCHED.update({"deepen_candidates": 0, "deepen_admitted": 0, "deepen_finished": 0, "deepen_changed_attempt1": 0,
++              "deepen_not_started": 0})
++
++def _reserve(st):
++    """worst-case KV tokens a running request may still need: prompt + its whole generation budget + the answer"""
++    cap = st.get("cap_resume") or st.get("cap1") or P1_CAPS.get(st["uid"], THINK_BUDGET)
++    return len(st["prompt_ids"]) + cap + ANSWER_MAX_TOKENS
++
++def deepen_fits(base, active):
++    """COVER-FIRST KV guard: admit a resumed trace only if every running request can still reach its maximum length
++    without preemption (Poetiq R5: 99.5 % KV, 9 preemptions with 16 long requests). One request always fits."""
++    kv = ENGINE_INFO.get("kv_tokens")
++    if not kv or not active:
++        return True
++    return sum(_reserve(s) for s in active) + len(PROMPT_IDS[base]) + P1_CAPS[base] + ANSWER_MAX_TOKENS <= kv
++
++def admit_deepen(base):
++    """resume the unit's own pass-1 thinking (token-exact continuation) for the rest of its thinking budget"""
++    rid = base + DEEPEN_SUFFIX
++    think = DEEPEN_CAND.pop(base)
++    UNIT_TASK[rid], UNIT_Q[rid] = UNIT_TASK[base], UNIT_Q[base]
++    UNIT_INDEX[rid] = UNIT_INDEX[base] + 200000
++    remaining = P1_CAPS[base] - len(think)
++    st = {"uid": rid, "deepen_of": base, "phase": 1, "prompt_ids": list(PROMPT_IDS[base]) + think, "p1_ids": [],
++          "p2_ids": [], "p2_prefix": [], "p1_finish": None, "p2_finish": None, "t_admit": time.perf_counter(),
++          "t_done": None, "mode": None, "cap_resume": remaining, "pass1_think": len(think)}
++    STATE[rid] = st
++    engine.add_request(_req(rid, 1), {"prompt_token_ids": list(st["prompt_ids"])},
++                       make_params(remaining, SEED + 10 * UNIT_INDEX[rid] + 1))
++    SCHED["deepen_admitted"] += 1
++
++def _record_deepen(rid, st, grid):
++    base = st["deepen_of"]
++    before = dict(FINAL[base])
++    changed = bool(valid_grid(grid) and grid != before["attempt_1"])
++    if changed:       # the deeper answer leads; the pass-1 answer stays as the other attempt (nothing is lost)
++        FINAL[base] = {"attempt_1": grid, "src_1": "deep", "attempt_2": before["attempt_1"], "src_2": before["src_1"]}
++        SCHED["deepen_changed_attempt1"] += 1
++    SCHED["deepen_finished"] += 1
++    sc, sb = score_unit(base, FINAL[base]), score_unit(base, before)
++    total_think = st["pass1_think"] + st["think_tokens"]
++    rec = {"unit": rid, "deepen_of": base, "task_id": UNIT_TASK[base], "query": UNIT_Q[base],
++           "mode": st["mode"] or "natural", "end_reason": st["end_reason"], "prompt_tokens": len(st["prompt_ids"]),
++           "pass1_think": st["pass1_think"], "p1_tokens": len(st["p1_ids"]), "p2_tokens": len(st["p2_ids"]),
++           "think_tokens_total": total_think, "think_closed": st["think_closed"], "p1_finish": st["p1_finish"],
++           "p2_finish": st["p2_finish"], "sec": round(st["t_done"] - st["t_admit"], 1), "has_grid": st["has_grid"],
++           "changed_attempt1": changed, "score_before": sb, "score_after": sc,
++           "t_admit_min": round((st["t_admit"] - NOTEBOOK_T0) / 60, 2), "t_done_min": round((st["t_done"] - NOTEBOOK_T0) / 60, 2)}
++    DEEP_RECORDS.append(rec)
++    for r in RECORDS:                 # the unit's own record carries its final attempts and score
++        if r["unit"] == base:
++            r.update({"score": sc, "src": [FINAL[base]["src_1"], FINAL[base]["src_2"]], "deepened": True,
++                      "deep_mode": rec["mode"], "deep_think_total": total_think})
++    try:
++        with open(DEEP_RECORDS_PATH, "a", encoding="utf-8") as f:
++            f.write(json.dumps(rec) + "\n")
++    except Exception as e:
++        print("deep record write failed:", rid, repr(e)[:200])
++    print(f"[{(time.perf_counter() - NOTEBOOK_T0) / 60:6.1f} min] {rid:16s} DEEP {rec['mode']:12s} think {total_think:6d} "
++          f"closed={rec['think_closed']} grid={rec['has_grid']} attempt_1 changed={changed}"
++          + (f" hit {sc['hit']} (before {sb['hit']})" if sc else ""), flush=True)
+     write_submission()
+@@ -117,5 +194,11 @@
+             admit(queue.pop(0)); active = [s for s in STATE.values() if s["phase"] in (1, 2)]
++        # COVER-FIRST: depth only after every unit has been admitted; the most promising (ORDER2 rank) first
++        while COVER_FIRST and not queue and DEEPEN_CAND and len(active) < CONCURRENCY and now < ADMIT_DEADLINE and not drained:
++            _base = min(DEEPEN_CAND, key=lambda u: ORDER_ADMIT_RANK[u])
++            if not deepen_fits(_base, active):
++                break
++            admit_deepen(_base); active = [s for s in STATE.values() if s["phase"] in (1, 2)]
+         SCHED["max_active"] = max(SCHED["max_active"], len(active))
+         if not active:
+-            if not queue or now >= ADMIT_DEADLINE or drained:
++            if (not queue and not (COVER_FIRST and DEEPEN_CAND)) or now >= ADMIT_DEADLINE or drained:
+                 break
+@@ -147,2 +230,3 @@
+     SCHED["not_admitted"] = len(queue)
++    SCHED["deepen_not_started"] = len(DEEPEN_CAND)
+     SCHED["wall_sec"] = round(time.perf_counter() - SCHED["started"], 1)
+@@ -180,2 +264,9 @@
+     write_submission()
++    try:   # COVER-FIRST: records.jsonl ends with every unit's final attempts and score (deepened units updated)
++        if DEEP_RECORDS:
++            _tmp = RECORDS_PATH.with_suffix(".tmp")
++            _tmp.write_text("".join(json.dumps(r) + "\n" for r in RECORDS), encoding="utf-8")
++            os.replace(_tmp, RECORDS_PATH)
++    except Exception as _e:
++        print("records rewrite failed:", repr(_e)[:200])
+ print("scheduler done:", json.dumps({k: v for k, v in SCHED.items() if k != "error"}), "| error:", bool(SCHED_ERROR))
+
+===== cell 8
+--- 
++++ 
+@@ -28,2 +28,11 @@
+         report["eval_hit_units"] = [r["unit"] for r in rows if r["score"] and r["score"]["hit"]]
++    report["cover_first"] = {"enabled": COVER_FIRST, "pass1_think": PASS1_THINK, "think_budget": THINK_BUDGET,
++                             "candidates": SCHED.get("deepen_candidates"), "admitted": SCHED.get("deepen_admitted"),
++                             "finished": SCHED.get("deepen_finished"), "changed_attempt1": SCHED.get("deepen_changed_attempt1"),
++                             "not_started": SCHED.get("deepen_not_started"),
++                             "deep_modes": {m: sum(r["mode"] == m for r in DEEP_RECORDS) for m in ("natural", "continue", "forced_close")},
++                             "deep_gen_tokens": sum(r["p1_tokens"] + r["p2_tokens"] for r in DEEP_RECORDS)}
++    if SOLUTIONS is not None and DEEP_RECORDS:
++        report["cover_first"]["deepened_hits_before"] = sum(r["score_before"]["hit"] for r in DEEP_RECORDS)
++        report["cover_first"]["deepened_hits_after"] = sum(r["score_after"]["hit"] for r in DEEP_RECORDS)
+     _live = sorted(r["prompt_tokens"] + r["p1_tokens"] + r["p2_tokens"] for r in rows)
+

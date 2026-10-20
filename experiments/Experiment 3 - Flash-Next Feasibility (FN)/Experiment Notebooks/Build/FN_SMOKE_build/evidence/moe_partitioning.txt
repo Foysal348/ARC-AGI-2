@@ -1,0 +1,68 @@
+### layers/quantization/marlin_utils.py 185-210 (group-size divisibility)
+    # Validate output_size_per_partition
+    if output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N != 0:
+        raise ValueError(
+            f"Weight output_size_per_partition = "
+            f"{output_size_per_partition} is not divisible by "
+            f" min_thread_n = {GPTQ_MARLIN_MIN_THREAD_N}. "
+            "Consider reducing tensor_parallel_size or running "
+            "with --quantization gptq."
+        )
+
+    # Validate input_size_per_partition
+    if input_size_per_partition % GPTQ_MARLIN_MIN_THREAD_K != 0:
+        raise ValueError(
+            f"Weight input_size_per_partition = "
+            f"{input_size_per_partition} is not divisible "
+            f"by min_thread_k = {GPTQ_MARLIN_MIN_THREAD_K}. "
+            "Consider reducing tensor_parallel_size or running "
+            "with --quantization gptq."
+        )
+
+    if group_size < input_size and input_size_per_partition % group_size != 0:
+        raise ValueError(
+            f"Weight input_size_per_partition = {input_size_per_partition}"
+            f" is not divisible by group_size = {group_size}. "
+            "Consider reducing tensor_parallel_size or running "
+            "with --quantization gptq."
+
+### models/qwen2_moe.py 144-173 can_fuse_shared_expert (shared 640 == moe 640 -> fused as an extra expert)
+def can_fuse_shared_expert(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether the shared expert may be fused as an extra MoE expert.
+
+    Caller must still gate on the model/backend support flag.
+    """
+    if (
+        get_exec().moe.disable_shared_experts_fusion is True
+        or getattr(config, "shared_expert_intermediate_size", 0) <= 0
+        or config.shared_expert_intermediate_size != config.moe_intermediate_size
+        or get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_mori()
+    ):
+        return False
+
+    if quant_config is not None:
+        exclude_layers = getattr(quant_config, "exclude_layers", None)
+        if exclude_layers is None:
+            exclude_layers = getattr(quant_config, "ignored_layers", [])
+
+        # Other backends than quark do not exclude the shared expert here, so they
+        # intentionally fall through and remain fusable
+        can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+        if can_fuse_fn is not None:
+            if not can_fuse_fn():
+                return False
+
+    return True
+
+### models/qwen3_5.py 2340-2346 (shared_expert mapped to experts.512)
+
+            if self.enable_shared_expert_fusion:
+                if "mlp.shared_expert." in name:
+                    # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj
+                    name = name.replace(
+                        "mlp.shared_expert.",
+                        f"mlp.experts.{num_experts}.",

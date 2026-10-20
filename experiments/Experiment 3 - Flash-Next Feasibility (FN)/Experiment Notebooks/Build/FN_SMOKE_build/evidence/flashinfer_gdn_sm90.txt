@@ -1,0 +1,41 @@
+### layers/attention/linear/kernels/gdn_flashinfer.py (SM90+ requirement)
+"""FlashInfer-based kernels for GDN (Gated Delta Network) linear attention.
+
+Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
+
+SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
+SM100 (Blackwell): full support — decode, prefill, MTP.
+
+Requires flashinfer >= 0.6.14.
+            _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
+            _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
+            _flashinfer_gated_delta_rule_mtp_bf16 = gated_delta_rule_mtp_bf16
+            _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
+            _flashinfer_gdn_available = (
+                is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+            )
+            if _flashinfer_gdn_available:
+                logger.info("FlashInfer GDN kernels loaded successfully")
+            mtp_bf16_fn,
+        ) = _get_flashinfer_gdn_kernels()
+
+        if not available:
+            raise RuntimeError(
+                "FlashInfer GDN kernels are not available. "
+                "Requires SM90+ and FlashInfer with GDN kernel support."
+            )
+        if self._decode_fn is None:
+            raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
+
+        sm_major = torch.cuda.get_device_capability()[0]
+        self.use_state_pool = sm_major >= 10
+        # The SM120 chunked-prefill kernel only accepts float32 initial
+        # states; SM100 accepts the state-pool dtype directly.
+        self._prefill_needs_fp32_state = sm_major >= 12
+        self.supports_target_verify = sm_major in (9, 10)
+        self.supports_none_mode_target_verify = (
+            sm_major == 12
+            and self.use_state_pool
+            and is_flashinfer_gdn_wy_output_only_available()
+        )
+

@@ -1,0 +1,294 @@
+--- E8_PREVIOUS_TO_FIXED_HELPERS.patch:original
++++ E8_PREVIOUS_TO_FIXED_HELPERS.patch:updated
+@@ -10,7 +10,7 @@
+ E8_RANK_METRIC = "mean_nll"      # 'mean_nll' or 'total_nll'
+ E8_MAX_CANDIDATES = 4
+ E8_BATCH_SIZE = 2
+-E8_STAGE_GUARD_SEC = 30.0         # keep margin before HARD_STOP for final validation/reporting
++E8_STAGE_GUARD_SEC = 0.0          # Stage deadline set explicitly in Cell 1; no extra silent cuts
+ E8_MAX_SCORING_PROMPT_TOKENS = MAX_MODEL_LEN - 8
+ 
+ assert E8_POLICY == "apply"
+@@ -77,8 +77,7 @@
+     add(primary, "frozen_attempt_1")
+     add(fallback, "frozen_attempt_2")
+     baseline_count = len(pool)
+-    add(inp, "legacy_identity")
+-    add([list(reversed(r)) for r in inp], "legacy_mirror")
++    # F2: rank train-consistent solutions before legacy guesses; bounded cap is respected.
+     for transpose in (False, True):
+         for turns in range(4):
+             if e8_is_train_supported(task, transpose, turns):
+@@ -86,7 +85,10 @@
+     mapped = e8_mapping_candidate(task, inp)
+     if mapped is not None:
+         add(mapped, "train_color_mapping")
+-    cap = max(int(max_candidates), baseline_count)
++    supported_count = len(pool)  # Never truncate any train-supported hypothesis.
++    add(inp, "legacy_identity")
++    add([list(reversed(r)) for r in inp], "legacy_mirror")
++    cap = max(int(max_candidates), supported_count)
+     return pool[:cap]
+ 
+ 
+@@ -128,17 +130,26 @@
+ 
+ 
+ def e8_prepare_score_request(uid, candidate, view, view_id):
+-    prefix_ids = tokenizer.encode(view['input'])
+-    answer_ids = tokenizer.encode(view['reply'])
++    # Donor calc_scores also uses two tokenized pieces concatenated in token space.
++    # Disable accidental extra BOS/EOS; these are already explicit in QwenFormatter text.
++    prefix_ids = tokenizer.encode(view['input'], add_special_tokens=False)
++    answer_ids = tokenizer.encode(view['reply'], add_special_tokens=False)
+     if not prefix_ids or not answer_ids:
+         raise ValueError('empty_score_tokens')
+     ids = prefix_ids + answer_ids
++    # The scored suffix is *exactly* the supplied answer token sequence (donor semantics).
++    # Joint text tokenization may differ at a BPE boundary; record it as diagnostic,
++    # never silently shift chosen-token logprob positions.
++    joined_ids = tokenizer.encode(view['input'] + view['reply'], add_special_tokens=False)
++    boundary_equal = joined_ids == ids
++    assert ids[len(prefix_ids):] == answer_ids
+     if len(ids) > E8_MAX_SCORING_PROMPT_TOKENS:
+         raise ValueError('scoring_prompt_exceeds_context')
+     return {
+         'uid': uid, 'source': candidate['source'], 'candidate_key': e8_key(candidate['grid']),
+         'view': view_id, 'prompt_ids': ids,
+         'answer_start': len(prefix_ids), 'answer_ids': answer_ids,
++        'boundary_equal': boundary_equal,
+     }
+ 
+ 
+@@ -173,10 +184,13 @@
+         rid = f'e8_score_{j}_{time.perf_counter_ns()}'
+         try:
+             engine_obj.add_request(rid, {'prompt_token_ids': r['prompt_ids']}, params)
+-        except Exception:
+-            if pending:
+-                try: engine_obj.abort_request(list(pending))
+-                except Exception: pass
++        except Exception as add_exc:
++            # add_request may register a request ID BEFORE raising. Abort that ID too.
++            cleanup_ids = list(pending) + [rid]
++            try:
++                engine_obj.abort_request(cleanup_ids)
++            except Exception as cleanup_exc:
++                raise RuntimeError('e8_ambiguous_registration_cleanup_failed') from cleanup_exc
+             raise
+         pending[rid] = r
+     try:
+@@ -192,8 +206,10 @@
+                 received[(r['uid'], r['candidate_key'], r['view'])] = (score, len(r['answer_ids']))
+     finally:
+         if pending:
+-            try: engine_obj.abort_request(list(pending))
+-            except Exception: pass
++            try:
++                engine_obj.abort_request(list(pending))
++            except Exception as cleanup_exc:
++                raise RuntimeError('e8_pending_request_cleanup_failed') from cleanup_exc
+     return received
+ 
+ 
+@@ -222,8 +238,8 @@
+     return False
+ 
+ 
+-def e8_select_attempt2(frozen_attempt1, frozen_attempt2, ranked):
+-    protected = e8_baseline_is_train_supported(_E8_CURRENT_UID, frozen_attempt2)
++def e8_select_attempt2(uid, frozen_attempt1, frozen_attempt2, ranked):
++    protected = e8_baseline_is_train_supported(uid, frozen_attempt2)
+     if protected:
+         return e8_matrix(frozen_attempt2), 'baseline_protected', protected
+     for c in ranked:
+@@ -235,13 +251,14 @@
+     return e8_matrix(frozen_attempt2), 'no_distinct_candidate', protected
+ 
+ 
+-def e8_validate_submission_obj(sub):
+-    if not isinstance(sub, dict):
+-        raise ValueError('submission_not_dict')
+-    for tid in test_challenges:
++def e8_validate_submission_obj(sub, challenges=None):
++    challenges = test_challenges if challenges is None else challenges
++    if not isinstance(sub, dict) or set(sub) != set(challenges):
++        raise ValueError('submission_task_set_mismatch')
++    for tid in challenges:
+         if tid not in sub or not isinstance(sub[tid], list):
+             raise ValueError(f'missing_task_{tid}')
+-        exp_n = len(test_challenges[tid])
++        exp_n = len(challenges[tid]['test'])
+         if len(sub[tid]) != exp_n:
+             raise ValueError(f'bad_task_len_{tid}')
+         for i, item in enumerate(sub[tid]):
+@@ -255,10 +272,34 @@
+     return True
+ 
+ 
+-def e8_validate_submission_file(path):
++def e8_validate_submission_file(path, challenges=None):
+     obj = _load_json(path)
+-    e8_validate_submission_obj(obj)
++    e8_validate_submission_obj(obj, challenges)
+     return obj
++
++
++def e8_make_eval_generated_submission():
++    """EVAL-only diagnostic predictions, separate from the hidden submission file."""
++    sub = identity_submission(CHALLENGES)
++    for uid, att in FINAL.items():
++        tid, qi = UNIT_TASK[uid], UNIT_Q[uid]
++        sub[tid][qi] = {
++            'attempt_1': e8_matrix(att['attempt_1']),
++            'attempt_2': e8_matrix(att['attempt_2']),
++        }
++    e8_validate_submission_obj(sub, CHALLENGES)
++    return sub
++
++
++def e8_actual_eval_results():
++    if SOLUTIONS is None:
++        return {}
++    hits = {uid: int(score_unit(uid, FINAL[uid])['hit']) for uid in FINAL}
++    return {
++        'eval_e8_hits': int(sum(hits.values())),
++        'eval_e8_total': len(UNITS),
++        'eval_e8_hit_units': sorted(uid for uid, hit in hits.items() if hit),
++    }
+ 
+ 
+ def e8_write_baseline_checkpoint():
+@@ -266,6 +307,9 @@
+     sub = e8_validate_submission_file(SUBMISSION_PATH)
+     ck = OUT / 'e8_baseline_submission.json'
+     write_json_atomic(ck, sub)
++    if SOLUTIONS is not None:
++        write_json_atomic(OUT / 'e8_eval_baseline_generated_submission.json',
++                          e8_make_eval_generated_submission())
+     return ck
+ 
+ 
+@@ -290,7 +334,6 @@
+ 
+ 
+ def e8_run_stage():
+-    global _E8_CURRENT_UID
+     t0 = time.perf_counter()
+     report = {
+         'version': 'E8_exact_architecture_v1',
+@@ -300,6 +343,8 @@
+         'rank_metric': E8_RANK_METRIC,
+         'units_total': len(FINAL),
+         'units_scored': 0,
++        'boundary_mismatch_views': 0,
++        'max_candidate_count': 0,
+         'units_with_novel': 0,
+         'attempt2_replaced': 0,
+         'checkpoint_written': False,
+@@ -319,8 +364,8 @@
+         if not ENGINE_READY or not FINAL:
+             skip('engine_or_primary_missing')
+             return report
+-        if SCHED_ERROR is not None or SCHED.get('aborted_at_hard_stop', 0) > 0:
+-            skip('scheduler_error_or_hardstop')
++        if SCHED_ERROR is not None:
++            skip('scheduler_error')
+             return report
+ 
+         ck = e8_write_baseline_checkpoint()
+@@ -342,7 +387,8 @@
+             report['oracle_added_hits'] = oracle_pool - oracle_base
+             report['oracle_denominator'] = len(UNITS)
+ 
+-        stage_deadline = HARD_STOP - E8_STAGE_GUARD_SEC
++        report['primary_hardstop_aborts'] = SCHED.get('aborted_at_hard_stop', 0)
++        stage_deadline = E8_STAGE_DEADLINE
+         if time.perf_counter() >= stage_deadline:
+             skip('past_stage_deadline')
+             return report
+@@ -358,6 +404,7 @@
+             baseline1 = e8_matrix(a['attempt_1'])
+             baseline2 = e8_matrix(a['attempt_2'])
+             candidates = e8_build_candidates(uid, baseline1, baseline2, E8_MAX_CANDIDATES)
++            report['max_candidate_count'] = max(report['max_candidate_count'], len(candidates))
+             if len(candidates) < 2:
+                 skip('insufficient_candidates')
+                 continue
+@@ -371,6 +418,7 @@
+                         raise TimeoutError('e8_stage_deadline')
+                     views = e8_make_views(uid, c['grid'], E8_AUG_COLOR_POLICY)
+                     requests = [e8_prepare_score_request(uid, c, v, i) for i, v in enumerate(views)]
++                    report['boundary_mismatch_views'] += sum(not r['boundary_equal'] for r in requests)
+                     for i in range(0, len(requests), E8_BATCH_SIZE):
+                         vals = e8_score_batch(engine, requests[i:i+E8_BATCH_SIZE], stage_deadline)
+                         for (_, ck, view), value in vals.items():
+@@ -381,8 +429,7 @@
+                     continue
+                 novel = [r for r in ranked if r['grid'] not in (baseline1, baseline2)]
+                 report['units_with_novel'] += bool(novel)
+-                _E8_CURRENT_UID = uid
+-                selected2, reason, protected = e8_select_attempt2(baseline1, baseline2, ranked)
++                selected2, reason, protected = e8_select_attempt2(uid, baseline1, baseline2, ranked)
+                 selection_map[uid] = selected2
+                 report['units_scored'] += 1
+                 row = {
+@@ -416,26 +463,44 @@
+                 if isinstance(exc, (ValueError, RuntimeError)) and ('logprob' in str(exc).lower() or 'prompt' in str(exc).lower()):
+                     break
+ 
+-        # Apply protected attempt_2 selections atomically only after the stage has produced its map.
++        # Apply protected attempt_2 selections only after stage has produced its map.
++        primary_snapshot = {uid: _e8_deepcopy(a['attempt_1']) for uid, a in FINAL.items()}
+         original_attempt2 = {uid: _e8_deepcopy(FINAL[uid]['attempt_2']) for uid in selection_map}
+         try:
+             for uid, selected2 in selection_map.items():
+                 if selected2 != FINAL[uid]['attempt_2']:
+                     FINAL[uid]['attempt_2'] = e8_matrix(selected2)
+                     report['attempt2_replaced'] += 1
++            assert all(FINAL[uid]['attempt_1'] == frozen for uid, frozen in primary_snapshot.items()), \
++                'e8_modified_attempt_1'
++            # EVAL's original write_submission() intentionally writes a test-set identity fallback.
++            # Record true EVAL generated pairs in a separate file, and compute their actual hit rate.
++            if SOLUTIONS is not None:
++                write_json_atomic(OUT / 'e8_eval_final_generated_submission.json',
++                                  e8_make_eval_generated_submission())
++                report.update(e8_actual_eval_results())
++                report['eval_e8_net_gain'] = (
++                    report['eval_e8_hits'] - report['oracle_base_hits']
++                )
+             write_submission()
+             e8_validate_submission_file(SUBMISSION_PATH)
+         except Exception:
+             for uid, old in original_attempt2.items():
+                 FINAL[uid]['attempt_2'] = old
+-            write_submission()
++            # Real rollback is from checkpoint, not from possibly modified live in-memory values.
++            write_json_atomic(SUBMISSION_PATH, _load_json(ck))
+             e8_validate_submission_file(SUBMISSION_PATH)
++            if SOLUTIONS is not None:
++                write_json_atomic(OUT / 'e8_eval_final_generated_submission.json',
++                                  e8_make_eval_generated_submission())
+             raise
+     except BaseException as exc:
+         report['error'] = repr(exc)[:500]
+-        # Ensure a valid baseline submission still exists.
++        # Ensure the baseline checkpoint is the recovery authority on any systemic failure.
+         try:
+-            if not SUBMISSION_PATH.exists():
++            if report['checkpoint_written'] and report['checkpoint_path']:
++                write_json_atomic(SUBMISSION_PATH, _load_json(Path(report['checkpoint_path'])))
++            elif not SUBMISSION_PATH.exists():
+                 write_submission()
+             e8_validate_submission_file(SUBMISSION_PATH)
+         except Exception as exc2:
+@@ -445,5 +510,8 @@
+         if SOLUTIONS is not None:
+             report['scored_baseline_hits'] = sum(bool(r.get('baseline_hit')) for r in report['rows'])
+             report['scored_selected_hits'] = sum(bool(r.get('selected_hit')) for r in report['rows'])
+-        write_json_atomic(OUT / 'e8_augmented_scoring_report.json', report)
++        try:
++            write_json_atomic(OUT / 'e8_augmented_scoring_report.json', report)
++        except Exception as report_exc:
++            print('E8 diagnostic write failed (submission retained):', repr(report_exc)[:300])
+     return report

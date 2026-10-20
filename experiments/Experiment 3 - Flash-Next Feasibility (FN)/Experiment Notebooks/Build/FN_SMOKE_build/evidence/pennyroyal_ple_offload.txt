@@ -1,0 +1,66 @@
+### models/qwen4_exp.py lines 486-518 (PLE built on meta when offloaded; pinned host table is the only allocation)
+        self.use_attn_tp_ngram = _use_attn_tp_ngram()
+        self.gather_dp_tokens = (
+            is_dp_attention_enabled()
+            and get_attention_dp_size() > 1
+            and not self.use_attn_tp_ngram
+        )
+        offload_embedding = bool(config.ple_offload_embedding)
+        # The offloaded table is consumed for its metadata only, so build the
+        # template on meta: the pinned host table becomes its first and only
+        # allocation instead of a transient per-rank device shard (sgl-project/sglang#39841).
+        with torch.device("meta") if offload_embedding else nullcontext():
+            ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if (quant_config is not None and quant_config.get_name() == "fp8")
+                    or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
+        # The scale is tiny; keep it on the real device with the model.
+        ngram_embedding.register_buffer(
+            "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+        )
+        self.ngram_embedding = (
+            Qwen4ExpPinnedHostEmbedding(ngram_embedding)
+            if offload_embedding
+            else ngram_embedding
+        )
+
+
+### models/qwen4_exp.py lines 771-800 (exact-size pinned host allocation)
+def _allocate_pinned_table(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host tensor that locks exactly ``shape``/``dtype`` bytes.
+
+    ``torch.empty(..., pin_memory=True)`` goes through the caching host
+    allocator, which rounds the request up to the next power of two; the
+    47.68 GiB fp8 Flash-Next table would lock 64 GiB (a bf16 table 128 GiB)
+    of unreclaimable host memory (sgl-project/sglang#40626). Map anonymous
+    memory of the exact size and register it with CUDA instead; the result is
+    pinned and device-accessible through the same host-pointer semantics the
+    Triton gathers already rely on.
+    """
+    shape = tuple(int(d) for d in shape)
+    nbytes = math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
+    if nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    raw = torch.frombuffer(buf, dtype=torch.uint8)
+    try:
+        err = torch.cuda.cudart().cudaHostRegister(
+            raw.data_ptr(), nbytes, _CUDA_HOST_REGISTER_PORTABLE_MAPPED
+        )
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister failed: {err}")
+    except Exception:
+        buf.close()
+        raise
+    _PINNED_TABLE_BUFFERS.append(buf)
+    return raw.view(dtype).view(shape)
+
+

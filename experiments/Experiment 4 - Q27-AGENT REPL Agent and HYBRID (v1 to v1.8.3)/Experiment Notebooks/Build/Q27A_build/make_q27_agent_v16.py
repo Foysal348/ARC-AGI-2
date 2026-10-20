@@ -1,0 +1,1229 @@
+"""Build Q27-AGENT v1.6: the Tufa-style REPL tool agent (python + submit, verified on the demos) from the public
+madarshbb/arc-qwen-3-8-27b-agent notebook, on our Qwen3.8-27B-FP8, with our dual-mode rule:
+
+  * commit / interactive run  -> REPL agent on the 12 EVAL12 evaluation tasks, scored, report written
+  * competition rerun         -> REPL agent on every hidden test task, submission.json rewritten as attempts finish
+
+The agent package (grids, sandbox, backend, agent, repl, client, repl_agent, run_direct, run_submit, submit_main)
+is copied verbatim from the source notebook; only submit_main gets a 3-line dispatch to the new run_eval.py.
+
+usage: python make_q27_agent.py [out.ipynb]
+"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SRC = HERE.parent / "LB_compare" / "madarshbb__arc-qwen-3-8-27b-agent" / "arc-qwen-3-8-27b-agent.ipynb"
+if not SRC.exists():                           # audit-bundle layout: build/ next to source_notebook/
+    SRC = HERE.parent / "source_notebook" / "arc-qwen-3-8-27b-agent.ipynb"
+DST = Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    Path(r"D:\ARC AGI 2\Research Base Experiment\Q27-AGENT-v1_6.ipynb") if (HERE.parent / "LB_compare").exists()
+    else HERE.parent / "notebook" / "Q27-AGENT-v1_6_REBUILT.ipynb")
+
+src = json.load(open(SRC, encoding="utf-8"))
+cells = ["".join(c["source"]) for c in src["cells"]]
+assert len(cells) == 14, len(cells)
+assert cells[8].startswith("%%writefile /kaggle/working/agent/repl_agent.py")
+assert cells[11].startswith("%%writefile /kaggle/working/agent/submit_main.py")
+
+
+def patch(i, old, new):
+    """v1.1: exact, single-occurrence replacement in source cell i (documented in provenance)."""
+    assert cells[i].count(old) == 1, (i, cells[i].count(old), old[:80])
+    cells[i] = cells[i].replace(old, new)
+
+
+# ---------------------------------------------------------------- v1.1 (GPT audit R1, every point reproduced first)
+# client.py: an unclosed final <parameter> (ended by </function>) keeps its code; non-dict tool arguments normalised
+patch(7, 'PARAM = re.compile(r"<parameter=([\\w\\-]+)>\\n?(.*?)\\n?</parameter>", re.S)',
+      # v1.1: TOOL_BLOCK hands PARAM the body WITHOUT </function>, so an unclosed final parameter ends at the body end
+      'PARAM = re.compile(r"<parameter=([\\w\\-]+)>\\n?(.*?)\\n?(?:</parameter>|\\Z)", re.S)   # v1.1')
+patch(7, '''        except json.JSONDecodeError:
+            args = {"_raw": fn.get("arguments")}''', '''        except json.JSONDecodeError:
+            args = {"_raw": fn.get("arguments")}
+        if not isinstance(args, dict):                 # v1.1: a list/str/number would crash .get() later
+            args = {"_invalid_arguments": repr(args)[:300]}''')
+# v1.5 client.py: the budget-drop retry fired on ANY 400 mentioning "reasoning"/"thinking" (run 1: "Unexpected
+# reasoning effort high") and silently dropped the budget; now only an error about the budget itself counts
+patch(7, '''any(w in detail.lower() for w in ("thinking", "budget", "reasoning"))''',
+      '''any(w in detail.lower() for w in ("thinking_token_budget", "thinking budget", "token budget"))''')
+# v1.3 client.py: ONE absolute deadline per logical request (the budget-rejection retry used a fresh timeout), and a
+# visible record when the client drops thinking_token_budget at runtime
+patch(7, "import json\nimport re\n", "import json\nimport re\nimport time\n")
+patch(7, '''    def chat(self, messages, tools=None, max_tokens=None, seed=None, timeout=None,
+             tool_choice=None, template_kwargs=None):''', '''    def chat(self, messages, tools=None, max_tokens=None, seed=None, timeout=None,
+             tool_choice=None, template_kwargs=None, _deadline=None):
+        if _deadline is None:                          # v1.3: absolute deadline shared with the retry below
+            _deadline = time.monotonic() + (timeout or self.timeout)
+        _remaining = _deadline - time.monotonic()
+        if _remaining <= 0:
+            return {"error": "request deadline exhausted", "context_overflow": False, "timeout": True}''')
+patch(7, '''            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:''',
+      '''            with urllib.request.urlopen(req, timeout=_remaining) as r:''')
+patch(7, '''                self.thinking_token_budget = None
+                return self.chat(messages, tools, max_tokens, seed, timeout, tool_choice, template_kwargs)''',
+      '''                self.thinking_token_budget = None
+                self.budget_dropped = True             # v1.3: reported by run_eval / smoke, printed once
+                print("WARNING: server rejected thinking_token_budget -> dropped for all later calls", flush=True)
+                return self.chat(messages, tools, max_tokens, seed, timeout, tool_choice, template_kwargs,
+                                 _deadline=_deadline)''')
+# repl_agent.py: every request is capped by the attempt's remaining token budget
+patch(8, '''        r = client.chat(trim(messages, context_budget, keep_recent, trim_drain, trim_state),
+                        tools=tools, seed=seed + att.turns,
+                        timeout=req_timeout, max_tokens=turn_max_tokens,''', '''        # v1.1: never ask for more than the attempt has left (the last turn could overshoot by 12k before)
+        request_cap = min(turn_max_tokens or client.max_tokens, max_gen_tokens - att.gen_tokens)
+        if request_cap < 256:
+            att.status, att.note = "failed", "token budget"
+            break
+        r = client.chat(trim(messages, context_budget, keep_recent, trim_drain, trim_state),
+                        tools=tools, seed=seed + att.turns,
+                        timeout=req_timeout, max_tokens=request_cap,''')
+# repl_agent.py: a tool call without a usable `code` string gets targeted feedback instead of crashing/running ""
+patch(8, '''            code = (c["arguments"] or {}).get("code") or ""
+            if c["name"] == "python":''', '''            _args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}   # v1.1
+            code = _args.get("code") if isinstance(_args.get("code"), str) else ""
+            if c["name"] in ("python", "submit") and not code.strip():
+                out = ("[harness] That tool call had no valid 'code' string. Call the tool again with the "
+                       "complete Python source in the `code` argument.")
+            elif c["name"] == "python":''')
+# repl_agent.py: attempt k+1 of a task is queued only after attempt k ended without a verified program
+patch(8, '''    # attempt-major order: every task gets its first attempt before any gets a second
+    atts = [Attempt(tid, k) for k in range(attempts) for tid in tasks]
+    t0 = time.time()''', '''    # v1.1: attempt 0 of every task is queued first; attempt k+1 of a task is queued (at the back) only when its
+    # attempt k ended unverified -- two attempts of one task never run at the same time
+    atts = []
+    t0 = time.time()''')
+patch(8, '''    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        list(ex.map(work, atts))''', '''    from concurrent.futures import wait, FIRST_COMPLETED
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        live = set()
+        for tid in tasks:
+            a0 = Attempt(tid, 0)
+            atts.append(a0)
+            live.add(ex.submit(work, a0))
+        while live:
+            finished, live = wait(live, return_when=FIRST_COMPLETED)
+            for f in finished:
+                a = f.result()
+                if (a.idx + 1 < attempts and time.time() < deadline
+                        and shared.verified.get(a.task_id, 0) < stop_after):
+                    nxt = Attempt(a.task_id, a.idx + 1)
+                    atts.append(nxt)
+                    live.add(ex.submit(work, nxt))''')
+# run_submit.py: per-attempt cap = token supply / tasks (no x1.3: a second attempt may follow)
+patch(10, 'supply / max(n, 1) * 1.3)))', 'supply / max(n, 1) * cfg.get("cap_factor", 1.0))))   # v1.1: was x1.3')
+# v1.6 run_submit.py: HYBRID -- the agent until agent_frac of the time, then DIRECT answers (rescue.py) for every task
+# without a verified program; the circuit breaker on every finished attempt
+patch(10, '''from repl_agent import solve_repl, AGENT_OPTS      # noqa: E402''',
+      '''from repl_agent import solve_repl, AGENT_OPTS, breaker   # noqa: E402''')
+patch(10, '''    lock = threading.Lock()
+    done = {}
+
+    def on_done(rec):
+        with lock:
+            done.setdefault(rec["task_id"], []).append(rec)
+            task = tasks[rec["task_id"]]
+            for j, cands in enumerate(ranked_answers(done[rec["task_id"]], task)):
+                inp = task["test"][j]["input"]
+                a1 = cands[0] if cands else inp
+                a2 = cands[1] if len(cands) > 1 else inp
+                sub[rec["task_id"]][j] = {"attempt_1": a1, "attempt_2": a2}
+            write_atomic(sub, sub_path)
+
+    _, report = solve_repl(
+        tasks, client, attempts=cfg.get("attempts", 1), concurrency=cfg.get("concurrency", 24),
+        deadline=deadline, stop_after=1,''', '''    from rescue import run_rescue, merge, direct_grid      # v1.6
+    lock = threading.Lock()
+    done = {}
+    direct_recs = {}
+
+    def tagged(tid):
+        """ranked_answers with the verified flag (rescue.merge puts the direct answer after verified grids only)"""
+        task, recs = tasks[tid], done.get(tid, [])
+        ntr = len(task["train"])
+        out = []
+        for j, cands in enumerate(ranked_answers(recs, task)):
+            ver = {json.dumps(p["test"][j]) for r in recs for p in r["programs"]
+                   if p["n_ok"] == ntr and j < len(p["test"]) and p["test"][j] is not None}
+            out.append([(g, "verified" if json.dumps(g) in ver else "unverified") for g in cands])
+        return out
+
+    def refresh(tid):                                  # caller holds `lock`
+        task = tasks[tid]
+        for j, ranked in enumerate(tagged(tid)):
+            sub[tid][j] = merge(ranked, direct_grid(direct_recs.get(tid), j), task["test"][j]["input"])
+        write_atomic(sub, sub_path)
+
+    def on_done(rec):
+        breaker(rec)                                   # v1.6: stop early if the first attempts all die on HTTP errors
+        with lock:
+            done.setdefault(rec["task_id"], []).append(rec)
+            refresh(rec["task_id"])
+
+    agent_deadline = (t0 + (deadline - t0) * float(cfg.get("agent_frac", 0.5))
+                      if cfg.get("rescue") else deadline)
+    print(f"agent until {(agent_deadline - time.time()) / 3600:.2f} h from now, then direct rescue until "
+          f"{(deadline - time.time()) / 3600:.2f} h", flush=True)
+    _, report = solve_repl(
+        tasks, client, attempts=cfg.get("attempts", 1), concurrency=cfg.get("concurrency", 24),
+        deadline=agent_deadline, stop_after=1,''')
+patch(10, '''    ver = sum(1 for a in report["attempts"] if a["status"] == "verified")
+    print(f"done: {ver}/{n} tasks verified, {sum(a['gen_tokens'] for a in report['attempts'])} "
+          f"tokens, {time.time() - t0:.0f}s", flush=True)''', '''    ver = sum(1 for a in report["attempts"] if a["status"] == "verified")
+    print(f"agent done: {ver}/{n} tasks verified, {sum(a['gen_tokens'] for a in report['attempts'])} "
+          f"tokens, {time.time() - t0:.0f}s", flush=True)
+    if cfg.get("rescue"):
+        verified = {a["task_id"] for a in report["attempts"] if a["status"] == "verified"}
+        todo = [t for t in tasks if t not in verified]      # cheapest prompts first, like the agent
+
+        def on_result(tid, rec):                       # run_rescue calls this under its own lock
+            with lock:
+                direct_recs[tid] = rec
+                refresh(tid)
+
+        print(f"rescue (direct answers): {len(todo)} unverified tasks, {(deadline - time.time()) / 3600:.2f} h left",
+              flush=True)
+        recs, _ = run_rescue(todo, tasks, cfg, deadline, log=lambda m: print(m, flush=True), on_result=on_result)
+        print(f"rescue done: {sum(1 for r in recs.values() if r.get('grids'))}/{len(todo)} answered, "
+              f"{time.time() - t0:.0f}s", flush=True)''')
+# last cell: ARC grid limits 1..30, ints only (bool excluded), atomic rewrite
+patch(13, '''    def ok_grid(g):
+        return (isinstance(g, list) and g and all(isinstance(r, list) and r and len(r) == len(g[0]) for r in g)
+                and all(isinstance(v, int) and 0 <= v <= 9 for r in g for v in r))''', '''    def ok_grid(g):   # v1.1: 1..30 on each side, plain ints 0-9 (bool is not a colour)
+        return (isinstance(g, list) and 1 <= len(g) <= 30
+                and all(isinstance(r, list) and 1 <= len(r) <= 30 and len(r) == len(g[0]) for r in g)
+                and all(type(v) is int and 0 <= v <= 9 for r in g for v in r))''')
+patch(13, '''        json.dump(sub, open("/kaggle/working/submission.json", "w"))''', '''        with open("/kaggle/working/submission.json.tmp", "w") as _f:   # v1.1: atomic rewrite
+            json.dump(sub, _f)
+        os.replace("/kaggle/working/submission.json.tmp", "/kaggle/working/submission.json")''')
+patch(13, "import json, glob", "import json, glob, os")
+
+# ---------------------------------------------------------------- v1.4 (GPT re-audit: preexec_fn in threads)
+# Python docs: preexec_fn "is not safe in the presence of threads ... the child process could deadlock before exec".
+# The sandbox and the python tool are called from 16 worker threads -> set RLIMIT_AS inside the child instead.
+_CHILD_LIMIT = """try:                                    # v1.4: memory cap set by the child itself (no preexec_fn)
+    import os as _q27_os, resource as _q27_res
+    _q27_lim = int(_q27_os.environ.get("Q27_CHILD_MAX_AS", "0"))
+    if _q27_lim > 0:
+        _q27_res.setrlimit(_q27_res.RLIMIT_AS, (_q27_lim, _q27_lim))
+except Exception:
+    pass
+try:                                    # v1.6: fail-closed isolation via a PEP 578 audit hook (cannot be removed)
+    import sys as _q27_sys, os as _q27_os2
+    _q27_deny = tuple(p for p in _q27_os2.environ.get("Q27_DENY_PATHS", "/kaggle/input|solution").lower().split("|") if p)
+    _q27_busy = []
+    def _q27_hook(event, args, _deny=_q27_deny, _busy=_q27_busy):
+        if event in ("open", "os.listdir", "os.scandir", "os.chdir", "os.rename", "os.remove", "shutil.copyfile",
+                     "shutil.copytree", "glob.glob", "os.walk", "os.symlink", "os.link"):
+            if _busy:
+                return
+            _busy.append(1)
+            try:                        # the path as given AND resolved (relative paths after chdir, symlinks)
+                _ps = []
+                for _a in args[:2]:
+                    if isinstance(_a, (str, bytes)) or hasattr(_a, "__fspath__"):
+                        _ps.append(str(_a))
+                        try:
+                            _ps.append(str(_q27_os2.path.realpath(_a)))
+                        except Exception:
+                            pass
+            finally:
+                _busy.pop()
+            for _p in _ps:
+                if any(d in _p.lower().replace("\\\\", "/") for d in _deny):
+                    raise PermissionError("[sandbox] access denied: " + _p)
+        elif event in ("subprocess.Popen", "os.system", "os.exec", "os.spawn", "os.posix_spawn", "os.fork",
+                       "socket.connect"):
+            raise PermissionError("[sandbox] not allowed: " + event)
+    _q27_sys.addaudithook(_q27_hook)
+except Exception:
+    pass
+"""
+patch(3, "RUNNER = r'''\nimport sys, json, io, contextlib, copy, traceback\n",
+      "RUNNER = r'''\n" + _CHILD_LIMIT + "import sys, json, io, contextlib, copy, traceback\n")
+patch(3, """            preexec_fn=_limits(mem_bytes),
+            env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                     MKL_NUM_THREADS="1", PYTHONHASHSEED="0"))""",
+      """            env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                     MKL_NUM_THREADS="1", PYTHONHASHSEED="0", Q27_CHILD_MAX_AS=str(mem_bytes)))   # v1.4""")
+patch(6, "RUNNER = r'''\nimport sys, json, io, contextlib, traceback\n",
+      "RUNNER = r'''\n" + _CHILD_LIMIT + "import sys, json, io, contextlib, traceback\n")
+patch(6, """                           capture_output=True, text=True, timeout=timeout, preexec_fn=pre,
+                           env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1"))""",
+      """                           capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                                    Q27_CHILD_MAX_AS=str(mem_bytes)))   # v1.4: no preexec_fn""")
+
+# ---------------------------------------------------------------- v1.6 (GPT deep audit): agent loop
+# circuit breaker: when the first attempts all die on HTTP errors with zero tokens (run 1), stop the whole run early
+patch(8, '''def verify(code, task, timeout=10.0):
+    """Run a submitted program; return (n_ok, test_outputs, feedback_text)."""
+    tr = task["train"]''', '''ABORT = {"flag": False, "why": ""}                 # v1.6: shared stop switch (circuit breaker)
+_BREAKER = {"n": 0, "http": 0}
+_BREAKER_LOCK = threading.Lock()
+
+
+def breaker(rec, first_n=6):
+    """v1.6: call once per finished attempt; trips ABORT if the first `first_n` all failed on HTTP errors with no
+    generated tokens (a request-shape or server problem -- more attempts would only burn the GPU budget)."""
+    with _BREAKER_LOCK:
+        if _BREAKER["n"] >= first_n:
+            return
+        _BREAKER["n"] += 1
+        if rec.get("gen_tokens", 0) == 0 and str(rec.get("note", "")).startswith("HTTP"):
+            _BREAKER["http"] += 1
+        if _BREAKER["n"] == first_n and _BREAKER["http"] == first_n:
+            ABORT.update(flag=True, why=f"first {first_n} attempts failed on HTTP errors: {rec.get('note', '')[:200]}")
+            print("CIRCUIT BREAKER:", ABORT["why"], flush=True)
+
+
+_NONPORTABLE = {"train_inputs", "train_outputs", "test_inputs"}
+
+
+def _nonportable(code):
+    """v1.6: names that exist only inside the python tool; a transform using them fails in the submit sandbox"""
+    import ast
+    try:
+        return {n.id for n in ast.walk(ast.parse(code)) if isinstance(n, ast.Name)} & _NONPORTABLE
+    except SyntaxError:
+        return set()
+
+
+def verify(code, task, timeout=10.0):
+    """Run a submitted program; return (n_ok, test_outputs, feedback_text)."""
+    tr = task["train"]
+    _bad = sorted(_nonportable(code))
+    if _bad:                                           # v1.6: fail fast with a precise instruction
+        return 0, [None] * len(task["test"]), (
+            "The program uses " + ", ".join(_bad) + ", which exist only inside the python tool. transform(grid) must "
+            "compute everything from its `grid` argument (constants and its own helpers are fine). Rewrite and submit.")''')
+patch(8, '''    while att.turns < max_turns:
+        with shared.lock:''', '''    while att.turns < max_turns:
+        if ABORT["flag"]:                              # v1.6: circuit breaker tripped
+            att.status, att.note = "stopped", "aborted: " + ABORT["why"][:150]
+            break
+        with shared.lock:''')
+# per-attempt token caps: a short scout attempt for every task first, a deeper second attempt only where it failed
+patch(8, '''            over = dict(kw, **(task_kw or {}).get(att.task_id, {}))
+            arm_client = over.pop("client", client)''', '''            over = dict(kw, **(task_kw or {}).get(att.task_id, {}))
+            _caps = over.pop("attempt_caps", None)     # v1.6: e.g. [24000, 36000] = scout, then deep
+            if _caps:
+                over["max_gen_tokens"] = int(_caps[min(att.idx, len(_caps) - 1)])
+            arm_client = over.pop("client", client)''')
+patch(8, '''              "degenerate_guard", "timeout_as_cut", "snippet_timeout")''',
+      '''              "degenerate_guard", "timeout_as_cut", "snippet_timeout", "attempt_caps")   # v1.6''')
+
+# v1.6 repl.py: never KEEP a function that reads the python tool's own globals (GPT audit #10, reproduced: a kept
+# transform using train_inputs passed the keep check, then failed in the submit sandbox with NameError)
+patch(6, '''    notes = []
+    for name, src in kept["defs"].items():
+        if store["defs"].get(name) != src:''', '''    notes = []
+    import ast as _ast
+    _tool_only = {"train_inputs", "train_outputs", "test_inputs"}
+    for name, src in list(kept["defs"].items()):
+        try:
+            _bad = sorted({n.id for n in _ast.walk(_ast.parse(src)) if isinstance(n, _ast.Name)} & _tool_only)
+        except SyntaxError:
+            _bad = []
+        if _bad:                                     # v1.6: not portable to submit -> not kept (older copy dropped)
+            kept["defs"].pop(name)
+            store["defs"].pop(name, None)
+            notes.append(f"not kept: {name} (uses {', '.join(_bad)}, which exist only in this tool -- "
+                         "compute from the function's own arguments)")
+    for name, src in kept["defs"].items():
+        if store["defs"].get(name) != src:''')
+
+EVAL12 = ["136b0064", "20a9e565", "21897d95", "247ef758", "2b83f449", "4c3d4a41", "4c7dc4dd", "6e4f6532",
+          "88bcf3b4", "898e7135", "8b7bacbf", "b6f77b65"]   # Q27-XHIGH EVAL12 (seed 20261005): direct = 3/22 (run 7)
+
+HEAD = r'''# Q27-AGENT v1.6 — Qwen3.8-27B REPL tool agent + DIRECT rescue (HYBRID), 4×L4
+
+**Why.** Our direct-answer pipeline (Q27-XHIGH) scored LB 18.75: the model reasons up to 49k tokens and writes the
+grid. The Kaggle discussions attribute the October jump to 60+ to Qwen3.8-27B *agents*; the public
+`madarshbb/arc-qwen-3-8-27b-agent` notebook contains a REPL agent modelled on the Tufa Labs duck harness (Tufa Labs is
+#1 at 88). This notebook runs that agent on our model.
+
+**How the agent works** (code copied verbatim from the source notebook, cells 2–11):
+* two tools: `python(code)` explores the task (grids preloaded as numpy arrays + helpers `show`, `diff`, `objects`);
+  `submit(code)` runs a `transform(grid)` program on every train input and returns which examples it reproduced plus a
+  cell diff. Reproducing all of them verifies the program; its test outputs become the answer.
+* many short turns instead of one 49k-token monologue; per-turn thinking cap (`thinking_token_budget`), early-submit
+  nudges, forced submit after 10 python calls, reasoning-effort ladder after a cut turn, function retention, context
+  trimming with hysteresis (keeps the vLLM prefix cache valid), repetition-loop guard.
+* answers: verified programs vote; otherwise the best unverified programs (most train examples right).
+* serving: vLLM OpenAI server from our wheelhouse + the `taaf-duck-qwen38-serving-v1` transformers overlay,
+  tool parser `qwen3_coder`, reasoning parser `qwen3`, prefix caching, fp8 KV, MTP (ladder falls back to plain).
+
+**v1.6 (GPT deep audit DIRECT vs AGENT; each claim checked first):**
+* HYBRID: the agent runs until `agent_frac` of the time (rerun 0.5, eval 0.6); then every task without a verified
+  program gets a DIRECT answer (`rescue.py` → `run_direct.answer`, xhigh, 32,768 thinking + 4,096 answer tokens, one
+  no-thinking commit call if cut). Merge per test input: verified grids → direct grid → unverified grids → test input.
+  The commit run rescues EVERY task and reports agent-only / direct-only / hybrid official scores and their overlap.
+* isolation: a PEP 578 audit hook in every child (sandbox + python tool) denies opening / listing any path containing
+  `/kaggle/input` or `solution` and blocks subprocess / os.system / socket connect (fail-closed, cannot be removed by
+  the generated code); the regex scan of executed code stays as a second, report-only signal.
+* two-tier budget `attempt_caps` [24k scout, 36k deep] instead of one 60k cap per attempt.
+* circuit breaker: if the first 6 finished attempts all failed on HTTP errors with 0 tokens (run 1's failure mode),
+  the agent stops and the time goes to the rescue.
+* a submitted `transform` that uses the python-tool-only names `train_inputs` / `train_outputs` / `test_inputs` is
+  rejected with feedback instead of failing silently in the sandbox.
+
+**v1.5 (commit run 1 on esfersami50, 2026-10-11):** the infrastructure passed (libcuda probe PASS, rung 0 = MTP + fp8 KV
++ reasoning-config up in 490 s, every smoke stage incl. the roundtrip and the 6,144 budget OK in 64 s), but every
+agent request failed: Qwen3.8's chat template rejects `reasoning_effort: "high"` (only xhigh / medium / low). Now
+effort `xhigh` (template default; LB 18.75 and ARC Prize 42.4 % used it) with ladder [`medium`, `low`]; the smoke also sends the agent's EXACT request (its effort, sampling, budget,
+tools; 32 output tokens) for its own effort and every ladder step, and a rejection stops the ladder (AGENT_PARAMS: a
+config error, the same on every rung); the client no longer treats any 400 mentioning "reasoning" as a budget
+rejection (run 1 dropped the budget because of that message).
+
+**v1.4 (external re-audit; verified first):** the sandbox and the python tool no longer use `preexec_fn` (Python
+documents a deadlock risk with threads; both run from 16 worker threads) -- the child sets its own RLIMIT_AS from
+`Q27_CHILD_MAX_AS`; `pip install` has a timeout (wheelhouse 30 min, overlay 10 min); the GPU-drain wait after killing a
+server is bounded (240 s, each nvidia-smi call 20 s).
+
+**v1.3 (external audit R3; each point verified first):** the tool smoke adds a ROUNDTRIP on the mode the agent
+will use (python call -> tool result sent back as role "tool" -> second request -> a `submit` that verifies, without
+tool_choice), so a server that cannot take tool results is rejected; the thinking test sends the agent's real
+`thinking_token_budget` (6,144; effort low to stay short); the python check uses a fresh random grid (a hard-coded
+print cannot pass); the client keeps ONE absolute deadline per logical request including its budget-rejection retry,
+and a runtime budget drop is printed and reported (`thinking_budget_dropped_at_runtime`); a rung that fails to start
+is classified from the server log (CUDA_LINKER / UNSUPPORTED_FLAGS / OOM / UNKNOWN) and a CUDA-linker failure stops
+the ladder (no rung changes the attention backend, so it would repeat); the file-access detector is wider (still
+detection for review, not a sandbox).
+
+**v1.2 (external audit R2; each point reproduced first):** the tool smoke now runs the returned code (a submit
+must verify on a tiny identity task and return the right test output; a python call must run and print the shape), the
+thinking test fails if the client had to drop `thinking_token_budget` (then the agent runs with thinking off and no
+budget, explicitly), the whole smoke has one deadline (<= 180 s, each request <= 75 s) inside the agent reserve, a
+failed `-lcuda` probe is reported loudly (not fatal: only FlashInfer JIT needs it); install/start/smoke times and the
+time left for the agent are in `agent_server_report.json`; `progress.json` is written atomically; the eval report adds
+`verified_but_wrong_tasks` and `file_access_suspicious_tasks` (generated code that touched files/paths, since the
+evaluation solutions file exists on disk); the last cell is rewritten to repair bad ROWS (non-dict file, null/str rows,
+ragged or out-of-range grids, unknown keys); the notebook is written with LF newlines so its SHA-256 is reproducible.
+
+**v1.1 (external audit R1; every point reproduced or checked in code before the change):**
+* server: libcuda shim + `-lcuda` link probe (Q27-XHIGH run 2 failed without it), `--max-num-batched-tokens 4096` and
+  `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1` (run-2 OOM fix); each ladder rung must pass a real tool-calling smoke
+  test (forced `submit`, automatic `python`, automatic with thinking) before the agent starts -- a failed forced test
+  turns forced submits off, a failed thinking test runs the agent without thinking; the ladder stops when less than
+  `min_agent_s` (eval 30 min, rerun 60 min) would remain; server PID file + SIGTERM handler, and the launcher kills a
+  leftover vLLM process group after `submit_main` ends or is killed; `agent_server_report.json`.
+* agent: every request is capped by the attempt's remaining tokens; attempt 2 of a task is queued only after attempt 1
+  ended unverified (never both at once); a tool call without a usable `code` string gets targeted feedback; markup
+  recovery keeps a final `<parameter>` closed only by `</function>`; non-dict tool arguments are normalised.
+* budget: per-attempt cap = token supply / tasks (was x1.3); per turn 6,144 thinking / 8,192 total, 30 turns, nudge
+  every 4 python calls, forced submit after 5 (were 8,192 / 12,288 / 40 / 6 / 10: seven full turns filled the 60k cap
+  before a forced submit could happen).
+* eval report: `official_score_pct` = correct test outputs / all test outputs (Kaggle's metric; the old task average
+  is kept as `task_macro_score_pct`); fresh `attempts.jsonl` per run; `progress.json` after every attempt.
+* last cell: grids must be 1..30 on each side with plain ints 0-9; the repair is written atomically.
+
+**Modes** (same notebook):
+* commit / interactive run: the agent on the 12 EVAL12 evaluation tasks (the same tasks as Q27-XHIGH run 7: direct =
+  3/22 queries), budget 2.5 h from the first cell; report in `/kaggle/working/agent_eval/`.
+* competition rerun: every hidden test task; `submission.json` is rewritten as each attempt finishes; the agent stops
+  at 11 h 35 min and the process is cut at 11 h 50 min (10 min before the 12 h limit). A valid fallback submission is
+  written in the first cell, and the last cell repairs any malformed row.
+'''
+
+C1 = cells[1]                                  # fallback submission + start epoch (verbatim)
+
+RESCUE = r'''%%writefile /kaggle/working/agent/rescue.py
+"""v1.6 HYBRID: a DIRECT answer (the LB-18.75 method: reason, then write the grid; run_direct.answer) for every task
+the agent did not verify, so no task ends with only the test input. Also the shared merge / scoring helpers.
+
+Candidate order per test input: verified program outputs (voted) -> the direct answer -> unverified program outputs
+(most train pairs right first) -> the test input. The first two distinct grids become attempt_1 / attempt_2.
+"""
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from client import ChatClient
+from run_direct import answer
+
+
+def direct_client(cfg):
+    think = int(cfg.get("rescue_think", 16384))
+    use_think = bool(cfg.get("thinking", True))
+    return ChatClient(cfg["base_url"], cfg["model"], max_tokens=think + int(cfg.get("rescue_answer", 4096)),
+                      temperature=cfg.get("rescue_temperature", 0.6), top_p=cfg.get("top_p", 0.95),
+                      top_k=cfg.get("top_k", 20), thinking=use_think,
+                      thinking_token_budget=(think if use_think and cfg.get("thinking_token_budget") else None),
+                      template_kwargs={"reasoning_effort": cfg.get("rescue_effort", "xhigh")})
+
+
+def run_rescue(task_ids, tasks, cfg, deadline, log=print, on_result=None):
+    """direct answers for task_ids, concurrently; returns ({tid: record}, client). record['grids'] = list per test."""
+    client = direct_client(cfg)
+    out, lock = {}, threading.Lock()
+
+    def work(tid):
+        if deadline - time.time() < float(cfg.get("rescue_min_start_s", 300)):
+            rec = {"status": "skipped: deadline", "grids": None, "gen_tokens": 0}
+        else:
+            t = time.time()
+            try:
+                rec = answer(client, tasks[tid], 7, deadline, max_tokens=client.max_tokens,
+                             rescue_tokens=int(cfg.get("rescue_commit_tokens", 4096)))
+            except Exception as e:                       # one task must never sink the stage
+                rec = {"status": f"crashed: {type(e).__name__}: {e}"[:200], "grids": None, "gen_tokens": 0}
+            rec["wall"] = round(time.time() - t, 1)
+        with lock:
+            out[tid] = rec
+            if on_result:
+                try:
+                    on_result(tid, rec)
+                except Exception as e:
+                    log(f"[rescue] on_result failed for {tid}: {e}")
+        log(f"[rescue] {tid} {str(rec.get('status'))[:40]} tok {rec.get('gen_tokens', 0)}")
+
+    with ThreadPoolExecutor(max_workers=int(cfg.get("concurrency", 16))) as ex:
+        list(ex.map(work, list(task_ids)))
+    return out, client
+
+
+def direct_grid(rec, j):
+    grids = (rec or {}).get("grids")
+    return grids[j] if isinstance(grids, list) and j < len(grids) else None
+
+
+def merge(agent_ranked, direct, inp):
+    """agent_ranked: [(grid, source)] best first, source 'verified ...' or 'unverified ...'; direct: grid or None"""
+    ver = [g for g, s in agent_ranked if str(s).startswith("verified")]
+    unv = [g for g, s in agent_ranked if not str(s).startswith("verified")]
+    out = []
+    for g in ver + ([direct] if direct is not None else []) + unv + [inp]:
+        if g is not None and g not in out:
+            out.append(g)
+        if len(out) == 2:
+            break
+    while len(out) < 2:
+        out.append(inp)
+    return {"attempt_1": out[0], "attempt_2": out[1]}
+
+
+def hybrid_submission(answers, rescue_recs, tasks):
+    return {t: [merge(answers.get(t, [[]] * len(task["test"]))[j], direct_grid(rescue_recs.get(t), j), x["input"])
+                for j, x in enumerate(task["test"])] for t, task in tasks.items()}
+
+
+def direct_submission(rescue_recs, tasks):
+    sub = {}
+    for t, task in tasks.items():
+        rows = []
+        for j, x in enumerate(task["test"]):
+            g = direct_grid(rescue_recs.get(t), j)
+            rows.append({"attempt_1": g if g is not None else x["input"], "attempt_2": x["input"]})
+        sub[t] = rows
+    return sub
+
+
+def hits(sub, sol, ids):
+    """per-query correctness (Kaggle metric: either attempt exact)"""
+    return {(t, j): int(s in (sub[t][j]["attempt_1"], sub[t][j]["attempt_2"]))
+            for t in ids for j, s in enumerate(sol[t])}
+'''
+
+RUN_EVAL = r'''%%writefile /kaggle/working/agent/run_eval.py
+"""Commit-run evaluation: the REPL agent on a fixed set of evaluation tasks, scored against the public solutions.
+
+    python run_eval.py '<json config>'   (normally called by submit_main once the server is up)
+
+Writes /kaggle/working/agent_eval/attempts.jsonl (one line per finished attempt, with transcript) and
+eval_report.json (score, per task, tokens, turns, statuses). Never touches /kaggle/working/submission.json.
+"""
+import glob
+import json
+import os
+import re
+import sys
+import threading
+import time
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from client import ChatClient                      # noqa: E402
+from repl_agent import solve_repl, AGENT_OPTS, breaker, ABORT   # noqa: E402
+from agent import to_submission, score             # noqa: E402
+from rescue import run_rescue, hybrid_submission, direct_submission, hits   # noqa: E402  (v1.6)
+
+
+def find(name, root="/kaggle/input"):
+    found = glob.glob(f"{root}/**/{name}", recursive=True)
+    if not found:
+        raise FileNotFoundError(name)
+    return found[0]
+
+
+def main(cfg):
+    t0 = time.time()
+    root = cfg.get("data_dir", "/kaggle/input")
+    ch = json.load(open(find("arc-agi_evaluation_challenges.json", root)))
+    sol = json.load(open(find("arc-agi_evaluation_solutions.json", root)))
+    ids = [t for t in cfg["eval_task_ids"] if t in ch]
+    tasks = {t: ch[t] for t in ids}
+    out = Path(cfg.get("eval_out", "/kaggle/working/agent_eval"))
+    out.mkdir(parents=True, exist_ok=True)
+    client = ChatClient(cfg["base_url"], cfg["model"], max_tokens=cfg.get("max_tokens", 16384),
+                        temperature=cfg.get("temperature", 0.6), top_p=cfg.get("top_p", 0.95),
+                        top_k=cfg.get("top_k", 20), thinking=cfg.get("thinking", True),
+                        reasoning_effort=cfg.get("reasoning_effort"),
+                        thinking_token_budget=cfg.get("thinking_token_budget"),
+                        template_kwargs=cfg.get("template_kwargs"))
+    lock = threading.Lock()
+    jsonl = open(out / "attempts.jsonl", "w", encoding="utf-8")     # v1.1: fresh log per run
+    progress = {"attempts_done": 0, "verified_tasks": set(), "gen_tokens": 0, "statuses": Counter()}
+
+    def on_done(rec):
+        breaker(rec)                                   # v1.6: stop early if the first attempts all die on HTTP errors
+        with lock:
+            jsonl.write(json.dumps(rec, default=str) + "\n")
+            jsonl.flush()
+            # v1.1: a progress snapshot after every attempt survives a deadline cut or a killed process
+            progress["attempts_done"] += 1
+            progress["gen_tokens"] += rec.get("gen_tokens", 0)
+            progress["statuses"][rec.get("status")] += 1
+            if rec.get("status") == "verified":
+                progress["verified_tasks"].add(rec["task_id"])
+            (out / "progress.json.tmp").write_text(json.dumps(
+                {"attempts_done": progress["attempts_done"], "verified_tasks": sorted(progress["verified_tasks"]),
+                 "gen_tokens": progress["gen_tokens"], "statuses": dict(progress["statuses"]),
+                 "elapsed_s": round(time.time() - t0)}, indent=1))
+            os.replace(out / "progress.json.tmp", out / "progress.json")     # v1.2: atomic
+
+    # v1.6: the agent gets agent_frac of the time; the rest is for DIRECT rescue answers
+    agent_deadline = (t0 + (cfg["deadline_epoch"] - t0) * float(cfg.get("agent_frac", 0.6))
+                      if cfg.get("rescue") else cfg["deadline_epoch"])
+    print(f"eval: {len(tasks)} tasks, agent deadline in {(agent_deadline - time.time()) / 60:.0f} min, "
+          f"final deadline in {(cfg['deadline_epoch'] - time.time()) / 60:.0f} min", flush=True)
+    answers, report = solve_repl(
+        tasks, client, attempts=cfg.get("attempts", 2), concurrency=cfg.get("concurrency", 16),
+        deadline=agent_deadline, stop_after=1, max_turns=cfg.get("max_turns", 40),
+        max_gen_tokens=cfg.get("eval_cap", 60000), context_budget=cfg.get("context_budget", 28000),
+        nudge_every=cfg.get("nudge_every", 0), turn_max_tokens=cfg.get("turn_max_tokens"),
+        in_python=cfg.get("in_python", False), log=lambda m: print(m, flush=True), on_done=on_done,
+        **{k: cfg[k] for k in AGENT_OPTS if k in cfg and k not in ("turn_max_tokens", "in_python")})
+    jsonl.close()
+    # v1.6 HYBRID: DIRECT answers for tasks the agent did not verify (rescue_all: every task, to measure overlap)
+    atts0 = report["attempts"]
+    verified0 = {a["task_id"] for a in atts0 if a["status"] == "verified"}
+    rescue_recs, rescue_client = {}, None
+    if cfg.get("rescue"):
+        ids_r = ids if cfg.get("rescue_all") else [t for t in ids if t not in verified0]
+        print(f"rescue (direct answers): {len(ids_r)} tasks, {(cfg['deadline_epoch'] - time.time()) / 60:.0f} min left",
+              flush=True)
+        rescue_recs, rescue_client = run_rescue(ids_r, tasks, cfg, cfg["deadline_epoch"],
+                                                log=lambda m: print(m, flush=True))
+    agent_sub = to_submission(answers, tasks)
+    direct_sub = direct_submission(rescue_recs, tasks)
+    sub = hybrid_submission(answers, rescue_recs, tasks)          # the deployed policy
+    sol_ids = {t: sol[t] for t in ids}
+    h_agent, h_direct, h_hybrid = hits(agent_sub, sol_ids, ids), hits(direct_sub, sol_ids, ids), hits(sub, sol_ids, ids)
+    rescued_q = [(t, j) for t in rescue_recs for j in range(len(sol[t]))]
+    complementarity = {
+        "queries": len(h_agent),
+        "agent_correct": sum(h_agent.values()), "direct_correct": sum(h_direct.values()),
+        "hybrid_correct": sum(h_hybrid.values()),
+        "agent_only": sum(1 for k in h_agent if h_agent[k] and not h_direct[k]),
+        "direct_only": sum(1 for k in h_agent if h_direct[k] and not h_agent[k]),
+        "both": sum(1 for k in h_agent if h_agent[k] and h_direct[k]),
+        "direct_correct_on_rescued_queries": sum(h_direct[k] for k in rescued_q),
+        "rescued_queries": len(rescued_q),
+        "rescue_statuses": dict(Counter(str(r.get("status")).split(":")[0] for r in rescue_recs.values())),
+        "rescue_gen_tokens": sum(r.get("gen_tokens", 0) for r in rescue_recs.values()),
+        "rescue_budget_dropped": bool(getattr(rescue_client, "budget_dropped", False)),
+    }
+    total, pct, per = score(sub, {t: sol[t] for t in ids})
+    q_hit = q_tot = 0
+    for t in ids:
+        for j, s in enumerate(sol[t]):
+            q_tot += 1
+            q_hit += int(s in (sub[t][j]["attempt_1"], sub[t][j]["attempt_2"]))
+    atts = report["attempts"]
+    gen = sum(a["gen_tokens"] for a in atts)
+    wall = time.time() - t0
+    official_pct = 100.0 * q_hit / q_tot if q_tot else 0.0
+    verified_tasks = sorted({a["task_id"] for a in atts if a["status"] == "verified"})
+    # v1.2: generated code runs with the real filesystem, where the evaluation SOLUTIONS file exists. Flag every task
+    # whose executed code touched files/paths so a score cannot silently come from reading answers.
+    # v1.3: wider net (audit R3 read a file via builtins) -- this is DETECTION for manual review, not a sandbox
+    leak_re = re.compile(r"solution|/kaggle/|open\s*\(|listdir|scandir|glob|pathlib|Path\s*\(|walk\s*\(|builtins|"
+                         r"__import__|importlib|\bio\b|\bos\b|\bsys\b|subprocess|shutil|socket|eval\s*\(|exec\s*\(|"
+                         r"compile\s*\(|getattr\s*\(|globals\s*\(|locals\s*\(|vars\s*\(", re.I)
+    suspicious = sorted({a["task_id"] for a in atts for x in a.get("transcript", [])
+                         if isinstance(x, dict) and isinstance(x.get("code"), str) and leak_re.search(x["code"])})
+    summary = {
+        "verified_but_wrong_tasks": [t for t in verified_tasks if per.get(t, 0) < 1],   # train-fit != test-correct
+        "file_access_suspicious_tasks": suspicious,
+        "thinking_budget_dropped_at_runtime": bool(getattr(client, "budget_dropped", False)),   # v1.3
+        # v1.1: Kaggle's metric = correct test outputs / all test outputs (micro); the task average is kept beside it
+        "official_score_pct": round(official_pct, 2), "task_macro_score_pct": round(pct, 2),
+        # v1.6: official = the deployed HYBRID policy; the two single-method scores and their overlap beside it
+        "agent_only_official_pct": round(100.0 * complementarity["agent_correct"] / max(q_tot, 1), 2),
+        "direct_only_official_pct": round(100.0 * complementarity["direct_correct"] / max(q_tot, 1), 2),
+        "complementarity": complementarity,
+        "circuit_breaker": dict(ABORT),
+        "agent_deadline_epoch": agent_deadline,
+        "score_tasks": round(total, 3), "score_pct": round(pct, 2), "n_tasks": len(ids),
+        "query_hits": q_hit, "queries": q_tot, "per_task": per,
+        "tasks_with_verified_program": sum(1 for t in ids if any(a["status"] == "verified" and a["task_id"] == t
+                                                                  for a in atts)),
+        "status_counts": dict(Counter(a["status"] for a in atts)),
+        "notes": dict(Counter(a["note"] for a in atts if a["note"])),
+        "gen_tokens_total": gen, "gen_tokens_mean_per_attempt": round(gen / max(len(atts), 1)),
+        "turns_mean": round(sum(a["turns"] for a in atts) / max(len(atts), 1), 1),
+        "cuts_total": sum(a["cuts"] for a in atts), "submits_total": sum(a["submits"] for a in atts),
+        "python_calls_total": sum(a["python_calls"] for a in atts),
+        "wall_s": round(wall), "gen_tok_per_s": round(gen / max(wall, 1e-6), 1),
+        "config": {k: v for k, v in cfg.items() if k not in ("base_url",)},
+        "per_attempt": [{k: a[k] for k in ("task_id", "idx", "status", "note", "turns", "python_calls", "submits",
+                                           "cuts", "forced", "gen_tokens", "prompt_tokens", "wall", "best_ok",
+                                           "n_train", "effort_steps", "evictions")} for a in atts]}
+    (out / "eval_report.json").write_text(json.dumps(summary, indent=1, default=str))
+    (out / "eval_submission.json").write_text(json.dumps(sub))
+    print(f"\nHYBRID vs single methods: agent {summary['agent_only_official_pct']}% | direct "
+          f"{summary['direct_only_official_pct']}% | {complementarity}", flush=True)
+    print(f"\nEVAL OFFICIAL {official_pct:.1f}% = queries {q_hit}/{q_tot} | task average {total:.2f} / {len(ids)} "
+          f"({pct:.1f}%) | "
+          f"verified tasks {summary['tasks_with_verified_program']} | tokens {gen} ({summary['gen_tok_per_s']} tok/s) | "
+          f"wall {wall / 60:.0f} min | {summary['status_counts']}", flush=True)
+    print("per task:", {t: round(v, 2) for t, v in per.items()}, flush=True)
+
+
+if __name__ == "__main__":
+    main(json.loads(sys.argv[1]))
+'''
+
+C11 = cells[11]
+_old = '''        sys.path.insert(0, HERE)
+        import run_submit
+        run_submit.main(dict(cfg, base_url="http://127.0.0.1:1234/v1", model="qwen"))'''
+assert C11.count(_old) == 1
+C11 = C11.replace(_old, '''        sys.path.insert(0, HERE)
+        if cfg.get("eval"):                  # Q27-AGENT: commit run = evaluation subset, scored
+            import run_eval
+            run_eval.main(dict(cfg, base_url="http://127.0.0.1:1234/v1", model="qwen"))
+        else:
+            import run_submit
+            run_submit.main(dict(cfg, base_url="http://127.0.0.1:1234/v1", model="qwen"))''')
+
+
+def patch11(old, new):
+    global C11
+    assert C11.count(old) == 1, (C11.count(old), old[:80])
+    C11 = C11.replace(old, new)
+
+
+# v1.1 submit_main.py: libcuda shim + link probe, memory-safe flags, deadline-bounded ladder, real tool smoke gate,
+# server PID file + SIGTERM cleanup, server report
+patch11('''HERE = os.path.dirname(os.path.abspath(__file__))''', '''HERE = os.path.dirname(os.path.abspath(__file__))
+SERVER_PID = Path("/kaggle/working/vllm_server.pid")     # v1.1: lets the launcher kill a leftover server group
+REPORT_PATH = Path("/kaggle/working/agent_server_report.json")
+LINK_DIR = Path("/tmp/q27a_cuda_link")
+CUDA_LINK = {}
+CURRENT = {"proc": None}
+
+
+def ensure_libcuda():
+    """v1.1 (Q27-XHIGH run 2: FlashInfer JIT failed with `ld: cannot find -lcuda`; Kaggle ships only libcuda.so.1).
+    Make -lcuda linkable through a private symlink directory and prove it with a tiny link."""
+    import shutil as _sh
+    info = {"needed": True}
+    cands = []
+    for d in ("/usr/local/nvidia/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/lib64", "/usr/lib64"):
+        cands += sorted(glob.glob(f"{d}/libcuda.so.1")) + sorted(glob.glob(f"{d}/libcuda.so.*[0-9]"))
+    real = next((Path(c) for c in cands if Path(c).is_file()), None)
+    if real is None:
+        info.update(probe="SKIP", reason="libcuda.so.1 not found")
+    else:
+        LINK_DIR.mkdir(parents=True, exist_ok=True)
+        link = LINK_DIR / "libcuda.so"
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(real.resolve())
+        info.update(real=str(real), shim=str(link))
+        cxx = _sh.which("c++") or _sh.which("g++") or _sh.which("gcc")
+        if cxx:
+            src = Path("/tmp/q27a_cuda_probe.c")
+            src.write_text("int cuInit(unsigned int);\\nint main(void){return 0;}\\nvoid *p = (void *)cuInit;\\n")
+            env = dict(os.environ, LIBRARY_PATH=f"{LINK_DIR}:" + os.environ.get("LIBRARY_PATH", ""))
+            r = subprocess.run([cxx, "-x", "c", str(src), "-o", "/tmp/q27a_cuda_probe", "-lcuda"],
+                               capture_output=True, text=True, env=env, timeout=120)
+            info.update(probe="PASS" if r.returncode == 0 else "FAIL", probe_out=(r.stdout + r.stderr)[-600:])
+        else:
+            info.update(probe="SKIP", reason="no C compiler")
+    CUDA_LINK.clear()
+    CUDA_LINK.update(info)
+    print("libcuda link:", {k: v for k, v in info.items() if k != "probe_out"}, flush=True)
+    return info
+
+
+def _on_sigterm(signum, frame):
+    """v1.1: a SIGTERM to this launcher also ends the vLLM server's process group (it runs in its own session)."""
+    if CURRENT["proc"] is not None:
+        try:
+            os.killpg(CURRENT["proc"].pid, 9)
+        except Exception:
+            pass
+    sys.exit(0)
+
+
+def classify_startup_failure(path=None):
+    """v1.3: why did a rung fail to come up? (read from the tail of the server log)"""
+    try:
+        tail = Path(path or LOG).read_text(errors="replace")[-20000:].lower()
+    except Exception:
+        return "NO_LOG"
+    if "cannot find -lcuda" in tail or "cannot find libcuda" in tail:
+        return "CUDA_LINKER"
+    if "unrecognized arguments" in tail or "error: argument" in tail:
+        return "UNSUPPORTED_FLAGS"
+    if "out of memory" in tail or "outofmemory" in tail:
+        return "OOM"
+    return "UNKNOWN"
+
+
+def _smoke_task():
+    """v1.3: a fresh random identity task per smoke, so a hard-coded print cannot pass the python check."""
+    import random
+    h, w = random.choice([(2, 3), (3, 2), (2, 4), (4, 3), (3, 5), (5, 2)])
+    grid = [[random.randint(1, 9) for _ in range(w)] for _ in range(h)]
+    test = [[random.randint(1, 9) for _ in range(w)] for _ in range(h)]
+    return {"train": [{"input": grid, "output": grid}], "test": [{"input": test}]}, f"({h}, {w})"
+
+
+def smoke(cfg, smoke_deadline):
+    """The server answering /v1/models does not prove tool calling. v1.3 checks, all inside ONE deadline:
+      forced    a named `submit` call (thinking off)
+      auto      an automatic `python` call (thinking off)
+      thinking  an automatic `python` call with thinking on and the agent's REAL thinking_token_budget
+      roundtrip the agent's real loop: python call -> tool result sent back (role "tool") -> second request ->
+                a `submit` that verifies (no tool_choice, so the automatic submit path is tested too)
+    A call only counts if its code really runs on a fresh random task (python must print the right shape, submit
+    must verify and return the test grid). The thinking test fails if the client had to drop the budget.
+    ok = (auto or thinking) and roundtrip."""
+    sys.path.insert(0, HERE)
+    from client import ChatClient
+    from repl_agent import make_tools, verify
+    from repl import run_snippet
+    task, shape = _smoke_task()
+    tools = make_tools(cfg.get("retain_functions", False))
+    out = {"forced": [], "auto": [], "thinking": [], "roundtrip": [], "deadline_hit": False}
+
+    def left():
+        return smoke_deadline - time.time()
+
+    def semantic(name, code):
+        try:
+            compile(code, "<smoke>", "exec")
+        except Exception as e:
+            return False, f"does not compile: {e}"[:200], None
+        if left() <= 2:
+            return False, "smoke deadline", None
+        if name == "submit":
+            n_ok, test_out, fb = verify(code, task, timeout=min(8.0, left()))
+            return (n_ok == 1 and test_out == [task["test"][0]["input"]]), fb[:200], None
+        o = run_snippet(code, task, timeout=min(8.0, left()))
+        return (shape in o and "Traceback" not in o and "[snippet crashed]" not in o), o[:200], o
+
+    def check(r, name):
+        calls = r.get("tool_calls") or []
+        if "error" in r or not calls or calls[0].get("name") != name:
+            return False, "no tool call, or the wrong tool", None
+        args = calls[0].get("arguments")
+        code = args.get("code") if isinstance(args, dict) else None
+        if not isinstance(code, str) or not code.strip():
+            return False, "no code string", None
+        return semantic(name, code)
+
+    def rec(r, ok, why, t):
+        return {"ok": ok, "why": why, "sec": round(time.time() - t, 1), "error": r.get("error"),
+                "finish": r.get("finish_reason"), "completion_tokens": r.get("completion_tokens"),
+                "calls": [(c.get("name"), str(c.get("arguments"))[:200]) for c in r.get("tool_calls") or []],
+                "content": (r.get("content") or "")[:200]}
+
+    def ask(cl, msgs, choice):
+        rem = left()
+        if rem <= 5:
+            out["deadline_hit"] = True
+            return None
+        return cl.chat(msgs, tools=tools, tool_choice=choice, timeout=min(75.0, rem))
+
+    sysmsg = {"role": "system", "content": "You are testing tool calling. Answer only with the requested tool call."}
+    ask_submit = {"role": "user", "content": "Call the `submit` tool with a Python program that defines "
+                                             "transform(grid) and returns grid unchanged."}
+    ask_python = {"role": "user", "content": "Call the `python` tool with code that prints train_inputs[0].shape."}
+    budget = cfg.get("thinking_token_budget") or 6144           # v1.3: the agent's real budget, not 1024
+    plain = ChatClient("http://127.0.0.1:1234/v1", "qwen", temperature=0.0, max_tokens=1024, thinking=False)
+    # effort "low" keeps the smoke short; what is tested is that the server ACCEPTS this budget value with tools
+    think = ChatClient("http://127.0.0.1:1234/v1", "qwen", temperature=0.6,
+                       max_tokens=max(int(cfg.get("turn_max_tokens") or 8192), budget + 1024), thinking=True,
+                       thinking_token_budget=budget, template_kwargs={"reasoning_effort": "low"})
+    first_python = {}
+    for key, cl, msgs, name, choice in (("forced", plain, [sysmsg, ask_submit], "submit", "submit"),
+                                        ("auto", plain, [sysmsg, ask_python], "python", None),
+                                        ("thinking", think, [sysmsg, ask_python], "python", None)):
+        for _ in range(2):
+            t = time.time()
+            r = ask(cl, msgs, choice)
+            if r is None:
+                break
+            ok, why, tool_out = check(r, name)
+            out[key].append(rec(r, ok, why, t))
+            if ok:
+                if name == "python":
+                    first_python.setdefault(key, (cl, msgs, r, tool_out))
+                break
+    out["forced_ok"] = any(x["ok"] for x in out["forced"])
+    out["auto_ok"] = any(x["ok"] for x in out["auto"])
+    out["thinking_budget_requested"] = budget
+    out["thinking_budget_retained"] = think.thinking_token_budget == budget
+    out["thinking_ok"] = any(x["ok"] for x in out["thinking"]) and out["thinking_budget_retained"]
+    # v1.5: the EXACT request shape the agent will send (its template_kwargs, sampling, budget, max_tokens, tools),
+    # cut to 32 output tokens -- the server only has to ACCEPT it (run 1: the template rejected effort "high")
+    agent_cl = ChatClient("http://127.0.0.1:1234/v1", "qwen", temperature=cfg.get("temperature", 0.6),
+                          top_p=cfg.get("top_p", 0.95), top_k=cfg.get("top_k", 20), max_tokens=32,
+                          thinking=cfg.get("thinking", True) and out["thinking_ok"],
+                          thinking_token_budget=cfg.get("thinking_token_budget") if out["thinking_ok"] else None,
+                          template_kwargs=cfg.get("template_kwargs"))   # same fallback the ladder will apply
+    out["agent_params"] = []
+    rungs_eff = [None] + [{"reasoning_effort": e} for e in (cfg.get("effort_ladder") or [])]
+    for extra_kw in rungs_eff:                      # the agent's own effort and every effort-ladder step
+        if left() <= 5:
+            out["deadline_hit"] = True
+            break
+        t = time.time()
+        r = agent_cl.chat([sysmsg, ask_python], tools=tools, timeout=min(75.0, left()), template_kwargs=extra_kw)
+        okp = "error" not in r and not getattr(agent_cl, "budget_dropped", False)
+        out["agent_params"].append({"ok": okp, "effort": (extra_kw or cfg.get("template_kwargs") or {}),
+                                    "sec": round(time.time() - t, 1), "error": (r.get("error") or "")[:300],
+                                    "finish": r.get("finish_reason")})
+    out["agent_params_ok"] = bool(out["agent_params"]) and all(x["ok"] for x in out["agent_params"])
+    # v1.6: the DIRECT rescue's two request shapes (its effort + 32k budget; the no-thinking commit call), 32 output
+    # tokens each. Informational: a rejection is reported, it does not fail the smoke (the agent can still run)
+    out["rescue_params"] = []
+    if cfg.get("rescue"):
+        from rescue import direct_client
+        rcl = direct_client(cfg)
+        for extra_kw in (None, {"enable_thinking": False, "reasoning_effort": "low"}):
+            if left() <= 5:
+                out["deadline_hit"] = True
+                break
+            t = time.time()
+            r = rcl.chat([sysmsg, {"role": "user", "content": "Reply with the digit 7."}], max_tokens=32,
+                         timeout=min(75.0, left()), template_kwargs=extra_kw)
+            out["rescue_params"].append({"ok": "error" not in r and not getattr(rcl, "budget_dropped", False),
+                                         "commit_call": extra_kw is not None, "sec": round(time.time() - t, 1),
+                                         "error": (r.get("error") or "")[:300], "finish": r.get("finish_reason")})
+    out["rescue_params_ok"] = (all(x["ok"] for x in out["rescue_params"]) if out["rescue_params"] else None)
+    # roundtrip on the mode the agent will actually use (thinking if it passed, else plain)
+    mode = "thinking" if out["thinking_ok"] and "thinking" in first_python else "auto"
+    out["roundtrip_mode"] = mode
+    if mode in first_python:
+        cl, msgs, r1, tool_out = first_python[mode]
+        c = r1["tool_calls"][0]
+        follow = msgs + [
+            {"role": "assistant", "content": r1.get("content") or "",
+             "tool_calls": [{"id": c["id"], "type": "function",
+                             "function": {"name": "python", "arguments": json.dumps(c["arguments"])}}]},
+            {"role": "tool", "tool_call_id": c["id"], "content": tool_out},
+            {"role": "user", "content": "Good. Now call the `submit` tool with a Python program that defines "
+                                        "transform(grid) and returns grid unchanged."}]
+        for _ in range(2):
+            t = time.time()
+            r2 = ask(cl, follow, None)
+            if r2 is None:
+                break
+            ok, why, _ = check(r2, "submit")
+            out["roundtrip"].append(rec(r2, ok, why, t))
+            if ok:
+                break
+    out["roundtrip_ok"] = any(x["ok"] for x in out["roundtrip"])
+    out["ok"] = (out["auto_ok"] or out["thinking_ok"]) and out["roundtrip_ok"] and out["agent_params_ok"]
+    print("tool smoke:", {k: out[k] for k in ("forced_ok", "auto_ok", "thinking_ok", "thinking_budget_retained",
+                                              "roundtrip_ok", "roundtrip_mode", "agent_params_ok",
+                                              "rescue_params_ok", "deadline_hit", "ok")}, flush=True)
+    return out''')
+patch11('''def start_server(cfg, extra):''', '''def start_server(cfg, extra, timeout=1500):''')
+# v1.4: bounded install (pip had no timeout) and bounded GPU-drain polling after a kill (nvidia-smi had no timeout)
+patch11('''                    "--disable-pip-version-check", "--no-warn-conflicts", "-q"], check=True)''',
+        '''                    "--disable-pip-version-check", "--no-warn-conflicts", "-q"], check=True,
+                   timeout=float(cfg.get("install_timeout_s", 1800)))   # v1.4''')
+patch11('''                        "--disable-pip-version-check", "-q", *wheels], check=True)''',
+        '''                        "--disable-pip-version-check", "-q", *wheels], check=True, timeout=600)   # v1.4''')
+patch11('''    for _ in range(36):
+        used = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                              capture_output=True, text=True).stdout.split()
+        if used and all(int(u) < 1500 for u in used if u.strip().isdigit()):
+            return
+        time.sleep(5)''', '''    t_end = time.time() + 240                       # v1.4: the whole drain wait is bounded
+    while time.time() < t_end:
+        try:
+            used = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                                  capture_output=True, text=True, timeout=20).stdout.split()
+        except Exception:
+            used = []
+        if used and all(int(u) < 1500 for u in used if u.strip().isdigit()):
+            return
+        time.sleep(5)''')
+patch11('''               LIBRARY_PATH="/usr/local/nvidia/lib64:" + os.environ.get("LIBRARY_PATH", ""))''',
+        '''               LIBRARY_PATH=f"{LINK_DIR}:/usr/local/nvidia/lib64:" + os.environ.get("LIBRARY_PATH", ""),
+               VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="1")   # v1.1: libcuda shim dir first; graph memory in budget''')
+patch11('''           "--max-num-seqs", str(cfg.get("max_num_seqs", 32)), *extra]''',
+        '''           "--max-num-seqs", str(cfg.get("max_num_seqs", 32)),
+           # v1.1: 4096 = the batch step that fixed Q27-XHIGH run 2's MTP-drafter OOM (default prefill step was larger)
+           "--max-num-batched-tokens", str(cfg.get("max_num_batched_tokens", 4096)), *extra]''')
+patch11('''                            start_new_session=True)
+    while time.time() - t < 1500:''', '''                            start_new_session=True)
+    CURRENT["proc"] = proc
+    SERVER_PID.write_text(str(proc.pid))                 # v1.1: the notebook kills this group if we are killed
+    while time.time() - t < timeout:''')
+patch11('''        install(cfg)
+        # A ladder of server option sets, most ambitious first; the last is plain serving.
+        # Untested-on-L4 options (MTP, --reasoning-config) must never cost the whole run.
+        ladder = server_ladder(cfg)
+        for i, extra in enumerate(ladder):
+            proc = start_server(cfg, extra)
+            if proc is not None:
+                print(f"server up with option set {i}: {extra}", flush=True)
+                break
+            print(f"option set {i} failed -> next", flush=True)
+            time.sleep(20)
+        if proc is None:
+            return''', '''        import signal as _signal
+        _signal.signal(_signal.SIGTERM, _on_sigterm)
+        t_install = time.time()
+        install(cfg)
+        install_s = round(time.time() - t_install)
+        link = ensure_libcuda()
+        if link.get("probe") == "FAIL":
+            # v1.2: logged loudly, not fatal -- only FlashInfer's JIT needs -lcuda; other attention backends on the
+            # ladder load without it, and every rung must still pass the tool smoke before the agent starts
+            print("WARNING: -lcuda link probe FAILED; rungs that need FlashInfer JIT will fail", flush=True)
+        # A ladder of server option sets, most ambitious first; the last is plain serving.
+        # Untested-on-L4 options (MTP, --reasoning-config) must never cost the whole run.
+        # v1.1: each rung must also pass a real tool-calling smoke test, and the ladder never eats the time the
+        # agent needs (min_agent_s before the deadline).
+        ladder = server_ladder(cfg)
+        report = {"cuda_link": CUDA_LINK, "install_s": install_s, "rungs": []}
+        reserve = float(cfg.get("min_agent_s", 1800))
+        for i, extra in enumerate(ladder):
+            left = cfg["deadline_epoch"] - time.time() - reserve
+            if left < 300:
+                print(f"no time for server option set {i} ({left:.0f}s before the agent reserve) -> stop", flush=True)
+                break
+            t_rung = time.time()
+            proc = start_server(cfg, extra, timeout=min(1500.0, left))
+            rung = {"index": i, "extra": extra, "server_up": proc is not None, "start_s": round(time.time() - t_rung)}
+            if proc is not None:
+                # v1.2: the smoke has its own hard deadline inside the time left before the agent reserve
+                slack = cfg["deadline_epoch"] - time.time() - reserve
+                if slack <= 60:
+                    print(f"option set {i}: server up but no time left for the tool smoke -> stop", flush=True)
+                    rung["note"] = "no time for the smoke"
+                    report["rungs"].append(rung)
+                    kill(proc)
+                    proc = None
+                    break
+                t_smoke = time.time()
+                sm = smoke(cfg, time.time() + min(240.0, slack - 30.0))   # v1.3: 240 s (adds the roundtrip)
+                rung["smoke_s"] = round(time.time() - t_smoke)
+                rung["smoke"] = sm
+                if sm["ok"]:
+                    if not sm["forced_ok"]:
+                        cfg["force_submit_after"] = 0      # named tool_choice does not work on this rung
+                    if not sm["thinking_ok"]:
+                        cfg["thinking"] = False            # explicit fallback: no thinking, so no unbounded thinking
+                        cfg["thinking_token_budget"] = None
+                    report["rungs"].append(rung)
+                    report["chosen"] = {"index": i, "extra": extra, "force_submit_after": cfg.get("force_submit_after"),
+                                        "thinking": cfg.get("thinking", True),
+                                        "thinking_budget_retained": sm.get("thinking_budget_retained", False)}
+                    report["remaining_agent_s"] = round(cfg["deadline_epoch"] - time.time())
+                    REPORT_PATH.write_text(json.dumps(report, indent=1, default=str))
+                    print(f"server up with option set {i}: {extra}", flush=True)
+                    break
+                kill(proc)
+                proc = None
+                if sm.get("roundtrip_ok") and not sm.get("agent_params_ok"):
+                    # v1.5: the server works, the AGENT's request is rejected (a config error, the same on every rung)
+                    rung["failure"] = "AGENT_PARAMS"
+                    report["rungs"].append(rung)
+                    REPORT_PATH.write_text(json.dumps(report, indent=1, default=str))
+                    print(f"option set {i}: agent request parameters rejected -> stop the ladder", flush=True)
+                    break
+                print(f"option set {i}: server up but tool smoke FAILED -> next", flush=True)
+            else:
+                # v1.3: classify the startup failure; no rung changes the attention backend, so a CUDA-linker failure
+                # would repeat on every rung -> stop instead of reloading the 27B model again and again
+                rung["failure"] = classify_startup_failure()
+                if rung["failure"] == "CUDA_LINKER":
+                    report["rungs"].append(rung)
+                    REPORT_PATH.write_text(json.dumps(report, indent=1, default=str))
+                    print(f"option set {i}: CUDA linker failure ({CUDA_LINK.get('probe')}) -> stop the ladder",
+                          flush=True)
+                    break
+            report["rungs"].append(rung)
+            REPORT_PATH.write_text(json.dumps(report, indent=1, default=str))
+            print(f"option set {i} failed ({rung.get('failure', 'smoke')}) -> next", flush=True)
+            time.sleep(20)
+        REPORT_PATH.write_text(json.dumps(report, indent=1, default=str))
+        if proc is None:
+            return''')
+
+
+SERVER = {k: v for k, v in json.loads(cells[12].split('cfg = json.loads(r"""', 1)[1].split('""")', 1)[0]).items()
+          if k in ("model_glob", "overlay", "parsers", "server_ladder", "max_model_len", "max_num_seqs")}
+assert SERVER["max_model_len"] == 81920 and SERVER["max_num_seqs"] == 16 and len(SERVER["server_ladder"]) == 6
+
+AGENT_CFG = {
+    "mode": "repl", "attempts": 2, "concurrency": 16,
+    "temperature": 0.6, "top_p": 0.95, "top_k": 20,
+    # v1.5 (run 1 on esfersami50): Qwen3.8's chat template only knows xhigh (default) / medium / low -- "high" made
+    # every agent request fail with HTTP 400. xhigh = the template default and the setting behind our LB 18.75 and
+    # ARC Prize's 42.4 %; the per-turn thinking_token_budget still caps each turn; after a cut turn the ladder steps
+    # down to medium, then low.
+    "template_kwargs": {"reasoning_effort": "xhigh"},
+    # v1.1 (audit H4): 8192 x 7 turns already filled the 60k cap before a forced submit could ever happen
+    "thinking_token_budget": 6144,      # vLLM forces </think> after this many reasoning tokens in a turn
+    "max_tokens": 8192, "turn_max_tokens": 8192,
+    "max_turns": 30, "context_budget": 28000, "keep_recent": 6, "trim_drain": 6000,
+    "nudge_every": 4, "in_python": True, "force_submit_after": 5,
+    "effort_ladder": ["medium", "low"], "retain_functions": True,
+    "degenerate_guard": True, "timeout_as_cut": True, "snippet_timeout": 30.0,
+    "tok_per_s": 300, "min_cap": 15000, "max_cap": 60000, "eval_cap": 60000, "cap_factor": 1.0,
+    "max_num_batched_tokens": 4096,     # v1.1 (audit H5): Q27-XHIGH run 2 OOM fix
+    # v1.6 (GPT deep audit): two-tier budget -- a 24k scout attempt for every task, a 36k deep attempt only where the
+    # scout failed (attempt_caps overrides the supply-based cap per attempt index)
+    "attempt_caps": [24000, 36000],
+    # v1.6 HYBRID: after agent_frac of the time, a DIRECT answer (LB-18.75 method, run_direct.answer) for every task
+    # without a verified program; merge order verified > direct > unverified > test input
+    "rescue": True, "agent_frac": 0.5, "rescue_effort": "xhigh", "rescue_think": 32768, "rescue_answer": 4096,
+    "rescue_commit_tokens": 4096, "rescue_temperature": 0.6, "rescue_min_start_s": 300,
+}
+
+C12 = r'''# ==================================================================== launch: evaluation (commit run) or hidden test (rerun)
+import json, os, subprocess, sys, time
+from pathlib import Path
+START = float(Path("/kaggle/working/start_epoch.txt").read_text())
+RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true"}
+EVAL12 = ''' + json.dumps(EVAL12) + r'''
+SERVER = json.loads(r"""''' + json.dumps(SERVER) + r'''""")
+AGENT = json.loads(r"""''' + json.dumps(AGENT_CFG) + r'''""")
+cfg = dict(SERVER, **AGENT)
+if RERUN:
+    # hidden test: the agent stops at 11 h 35 min; the process is cut at 11 h 50 min (10 min before the 12 h limit)
+    cfg["deadline_epoch"] = START + 12 * 3600 - 25 * 60
+    cfg["min_agent_s"] = 3600            # the server ladder never starts a rung with < 1 h left for the agent
+else:
+    EVAL_HOURS = float(os.environ.get("Q27A_EVAL_HOURS", 2.0))
+    _ids = os.environ.get("Q27A_EVAL_TASKS", "eval12").strip()
+    cfg.update(eval=True, deadline_epoch=START + EVAL_HOURS * 3600, min_agent_s=1800,
+               eval_task_ids=EVAL12 if _ids == "eval12" else [t.strip() for t in _ids.split(",") if t.strip()])
+    # v1.6: the commit run rescues EVERY task with a direct answer, so the report shows agent-only / direct-only /
+    # hybrid scores and their overlap; the agent gets 60 % of the eval time
+    cfg.update(rescue_all=True, agent_frac=float(os.environ.get("Q27A_AGENT_FRAC", 0.6)))
+print("mode:", "COMPETITION RERUN (hidden test)" if RERUN else f"EVALUATION ({len(cfg['eval_task_ids'])} tasks)",
+      "| agent deadline in", round((cfg["deadline_epoch"] - time.time()) / 60), "min", flush=True)
+print(json.dumps({k: v for k, v in cfg.items() if k not in ("server_ladder",)}, indent=1), flush=True)
+
+
+def kill_leftover_server():
+    """v1.1: subprocess.run's timeout SIGKILLs submit_main, whose finally-cleanup then never runs, and the vLLM
+    server lives in its own session. Kill that recorded process group (only if it is a vLLM server or already gone)."""
+    import signal
+    pid_file = Path("/kaggle/working/vllm_server.pid")
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        cmd = Path(f"/proc/{pid}/cmdline")
+        if (not cmd.exists()) or ("vllm" in cmd.read_bytes().decode(errors="replace")):
+            os.killpg(pid, signal.SIGKILL)
+            print("killed leftover vLLM server process group", pid, flush=True)
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        print("server cleanup:", repr(e), flush=True)
+
+
+try:
+    rc = subprocess.run([sys.executable, "/kaggle/working/agent/submit_main.py", json.dumps(cfg)],
+                        timeout=max(60, cfg["deadline_epoch"] + 15 * 60 - time.time())).returncode
+    print("submit_main exit code", rc)
+except Exception as e:
+    print("submit_main did not finish cleanly:", repr(e))
+finally:
+    kill_leftover_server()
+for _p in ("/kaggle/working/agent_server_report.json", "/kaggle/working/agent_eval/eval_report.json",
+           "/kaggle/working/agent_eval/progress.json"):
+    try:
+        _r = json.loads(Path(_p).read_text())
+        if _p.endswith("eval_report.json"):
+            _r = {k: _r.get(k) for k in ("official_score_pct", "query_hits", "queries", "task_macro_score_pct",
+                                         "agent_only_official_pct", "direct_only_official_pct", "complementarity",
+                                         "tasks_with_verified_program", "status_counts", "circuit_breaker",
+                                         "gen_tokens_total", "gen_tok_per_s", "wall_s")}
+        print(_p, json.dumps(_r, default=str)[:3000], flush=True)
+    except Exception as e:
+        print("no", _p, repr(e)[:120], flush=True)
+'''
+
+C13 = r'''# Last line of defence (v1.2, rewritten): whatever was left behind, submission.json ends up valid -- every hidden
+# task, every test input, two grids of plain ints 0-9 with 1..30 rows and columns. A bad ROW is replaced by the
+# fallback (test input); a non-dict file, null/str rows, ragged or out-of-range grids and unknown task keys are handled.
+import json, glob, os
+PATH = "/kaggle/working/submission.json"
+
+
+def ok_grid(g):
+    return (isinstance(g, list) and 1 <= len(g) <= 30
+            and all(isinstance(r, list) and 1 <= len(r) <= 30 and len(r) == len(g[0]) for r in g)
+            and all(type(v) is int and 0 <= v <= 9 for r in g for v in r))
+
+
+try:
+    ch = json.load(open(glob.glob("/kaggle/input/**/arc-agi_test_challenges.json", recursive=True)[0]))
+    try:
+        raw = json.load(open(PATH))
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    fixed, n_bad, answered = {}, 0, 0
+    for t, task in ch.items():
+        rows = raw.get(t)
+        rows = rows if isinstance(rows, list) and len(rows) == len(task["test"]) else [None] * len(task["test"])
+        out_rows = []
+        for r, x in zip(rows, task["test"]):
+            if isinstance(r, dict) and ok_grid(r.get("attempt_1")) and ok_grid(r.get("attempt_2")):
+                out_rows.append({"attempt_1": r["attempt_1"], "attempt_2": r["attempt_2"]})
+                answered += int(r["attempt_1"] != x["input"])
+            else:
+                n_bad += 1
+                out_rows.append({"attempt_1": x["input"], "attempt_2": x["input"]})
+        fixed[t] = out_rows
+    unknown = [t for t in raw if t not in ch]
+    with open(PATH + ".tmp", "w") as f:
+        json.dump(fixed, f)
+    os.replace(PATH + ".tmp", PATH)
+    print(f"submission.json valid: {len(fixed)} tasks, {answered} test outputs answered by the agent, "
+          f"{n_bad} rows replaced by the fallback, {len(unknown)} unknown task keys dropped")
+except Exception as e:
+    print("validation error:", repr(e))
+'''
+
+out_cells = [("markdown", HEAD), ("code", C1)] + [("code", c) for c in cells[2:11]] + \
+            [("code", C11), ("code", RESCUE), ("code", RUN_EVAL), ("code", C12), ("code", C13)]
+nb = {"cells": [{"cell_type": t, "metadata": {}, "source": s.splitlines(keepends=True),
+                 **({"outputs": [], "execution_count": None} if t == "code" else {})} for t, s in out_cells],
+      "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                   "language_info": {"name": "python"}},
+      "nbformat": 4, "nbformat_minor": 5}
+text = json.dumps(nb, indent=1, ensure_ascii=False)
+DST.write_text(text, encoding="utf-8", newline="\n")      # v1.2: LF on every OS -> reproducible bytes
+print("wrote", DST, hashlib.sha256(DST.read_bytes()).hexdigest())   # hash of the file on disk

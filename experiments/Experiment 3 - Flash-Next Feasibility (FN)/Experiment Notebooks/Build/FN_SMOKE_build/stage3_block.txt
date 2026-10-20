@@ -1,0 +1,15 @@
+        probe = ("import torch, sglang, sgl_kernel, flashinfer, triton;"
+                 "print('sglang', sglang.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda, 'triton', triton.__version__);"
+                 "assert torch.cuda.is_available() and torch.cuda.device_count() == 4, torch.cuda.device_count();"
+                 "caps=[torch.cuda.get_device_capability(i) for i in range(4)]; print('caps', caps);"
+                 "assert all(c == (8, 9) for c in caps), caps;"
+                 "x=torch.randn(1024,1024,device='cuda'); y=x@x; torch.cuda.synchronize(); print('matmul ok', tuple(y.shape))")
+        r = subprocess.run([PYTHON, "-c", probe], text=True, capture_output=True, env=env, timeout=clamp(600))
+        need = ["--tensor-parallel-size", "--ep-size", "--quantization", "--ple-offload-embedding", "--language-model-only",
+                "--mamba-backend", "--linear-attn-decode-backend", "--linear-attn-prefill-backend", "--disable-cuda-graph",
+                "--max-mamba-cache-size", "--moe-runner-backend"]
+        h = subprocess.run([SGLANG, "serve", "--help"], text=True, capture_output=True, env=env, timeout=clamp(300))
+        help_text = h.stdout + h.stderr
+        missing = [f for f in need if f not in help_text]
+        stage("3_preflight", r.returncode == 0 and not missing, cuda_home=CUDA_HOME, cxx=CXX,
+              probe_output=(r.stdout + r.stderr)[-3000:], missing_flags=missing, help_exit=h.returncode)
