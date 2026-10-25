@@ -1,0 +1,3077 @@
+"""ARC-AGI-2 adapter for Tufa Labs' Duck harness (Daniel Franzen's milestone-2 fork, vendored verbatim in vendor/).
+
+Experiment 12 (user-approved plan, Rev 1). Only what differs between ARC-AGI-2 and ARC-AGI-3 lives here:
+  1. system prompt = ARC-2 objective + the task itself, set after ToolAgent.__init__ (Rev 1 #1)
+  2. a trusted pure-Python prelude (task grids + check/submit) prepended to the model's code (Rev 1 #2)
+  3. submit() signals through Duck's existing action channel; the host re-verifies the retained function in a
+     clean sandbox and never trusts the self-report (Rev 1 #3)
+  4. no numpy: the sandbox is unchanged; transforms use lists (Rev 1 #4)
+  5. a minimal runtime-state file via Duck's write_runtime_state + an ARC-2 tool description (Rev 1 #5)
+  6. selection: host-verified train pass > agreement across branches > distinct attempt_2 (Rev 1 #6)
+  8. Duck's inline no-tool-call nudge keeps its generic prefix; only the game tail is replaced (Rev 1 #8)
+Rev 5 (E12 weakness analysis + 3 GPT reports, validated 2026-10-21; on only when E12_ARC2_REV5=1, so older profiles keep
+their exact behaviour): B1 every check() that is exact on all pairs is re-verified on the host and kept as a candidate
+(the branch continues); B2 two attempts from distinct verified candidates (latest per branch first); B3 the trimming
+estimate counts assistant reasoning with the real tokenizer instead of the grid-calibrated chars/token ratio; B4 a
+truthful resume message after history was trimmed; B6 a tool call cut by the output limit is not executed; B7/B8 short
+prompt wording (code-first, valid lookups, alternatives, `train` usage). B5 (output cap) and B9 (temperature) are config.
+The driver loop follows Duck's HarnessSolver.play()/_play_inner() (priority gate, failure back-off, yield handling).
+
+Import order matters: Duck reads its LOCAL_ANALYZER_* / ARC3_* settings at import time, so the caller sets the
+environment (DUCK_ENV below, the milestone-2 values) before importing this module.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Callable
+
+# Milestone-2 settings copied from dfranzen/arc-agi-3-milestone-2-solution cell 4 (game-only switches left off).
+DUCK_ENV = {
+    "LOCAL_ANALYZER_PROVIDER": "vllm", "OPENAI_PROVIDER": "vllm",
+    "LOCAL_ANALYZER_APP_NAME": "ARC2 Duck Harness",
+    "ARC3_REASONING_HISTORY_KEY": "reasoning_content",
+    "LOCAL_ANALYZER_ENABLE_THINKING": "true",
+    "LOCAL_ANALYZER_TOOL_STEPS": "0",
+    "LOCAL_ANALYZER_TOOL_TIMEOUT": "30",
+    "LOCAL_ANALYZER_YIELD_SECONDS": "0",
+    "LOCAL_ANALYZER_YIELD_TOKENS": "2048",
+    "LOCAL_ANALYZER_TEMPERATURE": "0.7", "LOCAL_ANALYZER_TOP_P": "0.95", "LOCAL_ANALYZER_TOP_K": "20",
+    "LOCAL_ANALYZER_CONTEXT_WINDOW": str((116 + 12) * 1024),
+    "LOCAL_ANALYZER_MAX_OUTPUT": str(12 * 1024),
+    "ARC3_CONTEXT_DRAIN_TOKENS": str(58 * 1024),
+    "ARC3_HISTORY_ASSISTANT_TURNS": "150", "ARC3_HISTORY_TURN_DRAIN": "30", "ARC3_HISTORY_DRAIN_COALESCE": "1",
+    "LOCAL_ANALYZER_TOOL_OUTPUT_TOKENS": "3072", "ARC3_MIDDLE_TRUNCATION": "1",
+    "ARC3_MEMORY_SECTIONS": "off",
+    "ARC3_PERSISTENT_FUNCTIONS": "1", "ARC3_PERSISTENT_FUNCTIONS_SCOPE": "game",
+    "ARC3_PERSISTENT_FUNCTIONS_IMPORTS": "1",
+    "ARC3_PRIORITY_REFRESH_QUEUE": "1", "ARC3_PRIORITY_PACE": "0",
+    "ARC3_PRIORITY_TAIL_FADE": "1", "ARC3_PRIORITY_TAIL_FADE_FRACTION": "0.2",
+    "ARC3_PRIORITY_TAIL_LOOKUP": "remaining", "ARC3_PRIORITY_SCORE_NORMALIZATION": "1",
+    "ARC3_HTTP_RETRY_INITIAL_SECONDS": "900",
+}
+
+
+def duck_env(base_url: str, model_id: str, max_active_streams: int) -> dict[str, str]:
+    env = dict(DUCK_ENV)
+    env.update({"LOCAL_ANALYZER_BASE_URL": base_url, "OPENAI_BASE_URL": base_url,
+                "LOCAL_ANALYZER_MODEL_ID": model_id, "INFERENCE_ANALYZER_MODEL": model_id,
+                "ARC3_MAX_ACTIVE_STREAMS": str(int(max_active_streams))})
+    # rev 4 (user 2026-10-20, EVAL6 test): output per request; the 60k thinking floor instead of the milestone's 12,288
+    if os.environ.get("E12_DUCK_MAX_OUTPUT"):
+        env["LOCAL_ANALYZER_MAX_OUTPUT"] = str(int(os.environ["E12_DUCK_MAX_OUTPUT"]))
+    # rev 5 B9 (user 2026-10-21): Qwen3.8 model-card thinking temperature 1.0 (huggingface.co/Qwen/Qwen3.8-27B); milestone 0.7
+    if os.environ.get("E12_DUCK_TEMPERATURE"):
+        env["LOCAL_ANALYZER_TEMPERATURE"] = str(float(os.environ["E12_DUCK_TEMPERATURE"]))
+    # rev 6 R6-S5 (GPT plan review 2): history drain sized for 10 streams (Duck reads the drain at call time)
+    if os.environ.get("E12_DUCK_DRAIN_TOKENS"):
+        env["ARC3_CONTEXT_DRAIN_TOKENS"] = str(int(os.environ["E12_DUCK_DRAIN_TOKENS"]))
+    return env
+
+
+def _rev6() -> bool:
+    """Rev 6 switch (code-first view + coverage scheduler; user 2026-10-21). Implies every rev 5 fix."""
+    return os.environ.get("E12_ARC2_REV6", "") == "1"
+
+
+def _raw_reasoning_history() -> bool:
+    """E14-P switch (user 2026-10-23): history keeps the server's raw reasoning (blank lines included). Off by default."""
+    return os.environ.get("E12_RAW_REASONING_HISTORY", "0").strip() == "1"
+
+
+def _rev5() -> bool:
+    """Rev 5 behaviour switch (read at call time; the builder sets it for the R5 profiles only). Rev 6 includes it."""
+    return os.environ.get("E12_ARC2_REV5", "") == "1" or _rev6()
+
+
+def _finite01(x) -> float | None:
+    """A usage gauge in [0, 1], else None (missing, NaN, out of range)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if 0.0 <= v <= 1.0 else None
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+_TOKENIZER = {"obj": None, "tried": False, "lock": threading.Lock()}
+REASONING_CHARS_PER_TOKEN_FALLBACK = 1.9   # measured 2.1 on EVAL6 60k replies; lower = safer (over-estimates)
+
+
+def reasoning_tokens(text: str) -> int:
+    """Real token count of an assistant reasoning string (rev 5 B3): the served model's tokenizer.json when available
+    (E12_TOKENIZER_JSON), else a conservative chars/token fallback. Cached by content hash (history repeats it)."""
+    if not text:
+        return 0
+    key = hash(text)
+    cache = _TOKENIZER.setdefault("cache", {})
+    if key in cache:
+        return cache[key]
+    with _TOKENIZER["lock"]:
+        if not _TOKENIZER["tried"]:
+            _TOKENIZER["tried"] = True
+            path = os.environ.get("E12_TOKENIZER_JSON", "")
+            try:
+                if path and Path(path).is_file():
+                    from tokenizers import Tokenizer
+                    _TOKENIZER["obj"] = Tokenizer.from_file(path)
+            except Exception as exc:     # the fallback ratio is used; reported once
+                _TOKENIZER["error"] = f"{type(exc).__name__}: {exc}"[:300]
+                log.warning("reasoning tokenizer unavailable (%s); using %.1f chars/token", exc,
+                            REASONING_CHARS_PER_TOKEN_FALLBACK)
+            if _TOKENIZER["obj"] is None and "error" not in _TOKENIZER:
+                _TOKENIZER["error"] = f"tokenizer.json not found: {path!r}"
+        tok = _TOKENIZER["obj"]
+    try:
+        n = len(tok.encode(text).ids) if tok is not None else int(len(text) / REASONING_CHARS_PER_TOKEN_FALLBACK) + 1
+    except Exception:
+        n = int(len(text) / REASONING_CHARS_PER_TOKEN_FALLBACK) + 1
+    if len(cache) > 4096:
+        cache.clear()
+    cache[key] = n
+    return n
+
+
+def tokenizer_status() -> dict:
+    """rev 5 R5-4 (GPT rev 5 audits 1/2): whether B3 really counts with the tokenizer (else the fallback ratio).
+    Recorded in the notebook's CONFIG and report; never fatal (with the fallback the run still works)."""
+    probe = "A longer reasoning passage about grids, objects and colors. " * 40
+    n = reasoning_tokens(probe)
+    return {"loaded": _TOKENIZER["obj"] is not None, "path": os.environ.get("E12_TOKENIZER_JSON", ""),
+            "error": _TOKENIZER.get("error"), "probe_chars": len(probe), "probe_tokens": n}
+
+
+def _import_duck():
+    """Deferred import: Duck reads the environment at import time."""
+    from inference.agent import tool_agent as TA
+    from inference.agent import prompts as DP
+    from inference.agent.python_tool_sandbox import run_sandboxed_python
+    from inference.agent.runtime_state import write_runtime_state
+    return TA, DP, run_sandboxed_python, write_runtime_state
+
+
+log = logging.getLogger("arc2_duck")
+
+# ------------------------------------------------------------------ grids and the trusted prelude
+PRELUDE_NAMES = frozenset({"train", "test_inputs", "check", "submit", "_arc2_grid_ok"})
+SUBMIT_PREFIX = "SUBMIT:"
+
+_HELPERS_SRC = '''def _arc2_grid_ok(g):
+    if not isinstance(g, (list, tuple)) or not 1 <= len(g) <= 30 or not isinstance(g[0], (list, tuple)):
+        return False
+    w = len(g[0])
+    if not 1 <= w <= 30:
+        return False
+    for r in g:
+        if not isinstance(r, (list, tuple)) or len(r) != w:
+            return False
+        for v in r:
+            if type(v) is not int or not 0 <= v <= 9:
+                return False
+    return True
+def check(transform, verbose=True):
+    results = []
+    for i, p in enumerate(train):
+        try:
+            out = transform([list(r) for r in p["input"]])
+            out = [list(r) for r in out] if isinstance(out, (list, tuple)) else out
+        except Exception as e:
+            results.append({"pair": i, "ok": False, "error": type(e).__name__ + ": " + str(e)[:300]})
+            continue
+        if not _arc2_grid_ok(out):
+            results.append({"pair": i, "ok": False, "error": "not a valid grid (rectangular list of lists of ints 0-9, 1..30 per side)"})
+            continue
+        exp = p["output"]
+        if len(out) != len(exp) or len(out[0]) != len(exp[0]):
+            results.append({"pair": i, "ok": False, "shape": [len(out), len(out[0])], "expected_shape": [len(exp), len(exp[0])]})
+            continue
+        wrong = [(r, c, out[r][c], exp[r][c]) for r in range(len(exp)) for c in range(len(exp[0])) if out[r][c] != exp[r][c]]
+        results.append({"pair": i, "ok": not wrong, "wrong_cells": len(wrong), "wrong_sample_row_col_got_expected": wrong[:12]})
+    if not verbose:
+        return results
+    print("check:", sum(1 for r in results if r["ok"]), "/", len(results), "train pairs correct")
+    for r in results:
+        if not r["ok"]:
+            print(" ", r)
+def submit(transform):
+    name = getattr(transform, "__name__", "")
+    if not callable(transform) or not name or name == "<lambda>":
+        raise ValueError("submit(transform) needs a function defined at top level with def")
+    action({"action": "''' + SUBMIT_PREFIX + '''" + name})
+    print("submitted", name, "- the harness now verifies it on every train pair in a clean sandbox")
+'''
+
+
+CHECK_PREFIX = "CHECKED:"
+# rev 5 B1: when check() finds every training pair exact, it tells the host the function's name through the same
+# action channel as submit(). The host never trusts it: it re-runs the retained function in a clean sandbox
+# (_verify_submission) and keeps it only if that re-run is exact. Outside the tool call (the verification sandbox)
+# action() is refused, which the try/except ignores.
+_CHECK_HOOK_ANCHOR = '''    if not verbose:
+        return results
+    print("check:"'''
+_HELPERS_SRC_R5 = _HELPERS_SRC.replace(_CHECK_HOOK_ANCHOR, '''    if results and all(r["ok"] for r in results):
+        _n = getattr(transform, "__name__", "")
+        if isinstance(_n, str) and _n.isidentifier():
+            try:
+                action({"action": "''' + CHECK_PREFIX + '''" + _n})
+            except Exception:
+                pass
+''' + _CHECK_HOOK_ANCHOR, 1)
+assert _HELPERS_SRC_R5 != _HELPERS_SRC
+
+
+def task_prelude(task: dict, rev5: bool = False) -> str:
+    train = [{"input": p["input"], "output": p["output"]} for p in task["train"]]
+    tests = [q["input"] for q in task["test"]]
+    return ("train = " + json.dumps(train, separators=(",", ":")) + "\n"
+            + "test_inputs = " + json.dumps(tests, separators=(",", ":")) + "\n"
+            + (_HELPERS_SRC_R5 if rev5 else _HELPERS_SRC))
+
+
+def _grid_call_code(name: str, grid: list, guard: bool = False) -> str:
+    """One clean verification call: only the retained functions and ONE input grid exist in the sandbox (no train
+    outputs, no other grids, no host marker). The value comes back through the sandbox's structured `result` field,
+    not stdout, so print/builtins tampering cannot forge it (GPT audit 2026-10-19, reproduced and fixed).
+    rev 5 R5-1 (GPT rev 5 audit 2, reproduced: a wrong function that reassigns json.dumps forged the sandbox's result
+    payload and was host-accepted via submit() and via CHECKED): with guard, the original json.dumps is restored after
+    the call and a reassignment fails the verification. Covers that demonstrated path, not every possible tamper."""
+    if not guard:
+        return ("_arc2_in = " + json.dumps(grid, separators=(",", ":")) + "\n"
+                f"result = {name}([list(r) for r in _arc2_in])\n")
+    return ("import json as _arc2_ser\n_arc2_original_dumps = _arc2_ser.dumps\n"
+            "_arc2_in = " + json.dumps(grid, separators=(",", ":")) + "\n"
+            "try:\n"
+            f"    result = {name}([list(r) for r in _arc2_in])\n"
+            "finally:\n"
+            "    _arc2_dumps_changed = _arc2_ser.dumps is not _arc2_original_dumps\n"
+            "    _arc2_ser.dumps = _arc2_original_dumps\n"
+            "if _arc2_dumps_changed:\n"
+            "    raise RuntimeError('verification: the function modified json.dumps')\n")
+
+
+# Rev 2 (GPT audit): optional per-process address-space limit for every Duck sandbox child (tool calls and
+# verification). Applied from the host with prlimit right after the child starts: the child waits for its code on
+# stdin, so the limit is in place before any model code runs. No preexec_fn (unsafe with many host threads); the
+# vendored sandbox file is unchanged (its module-level `subprocess` reference is swapped for a proxy).
+SANDBOX_LIMIT = {"mb": 0, "applied": 0, "failed": 0, "readback_ok": None, "last_error": ""}
+_SANDBOX_LIMIT_LOCK = threading.Lock()
+
+
+def install_sandbox_memory_limit(mb: int) -> dict:
+    import subprocess
+    import types
+    from inference.agent import python_tool_sandbox as PTS
+    SANDBOX_LIMIT["mb"] = int(mb or 0)
+    if SANDBOX_LIMIT["mb"] <= 0:
+        return SANDBOX_LIMIT
+    try:
+        import resource
+        prlimit, rlim_as = resource.prlimit, resource.RLIMIT_AS
+    except (ImportError, AttributeError) as exc:
+        SANDBOX_LIMIT["last_error"] = f"not available on this platform: {exc}"
+        return SANDBOX_LIMIT
+    lim = SANDBOX_LIMIT["mb"] * 1024 * 1024
+    base = subprocess.Popen
+
+    class _LimitedPopen(base):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            try:
+                prlimit(self.pid, rlim_as, (lim, lim))
+                actual = tuple(prlimit(self.pid, rlim_as))      # read back every child
+                if actual != (lim, lim):
+                    raise RuntimeError(f"RLIMIT_AS read-back mismatch: {actual}")
+                with _SANDBOX_LIMIT_LOCK:
+                    SANDBOX_LIMIT["applied"] += 1
+                    SANDBOX_LIMIT["readback_ok"] = True
+            except Exception as exc:
+                # rev 3 (GPT re-audit, reproduced): fail closed. The child has not received any model code yet
+                # (that is sent on stdin after Popen returns); kill it and raise OSError, which Duck's runner turns
+                # into "Sandbox process could not start." for this one call.
+                with _SANDBOX_LIMIT_LOCK:
+                    SANDBOX_LIMIT["failed"] += 1
+                    SANDBOX_LIMIT["readback_ok"] = False
+                    SANDBOX_LIMIT["last_error"] = f"{type(exc).__name__}: {exc}"[:200]
+                try:
+                    self.kill()
+                    self.wait(timeout=5)
+                except Exception:
+                    pass
+                for _s in (self.stdin, self.stdout, self.stderr):
+                    try:
+                        if _s is not None:
+                            _s.close()
+                    except Exception:
+                        pass
+                raise OSError("sandbox RLIMIT_AS setup failed") from exc
+
+    proxy = types.ModuleType("subprocess")
+    proxy.__dict__.update(subprocess.__dict__)
+    proxy.Popen = _LimitedPopen
+    PTS.subprocess = proxy
+    return SANDBOX_LIMIT
+
+
+def valid_grid(g: Any) -> bool:
+    """Host-side mirror of _arc2_grid_ok (never trust the sandbox's own flag)."""
+    if not isinstance(g, list) or not 1 <= len(g) <= 30 or not isinstance(g[0], list):
+        return False
+    w = len(g[0])
+    if not 1 <= w <= 30:
+        return False
+    return all(isinstance(r, list) and len(r) == w and all(type(v) is int and 0 <= v <= 9 for v in r) for r in g)
+
+
+def grid_rows(g: list[list[int]]) -> str:
+    return "\n".join(" ".join(str(v) for v in row) for row in g)
+
+
+# ------------------------------------------------------------------ prompts (Duck wording kept where not game-specific)
+def arc2_system_prompt(task: dict, DP, tool_output_tokens: int, rev5: bool = False) -> str:
+    parts = ["You are a coding agent solving an ARC-AGI-2 grid puzzle."]
+    parts.append(
+        "\n\nTask:\n"
+        "- Each grid is a rectangular list of rows of integers 0-9 (colors). The training pairs below define one "
+        "transformation from input grid to output grid.\n"
+        "- Find the single rule that maps every training input to its output, implement it as a Python function "
+        "`transform(grid)` that takes and returns a list of lists of ints, and submit it. It is then applied to each "
+        "test input; the test outputs are unknown to everyone.\n"
+        "- Prefer the simplest rule that explains all pairs, and make it general: derive positions, sizes, colors and "
+        "counts from the input. Use a fixed coordinate, color or size only when the examples show it is part of the "
+        "rule. Check that the rule also fits the structure of the test inputs.\n")
+    for i, p in enumerate(task["train"], 1):
+        parts.append(f"\nTraining pair {i} input:\n{grid_rows(p['input'])}\nTraining pair {i} output:\n{grid_rows(p['output'])}\n")
+    for i, q in enumerate(task["test"], 1):
+        parts.append(f"\nTest input {i}:\n{grid_rows(q['input'])}\n")
+    parts.append(
+        "\n\nPython tool guidance:\n"
+        "- Provided globals in every `python` call: `train` (a list of {'input': grid, 'output': grid}), "
+        "`test_inputs` (a list of grids), `check(transform)` and `submit(transform)`.\n"
+        "- `check(transform)` runs your function on every training input and prints how many pairs are exact and, for "
+        "each failing pair, the shape mismatch or the error, or a sample of wrong cells as (row, col, got, expected). "
+        "`check(transform, verbose=False)` prints nothing and returns the per-pair results as a list.\n"
+        "- `submit(transform)` submits your final function. The harness re-runs it on every training pair in a clean "
+        "sandbox; if all pairs are exact, its test outputs become your answer and the task ends. Otherwise you get "
+        "the failures and continue. Submit only a function that `check` shows exact on every pair.\n"
+        "- Work in pure Python lists: numpy is not available.\n"
+        "- The only importable standard-library modules are: bisect, collections, copy, difflib, fractions, functools, "
+        "heapq, itertools, json, math, operator, random, re, statistics, string.\n"
+        "- Never print full grids unless they are small. Return compact derived summaries such as object lists, "
+        "diffs, coordinates or counts.\n"
+        "- Use `print(...)` for compact summaries, or assign a final compact object to `result`.\n"
+        "- A strong default loop is: inspect the pairs in Python, form a hypothesis, write `transform`, run "
+        "`check(transform)`, fix it from the reported cells, then `submit(transform)`.\n")
+    persistent = DP.PERSISTENT_FUNCTIONS_LINE.format(
+        lifetime="for later calls on this task",
+        import_guidance="Supported explicit top-level imports used by retained functions are restored with them; "
+                        "imports inside a function also work.",
+    ).replace("Python builtins, provided globals such as `current_frame`, and other retained functions",
+              "Python builtins and other retained functions (not the provided globals)")
+    parts.append(
+        "\n\nTool session rules:\n"
+        "- You have exactly one tool: `python`.\n"
+        f"- {DP.TOOL_CALL_FORMAT_GUIDANCE}\n"
+        f"{persistent}"
+        "- Functions that read `train` or `test_inputs` directly are not retained; pass the data as arguments.\n"
+        "- You can call the `python` tool as many times as you want. Investigate until your code has a clear plan.\n"
+        "- Each `python` tool call has a hard time limit of 30 seconds.\n"
+        f"- Tool responses are capped to about {tool_output_tokens} tokens. If a response is cut off, the tool "
+        "result will tell you that.\n"
+        "- Keep code snippets short and purpose-built rather than dumping large frameworks into one call.\n")
+    text = "".join(parts)
+    if rev5:
+        text = arc2_rev5_prompt_edits(text)
+    return text
+
+
+# rev 5 B7/B8: short wording changes only (no reasoning template: the three GPT reports and Johan Land, arXiv 2606.31543,
+# warn that prescriptive templates reduce hypothesis diversity). Evidence: 22/24 (EVAL30) and 5/8 (EVAL6) failed branches
+# never ran check(); hand misreads of grids; a lookup that fitted every pair was refused (136b0064); the `train` dict trap.
+_R5_EDITS = [
+    ("- Prefer the simplest rule that explains all pairs, and make it general: derive positions, sizes, colors and "
+     "counts from the input. Use a fixed coordinate, color or size only when the examples show it is part of the "
+     "rule. Check that the rule also fits the structure of the test inputs.\n",
+     "- Prefer the simplest rule that explains all pairs and also fits the structure of the test inputs. Use a fixed "
+     "coordinate, color or size only when the examples show it is part of the rule. A lookup table or case "
+     "distinction keyed on what you read from the input is a valid rule when the examples support it. Different rules "
+     "can fit every training pair yet disagree on a test input: when you see that, compare their test outputs.\n"),
+    ("`test_inputs` (a list of grids), `check(transform)` and `submit(transform)`.\n",
+     "`test_inputs` (a list of grids), `check(transform)` and `submit(transform)`. Each `train` item is a dict: "
+     "`for p in train: inp, out = p['input'], p['output']`.\n"
+     "- Read exact grid values, sizes, counts and coordinates with Python rather than counting cells or simulating "
+     "outputs by hand.\n"),
+    ("Submit only a function that `check` shows exact on every pair.\n",
+     "Submit only a function that `check` shows exact on every pair.\n"
+     "- Every time `check(transform)` is exact on every pair, the harness re-runs that function in a clean sandbox and "
+     "keeps it as a candidate answer, even if you never submit it; later exact versions are kept too. So check a "
+     "candidate as soon as you have a plausible rule.\n"),
+    ("Investigate until your code has a clear plan.\n",
+     "Write and check a candidate `transform` as soon as you have a plausible rule; do not wait for a perfect "
+     "explanation.\n"),
+]
+
+
+def arc2_rev5_prompt_edits(text: str) -> str:
+    for old, new in _R5_EDITS:
+        if text.count(old) != 1:
+            raise ValueError(f"rev 5 prompt edit anchor not found exactly once: {old[:60]!r}")
+        text = text.replace(old, new)
+    return text
+
+
+ARC2_TOOL_DESCRIPTION = (
+    "Run one Python snippet. Provided globals: `train` (list of {'input': grid, 'output': grid}), `test_inputs` "
+    "(list of grids), `check(transform)` (prints and returns per-pair exactness on the training pairs) and "
+    "`submit(transform)` (submits a top-level function; the harness verifies it). Grids are lists of lists of ints "
+    "0-9; numpy is not available. Use `print(...)` for compact output or assign final data to `result`."
+)
+
+ARC2_NUDGE_TAIL = (
+    "Call the `python` tool: write or fix `transform(grid)`, run `check(transform)` on the training pairs, and "
+    "`submit(transform)` once every pair is exact. "
+)
+_NUDGE_GAME_TAIL_START = "Then investigate and revise your working world model"
+
+# rev 5 B4: resume texts. EVAL6 (validated): after a trim the old text claimed "your tool results above are still valid"
+# while the reply and the tool results were gone, and the model restarted its analysis from zero.
+ARC2_RESUME_R5 = ("Nothing has been submitted yet. Your earlier reasoning and any tool results are above: continue "
+                  "from them rather than starting over.")
+# rev 5 B6: Duck sends its own "cut off" note only when the turn continues; with the milestone yield (2,048 tokens) every
+# long reply ends the turn first, so the resume opener carries it (harness r5: the note never reached the model before)
+ARC2_RESUME_CUT = ("Your previous reply reached the output limit before its tool call was complete, so nothing was "
+                   "executed; emit the `python` tool call earlier this time. ")
+ARC2_RESUME_TRIMMED = ("Nothing has been submitted yet. To fit the context window, older messages were removed, "
+                       "possibly including your latest reasoning and tool results. Functions you defined are still "
+                       "retained in the Python tool. Recover any fact you need by running Python rather than by "
+                       "re-deriving it by hand, then write or fix `transform`, `check` it, and submit it.")
+
+
+# ================================================================== rev 6 (user 2026-10-21; fix list "Rev 6 gap check")
+# Code-first view (R6-V1..V4), short prompt and state-aware resumes (R6-P1..P3), auto-check (R6-K1..K3), dynamic request
+# caps (R6-Q1), deadline-safe requests (R6-S6). The scheduler (R6-S1..S5, R6-Q2) is solve_all_r6 below.
+#
+# R6-V3 / T1 (code-verified): a model function that calls a prelude helper is dropped by Duck's retention ("unavailable
+# dependencies") and fails the clean host verify (the verify call has only retained sources). So the grid helpers are NOT
+# prelude code: they are trusted retained sources, restored before every tool call and every verification call, and hidden
+# from the model's retained list. Exploration helpers that read `train`/`test_inputs` stay in the prelude (never retained).
+R6_HELPER_SOURCES = [
+    '''def grid_shape(g):
+    """(rows, cols) of a grid."""
+    return (len(g), len(g[0]) if g else 0)''',
+    '''def color_counts(g):
+    """{color: count} sorted by color."""
+    d = {}
+    for row in g:
+        for v in row:
+            d[v] = d.get(v, 0) + 1
+    return dict(sorted(d.items()))''',
+    '''def modal_color(g):
+    """The most frequent color (ties: the smallest). A frequency fact, not necessarily the background."""
+    d = color_counts(g)
+    return max(sorted(d), key=lambda c: d[c]) if d else 0''',
+    '''def components(g, color=None, connectivity=4, ignore=None):
+    """Same-color connected components (connectivity 4 or 8). color: only that color; ignore: skip that color.
+    Each item: {"color", "size", "bbox": (r0, c0, r1, c1) inclusive, "cells": sorted [(r, c), ...]}; largest first."""
+    H, W = len(g), (len(g[0]) if g else 0)
+    seen = [[False] * W for _ in range(H)]
+    steps = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    if connectivity == 8:
+        steps += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+    out = []
+    for r in range(H):
+        for c in range(W):
+            if seen[r][c]:
+                continue
+            v = g[r][c]
+            if (color is not None and v != color) or (ignore is not None and v == ignore):
+                seen[r][c] = True
+                continue
+            stack, cells = [(r, c)], []
+            seen[r][c] = True
+            while stack:
+                y, x = stack.pop()
+                cells.append((y, x))
+                for dy, dx in steps:
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < H and 0 <= nx < W and not seen[ny][nx] and g[ny][nx] == v:
+                        seen[ny][nx] = True
+                        stack.append((ny, nx))
+            cells.sort()
+            ys = [p[0] for p in cells]
+            xs = [p[1] for p in cells]
+            out.append({"color": v, "size": len(cells), "bbox": (min(ys), min(xs), max(ys), max(xs)), "cells": cells})
+    out.sort(key=lambda o: (-o["size"], o["bbox"], o["color"]))
+    return out''',
+    '''def bbox(cells):
+    """(r0, c0, r1, c1) inclusive of a list of (r, c) cells; None when empty."""
+    if not cells:
+        return None
+    ys = [p[0] for p in cells]
+    xs = [p[1] for p in cells]
+    return (min(ys), min(xs), max(ys), max(xs))''',
+    '''def crop(g, r0, c0, r1, c1):
+    """Rows r0..r1 and columns c0..c1, inclusive (the same order as bbox)."""
+    return [list(row[c0:c1 + 1]) for row in g[r0:r1 + 1]]''',
+    '''def rot90(g):
+    """Rotate 90 degrees clockwise."""
+    return [list(r) for r in zip(*g[::-1])]''',
+    '''def flip_h(g):
+    """Mirror left-right."""
+    return [list(reversed(r)) for r in g]''',
+    '''def flip_v(g):
+    """Mirror top-bottom."""
+    return [list(r) for r in g[::-1]]''',
+    '''def transpose(g):
+    """Swap rows and columns."""
+    return [list(r) for r in zip(*g)]''',
+    '''def diff_cells(a, b):
+    """[(r, c, a_value, b_value)] where two same-shape grids differ; None when the shapes differ."""
+    if len(a) != len(b) or (a and len(a[0]) != len(b[0])):
+        return None
+    return [(r, c, a[r][c], b[r][c]) for r in range(len(a)) for c in range(len(a[0])) if a[r][c] != b[r][c]]''',
+    '''def diff_summary(a, b):
+    """Shape-aware difference of two grids: same_shape, shapes, changed cell count, changed bbox, top (a, b, count)."""
+    sa, sb = grid_shape(a), grid_shape(b)
+    if sa != sb:
+        return {"same_shape": False, "shape_a": sa, "shape_b": sb, "changed_cells": None}
+    d = diff_cells(a, b)
+    t = {}
+    for _, _, x, y in d:
+        t[(x, y)] = t.get((x, y), 0) + 1
+    top = sorted(t.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+    return {"same_shape": True, "shape": sa, "changed_cells": len(d),
+            "changed_bbox": bbox([(r, c) for r, c, _, _ in d]), "top_changes": [(k[0], k[1], n) for k, n in top]}''',
+    '''def object_diff(a, b, connectivity=4):
+    """Object-level difference: components of a and b (each grid's modal color excluded) matched as kept (same color and
+    cells), recolored (same cells), moved (same color and shape, with the (dr, dc) offset) or removed / added. Works for
+    grids of different shapes (positions are then in each grid's own coordinates). Counts plus up to 6 examples each."""
+    ca = components(a, connectivity=connectivity, ignore=modal_color(a))
+    cb = components(b, connectivity=connectivity, ignore=modal_color(b))
+    def norm(o):
+        r0, c0 = o["bbox"][0], o["bbox"][1]
+        return tuple((r - r0, c - c0) for r, c in o["cells"])
+    out = {"kept": [], "recolored": [], "moved": [], "removed": [], "added": []}
+    left = list(range(len(cb)))
+    for kind in ("kept", "recolored", "moved"):
+        for oa in ca:
+            if oa.get("_m"):
+                continue
+            best = None
+            for j in left:
+                ob = cb[j]
+                if kind == "kept" and ob["color"] == oa["color"] and ob["cells"] == oa["cells"]:
+                    best = j
+                elif kind == "recolored" and ob["cells"] == oa["cells"] and ob["color"] != oa["color"]:
+                    best = j
+                elif kind == "moved" and ob["color"] == oa["color"] and norm(ob) == norm(oa):
+                    d = abs(ob["bbox"][0] - oa["bbox"][0]) + abs(ob["bbox"][1] - oa["bbox"][1])
+                    if best is None or d < best[1]:
+                        best = (j, d)
+                    continue
+                if best is not None and kind != "moved":
+                    break
+            if best is None:
+                continue
+            j = best[0] if kind == "moved" else best
+            ob = cb[j]
+            left.remove(j)
+            oa["_m"] = True
+            item = {"color": oa["color"], "size": oa["size"], "bbox": oa["bbox"]}
+            if kind == "recolored":
+                item["new_color"] = ob["color"]
+            if kind == "moved":
+                item["offset"] = (ob["bbox"][0] - oa["bbox"][0], ob["bbox"][1] - oa["bbox"][1])
+            out[kind].append(item)
+    out["removed"] = [{"color": o["color"], "size": o["size"], "bbox": o["bbox"]} for o in ca if not o.get("_m")]
+    out["added"] = [{"color": cb[j]["color"], "size": cb[j]["size"], "bbox": cb[j]["bbox"]} for j in left]
+    for o in ca:
+        o.pop("_m", None)
+    return {k: {"count": len(v), "examples": v[:6]} for k, v in out.items()}''',
+]
+
+
+def _src_name(src: str) -> str:
+    return re.match(r"def ([A-Za-z_][A-Za-z0-9_]*)\(", src).group(1)
+
+
+R6_HELPER_NAMES = frozenset(_src_name(s) for s in R6_HELPER_SOURCES)
+R6_HELPERS = {_src_name(s): s for s in R6_HELPER_SOURCES}
+R6_EXPLORE_NAMES = frozenset({"arc_overview", "inspect_pair", "inspect_test", "show", "check_many", "_arc2_check",
+                              "_arc2_err", "_arc2_eval_pair", "_ARC2_FACTS", "_ARC2_LINE_OFFSET", "_ARC2_SHOW_MAX",
+                              "_ARC2_FACTS_EXTRA", "_ARC2_SHOW_CALL", "_ARC2_SHOW_USED"})
+PROGRESS_PREFIX = "PROGRESS:"
+
+# R6-K2: check() prints the verdict first (pairs, identity flag, test inputs), then capped details; an error names the
+# function and its line; every run reports single-function progress to the host (R6-S4), exact ones as CHECKED (rev 5 B1)
+_R6_CHECK_SRC = '''def _arc2_err(e):
+    msg = type(e).__name__ + ": " + str(e)[:240]
+    try:
+        tb, last = e.__traceback__, None
+        while tb is not None:
+            co = tb.tb_frame.f_code
+            if co.co_filename in ("<python_tool>", "<retained>"):
+                last = (co.co_name, tb.tb_lineno - (_ARC2_LINE_OFFSET if co.co_filename == "<python_tool>" else 0),
+                        co.co_filename)
+            tb = tb.tb_next
+        if last is not None and last[0] not in ("check", "check_many", "_arc2_check", "_arc2_eval_pair"):
+            msg += " (in " + last[0] + ", line " + str(last[1]) + ("" if last[2] == "<python_tool>" else " of its source") + ")"
+    except Exception:
+        pass
+    return msg
+def _arc2_eval_pair(transform, p):
+    inp, exp = p["input"], p["output"]
+    try:
+        out = transform([list(r) for r in inp])
+        out = [list(r) for r in out] if isinstance(out, (list, tuple)) else out
+    except Exception as e:
+        return {"ok": False, "error": _arc2_err(e)}, 0.0
+    if not _arc2_grid_ok(out):
+        return {"ok": False, "error": "not a valid grid (rectangular list of lists of ints 0-9, 1..30 per side)"}, 0.0
+    if len(out) != len(exp) or len(out[0]) != len(exp[0]):
+        return {"ok": False, "shape": [len(out), len(out[0])], "expected_shape": [len(exp), len(exp[0])]}, 0.0
+    wrong = [(r, c, out[r][c], exp[r][c]) for r in range(len(exp)) for c in range(len(exp[0])) if out[r][c] != exp[r][c]]
+    res = {"ok": not wrong, "wrong_cells": len(wrong), "wrong_sample_row_col_got_expected": wrong[:6]}
+    if wrong and out == [list(r) for r in inp]:
+        res["identity"] = True
+    if len(inp) == len(exp) and len(inp[0]) == len(exp[0]):
+        chg = [(r, c) for r in range(len(exp)) for c in range(len(exp[0])) if inp[r][c] != exp[r][c]]
+        acc = (sum(1 for r, c in chg if out[r][c] == exp[r][c]) / len(chg)) if chg else (0.0 if wrong else 1.0)
+    else:
+        acc = 1.0 - len(wrong) / float(len(exp) * len(exp[0]))
+    return res, acc
+def _arc2_check(transform):
+    name = getattr(transform, "__name__", "?")
+    results, accs, tests = [], [], []
+    for i, p in enumerate(train):
+        r, a = _arc2_eval_pair(transform, p)
+        r["pair"] = i
+        results.append(r)
+        accs.append(a)
+    for g in test_inputs:
+        try:
+            o = transform([list(r) for r in g])
+            o = [list(r) for r in o] if isinstance(o, (list, tuple)) else o
+            tests.append("ok" if _arc2_grid_ok(o) else "invalid grid")
+        except Exception as e:
+            tests.append("error " + _arc2_err(e)[:160])
+    k, n = sum(1 for r in results if r["ok"]), len(results)
+    if isinstance(name, str) and name.isidentifier():
+        try:
+            action({"action": "''' + PROGRESS_PREFIX + '''" + name + "|" + str(k) + "|" + str(n) + "|"
+                    + str(int(round(1000 * sum(accs) / max(1, n))))})
+        except Exception:
+            pass
+        if n and k == n:
+            try:
+                action({"action": "''' + CHECK_PREFIX + '''" + name})
+            except Exception:
+                pass
+    return name, results, tests, k, n
+def _arc2_verdict(label, results, tests, k, n):
+    ident = [r["pair"] for r in results if r.get("identity")]
+    return (label + ": " + str(k) + "/" + str(n) + " train pairs exact"
+            + ("; returns the input unchanged on pair(s) " + str(ident) if ident else "")
+            + "; test inputs: " + ", ".join(tests))
+def _arc2_detail(r):
+    if "error" in r:
+        return "pair " + str(r["pair"]) + ": " + r["error"]
+    if "shape" in r:
+        return "pair " + str(r["pair"]) + ": shape " + str(r["shape"]) + ", expected " + str(r["expected_shape"])
+    return ("pair " + str(r["pair"]) + ": " + str(r["wrong_cells"]) + " wrong cells, sample (row, col, got, expected) "
+            + str(r["wrong_sample_row_col_got_expected"]))
+def check(transform, verbose=True):
+    name, results, tests, k, n = _arc2_check(transform)
+    if not verbose:
+        return results
+    print("check(" + str(name) + "): " + _arc2_verdict("", results, tests, k, n)[2:])
+    for r in results:
+        if not r["ok"]:
+            print("  " + _arc2_detail(r))
+def check_many(functions):
+    items = list(functions.items()) if isinstance(functions, dict) else [(getattr(f, "__name__", "?"), f) for f in functions]
+    rows = [(label, _arc2_check(f)) for label, f in items]
+    for label, (name, results, tests, k, n) in rows:
+        print(_arc2_verdict(str(label), results, tests, k, n))
+    for label, (name, results, tests, k, n) in rows:
+        for r in [r for r in results if not r["ok"]][:2]:
+            print("  " + str(label) + " " + _arc2_detail(r))
+    return {label: v[1] for label, v in rows}
+'''
+
+_R6_EXPLORE_SRC = '''def arc_overview():
+    if _ARC2_FACTS_EXTRA:
+        print("Facts left out of the system prompt for size (the rest is in the system prompt):")
+        print(_ARC2_FACTS_EXTRA)
+    else:
+        print("The facts in the system prompt are complete (not repeated here). Next: inspect_pair(i, 'objects'), "
+              "inspect_test(j, 'components'), show(grid), or a provisional transform plus check(transform).")
+def _arc2_brief(g):
+    m = modal_color(g)
+    comps = components(g, ignore=m)
+    by = {}
+    for o in comps:
+        by[o["color"]] = by.get(o["color"], 0) + 1
+    return m, comps, dict(sorted(by.items()))
+def inspect_pair(i, detail="summary"):
+    a, b = train[i]["input"], train[i]["output"]
+    print("train " + str(i) + ": in " + str(grid_shape(a)) + " colors " + str(color_counts(a)) + " | out " + str(grid_shape(b))
+          + " colors " + str(color_counts(b)))
+    print("  diff: " + str(diff_summary(a, b)))
+    if detail == "objects":
+        print("  objects: " + str({k: v["count"] for k, v in object_diff(a, b).items()}))
+    if detail not in ("summary", "objects"):
+        for tag, g in (("in", a), ("out", b)):
+            m, comps, by = _arc2_brief(g)
+            print("  " + tag + " components (4-conn, modal color " + str(m) + " excluded): " + str(len(comps)) + " " + str(by))
+            print("    largest (color, size, bbox): " + str([(o["color"], o["size"], o["bbox"]) for o in comps[:8]]))
+def inspect_test(j, detail="summary"):
+    g = test_inputs[j]
+    m, comps, by = _arc2_brief(g)
+    print("test " + str(j) + ": " + str(grid_shape(g)) + " colors " + str(color_counts(g)) + " modal " + str(m))
+    print("  components (4-conn, modal excluded): " + str(len(comps)) + " " + str(by))
+    if detail != "summary":
+        print("    largest (color, size, bbox): " + str([(o["color"], o["size"], o["bbox"]) for o in comps[:8]]))
+def show(g, r0=0, c0=0, r1=None, c1=None):
+    H, W = grid_shape(g)
+    r1 = H - 1 if r1 is None else min(r1, H - 1)
+    c1 = W - 1 if c1 is None else min(c1, W - 1)
+    if r0 < 0 or c0 < 0 or r0 > r1 or c0 > c1:
+        print("show: empty range for a " + str(H) + "x" + str(W) + " grid")
+        return
+    w = c1 - c0 + 1
+    if (r1 - r0 + 1) * w > _ARC2_SHOW_MAX:
+        print("show: " + str((r1 - r0 + 1) * w) + " cells requested; one show() prints at most " + str(_ARC2_SHOW_MAX)
+              + " cells. Narrow the rows or columns.")
+        return
+    room = (_ARC2_SHOW_CALL - _ARC2_SHOW_USED[0]) // w
+    cols = "" if (c0 == 0 and c1 == W - 1) else ", c0=" + str(c0) + ", c1=" + str(c1)
+    if room <= 0:
+        print("show: the limit of " + str(_ARC2_SHOW_CALL) + " shown cells per python call is used; call show(g, r0="
+              + str(r0) + cols + ") in your next call.")
+        return
+    last = min(r1, r0 + room - 1)
+    _ARC2_SHOW_USED[0] += (last - r0 + 1) * w
+    print("grid " + str(H) + "x" + str(W) + ", rows " + str(r0) + ".." + str(last) + ", cols " + str(c0) + ".." + str(c1))
+    print("      " + " ".join(str(c % 10) for c in range(c0, c1 + 1)))
+    for r in range(r0, last + 1):
+        print("r" + str(r).zfill(2) + " | " + " ".join(str(v) for v in g[r][c0:c1 + 1]))
+    if last < r1:
+        print("show: rows " + str(last + 1) + ".." + str(r1) + " not shown (limit of " + str(_ARC2_SHOW_CALL)
+              + " shown cells per python call); call show(g, r0=" + str(last + 1) + cols + ") in your next call.")
+'''
+
+
+def _h_counts(g):
+    d: dict[int, int] = {}
+    for row in g:
+        for v in row:
+            d[v] = d.get(v, 0) + 1
+    return dict(sorted(d.items()))
+
+
+def _h_modal(g):
+    d = _h_counts(g)
+    return max(sorted(d), key=lambda c: d[c]) if d else 0
+
+
+def _h_components(g, ignore):
+    ns: dict[str, Any] = {}
+    exec(R6_HELPERS["components"], ns)          # the same trusted source the model calls
+    return ns["components"](g, ignore=ignore)
+
+
+def arc2_facts_compact(task: dict, level: int) -> str:
+    """Q-5 emergency levels (rev 6c audits A2-1 / C6-5), used only when levels 0-3 are over the bound: 4 = shapes, color
+    counts and changed-cell counts; 5 = shapes only; 6 = counts only. Each says the details are in Python. Nothing is
+    truncated mid-line; every test input is still listed (4, 5) or counted (6)."""
+    head = ["ARC TASK FACTS: compact view; details omitted for size.",
+            f"train pairs: {len(task['train'])}; test inputs: {len(task['test'])}"]
+    tail = ("All exact grids and the detailed facts are in the python tool: train, test_inputs, arc_overview(), "
+            "inspect_pair(i, detail), inspect_test(j, detail).")
+    if level == 4:
+        rows = []
+        for i, p in enumerate(task["train"]):
+            a, b = p["input"], p["output"]
+            same = len(a) == len(b) and len(a[0]) == len(b[0])
+            chg = (f"; changed cells {sum(1 for r in range(len(a)) for c in range(len(a[0])) if a[r][c] != b[r][c])}"
+                   if same else "; shape changed")
+            rows.append(f"TRAIN {i}: in {len(a)}x{len(a[0])} {_h_counts(a)} -> out {len(b)}x{len(b[0])} {_h_counts(b)}{chg}")
+        rows += [f"TEST {j}: {len(q['input'])}x{len(q['input'][0])} {_h_counts(q['input'])}"
+                 for j, q in enumerate(task["test"])]
+        return "\n".join(head + rows + [tail])
+    if level == 5:
+        rows = [f"TRAIN {i}: {len(p['input'])}x{len(p['input'][0])} -> {len(p['output'])}x{len(p['output'][0])}"
+                for i, p in enumerate(task["train"])]
+        rows += [f"TEST {j}: {len(q['input'])}x{len(q['input'][0])}" for j, q in enumerate(task["test"])]
+        return "\n".join(head + rows + [tail])
+    return "\n".join(head + [tail])
+
+
+def arc2_facts(task: dict, *, lists: bool = True, level: int | None = None) -> str:
+    """R6-V2: deterministic facts computed from the exact grids (observations, not a rule). Shape-aware: no cellwise
+    diff for pairs whose shape changes (GPT code-first reviews A/B). 'modal color', never 'background'.
+    level 0 = everything; 1 = no largest-component lists; 2 = also no per-color component counts; 3 = no component lines
+    (Q-5 size levels)."""
+    level = (0 if lists else 1) if level is None else level
+    if level >= 4:
+        return arc2_facts_compact(task, level)
+    lists = level == 0
+    def comps_line(g):
+        m = _h_modal(g)
+        comps = _h_components(g, m)
+        by: dict[int, int] = {}
+        for o in comps:
+            by[o["color"]] = by.get(o["color"], 0) + 1
+        top = [(o["color"], o["size"], o["bbox"]) for o in comps[:3]]
+        return len(comps), dict(sorted(by.items())), top
+
+    L = ["ARC TASK FACTS: computed by the harness from the exact grids; observations, not a rule. (row, col) are zero-based; "
+         "bbox = (r0, c0, r1, c1) inclusive; components are same-color, 4-connected, modal color excluded.",
+         f"train pairs: {len(task['train'])}; test inputs: {len(task['test'])}"]
+    for i, p in enumerate(task["train"]):
+        a, b = p["input"], p["output"]
+        sa, sb = (len(a), len(a[0])), (len(b), len(b[0]))
+        L.append(f"TRAIN {i}")
+        L.append(f"  in  {sa[0]}x{sa[1]} colors {_h_counts(a)} modal {_h_modal(a)}")
+        L.append(f"  out {sb[0]}x{sb[1]} colors {_h_counts(b)} modal {_h_modal(b)}")
+        if sa == sb:
+            d = [(r, c, a[r][c], b[r][c]) for r in range(sa[0]) for c in range(sa[1]) if a[r][c] != b[r][c]]
+            if d:
+                t: dict[tuple, int] = {}
+                for _, _, x, y in d:
+                    t[(x, y)] = t.get((x, y), 0) + 1
+                top = [(k[0], k[1], n) for k, n in sorted(t.items(), key=lambda kv: (-kv[1], kv[0]))[:4]]
+                ys, xs = [q[0] for q in d], [q[1] for q in d]
+                L.append(f"  same shape; changed cells {len(d)}; changed bbox {(min(ys), min(xs), max(ys), max(xs))}; "
+                         f"top changes (in, out, count) {top}")
+            else:
+                L.append("  same shape; output identical to input")
+        else:
+            L.append(f"  shape changed {sa[0]}x{sa[1]} -> {sb[0]}x{sb[1]}")
+        ni, bi, ti = comps_line(a)
+        no, bo, to = comps_line(b)
+        if level < 3:
+            L.append(f"  components: in {ni} {bi}, out {no} {bo}" if level < 2 else f"  components: in {ni}, out {no}")
+        if lists:
+            L.append(f"  largest (color, size, bbox): in {ti}; out {to}")
+    for j, q in enumerate(task["test"]):
+        g = q["input"]
+        n, by, top = comps_line(g)
+        L.append(f"TEST {j}")
+        L.append(f"  in  {len(g)}x{len(g[0])} colors {_h_counts(g)} modal {_h_modal(g)}")
+        if level < 3:
+            L.append(f"  components: {n}" + (f" {by}" if level < 2 else "")
+                     + (f"; largest (color, size, bbox) {top}" if lists else ""))
+    if level >= 1:
+        L.append("(" + {1: "largest-component lists", 2: "per-color component counts and largest-component lists",
+                        3: "all component facts"}[level] + " omitted for size: call inspect_pair(i, 'components') / "
+                 "inspect_test(j, 'components'))")
+    L.append("Exact grids in the python tool: train[i]['input'], train[i]['output'], test_inputs[j].")
+    return "\n".join(L)
+
+
+def _facts_level(text: str) -> int:
+    if text.startswith("ARC TASK FACTS: compact view"):
+        return (4 if " -> out " in text else 5) if "\nTRAIN 0: " in text else 6
+    if "omitted for size" not in text:
+        return 0
+    return 1 if "(largest-component lists omitted" in text else 2 if "(per-color component" in text else 3
+
+
+def reasoning_shares(text: str) -> dict:
+    """R6-M1 hand-reading proxies over one reply's reasoning: characters in grid-like rows, digit characters, and
+    characters of lines (>= 20 chars) repeated earlier in the same reply (loops)."""
+    seen, grid, rep = set(), 0, 0
+    for ln in text.split("\n"):
+        st = ln.strip()
+        if len(st) <= _GRID_ROW_MAX and _GRID_ROW_RE.match(st):
+            grid += len(ln)
+        if len(st) >= 20:
+            if st in seen:
+                rep += len(ln)
+            seen.add(st)
+    return {"chars": len(text), "grid": grid, "digits": sum(ch.isdigit() for ch in text), "repeat": rep}
+
+
+def arc2_facts_bounded(task: dict) -> str:
+    """R6-V2 / Q-5 size bound (both plan reviews: 600-800 Qwen tokens first; measured on the 120 eval tasks the full block
+    is p50 1,237 / p90 1,752 tokens): the richest level within E12_R6_FACTS_MAX_TOKENS (800, counted with the served
+    tokenizer, else the conservative fallback ratio), and within E12_R6_FACTS_MAX_CHARS. Details are dropped, never
+    silently: the text says what was omitted and how to get it."""
+    max_tok, max_chr = _env_int("E12_R6_FACTS_MAX_TOKENS", 800), _env_int("E12_R6_FACTS_MAX_CHARS", 3600)
+    text = ""
+    for level in (0, 1, 2, 3, 4, 5, 6):
+        text = arc2_facts(task, level=level)
+        if reasoning_tokens(text) <= max_tok and len(text) <= max_chr:
+            return text
+    return text      # level 6 (counts + where the details are) even when over: never cut facts mid-line
+
+
+def arc2_facts_extra(task: dict) -> str:
+    """G4-5: the lines of the full facts that the bounded system-prompt block left out, with their TRAIN/TEST header,
+    so arc_overview() never repeats what the model already has. Empty when nothing was left out."""
+    bounded, full = arc2_facts_bounded(task), arc2_facts(task, level=0)
+    if bounded == full:
+        return ""
+    have = set(bounded.splitlines())
+    out, head, head_done = [], None, True
+    for ln in full.splitlines():
+        if ln.startswith(("TRAIN ", "TEST ")):
+            head = ln
+            head_done = ln not in have        # a header the bounded block lacks is itself new: emit it now
+            if head_done:
+                out.append(ln)
+            continue
+        if ln in have or ln.startswith("Exact grids in the python tool"):
+            continue
+        if head is not None and not head_done:
+            out.append(head)
+            head_done = True
+        out.append(ln)
+    return "\n".join(out)
+
+
+def task_prelude_r6(task: dict) -> str:
+    """rev 6 prelude: data + exploration helpers + check/check_many/submit. The grid helpers are trusted retained
+    sources (R6_HELPER_SOURCES), restored before this code runs."""
+    train = [{"input": p["input"], "output": p["output"]} for p in task["train"]]
+    tests = [q["input"] for q in task["test"]]
+    body = ("train = " + json.dumps(train, separators=(",", ":")) + "\n"
+            + "test_inputs = " + json.dumps(tests, separators=(",", ":")) + "\n"
+            + "_ARC2_FACTS = " + json.dumps(arc2_facts_bounded(task)) + "\n"
+            + "_ARC2_FACTS_EXTRA = " + json.dumps(arc2_facts_extra(task)) + "\n"
+            + "_ARC2_SHOW_MAX = " + str(_env_int("E12_R6_SHOW_MAX_CELLS", 900)) + "\n"
+            + "_ARC2_SHOW_CALL = " + str(_env_int("E12_R6_SHOW_CALL_CELLS", 1000)) + "\n"
+            + "_ARC2_SHOW_USED = [0]\n"
+            + "_ARC2_LINE_OFFSET = @@OFFSET@@\n"
+            + _HELPERS_SRC.split("def check(transform, verbose=True):")[0]       # _arc2_grid_ok
+            + _R6_CHECK_SRC
+            + "def submit(transform):" + _HELPERS_SRC.split("def submit(transform):")[1]
+            + _R6_EXPLORE_SRC)
+    return body.replace("@@OFFSET@@", str(body.count("\n")))
+
+
+# separators are disjoint (a comma with optional spaces, or spaces only), so a non-matching long line fails in linear time;
+# overlapping alternatives backtracked exponentially on print(grid) output (smoke hang, 2026-10-21)
+# G4-3 (G4B: 173 rows printed as print(r, row) reached the model): a row index (optionally "row", ":" or "=") before a
+# bracketed row of single-digit cells. Separators stay disjoint, so the match is linear time.
+# Self-audit of rev 6e (scan of 149 recorded transcripts): rows printed as an index plus joined digits
+# (print(r, ''.join(map(str, row))), 480 rows in 5 G4B branches), "r 0: [..]" (rev 5) and "3: 0 0 5 2" also leaked.
+# A "|" is never a separator here, so show() rows ("r03 | 0 0 5") stay exempt.
+_GRID_ROW_RE = re.compile(r"(?i)^\s*[\[\(]*\s*\d+(?:(?:\s*,\s*|\s+)\d+){3,}\s*[\]\)]*\s*,?\s*$|^\s*\d{8,}\s*$"
+                          r"|^\s*(?:(?:row|r)\s*)?\d+\s*[:=]?\s*[\[\(]\s*\d(?:\s*,\s*\d){3,}\s*[\]\)]\s*,?\s*$"
+                          r"|^\s*(?:(?:row|r)\s*)?\d+(?:\s*[:=]\s*|\s+)\d{8,}\s*$"
+                          r"|^\s*(?:(?:row|r)\s*)?\d+\s*[:=]\s*\d(?:\s+\d){3,}\s*$")
+_GRID_ROW_MAX = 600
+
+
+def guard_grid_prints(text: str, *, keep: int = 2, run_min: int = 6) -> tuple[str, int]:
+    """R6-V4 / T4: Duck's board guard needs >= 24 alphanumeric characters without spaces (tool_agent.py:1592-1598), so
+    ARC-2 rows ('0 1 2', '[0, 1, 2]') never match. Collapse runs of >= run_min grid-like rows to `keep` rows + a note,
+    and cut a single very long nested-list line (print(grid)). show() rows ('r03 | ...') are exempt."""
+    if not text:
+        return text, 0
+    lines, out, i, dropped = text.split("\n"), [], 0, 0
+    note = ("[... {n} more grid rows not shown: raw grid prints are hidden because counting characters by hand is "
+            "unreliable. Use show(grid) for an indexed view, or compute what you need in Python.]")
+    while i < len(lines):
+        j = i
+        while j < len(lines) and len(lines[j]) <= _GRID_ROW_MAX and _GRID_ROW_RE.match(lines[j]):
+            j += 1
+        if j - i >= run_min:
+            out += lines[i:i + keep] + [note.format(n=j - i - keep)]
+            dropped += j - i - keep
+            i = j
+            continue
+        ln = lines[i]
+        if len(ln) > 400 and ln.count("[") >= 8 and sum(ch.isdigit() for ch in ln) > 0.25 * len(ln):
+            out.append(ln[:160] + " " + note.format(n="(nested list)"))
+            dropped += 1
+        else:
+            out.append(ln)
+        i += 1
+    return "\n".join(out), dropped
+
+
+ARC2_R6_ALLOWED_IMPORTS = ("bisect, collections, copy, difflib, fractions, functools, heapq, itertools, json, math, "
+                           "operator, random, re, statistics, string")
+
+
+def arc2_system_prompt_r6(task: dict, DP, tool_output_tokens: int, view: str = "facts") -> str:
+    """R6-P1: short operational prompt (merged from the three GPT drafts, verbatim file in Experiment Review). No rigid
+    stages. view 'facts' = R6-V1 (no raw grids); view 'grids' = the branch-1 representation hedge (rows + facts)."""
+    grids = view in ("grids", "indexed")
+    p = ["You are a Python coding agent solving an ARC-AGI-2 grid task.",
+         "\n\nTask:\n"
+         "- The training pairs show one transformation from input grid to output grid. Infer it and implement it as a "
+         "top-level function `transform(grid)` that takes and returns a rectangular list of lists of ints 0-9. It is then "
+         "applied to each test input; the test outputs are unknown to everyone.\n"
+         "- Prefer the simplest rule that explains every training pair and fits the structure of the test inputs. A fixed "
+         "coordinate, color or size is fine when the examples show it is part of the rule; a lookup table or case "
+         "distinction keyed on what you read from the input is a valid rule when the examples support it.\n"]
+    if grids:
+        p.append("- The grids are shown below and are also available in the python tool as `train` (a list of "
+                 "{'input': grid, 'output': grid}) and `test_inputs` (a list of grids).\n")
+    else:
+        p.append("- The exact grids are not repeated in this prompt. They are in the python tool as `train` (a list of "
+                 "{'input': grid, 'output': grid}) and `test_inputs` (a list of grids). The facts below were computed from "
+                 "them by the harness: observations, not a rule, with some detail left out.\n")
+    p.append("- `for p in train: inp, out = p['input'], p['output']`.\n"
+             "\n\nWorking style:\n"
+             "- Your reasoning is for hypotheses and plans. Use Python for exact cells, counts, sizes, positions, objects, "
+             "differences and predicted grids; do not transcribe grids, count cells or simulate outputs by hand.\n"
+             "- Use the first Python call for evidence that the facts in this prompt do not already give. Prefer testing an "
+             "executable hypothesis to building a complete verbal explanation: write a pure `transform(grid)`, run "
+             "`check(transform)`, and use the failing pairs to revise it.\n"
+             "- If you have inspected several examples and still have no candidate, test your simplest current hypothesis "
+             "now, even if you expect it to fail. Do not reconstruct grids by hand instead of running code.\n"
+             "- When two rules seem plausible, write each as its own function and check both, e.g. "
+             "`check_many({'a': transform, 'b': transform_alt})`, before comparing their test predictions in Python.\n"
+             "\n\nPython tool:\n"
+             "- Provided in every `python` call: `train`, `test_inputs`, `check(transform)`, `check_many(functions)`, "
+             "`submit(transform)`; exploration helpers `arc_overview()` (prints facts left out of this prompt for size, if "
+             "any), `inspect_pair(i, detail='summary', 'components' or 'objects')`, `inspect_test(j, detail=...)`, "
+             "`show(grid, r0=0, c0=0, r1=None, c1=None)` (a whole grid up to 30x30, or a crop, with row and column indices; "
+             "about 1,000 cells per call); and grid functions you may also call inside `transform`: `grid_shape(g)`, "
+             "`color_counts(g)`, `modal_color(g)`, `components(g, color=None, connectivity=4, ignore=None)` (items with "
+             "color, size, bbox, cells), `bbox(cells)`, `crop(g, r0, c0, r1, c1)` (inclusive, the bbox order), `rot90(g)` "
+             "(clockwise), `flip_h(g)`, `flip_v(g)`, `transpose(g)`, `diff_cells(a, b)`, `diff_summary(a, b)`, "
+             "`object_diff(a, b)` (objects kept, recolored, moved with offset, removed, added).\n"
+             "- Examples: `objs = components(g, ignore=modal_color(g))` then `[(o['color'], o['size'], o['bbox']) for o in "
+             "objs]`; `object_diff(train[0]['input'], train[0]['output'])`; `diff_summary(a, b)` (changed cells and their "
+             "bbox); `check_many({'a': transform, 'b': transform_alt})` checks two hypotheses in one call.\n"
+             "- `check(transform)` runs your function on every training pair (and once on each test input) and prints how "
+             "many pairs are exact, then for each failing pair the error with its line, the shape mismatch, or sample wrong "
+             "cells as (row, col, got, expected).\n"
+             "- Every function that is exact on every training pair is re-run by the harness in a clean sandbox and kept "
+             "as a candidate answer. Checking does not end your work; later or alternative exact versions are kept too. "
+             "When you define or change a function named `transform...`, `solve...` or `..._alt`, the harness checks it "
+             "automatically after your code runs.\n"
+             "- A train-exact function is not proof that it generalizes. `submit(transform)` submits your final choice "
+             "and ends this branch; submit only a function that check shows exact.\n"
+             "- Work in pure Python lists: numpy is not available. The only importable standard-library modules are: "
+             + ARC2_R6_ALLOWED_IMPORTS + ".\n"
+             "- Raw grid prints are cut by the harness. Use `show(grid)` for an indexed view, or print counts, coordinates, "
+             "objects or small crops, or assign a final compact object to `result`.\n")
+    persistent = DP.PERSISTENT_FUNCTIONS_LINE.format(
+        lifetime="for later calls on this task",
+        import_guidance="Supported explicit top-level imports used by retained functions are restored with them; "
+                        "imports inside a function also work.",
+    ).replace("Python builtins, provided globals such as `current_frame`, and other retained functions",
+              "Python builtins, the grid functions above and other retained functions (not `train` or `test_inputs`)")
+    p.append("\n\nTool session rules:\n"
+             "- You have exactly one tool: `python`.\n"
+             f"- {DP.TOOL_CALL_FORMAT_GUIDANCE}\n"
+             f"{persistent}"
+             "- Functions that read `train` or `test_inputs` directly are not retained; pass the data as arguments.\n"
+             "- Each `python` tool call has a hard time limit of 30 seconds.\n"
+             f"- Tool responses are capped to about {tool_output_tokens} tokens. If a response is cut off, the tool "
+             "result will tell you that.\n"
+             "- Keep code snippets short and purpose-built.\n")
+    p.append("\n\n" + arc2_facts_bounded(task) + "\n")
+    if view == "indexed":
+        p.append(arc2_indexed_grids(task))
+    elif grids:
+        for i, q in enumerate(task["train"]):
+            p.append(f"\nTraining pair {i} input:\n{grid_rows(q['input'])}\nTraining pair {i} output:\n{grid_rows(q['output'])}\n")
+        for j, q in enumerate(task["test"]):
+            p.append(f"\nTest input {j}:\n{grid_rows(q['input'])}\n")
+    return "".join(p)
+
+
+def _indexed_rows(g: list[list[int]]) -> str:
+    """The show() layout: a column-index header and r00 | ... rows."""
+    W = len(g[0]) if g else 0
+    return "\n".join(["      " + " ".join(str(c % 10) for c in range(W))]
+                     + ["r" + str(r).zfill(2) + " | " + " ".join(str(v) for v in row) for r, row in enumerate(g)])
+
+
+def arc2_indexed_grids(task: dict) -> str:
+    """G4-11 (branch-1 view): every grid in the show() layout (row and column indices). Bounded by
+    E12_R6_B1_GRID_MAX_TOKENS: when the full text is over, grids are replaced, largest first, by a one-line pointer to
+    show() until it fits (the facts above still describe them). H6-7 (GPT rev 6e audits, reproduced: 10 train + 3 test
+    20x20 = 21,963 Qwen tokens with nothing hidden): small grids are no longer exempt, so the bound is hard."""
+    items = [x for i, q in enumerate(task["train"]) for x in ((f"Training pair {i} input", q["input"]),
+                                                               (f"Training pair {i} output", q["output"]))]
+    items += [(f"Test input {j}", q["input"]) for j, q in enumerate(task["test"])]
+    where = {f"Training pair {i} input": f"train[{i}]['input']" for i in range(len(task["train"]))}
+    where.update({f"Training pair {i} output": f"train[{i}]['output']" for i in range(len(task["train"]))})
+    where.update({f"Test input {j}": f"test_inputs[{j}]" for j in range(len(task["test"]))})
+    limit = _env_int("E12_R6_B1_GRID_MAX_TOKENS", 12000)
+    hidden: set = set()
+
+    def render() -> str:
+        out = []
+        for label, g in items:
+            if label in hidden:
+                out.append(f"\n{label}: {len(g)}x{len(g[0])}, not shown here for size; use show({where[label]}).\n")
+            else:
+                out.append(f"\n{label} ({len(g)}x{len(g[0])}):\n{_indexed_rows(g)}\n")
+        return "".join(out)
+    text = render()
+    for label, g in sorted(items, key=lambda x: -(len(x[1]) * len(x[1][0]))):
+        if reasoning_tokens(text) <= limit:
+            break
+        hidden.add(label)
+        text = render()
+    return text
+
+
+# R6-P2: state-aware resumes (fix list R6-P2; verbatim GPT drafts adapted: our submit() ends a branch, so borrowed
+# "submit" wording became check()). One primary state per resume, by precedence; facts, not advice.
+R6_COMPLETE = " The conversation above is complete."
+R6_TRIMMED = (" To fit the context window, older messages were removed (possibly reasoning and tool results); do not "
+              "assume they are still visible. Your retained functions and saved candidates remain: recover any fact you "
+              "need with Python.")
+R6_TEXT = {
+    "first": ("Solve the task in the system prompt. The exact grids are in `train` and `test_inputs` in the python tool. "
+              "Start with a small Python inspection or a provisional `transform` plus `check(transform)`."),
+    "cut": ("Your previous reply hit the output limit before its tool call was complete, so that call did NOT run. Keep the "
+            "reasoning above; send one complete, short `python` call now."),
+    "length": ("Your previous reply reached this request's output limit; its reasoning is kept above. Do not restart: in "
+               "this reply call `python` to test your current best hypothesis (write `transform` and `check(transform)`), "
+               "or to compute the fact you still need."),
+    "timeout": ("The previous request ran out of time and was abandoned; your earlier work above is intact. Keep the next "
+                "reply short and run Python early."),
+    "verified": ("`{name}` is host-verified on every training pair and saved as a candidate answer ({n} distinct saved). "
+                 "That does not prove it generalizes. If the test inputs suggest a materially different rule, write it under "
+                 "a new name and check() it; otherwise submit({name}) to finish this branch."),
+    "partial": ("Your best function so far, `{name}`, is exact on {k} of {n} training pairs. Use the reported failing pairs "
+                "and cells; keep the behaviour that already works and check() the smallest justified fix."),
+    "notool": ("Your previous reply ended without running Python. Continue from your reasoning above: run the smallest "
+               "Python inspection or a provisional `transform` plus `check(transform)`."),
+    "continue": "Continue from your work above.",
+    # G4-6 (GPT G4B audits; threshold from the G4B replay, fix list): sent once when a branch has generated
+    # E12_R6_NUDGE_TOKENS without defining any solution-named function
+    "provisional": ("You have inspected the training grids but have not tested a transformation yet. Write one "
+                    "provisional `transform(grid)` now. It may be imperfect; use `check(transform)` to locate what fails. "
+                    "Avoid another full-grid recount unless the missing observation is essential to the rule."),
+    "rejected": ("Your submission `{name}` was not accepted: {summary} Continue from your work above: fix the rule or the "
+                 "code, check() it, then submit again."),
+}
+R6_GENERALIZE = (" Before relying on it, check in Python whether it uses training-specific coordinates, offsets, sizes, "
+                 "counts or layouts that the test inputs do not share. Do not reject a fixed rule just because it is fixed; "
+                 "if another plausible rule predicts a different test output, keep it as an alternative under its own name.")
+_R6_AUTOCHECK_RE = re.compile(r"^(transform|solve|solution|predict)\w*$|^\w+_(alt\w*|v\d+)$")
+R6_PRELUDE_NAMES = PRELUDE_NAMES | R6_EXPLORE_NAMES | frozenset({"_arc2_brief", "_arc2_verdict", "_arc2_detail"})
+
+
+def _r6_reads(src: str) -> set[str]:
+    """Global names a function source reads (for the transitive dependency key, R6-K3)."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+
+def overfit_flags(task: dict, source: str, test_outputs: list) -> list[str]:
+    """R6-M1 / T7 (gap check): label-free warning signs on a host-verified candidate. Never a rejection: a fixed offset
+    can be the real rule (4c3d4a41: +10 was a training-layout constant the model itself doubted)."""
+    import ast
+    flags = []
+    tins = [q["input"] for q in task["test"]]
+    if any(o is not None and o == g for o, g in zip(test_outputs, tins)):
+        flags.append("test_output_equals_input")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        tree = None
+    out_rows = {tuple(r) for p in task["train"] for r in p["output"]}
+    in_rows = {tuple(r) for p in task["train"] for r in p["input"]}
+    dims = {d for p in task["train"] for g in (p["input"], p["output"]) for d in (len(g), len(g[0]))}
+    tdims = {d for g in tins for d in (len(g), len(g[0]))}
+    if tree is not None:
+        for n in ast.walk(tree):
+            if isinstance(n, ast.List) and len(n.elts) >= 3 and all(
+                    isinstance(e, ast.Constant) and isinstance(e.value, int) for e in n.elts):
+                row = tuple(e.value for e in n.elts)
+                if row in out_rows and row not in in_rows:
+                    flags.append("train_output_row_literal")
+                    break
+        offs = {n.right.value for n in ast.walk(tree) if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub))
+                and isinstance(n.right, ast.Constant) and isinstance(n.right.value, int) and n.right.value >= 3}
+        if offs:
+            flags.append("fixed_offset")
+            if any((o in dims or 2 * o in dims) and o not in tdims and 2 * o not in tdims for o in offs):
+                flags.append("offset_tied_to_train_dims")
+    same = all(len(p["input"]) == len(p["output"]) and len(p["input"][0]) == len(p["output"][0]) for p in task["train"])
+    shapes = {(len(p["output"]), len(p["output"][0])) for p in task["train"]}
+    pal = {v for p in task["train"] for r in p["output"] for v in r}
+    for o, g in zip(test_outputs, tins):
+        if o is None:
+            continue
+        if (same and (len(o), len(o[0])) != (len(g), len(g[0]))) or (len(shapes) == 1 and not same
+                                                                    and (len(o), len(o[0])) not in shapes):
+            flags.append("test_shape_outside_train_pattern")
+            break
+    for o, g in zip(test_outputs, tins):
+        if o is not None and {v for r in o for v in r} - pal - {v for r in g for v in r}:
+            flags.append("test_palette_outside_train")
+            break
+    if len(source) > 9000:
+        flags.append("long_source")
+    return sorted(set(flags))
+
+
+def _r6_single_grid_arg(src: str) -> bool:
+    """R6-K1 eligibility (GPT plan reviews 1/2): one required positional parameter (the grid)."""
+    import ast
+    try:
+        fn = ast.parse(src).body[-1]
+    except (SyntaxError, IndexError):
+        return False
+    if not isinstance(fn, ast.FunctionDef):
+        return False
+    a = fn.args
+    required = len(a.posonlyargs) + len(a.args) - len(a.defaults)
+    return required == 1 and not a.kwonlyargs
+
+
+# ------------------------------------------------------------------ the agent
+def make_agent_class():
+    TA, DP, run_sandboxed_python, _ = _import_duck()
+
+    class Arc2ToolAgent(TA.ToolAgent):
+        def __init__(self, *, task: dict, task_id: str, branch: int, view: str = "facts", **kwargs):
+            super().__init__(**kwargs)
+            self.arc2_task = task
+            self.arc2_task_id = task_id
+            self.arc2_branch = branch
+            self._arc2_rev5 = _rev5()
+            self._arc2_rev6 = _rev6()
+            self.arc2_view = view if self._arc2_rev6 else "grids"
+            # Rev 1 #1: the module-level prompt builder already ran in ToolAgent.__init__; replace its result
+            if self._arc2_rev6:
+                self._system_prompt = arc2_system_prompt_r6(task, DP, self._tool_output_tokens, view=self.arc2_view)
+                self._arc2_prelude = task_prelude_r6(task)
+            else:
+                self._system_prompt = arc2_system_prompt(task, DP, self._tool_output_tokens, rev5=self._arc2_rev5)
+                self._arc2_prelude = task_prelude(task, rev5=self._arc2_rev5)
+            self._arc2_prelude_lines = self._arc2_prelude.count("\n")
+            # rev 6 state: deadline (R6-S6), request caps (R6-Q1), progress (R6-S4), verification cache (R6-K3), metrics
+            self._arc2_deadline: float | None = None
+            self._arc2_window = _env_int("E12_DUCK_CONTEXT_WINDOW", TA._LOCAL_ANALYZER_CONTEXT_WINDOW)
+            self._arc2_cap = {"first": _env_int("E12_R6_CAP_FIRST", 12288), "progress": _env_int("E12_R6_CAP_PROGRESS", 24576),
+                              "rescue": _env_int("E12_R6_CAP_RESCUE", 32768),
+                              # G4-2: branch 1 (a grids view) makes its first call at 12.4-18.0k (G4B), so its first cap
+                              # is the approved 24,576; branch 0 keeps 12,288
+                              "first_b1": _env_int("E12_R6_CAP_FIRST_B1", 24576)}
+            self._arc2_first_transform_tokens: int | None = None     # G4-14 / G4-6
+            self._arc2_nudge_sent = False                             # G4-6
+            # E16: early code-first steering only after multiple *successful* inspection-only Python calls.
+            # This affects advisory text, not the sandbox, clean verifier, selection or request/token caps.
+            self._e16_inspection_calls = 0
+            self._e16_check_attempted = False
+            self._e16_early_nudge_enabled = _env_int("E12_E16_EARLY_NUDGE", 0) == 1
+            self._e16_early_nudge_calls = max(1, _env_int("E12_E16_INSPECTION_CALLS", 2))
+            self._e16_early_nudge_tokens = max(0, _env_int("E12_E16_NUDGE_TOKENS", 4000))
+            self._e16_raw_content_on = _env_int("E12_E16_RAW_CONTENT", 0) == 1 and _raw_reasoning_history()
+            self._e16_last_raw_content = None
+            # H6-1 (GPT rev 6e audits; G4B: 0 of 12 branch-0 runs had a new turn at >= 27k before the 28k pause, so an
+            # opener-borne nudge never reached stage 1): 24k (user 2026-10-22), sent in the next tool result
+            self._arc2_nudge_tokens = _env_int("E12_R6_NUDGE_TOKENS", 24000)
+            self._arc2_name_src: dict[str, str] = {}                  # H6-11
+            self._arc2_name_best: dict[str, tuple] = {}               # G4-18
+            self.arc2_requests: list[dict] = []                       # G4-15 per-request instrumentation
+            self._arc2_prev_msgs: list[str] | None = None
+            self._arc2_last_req_end: float | None = None
+            self._arc2_trimmed_flag = False
+            self._arc2_tool_ok = False
+            self._arc2_nocall_cuts = 0
+            self._arc2_length_pending = False
+            # E14-P (user 2026-10-23): raw reasoning in history, off by default (see _append_context_message)
+            self._arc2_raw_reasoning_on = _raw_reasoning_history()
+            self._arc2_last_raw_reasoning: str | None = None
+            self.arc2_raw_reasoning = {"kept": 0, "same": 0, "mismatch": 0, "markup": 0}
+            self.arc2_progress = {"best": None, "first_check_tokens": None, "runs": 0}
+            self._arc2_verdicts: dict[str, dict] = {}
+            self._arc2_accepted_sigs: dict[str, str] = {}
+            self._arc2_caps_used = {"check": 0, "auto": 0}
+            self._arc2_cap_limit = {"check": _env_int("E12_CHECK_VERIFY_CAP", 24), "auto": _env_int("E12_AUTOCHECK_CAP", 24)}
+            self._arc2_autochecked: dict[str, str] = {}
+            self._arc2_progress_names: list[str] = []
+            self._arc2_generalize_sent = False
+            self._arc2_origin = "check"
+            self.arc2_rev6_events = {"first_tool_tokens": None, "first_check_tokens": None, "autocheck_calls": 0,
+                                     "autocheck_functions": 0, "grid_rows_suppressed": 0, "resumes": {}, "caps": {},
+                                     "verify_sec": [], "verify_skipped_deadline": 0, "nudges_replaced": 0,
+                                     "length_cut_no_call": 0, "accepted_duplicate_outputs": 0, "timeouts_clamped": 0,
+                                     # R6-M1 additions (gap check vs the problem->fix map)
+                                     "facts_chars": None, "facts_tokens": None, "facts_level": None,
+                                     "reasoning_chars": 0, "reasoning_grid_row_chars": 0, "reasoning_digit_chars": 0,
+                                     "reasoning_repeat_chars": 0, "tool_calls": 0, "redefinitions": 0,
+                                     "infra_errors": 0, "trim_reasoning_only_blocks": 0,
+                                     # rev 6e (G4-6 / G4-14 / G4-18)
+                                     "first_transform_tokens": None, "provisional_nudge_tokens": None,
+                                     "e16_inspection_calls": 0, "e16_nudge_reason": None,
+                                     "e16_raw_content_kept": 0, "e16_raw_content_same": 0,
+                                     "e16_raw_content_mismatch": 0, "e16_raw_content_markup": 0,
+                                     # rev 6f (H6-1 / H6-11 / H6-18)
+                                     "provisional_nudge_via": None, "first_transform_after_nudge": None,
+                                     # rev 6g H7-10 / H7-8 / H7-7
+                                     "provisional_nudge_seen_request": None, "provisional_nudge_seen_tokens": None,
+                                     "indexed_view_tokens": None, "view_over_target": None, "requests_started": 0,
+                                     "first_check_after_nudge": None, "progress_same_name_new_source": 0,
+                                     "progress_reports": 0, "progress_same_improved": 0, "progress_new_hypothesis": 0}
+            if self._arc2_rev6 and self.arc2_view == "indexed":       # H7-8: record the view size and any overflow
+                _iv = reasoning_tokens(arc2_indexed_grids(task))
+                self._arc2_view_flags = (_iv, _iv > _env_int("E12_R6_B1_GRID_MAX_TOKENS", 12000))
+            if self._arc2_rev6:
+                _f = arc2_facts_bounded(task)
+                self.arc2_rev6_events.update(facts_chars=len(_f), facts_tokens=reasoning_tokens(_f),
+                                             facts_level=_facts_level(_f),
+                                             facts_over_target=reasoning_tokens(_f) > _env_int("E12_R6_FACTS_MAX_TOKENS", 800))
+                if getattr(self, "_arc2_view_flags", None):
+                    self.arc2_rev6_events.update(indexed_view_tokens=self._arc2_view_flags[0],
+                                                 view_over_target=self._arc2_view_flags[1])
+            self.arc2_submissions: list[dict] = []
+            # rev 5 B1: host-verified candidates from exact check() calls (kept apart from submissions: the opener
+            # reports the last *submission*), the code states already verified, and a per-branch verification cap
+            self.arc2_checked: list[dict] = []
+            self._arc2_pending_checks: list[str] = []
+            self._arc2_checked_keys: set = set()
+            self._arc2_check_cap = int(os.environ.get("E12_CHECK_VERIFY_CAP", "24"))
+            self._arc2_cut_pending = False
+            self.arc2_rev5_events = {"checks_signalled": 0, "checks_verified": 0, "checks_accepted": 0,
+                                     "checks_skipped_dup": 0, "checks_skipped_cap": 0, "cut_tool_calls_dropped": 0,
+                                     "resume_rewritten_after_trim": 0}
+            self.arc2_usage: list[dict] = []   # per served request (prefix-cache measurement, step 3.5)
+            self.arc2_accepted: dict | None = None
+            self._arc2_pending_submit: str | None = None
+            # Rev 2 (GPT audit): Duck's 900 s first-request grace is for an ARC-3 server that is still loading. Here
+            # every agent is built after the SGLang /health + smoke checks, and that grace ignores the run deadline
+            # (reproduced: a dead server kept a 5 s-deadline branch alive past 90 s). Duck's normal retries remain.
+            self._http_initial_grace_used = True
+
+        def _accumulate_usage_tokens(self, usage, *, count_toward_turn: bool = True) -> None:
+            super()._accumulate_usage_tokens(usage, count_toward_turn=count_toward_turn)   # Duck's counting, unchanged
+            if isinstance(usage, dict):
+                det = usage.get("prompt_tokens_details")
+                self.arc2_usage.append({"t": round(time.time(), 1), "prompt": usage.get("prompt_tokens"),
+                                        "completion": usage.get("completion_tokens"),
+                                        "cached": det.get("cached_tokens") if isinstance(det, dict) else None})
+
+        # rev 5 low-effort run (user 2026-10-21): a fixed reasoning_effort for every request when E12_REASONING_EFFORT is
+        # set (the Qwen3.8 template accepts xhigh / medium / low; xhigh is its default). Duck's effort ladder (unused
+        # here) keeps precedence when it is active.
+        def _harness_template_kwargs(self) -> dict[str, Any]:
+            kwargs = super()._harness_template_kwargs()
+            effort = os.environ.get("E12_REASONING_EFFORT", "").strip().lower()
+            if effort in ("xhigh", "medium", "low") and "reasoning_effort" not in kwargs:
+                kwargs["reasoning_effort"] = effort
+            return kwargs
+
+        # Rev 1 #5: ARC-2 tool description (same schema as Duck's)
+        def _tools(self, state_path: Path) -> list[dict[str, Any]]:
+            tools = super()._tools(state_path)
+            tools[0]["function"]["description"] = ARC2_TOOL_DESCRIPTION
+            return tools
+
+        # the task lives in the system prompt, which is never trimmed; openers stay short
+        def _build_user_prompt(self, action_num, *, valid_actions, current_frame=None, history_entries=None,
+                               previous_step_summary=None) -> str:
+            # Duck's milestone runs the 'full' resume mode: the opener is rebuilt after every yield (2,048 tokens).
+            # Duck's opener then restates unchanged state; the ARC-2 equivalent is a continuation, never a restart.
+            if self._arc2_rev6:
+                return self._arc2_r6_opener()
+            if getattr(self, "_resume_after_yield", False):
+                if self._arc2_rev5:   # rev 5 B4: no claim about tool results that may not exist; B6: say a call was cut
+                    cut, self._arc2_cut_pending = self._arc2_cut_pending, False
+                    return (ARC2_RESUME_CUT if cut else "") + ARC2_RESUME_R5
+                return ("Nothing has been submitted since the message above, so it still holds. Your tool results "
+                        "above are still valid: continue from them rather than starting over.")
+            if not self.arc2_submissions:
+                return ("Solve the task in the system prompt. Start with the `python` tool: inspect `train` and "
+                        "`test_inputs`, then build and `check` a `transform`.")
+            last = self.arc2_submissions[-1]
+            return ("Your last submission (`" + last["name"] + "`) was not accepted: " + last["summary"]
+                    + " Continue from your earlier work: fix the rule or the code, run `check`, and submit again.")
+
+        def _arc2_r6_status(self):
+            """(state, text) of the strongest saved evidence: a verified candidate, else single-function progress."""
+            acc = [v for v in self.arc2_checked + self.arc2_submissions if v.get("accepted")]
+            if acc:
+                last = max(acc, key=lambda v: v.get("t", 0))
+                return "verified", R6_TEXT["verified"].format(name=last["name"], n=len(self._arc2_accepted_sigs) or 1)
+            best = self.arc2_progress.get("best")
+            if best and (best["k"] > 0 or best["acc"] > 0):
+                return "partial", R6_TEXT["partial"].format(name=best["name"], k=best["k"], n=best["n"])
+            return None, ""
+
+        def _arc2_r6_opener(self) -> str:
+            """R6-P2: precedence cut call > length cut without a call > timeout > verified > partial > no-tool > neutral;
+            a new turn after a rejected submit says so (never the first-turn text).
+            One primary state; the sentinel sentence is swapped for the trimmed-history text when Duck trims (rewrite)."""
+            last = self.arc2_submissions[-1] if self.arc2_submissions else None
+            if not getattr(self, "_resume_after_yield", False) and last is not None and not last.get("accepted"):
+                # a rejected submit is an executed step, so Duck opens a new turn without a resume flag (harness rerun)
+                state, text = "rejected", R6_TEXT["rejected"].format(name=last["name"], summary=last["summary"])
+            elif not getattr(self, "_resume_after_yield", False):
+                state, text = "first", R6_TEXT["first"]
+            else:
+                reason = str(getattr(self, "_resume_reason", "") or "yield_bare")
+                cut, self._arc2_cut_pending = self._arc2_cut_pending, False
+                length, self._arc2_length_pending = self._arc2_length_pending, False
+                sstate, stext = self._arc2_r6_status()
+                if cut:
+                    state, text = "cut", R6_TEXT["cut"]
+                elif length:
+                    state, text = "length", R6_TEXT["length"]
+                elif reason == "timeout":
+                    state, text = "timeout", R6_TEXT["timeout"]
+                elif self._arc2_wants_nudge():
+                    state, text = "provisional", R6_TEXT["provisional"]
+                    self._arc2_mark_nudge("opener")
+                elif sstate:
+                    state, text = sstate, stext
+                elif reason == "yield_bare":
+                    state, text = "notool", R6_TEXT["notool"]
+                else:
+                    state, text = "continue", R6_TEXT["continue"]
+            ev = self.arc2_rev6_events["resumes"]
+            ev[state] = ev.get(state, 0) + 1
+            return text + R6_COMPLETE
+
+        def _arc2_mark_nudge(self, via: str) -> None:
+            self._arc2_nudge_sent = True
+            self.arc2_rev6_events["provisional_nudge_tokens"] = self.generated_tokens
+            self.arc2_rev6_events["provisional_nudge_via"] = via
+            self.arc2_rev6_events["e16_nudge_reason"] = (
+                "inspection" if self._e16_early_nudge_enabled
+                and self._e16_inspection_calls >= self._e16_early_nudge_calls
+                and self.generated_tokens >= self._e16_early_nudge_tokens
+                and self.generated_tokens < self._arc2_nudge_tokens
+                else "existing_24k")
+
+        def _arc2_wants_nudge(self) -> bool:
+            """G4-6 / H6-1: once per branch, after E12_R6_NUDGE_TOKENS generated tokens, when no one-grid solution-named
+            function was ever defined and no check() ran (G4B replay: the two solved branches defined `transform` at
+            18,383 and 26,228 tokens; the 10 branches that never defined one all passed 29k). Sent in the next tool
+            result (mid-turn), else in the next opener."""
+            # E16 review (agent A, 2026-10-24): a check/submit attempt blocks only the EARLY nudge; the existing 24k
+            # fallback stays exactly as in the base adapter (an attempt that reported no progress must not silence it)
+            if self._arc2_nudge_sent or self._arc2_first_transform_tokens is not None or self.arc2_progress.get("runs"):
+                return False
+            regular = self._arc2_nudge_tokens > 0 and self.generated_tokens >= self._arc2_nudge_tokens
+            early = (self._e16_early_nudge_enabled and not self._e16_check_attempted
+                     and self._e16_inspection_calls >= self._e16_early_nudge_calls
+                     and self.generated_tokens >= self._e16_early_nudge_tokens)
+            return regular or early
+
+        def _retained_function_context(self) -> str:  # Duck's opener note, scope wording -> ARC-2
+            return super()._retained_function_context().replace(" in this game: ", " on this task: ")
+
+        # R6-V3 / T1: the trusted grid helpers are restored before every call (tool and verification) and stay hidden
+        def _retained_sources(self):
+            own = super()._retained_sources()
+            if not self._arc2_rev6 or own is None:
+                return own
+            mine = self._kept_functions or {}
+            return [src for name, src in R6_HELPERS.items() if name not in mine] + list(own)
+
+        def _arc2_raw_reasoning_message(self, message):
+            """E14-P (Notes/11; user 2026-10-23). Duck stores TA._normalize_message_content(reasoning) in history: every
+            blank line is deleted and the ends are stripped (tool_agent.py L3414-3418). The next prompt then differs from
+            the tokens the model generated at the first paragraph break, and the server can reuse only the end-of-prefill
+            state, so the whole reply is prefilled again (G4B rev 6d: 68/150 requests, 217,541 tokens; 0/180 THINKING
+            blocks contain a blank line). With E12_RAW_REASONING_HISTORY=1 the assistant message of the latest reply
+            carries the server's raw reasoning instead. Only when it is the same reply (normalize(raw) == the stored
+            text) and Duck did not strip tool-call markup out of it; transcript, metrics and token counts are unchanged."""
+            if not (self._arc2_raw_reasoning_on and isinstance(message, dict)
+                    and str(message.get("role", "")).strip() == "assistant"):
+                return message                                # a user/tool message never consumes the capture
+            raw, self._arc2_last_raw_reasoning = self._arc2_last_raw_reasoning, None
+            if not raw:
+                return message
+            keys = [k for k in TA._reasoning_history_keys() if isinstance(message.get(k), str) and message.get(k)]
+            if not keys:
+                return message
+            norm = TA._normalize_message_content(raw)
+            if TA._contains_tool_call_markup(raw, ""):
+                self.arc2_raw_reasoning["markup"] += 1        # Duck stripped recovered call markup: keep its text
+                return message
+            if any(message[k] != norm for k in keys):
+                self.arc2_raw_reasoning["mismatch"] += 1      # not the reply we captured: never guess
+                return message
+            if raw == norm:
+                self.arc2_raw_reasoning["same"] += 1
+                return message
+            message = dict(message)
+            for k in keys:
+                message[k] = raw
+            self.arc2_raw_reasoning["kept"] += 1
+            return message
+
+        def _e16_raw_content_message(self, message):
+            """Cache efficiency: preserve *original* assistant content whitespace only if the existing
+            normalized stored message matches it. Tool-call markup / tool_calls are deliberately excluded,
+            because their canonical serialization is not reconstructible from these data. No guessing tokens.
+            """
+            if not (self._e16_raw_content_on and isinstance(message, dict)
+                    and str(message.get("role", "")).strip() == "assistant"):
+                return message
+            raw, self._e16_last_raw_content = self._e16_last_raw_content, None
+            if not isinstance(raw, str) or not raw or not isinstance(message.get("content"), str):
+                return message
+            if message.get("tool_calls") or TA._contains_tool_call_markup("", raw):
+                self.arc2_rev6_events["e16_raw_content_markup"] += 1
+                return message
+            if TA._normalize_message_content(raw) != message["content"]:
+                self.arc2_rev6_events["e16_raw_content_mismatch"] += 1
+                return message
+            if raw == message["content"]:
+                self.arc2_rev6_events["e16_raw_content_same"] += 1
+                return message
+            out = dict(message)
+            out["content"] = raw
+            self.arc2_rev6_events["e16_raw_content_kept"] += 1
+            return out
+
+        # Rev 1 #8: keep Duck's generic nudge prefix, replace only its game tail
+        def _append_context_message(self, messages, message) -> None:
+            message = self._arc2_raw_reasoning_message(message)
+            message = self._e16_raw_content_message(message)
+            if (self._arc2_rev6 and isinstance(message, dict) and message.get(TA._CONTROL_MESSAGE_KEY) == "nudge"
+                    and isinstance(message.get("content"), str)):
+                # T6: Duck's prefix "You have not acted yet. Investigate first." contradicts R6-P1
+                message = dict(message)
+                message["content"] = R6_TEXT["notool"] + " " + DP.TOOL_CALL_FORMAT_GUIDANCE
+                self.arc2_rev6_events["nudges_replaced"] += 1
+                return super()._append_context_message(messages, message)
+            if (isinstance(message, dict) and message.get(TA._CONTROL_MESSAGE_KEY) == "nudge"
+                    and isinstance(message.get("content"), str) and _NUDGE_GAME_TAIL_START in message["content"]):
+                prefix = message["content"].split(_NUDGE_GAME_TAIL_START, 1)[0]
+                message = dict(message)
+                message["content"] = prefix + ARC2_NUDGE_TAIL + DP.TOOL_CALL_FORMAT_GUIDANCE
+            super()._append_context_message(messages, message)
+
+        # rev 5 B4: when Duck's trimmer removed messages, the resume opener (the last user message it keeps) says so
+        def _trim_messages_for_context(self, messages, **kwargs):
+            if self._arc2_rev6:
+                self._arc2_apply_cap()          # R6-Q1 + R6-D1: the reserve the trimmer uses = this request's real cap
+            out = super()._trim_messages_for_context(messages, **kwargs)
+            if self._arc2_rev6 and len(out) < len(messages):
+                self._arc2_trimmed_flag = True  # G4-15
+            return self._arc2_rewrite_resume(messages, out)
+
+        def _arc2_apply_cap(self) -> int:
+            """R6-Q1 (user 2026-10-21): 12,288 until the first Python call runs without error, then 24,576; 32,768 after
+            two consecutive output-limit replies with no tool call. The thinking of earlier requests stays in history, so a
+            branch keeps its full >= 60k allowance over several requests. R6-D1 (C-2): Duck's reply reserve and context
+            budget (tool_agent.py:3497-3509) are re-derived from the same cap, so the trimmer and the request agree."""
+            c = self._arc2_cap
+            first = c["first_b1"] if self.arc2_view != "facts" else c["first"]
+            cap = c["rescue"] if self._arc2_nocall_cuts >= 2 else (c["progress"] if self._arc2_tool_ok else first)
+            self._max_output_tokens = cap
+            self._reply_reserve_tokens = cap
+            self._context_budget_tokens = max(1024, self._arc2_window - cap - self._request_safety_margin_tokens)
+            return cap
+
+        def _drop_oldest_history_block(self, history, *, preserve_recent):
+            """R6-D3 (fix list; GPT plan review 1 P5): Duck drops the oldest user-delimited block. Under rev 6 the oldest
+            COMPLETE block without any tool result (a reply that only reasoned, e.g. cut at the output limit) goes first,
+            so tool results survive longer (rev 5 low 4c3d4a41_b0: a trim lost tool results, then an overfit accept).
+            Blocks are removed whole (a call and its result are never split); the newest block is never a candidate."""
+            if self._arc2_rev6:
+                role = lambda m: str((m or {}).get("role", "")).strip()
+                starts = [i for i, m in enumerate(history) if role(m) == "user"]
+                limit = len(history) - max(0, preserve_recent)
+                for a, b in zip(starts, starts[1:]):
+                    if b > limit:
+                        break
+                    blk = history[a:b]
+                    if any(role(m) == "assistant" for m in blk) and not any(role(m) == "tool" for m in blk):
+                        del history[a:b]
+                        self.arc2_rev6_events["trim_reasoning_only_blocks"] += 1
+                        return True
+            return super()._drop_oldest_history_block(history, preserve_recent=preserve_recent)
+
+        # rev 5 R5-3 (GPT rev 5 audit 3): Duck's last resort after a server rejection drops a block without the trimmer
+        def _force_reduce_messages(self, messages, **kwargs):
+            return self._arc2_rewrite_resume(messages, super()._force_reduce_messages(messages, **kwargs))
+
+        def _arc2_rewrite_resume(self, messages, out):
+            if not self._arc2_rev5 or len(out) >= len(messages):
+                return out
+            if self._arc2_rev6:      # R6-P2: only the newest kept opener's sentinel becomes the truthful trim note
+                new = list(out)
+                for idx in range(len(new) - 1, -1, -1):
+                    m = new[idx]
+                    c = m.get("content") if isinstance(m, dict) else None
+                    if isinstance(c, str) and str(m.get("role", "")).strip() == "user" and R6_COMPLETE in c:
+                        m = dict(m)
+                        m["content"] = c.replace(R6_COMPLETE, R6_TRIMMED, 1)
+                        new[idx] = m
+                        self.arc2_rev5_events["resume_rewritten_after_trim"] += 1
+                        break
+                return new
+            new = []
+            for m in out:
+                c = m.get("content") if isinstance(m, dict) else None
+                if (isinstance(c, str) and str(m.get("role", "")).strip() == "user" and ARC2_RESUME_R5 in c):
+                    m = dict(m)
+                    m["content"] = c.replace(ARC2_RESUME_R5, ARC2_RESUME_TRIMMED, 1)
+                    self.arc2_rev5_events["resume_rewritten_after_trim"] += 1
+                new.append(m)
+            return new
+
+        # rev 5 B3: Duck estimates every message with one chars/token ratio calibrated on the served prompt, which here
+        # is digit grids (1.40-1.72). Long prose reasoning tokenizes at about 2.1, so a 60,000-token reply was counted as
+        # 72-102k and dropped although the real next prompt (65-69k) fitted the 70,560 budget (EVAL6, 5 resets, verified
+        # with the tokenizer). Assistant reasoning is counted with the real tokenizer; everything else is unchanged.
+        def _arc2_reasoning_parts(self, messages):
+            keys = TA._reasoning_history_keys()
+            for m in messages:
+                if isinstance(m, dict) and str(m.get("role", "")).strip() == "assistant":
+                    for k in keys:
+                        r = m.get(k)
+                        if isinstance(r, str) and len(r) >= 2000:
+                            yield r
+
+        def _estimate_request_input_tokens(self, messages, *, tools=None):
+            base = super()._estimate_request_input_tokens(messages, tools=tools)
+            if not self._arc2_rev5:
+                return base
+            cpt = self._text_chars_per_token or TA._text_token_chars()
+            adj = 0.0
+            for r in self._arc2_reasoning_parts(messages):
+                adj += reasoning_tokens(r) - len(json.dumps(r, ensure_ascii=False)) / cpt
+            return max(1, int(round(base + adj)))
+
+        def _calibrate_from_usage(self, messages, tools, usage):
+            est = None
+            if self._arc2_rev5 and isinstance(usage, dict):   # R5-5: the estimate the trimmer used, before recalibration
+                try:
+                    est = self._estimate_request_input_tokens(messages, tools=tools)
+                except Exception:
+                    est = None
+            note = super()._calibrate_from_usage(messages, tools, usage)
+            if est is not None and usage.get("prompt_tokens"):
+                pe = self.arc2_rev5_events.setdefault("prompt_estimates", [])
+                if len(pe) < 400:
+                    pe.append([int(est), int(usage["prompt_tokens"])])
+            if not self._arc2_rev5 or not TA._calibrate_text_tokens() or not isinstance(usage, dict):
+                return note
+            try:   # the ratio then describes the non-reasoning text only (it is applied to that text only, above)
+                parts = list(self._arc2_reasoning_parts(messages))
+                r_tok = sum(reasoning_tokens(r) for r in parts)
+                if not r_tok:
+                    return note
+                r_chars = sum(len(json.dumps(r, ensure_ascii=False)) for r in parts)
+                scrubbed, image_tokens = TA._split_messages_for_estimate(list(messages))
+                payload: dict[str, Any] = {"messages": scrubbed}
+                if tools:
+                    payload["tools"] = tools
+                    payload["tool_choice"] = TA._request_tool_choice(tools)
+                rendered = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+                rest_tokens = int(usage.get("prompt_tokens") or 0) - image_tokens - r_tok
+                if rest_tokens > 0 and rendered > r_chars:
+                    measured = (rendered - r_chars) / rest_tokens
+                    self._text_chars_per_token = min(TA._text_token_chars_max(), max(TA._text_token_chars_min(), measured))
+            except Exception as exc:
+                log.warning("rev 5 calibration correction skipped: %s", exc)
+            return note
+
+        # rev 5 B6: a reply cut at the output limit can carry a tool call whose arguments SGLang's parser closed, so the
+        # cut code ran (EVAL30: 5 times, e.g. a 3-line stub). Duck already handles cut calls when their JSON is broken:
+        # it drops them and tells the model it was cut off. Make such calls look broken so that path is taken.
+        def _chat_completion(self, messages, **kwargs):
+            if self._arc2_rev6 and self._arc2_deadline is not None:
+                # R6-S6 / T8 root cause (EVAL30 log + code): run_branch clamps the timeout once per TURN and Duck reuses it
+                # for every request of the turn, so a request started just before the deadline ran up to 336 s past it.
+                # Clamp every request to the absolute deadline.
+                given = kwargs.get("request_timeout_seconds")
+                left = self._arc2_deadline - time.monotonic()
+                clamp = max(0.5, min(float(given) if given is not None else float(self._timeout), left))
+                if given is None or clamp < float(given):
+                    self.arc2_rev6_events["timeouts_clamped"] += 1
+                kwargs["request_timeout_seconds"] = clamp
+            if self._arc2_rev6:     # R6-M1: one count per request (the trimmer can run several times per request)
+                ev = self.arc2_rev6_events["caps"]
+                mt = str(kwargs.get("max_tokens") or self._max_output_tokens)
+                ev[mt] = ev.get(mt, 0) + 1
+            if self._arc2_rev6:
+                ev7 = self.arc2_rev6_events
+                ev7["requests_started"] += 1                                   # H7-7: a request was really sent
+                if self._arc2_nudge_sent and ev7["provisional_nudge_seen_request"] is None:
+                    # H7-10 (GPT rev 6f audit 3): "emitted" (tool result / opener) is not "seen"; the first outbound
+                    # request whose messages carry the nudge text is when the model can read it
+                    key = R6_TEXT["provisional"][:60]
+                    if any(key in json.dumps(m, ensure_ascii=False, default=str) for m in messages):
+                        ev7["provisional_nudge_seen_request"] = len(self.arc2_requests)
+                        ev7["provisional_nudge_seen_tokens"] = self.generated_tokens
+            meta = self._arc2_request_begin(messages, kwargs) if self._arc2_rev6 else None
+            result = super()._chat_completion(messages, **kwargs)
+            if meta is not None:
+                self._arc2_request_end(meta, result)
+            if self._arc2_raw_reasoning_on:      # E14-P: the server's reasoning as generated, before Duck normalizes it
+                msg = getattr(result, "message", None)
+                raw = None
+                if isinstance(msg, dict):
+                    raw = msg.get("reasoning")          # the same key precedence as TA._extract_reasoning_text
+                    if raw in (None, ""):
+                        raw = msg.get("reasoning_content")
+                self._arc2_last_raw_reasoning = raw if isinstance(raw, str) and raw else None
+            if self._e16_raw_content_on:
+                msg = getattr(result, "message", None)
+                content = msg.get("content") if isinstance(msg, dict) else None
+                self._e16_last_raw_content = content if isinstance(content, str) and content else None
+            if self._arc2_rev6:     # R6-Q1 rescue cap / R6-P2 "length cut, no call" state
+                finish = str(getattr(result, "finish_reason", "") or "").strip()
+                msg = getattr(result, "message", None)
+                if isinstance(msg, dict):          # R6-M1 hand-reading / loop proxies
+                    try:
+                        sh = reasoning_shares(str(TA._extract_reasoning_text(msg) or ""))
+                        ev6 = self.arc2_rev6_events
+                        ev6["reasoning_chars"] += sh["chars"]
+                        ev6["reasoning_grid_row_chars"] += sh["grid"]
+                        ev6["reasoning_digit_chars"] += sh["digits"]
+                        ev6["reasoning_repeat_chars"] += sh["repeat"]
+                    except Exception:
+                        pass
+                has_calls = bool(msg.get("tool_calls")) if isinstance(msg, dict) else False
+                if finish == "length" and not has_calls and not (isinstance(msg, dict) and TA._contains_tool_call_markup(
+                        TA._extract_reasoning_text(msg), TA._normalize_message_content(msg.get("content", "")))):
+                    self._arc2_nocall_cuts += 1
+                    self._arc2_length_pending = True
+                    self.arc2_rev6_events["length_cut_no_call"] += 1
+                elif has_calls:
+                    self._arc2_nocall_cuts = 0
+            if self._arc2_rev5 and str(getattr(result, "finish_reason", "") or "").strip() == "length":
+                msg = getattr(result, "message", None)
+                calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+                # R5-2 (GPT rev 5 audit 3, reproduced): with no parsed call, Duck recovers one from <tool_call> markup in
+                # the content or reasoning (tool_agent.py:6842-6849) and runs it. One placeholder with invalid
+                # arguments keeps that recovery off and routes the reply into the same malformed-call drop.
+                if isinstance(msg, dict) and not calls and TA._contains_tool_call_markup(
+                        TA._extract_reasoning_text(msg), TA._normalize_message_content(msg.get("content", ""))):
+                    calls = msg["tool_calls"] = [{"id": "arc2-cut-placeholder", "type": "function",
+                                                  "function": {"name": "python", "arguments": ""}}]
+                if calls:
+                    for tc in calls:
+                        fn = tc.get("function") if isinstance(tc, dict) else None
+                        if isinstance(fn, dict):
+                            fn["arguments"] = '{"code": "<cut off at the output limit>'   # unterminated: invalid JSON
+                    self.arc2_rev5_events["cut_tool_calls_dropped"] += 1
+                    self._arc2_cut_pending = True
+            return result
+
+        def _arc2_request_begin(self, messages, kwargs=None) -> dict:
+            """G4-15: is the previous request's prompt a prefix of this one (message level)? A cache miss with an intact
+            prefix means the server lost the cached state; with a broken prefix the prompt itself changed (trim, rewrite).
+            Plus the idle time since this branch's previous request and the server gauges at the start (SERVER_LAST)."""
+            now = time.monotonic()
+            cur = [json.dumps(m, sort_keys=True, ensure_ascii=False, default=str) for m in messages]
+            prev = self._arc2_prev_msgs
+            n = 0
+            if prev is not None:
+                for a, b in zip(prev, cur):
+                    if a != b:
+                        break
+                    n += 1
+            g = dict(SERVER_LAST)
+            # H6-10 (GPT rev 6e audits): the message-level match is not the token prefix; add the serialized character
+            # prefix shared with the previous request and whether the tools / template kwargs changed (both are part of
+            # the rendered prompt). Still a proxy: the server's chat template renders the tokens
+            ser = "".join(cur)
+            prev_ser = getattr(self, "_arc2_prev_ser", None)
+            try:
+                tools_sha = hashlib.sha256(json.dumps((kwargs or {}).get("tools"), sort_keys=True, default=str)
+                                           .encode("utf-8")).hexdigest()[:16]
+                tpl_sha = hashlib.sha256(json.dumps(self._harness_template_kwargs(), sort_keys=True, default=str)
+                                         .encode("utf-8")).hexdigest()[:16]
+            except Exception:
+                tools_sha = tpl_sha = None
+            prev_sha = getattr(self, "_arc2_prev_shas", (None, None))
+            meta_h = {"payload_sha": hashlib.sha256((ser + str(tools_sha) + str(tpl_sha)).encode("utf-8")).hexdigest()[:16],
+                      "chars": len(ser),
+                      # a proxy (serialized messages, not the rendered tokens): never proof that the cache was kept or lost
+                      "serialized_char_prefix": len(os.path.commonprefix([prev_ser, ser])) if prev_ser else None,
+                      "prev_chars": len(prev_ser) if prev_ser else None,
+                      "tools_same": (tools_sha == prev_sha[0]) if prev_ser else None,
+                      "template_same": (tpl_sha == prev_sha[1]) if prev_ser else None}
+            self._arc2_prev_ser, self._arc2_prev_shas = ser, (tools_sha, tpl_sha)
+            meta = {"i": len(self.arc2_requests), "t": round(time.time(), 1), "msgs": len(cur), **meta_h,
+                    "prev_msgs": len(prev) if prev is not None else None, "prefix_msgs": n if prev is not None else None,
+                    "prefix_ok": (n == len(prev)) if prev is not None else None, "trimmed": self._arc2_trimmed_flag,
+                    "idle_sec": round(now - self._arc2_last_req_end, 1) if self._arc2_last_req_end is not None else None,
+                    "kv": g.get("kv_usage"), "mamba": g.get("mamba_usage"), "running": g.get("running"),
+                    "queue": g.get("queue"), "_t0": now}
+            self._arc2_trimmed_flag = False
+            self._arc2_prev_msgs = cur
+            return meta
+
+        def _arc2_request_end(self, meta: dict, result) -> None:
+            now = time.monotonic()
+            usage = getattr(result, "usage", None)
+            usage = usage if isinstance(usage, dict) else {}
+            det = usage.get("prompt_tokens_details")
+            cached = det.get("cached_tokens") if isinstance(det, dict) else None
+            meta.update(sec=round(now - meta.pop("_t0"), 1), prompt=usage.get("prompt_tokens"),
+                        completion=usage.get("completion_tokens"),
+                        # SGLang 0.5.21 omits prompt_tokens_details when nothing was cached (usage_processor.py:13-15)
+                        cached=int(cached) if cached is not None else 0, cached_reported=cached is not None,
+                        finish=str(getattr(result, "finish_reason", "") or ""))
+            self._arc2_last_req_end = now
+            if len(self.arc2_requests) < 600:
+                self.arc2_requests.append(meta)
+
+        def _fix_line_numbers(self, text: str) -> str:
+            off = self._arc2_prelude_lines
+
+            def _sub(m):
+                n = int(m.group(1))
+                return f'File "<python_tool>", line {n - off}' if n > off else m.group(0)
+            return re.sub(r'File "<python_tool>", line (\d+)', _sub, text)
+
+        # Rev 1 #2/#3: prelude + model code through Duck's verbatim sandbox; submit -> host re-verification
+        def _run_python_tool(self, state_path: Path, arguments: dict[str, Any]):
+            self._ensure_session(state_path)
+            code = str(arguments.get("code", "")).rstrip()
+            if not code:
+                return TA._ToolDispatchResult(json.dumps({"error": "python requires a non-empty `code` string."}, indent=2))
+            try:
+                compile(code, "<python_tool>", "exec")
+            except SyntaxError as exc:
+                return TA._ToolDispatchResult(json.dumps({"error": f"Python syntax error: {exc}"}, indent=2))
+            self._arc2_pending_submit = None
+            self._arc2_pending_checks = []
+            self._arc2_progress_names = []
+            best_before = self.arc2_progress.get("best")          # H7-2: identity; _arc2_note_progress makes a new dict
+            empty_state = {"current_frame": None, "history": [], "valid_actions": [], "last_action_call_result": {}}
+
+            def _handle_action(actions, *, stale_after=None):
+                names = [str((a or {}).get("action", "")) for a in actions]
+                if self._arc2_rev6 and names and all(n.startswith(PROGRESS_PREFIX) for n in names):
+                    for n in names:      # R6-S4: single-function progress (untrusted; scheduling/resume text only)
+                        self._arc2_note_progress(n[len(PROGRESS_PREFIX):])
+                    return {"action_result": {"executed": False, "progress": True}, "state": empty_state}
+                subs = [n[len(SUBMIT_PREFIX):] for n in names if n.startswith(SUBMIT_PREFIX)]
+                checks = [n[len(CHECK_PREFIX):] for n in names if self._arc2_rev5 and n.startswith(CHECK_PREFIX)]
+                if checks and not subs:   # rev 5 B1: a signal only; nothing is executed or trusted here
+                    self._arc2_pending_checks.extend(checks)
+                    self.arc2_rev5_events["checks_signalled"] += len(checks)
+                    return {"action_result": {"executed": False, "checked": checks[-1]}, "state": empty_state}
+                if not subs:
+                    raise RuntimeError("Only submit(transform) is available in this task.")
+                self._arc2_pending_submit = subs[-1]
+                result = {"executed": True, "submitted": subs[-1]}
+                return {"action_result": result, "state": empty_state}
+
+            sandbox_result = run_sandboxed_python(
+                code=self._arc2_prelude + code,
+                timeout_seconds=self._python_timeout,
+                initial_state=empty_state,
+                action_handler=_handle_action,
+                kept_functions=self._retained_sources(),
+                retain_imports=TA._get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False),
+                repair_hints=TA._get_env_bool("ARC3_PERSISTENT_FUNCTIONS_REPAIR_HINTS", False),
+            )
+            # the prelude's helpers are harness-provided, never the model's retained functions
+            sandbox_result = dict(sandbox_result)
+            hidden = R6_PRELUDE_NAMES if self._arc2_rev6 else PRELUDE_NAMES
+            sandbox_result["keepable_functions"] = [
+                f for f in (sandbox_result.get("keepable_functions") or []) if f.get("name") not in hidden
+                and not (self._arc2_rev6 and R6_HELPERS.get(f.get("name")) == f.get("source"))]   # trusted helper, untouched
+            sandbox_result["retention_rejected"] = [
+                r for r in (sandbox_result.get("retention_rejected") or []) if r.get("name") not in hidden]
+            payload: dict[str, Any] = {"tool": "python"}
+            before_kept = dict(self._kept_functions or {})
+            self._record_retained_functions(sandbox_result, payload)
+            if self._arc2_rev6 and self._arc2_first_transform_tokens is None and any(
+                    _R6_AUTOCHECK_RE.match(n) and before_kept.get(n) != src and _r6_single_grid_arg(src)
+                    for n, src in (self._kept_functions or {}).items()):
+                # G4-14 / G4-6; H6-2: a one-grid function only (the auto-check predicate), so transform(a, b) or a helper
+                # solve_row(r, i) neither suppresses the nudge nor counts as the first transform
+                self._arc2_first_transform_tokens = self.generated_tokens
+                self.arc2_rev6_events["first_transform_tokens"] = self.generated_tokens
+                if self._arc2_nudge_sent and self.arc2_rev6_events["first_transform_after_nudge"] is None:
+                    self.arc2_rev6_events["first_transform_after_nudge"] = self.generated_tokens      # H6-18
+            if "function_retention" in payload:  # Duck's scope wording ("in this game") -> ARC-2
+                payload["function_retention"] = payload["function_retention"].replace(" in this game.", " on this task.")
+            rendered_stdout = self._fix_line_numbers(str(sandbox_result.get("stdout", "") or ""))
+            rendered_error = self._fix_line_numbers(str(sandbox_result.get("error", "") or ""))
+            if self._arc2_rev6:
+                ev6 = self.arc2_rev6_events
+                ev6["tool_calls"] += 1
+                ev6["redefinitions"] += sum(1 for n, src in (self._kept_functions or {}).items()
+                                            if n in before_kept and before_kept[n] != src)
+                if "Tool timed out after" in rendered_error or "MemoryError" in rendered_error:
+                    # R6-K2: a harness limit, labelled as such (not a verdict on the rule)
+                    ev6["infra_errors"] += 1
+                    rendered_error += ("\n[harness limit: the call was stopped by the sandbox's time or memory limit. This "
+                                       "says nothing about whether the rule is right; make the code cheaper or test fewer "
+                                       "cases per call.]")
+                rendered_stdout, dropped = guard_grid_prints(rendered_stdout)      # R6-V4 / T4
+                self.arc2_rev6_events["grid_rows_suppressed"] += dropped
+                if self.arc2_rev6_events["first_tool_tokens"] is None:
+                    self.arc2_rev6_events["first_tool_tokens"] = self.generated_tokens
+                if not rendered_error:
+                    self._arc2_tool_ok = True                                   # R6-Q1: progress cap from now on
+            if rendered_error:
+                payload["error"] = rendered_error
+                if rendered_stdout:
+                    payload["stdout"] = rendered_stdout
+            else:
+                payload["returncode"] = 0
+                if rendered_stdout:
+                    payload["stdout"] = rendered_stdout
+                elif sandbox_result.get("result") is not None:
+                    payload["result"] = sandbox_result.get("result")
+            checked_now = set(self._arc2_pending_checks)
+            if self._arc2_rev5 and self._arc2_pending_checks:
+                self._arc2_origin = "check"
+                notes = self._arc2_harvest_checks(self._arc2_pending_checks, skip=self._arc2_pending_submit)
+                if notes:
+                    payload["candidate"] = " ".join(notes)
+            if self._arc2_rev6 and self._arc2_pending_submit is None:
+                self._arc2_autocheck(code, before_kept, checked_now | set(self._arc2_progress_names), payload)
+            # E16: a read-only inspection is a successful tool call with no check/submit attempt and no
+            # retained candidate. A single nudge after two such calls has lower prefix/prefill overhead
+            # than repeated instructions; checked/accepted tools always retain their original behavior.
+            if self._arc2_rev6 and self._e16_early_nudge_enabled:
+                import ast
+                try:
+                    tree = ast.parse(code, filename="<python_tool>")
+                    attempted = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                                    and n.func.id in ("check", "check_many", "submit")
+                                    for n in ast.walk(tree))
+                except SyntaxError:
+                    attempted = False
+                if attempted or self._arc2_progress_names or self._arc2_pending_checks:
+                    self._e16_check_attempted = True
+                valid_transform = any(
+                    _R6_AUTOCHECK_RE.match(n) and before_kept.get(n) != src and _r6_single_grid_arg(src)
+                    for n, src in (self._kept_functions or {}).items())
+                if (not rendered_error and not self._e16_check_attempted
+                        and not valid_transform and self._arc2_first_transform_tokens is None
+                        and not self.arc2_progress.get("runs") and self._arc2_pending_submit is None):
+                    self._e16_inspection_calls += 1
+                    self.arc2_rev6_events["e16_inspection_calls"] = self._e16_inspection_calls
+            if self._arc2_rev6:
+                for n in dict.fromkeys(self._arc2_progress_names):     # H6-11: same name, new source?
+                    if n in (self._kept_functions or {}):
+                        key = self._arc2_closure_key(n)[:16]
+                        old = self._arc2_name_src.get(n)
+                        if old is not None and old != key:
+                            self.arc2_rev6_events["progress_same_name_new_source"] += 1
+                        self._arc2_name_src[n] = key
+                        best = self.arc2_progress.get("best") or {}
+                        if best.get("name") == n and best is not best_before:   # H7-2: only a new best gets this source
+                            best["src"] = key
+                if self._arc2_nudge_sent and self.arc2_rev6_events["first_check_after_nudge"] is None \
+                        and self.arc2_progress.get("runs"):
+                    self.arc2_rev6_events["first_check_after_nudge"] = self.generated_tokens          # H6-18
+                if self._arc2_pending_submit is None and self._arc2_wants_nudge():
+                    payload["harness_note"] = R6_TEXT["provisional"]          # H6-1: mid-turn, before the 28k pause
+                    self._arc2_mark_nudge("tool")
+            step_executed = False
+            accepted = False
+            if self._arc2_pending_submit is not None:
+                verdict = self._verify_submission(self._arc2_pending_submit)
+                self.arc2_submissions.append(verdict)
+                payload["submission"] = verdict["summary"]
+                step_executed = True
+                accepted = verdict["accepted"]
+                if accepted:
+                    self.arc2_accepted = verdict
+            return TA._ToolDispatchResult(
+                self._render_tool_payload(payload, truncate_fields=("stdout", "error", "result")),
+                step_executed=step_executed, made_progress=accepted)
+
+        def _arc2_note_progress(self, text: str) -> None:
+            """R6-S4: 'name|pairs_exact|pairs|changed_cell_accuracy_permille' from one check() of ONE function (never a
+            union across functions). Changed-cell accuracy is 0 for the identity (V3.1: near misses were identity-level)."""
+            try:
+                name, k, n, acc = text.split("|")
+                k, n, acc = int(k), int(n), int(acc) / 1000.0
+            except ValueError:
+                return
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                return
+            self._arc2_progress_names.append(name)
+            ev6 = self.arc2_rev6_events                      # G4-18
+            ev6["progress_reports"] += 1
+            prev = self._arc2_name_best.get(name)
+            if prev is None:
+                ev6["progress_new_hypothesis"] += 1
+                self._arc2_name_best[name] = (k, acc)
+            elif (k, acc) > prev:
+                ev6["progress_same_improved"] += 1
+                self._arc2_name_best[name] = (k, acc)
+            pr = self.arc2_progress
+            pr["runs"] += 1
+            if pr["first_check_tokens"] is None:
+                pr["first_check_tokens"] = self.generated_tokens
+                self.arc2_rev6_events["first_check_tokens"] = self.generated_tokens
+            best = pr["best"]
+            if best is None or (k, acc) > (best["k"], best["acc"]):
+                pr["best"] = {"name": name, "k": k, "n": n, "acc": round(acc, 3), "tokens": self.generated_tokens}
+
+        def _arc2_closure(self, name: str) -> dict:
+            kept = self._kept_functions or {}
+            todo, seen = [name], {}
+            while todo:
+                n = todo.pop()
+                if n in seen or n not in kept:
+                    continue
+                seen[n] = kept[n]
+                todo += [m for m in _r6_reads(kept[n]) if m in kept and m not in seen]
+            return seen
+
+        def _arc2_closure_key(self, name: str) -> str:
+            """R6-K3: the function's source plus its transitive retained dependencies (trusted helpers are constant)."""
+            kept = self._kept_functions or {}
+            todo, seen = [name], {}
+            while todo:
+                n = todo.pop()
+                if n in seen or n not in kept:
+                    continue
+                seen[n] = kept[n]
+                todo += [m for m in _r6_reads(kept[n]) if m in kept and m not in seen]
+            blob = json.dumps([name, sorted(seen.items())], ensure_ascii=False)
+            return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+        def _arc2_autocheck(self, code: str, before_kept: dict, already: set, payload: dict) -> None:
+            """R6-K1: after the snippet ran, check every newly defined or changed retained function whose name looks like
+            a solution (transform*, solve*, solution*, predict*, *_alt, *_v<n>) and that takes one grid, unless this call
+            already ran check() on it. A separate, bounded sandbox call; check() itself reports exact ones (CHECKED) and
+            the host verifies them in a clean sandbox (the authority). Never submits, never stops the branch."""
+            kept = self._kept_functions or {}
+            todo = [n for n, src in kept.items()
+                    if _R6_AUTOCHECK_RE.match(n) and before_kept.get(n) != src and n not in already
+                    and self._arc2_autochecked.get(n) != src and _r6_single_grid_arg(src)]
+            todo = todo[:_env_int("E12_AUTOCHECK_PER_CALL", 3)]
+            if not todo:
+                return
+            left = (self._arc2_deadline - time.monotonic()) if self._arc2_deadline is not None else float(self._python_timeout)
+            if left < 3:
+                return
+            for n in todo:
+                self._arc2_autochecked[n] = kept[n]
+            self._arc2_pending_checks = []
+            self._arc2_progress_names = []
+            empty_state = {"current_frame": None, "history": [], "valid_actions": [], "last_action_call_result": {}}
+
+            def _signals(actions, *, stale_after=None):
+                for a in actions:
+                    s = str((a or {}).get("action", ""))
+                    if s.startswith(PROGRESS_PREFIX):
+                        self._arc2_note_progress(s[len(PROGRESS_PREFIX):])
+                    elif s.startswith(CHECK_PREFIX):
+                        self._arc2_pending_checks.append(s[len(CHECK_PREFIX):])
+                return {"action_result": {"executed": False}, "state": empty_state}
+            res = run_sandboxed_python(
+                code=self._arc2_prelude + "".join(f"check({n})\n" for n in todo),
+                timeout_seconds=max(1, min(self._python_timeout, int(left) - 1)), initial_state=empty_state,
+                action_handler=_signals, kept_functions=self._retained_sources(),
+                retain_imports=TA._get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False), repair_hints=False)
+            self.arc2_rev6_events["autocheck_calls"] += 1
+            self.arc2_rev6_events["autocheck_functions"] += len(todo)
+            out = self._fix_line_numbers(str(res.get("stdout", "") or ""))
+            err = self._fix_line_numbers(str(res.get("error", "") or ""))
+            text = guard_grid_prints(out)[0].strip()
+            if err:
+                text += ("\n" if text else "") + "auto-check error: " + err.strip().splitlines()[-1][:300]
+            note = "The harness checked " + ", ".join(f"`{n}`" for n in todo) + " automatically:\n" + text
+            if self._arc2_pending_checks:
+                self._arc2_origin = "auto"
+                notes = self._arc2_harvest_checks(self._arc2_pending_checks)
+                self._arc2_origin = "check"
+                if notes:
+                    note += "\n" + " ".join(notes)
+            payload["auto_check"] = note
+
+        def _arc2_harvest_checks(self, names: list[str], *, skip: str | None = None) -> list[str]:
+            if self._arc2_rev6:
+                return self._arc2_harvest_r6(names, skip=skip)
+            return self._arc2_harvest_r5(names, skip=skip)
+
+        def _arc2_harvest_r6(self, names: list[str], *, skip: str | None = None) -> list[str]:
+            """R6-K3 (GPT plan reviews 1/2): (1) key = the function + its transitive dependency sources; a hit reuses the
+            TRUSTED host verdict; (2) otherwise a clean host verify (the authority, unchanged); (3) only an accepted
+            verdict yields an output signature, used for dedupe after verification. Explicit check() and auto-check have
+            separate caps; a reached cap never blocks submit() and the note says so (no "submit your best" push)."""
+            notes = []
+            origin = self._arc2_origin
+            for name in dict.fromkeys(names):
+                if name == skip:
+                    continue
+                key = self._arc2_closure_key(name)
+                if key in self._arc2_verdicts:
+                    self.arc2_rev5_events["checks_skipped_dup"] += 1
+                    continue
+                if self._arc2_caps_used[origin] >= self._arc2_cap_limit[origin]:
+                    self.arc2_rev5_events["checks_skipped_cap"] += 1
+                    notes.append(f"`{name}` was not verified: the limit of {self._arc2_cap_limit[origin]} "
+                                 f"{'automatic' if origin == 'auto' else 'explicit'} candidate verifications for this branch "
+                                 f"is reached (submit({name}) still verifies it).")
+                    continue
+                self._arc2_caps_used[origin] += 1
+                v = self._verify_submission(name)
+                v["origin"] = origin
+                if v.get("skipped"):
+                    continue
+                self._arc2_verdicts[key] = v
+                self.arc2_checked.append(v)
+                self.arc2_rev5_events["checks_verified"] += 1
+                if v["accepted"]:
+                    self.arc2_rev5_events["checks_accepted"] += 1
+                    sig = hashlib.sha256(json.dumps(v["test_outputs"]).encode("utf-8")).hexdigest()
+                    if sig in self._arc2_accepted_sigs:
+                        v["dup_of"] = self._arc2_accepted_sigs[sig]
+                        self.arc2_rev6_events["accepted_duplicate_outputs"] += 1
+                        notes.append(f"`{name}` is exact on all training pairs; its test outputs equal the saved "
+                                     f"`{v['dup_of']}`, so no new candidate was added.")
+                        continue
+                    self._arc2_accepted_sigs[sig] = name
+                    msg = (f"Kept `{name}` as a candidate answer: a clean re-run is exact on all {len(v['train_exact'])} "
+                           f"training pairs ({len(self._arc2_accepted_sigs)} distinct saved).")
+                    if not self._arc2_generalize_sent:          # R6-P3: once per branch, after the first candidate
+                        self._arc2_generalize_sent = True
+                        msg += R6_GENERALIZE
+                    notes.append(msg)
+                else:
+                    notes.append(f"check() was exact, but the clean re-run did not keep `{name}`: {v['summary']}")
+            return notes
+
+        def _arc2_harvest_r5(self, names: list[str], *, skip: str | None = None) -> list[str]:
+            """rev 5 B1: host-verify each function that check() reported exact in this call (after retention was
+            updated). Dedupe on (name, all retained sources); a per-branch cap bounds the verification cost. The
+            branch is not stopped: a later exact version may generalise better (EVAL30 247ef758: first exact version
+            test-wrong, the next one correct). An explicit submit() of the same name is verified by the submit path."""
+            notes = []
+            kept = self._kept_functions or {}
+            state = hashlib.sha256(json.dumps(sorted(kept.items()), ensure_ascii=False).encode("utf-8")).hexdigest()
+            for name in dict.fromkeys(names):
+                if name == skip:
+                    continue
+                key = (name, state)
+                if key in self._arc2_checked_keys:
+                    self.arc2_rev5_events["checks_skipped_dup"] += 1
+                    continue
+                if len(self._arc2_checked_keys) >= self._arc2_check_cap:
+                    self.arc2_rev5_events["checks_skipped_cap"] += 1
+                    notes.append(f"`{name}` was not kept: the limit of {self._arc2_check_cap} candidate checks per "
+                                 "task is reached; submit your best function.")
+                    continue
+                self._arc2_checked_keys.add(key)
+                v = self._verify_submission(name)
+                v["origin"] = "check"
+                self.arc2_checked.append(v)
+                self.arc2_rev5_events["checks_verified"] += 1
+                if v["accepted"]:
+                    self.arc2_rev5_events["checks_accepted"] += 1
+                    notes.append(f"Kept `{name}` as a candidate answer: a clean re-run is exact on all "
+                                 f"{len(v['train_exact'])} training pairs. Keep improving it if you are unsure (each exact "
+                                 f"version is kept), or call submit({name}) to finish.")
+                else:
+                    notes.append(f"check() was exact, but the clean re-run did not keep `{name}`: {v['summary']}")
+            return notes
+
+        def _verify_submission(self, name: str) -> dict:
+            """Rev 2: one clean sandbox per grid (Duck's runner, retained sources + that one input only); the value is
+            read from the structured `result`; the host validates the grid and compares it with the truth. Test grids
+            are always run (they feed the best-partial fallback, Rev 1 #6)."""
+            v = {"name": name, "accepted": False, "train_exact": [], "test_outputs": [], "summary": "",
+                 "branch": self.arc2_branch, "t": time.time(), "tokens": self.generated_tokens}
+            if self._arc2_rev6 and name in (self._kept_functions or {}):
+                v["src_key"] = self._arc2_closure_key(name)[:16]      # H6-9: program identity = source + dependencies
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or "") or name in PRELUDE_NAMES:
+                v["summary"] = f"`{name}` is not a valid top-level function name."
+                return v
+            if name not in (self._kept_functions or {}):
+                v["summary"] = (f"`{name}` was not retained, so it cannot be verified. Define it at top level with def, "
+                                "pass any data as arguments (not `train` directly), and submit again.")
+                return v
+
+            def _refuse(actions, *, stale_after=None):
+                raise RuntimeError("actions are not available during verification")
+            train, test = self.arc2_task["train"], self.arc2_task["test"]
+            grids = [p["input"] for p in train] + [q["input"] for q in test]
+            budget_end = time.monotonic() + 2 * self._python_timeout   # all grids (one 30 s call before Rev 2)
+            if self._arc2_rev6 and self._arc2_deadline is not None:
+                # R6-S6 (GPT plan review 1 P4, code-verified): the verify budget obeys the run deadline too
+                budget_end = min(budget_end, self._arc2_deadline - 1.0)
+                if budget_end - time.monotonic() < 1.0:
+                    self.arc2_rev6_events["verify_skipped_deadline"] += 1
+                    v.update(skipped=True, summary=f"verification of `{name}` skipped: the run deadline is reached.")
+                    return v
+            _t_verify = time.monotonic()
+            outs, first_err, slow = [], "", False
+            for g in grids:
+                left = budget_end - time.monotonic()
+                if slow or left < 1:
+                    outs.append(None)
+                    continue
+                res = run_sandboxed_python(
+                    code=_grid_call_code(name, g, guard=self._arc2_rev5),
+                    timeout_seconds=max(1, min(self._python_timeout, int(left))),
+                    initial_state={"current_frame": None, "history": [], "valid_actions": [],
+                                   "last_action_call_result": {}},
+                    action_handler=_refuse, kept_functions=self._retained_sources(),
+                    retain_imports=TA._get_env_bool("ARC3_PERSISTENT_FUNCTIONS_IMPORTS", False), repair_hints=False)
+                err = str(res.get("error", "") or "")
+                got = None if err else res.get("result")
+                outs.append(got if valid_grid(got) else None)
+                if err and not first_err:
+                    first_err = err.strip().splitlines()[-1][:300] if err.strip() else err[:300]
+                if "timed out" in err:          # a slow function: do not spend the budget on every grid
+                    slow = True
+            exact = [bool(valid_grid(o) and o == p["output"]) for o, p in zip(outs[:len(train)], train)]
+            tests = outs[len(train):]
+            v.update(train_exact=exact, test_outputs=tests)
+            if self._arc2_rev6:     # R6-M1 (pending since rev 2/3): verification time and timeouts
+                v["verify_sec"] = round(time.monotonic() - _t_verify, 2)
+                v["verify_timed_out"] = bool(slow)
+                if len(self.arc2_rev6_events["verify_sec"]) < 200:
+                    self.arc2_rev6_events["verify_sec"].append(v["verify_sec"])
+            if first_err and not any(o is not None for o in outs):
+                v["summary"] = f"verification of `{name}` failed to run: {first_err}"
+                return v
+            if all(exact) and all(g is not None for g in tests):
+                v["accepted"] = True
+                v["summary"] = f"accepted: `{name}` is exact on all {len(exact)} training pairs."
+                if self._arc2_rev6:     # R6-M1 / T7: label-free overfit signs (scheduler + report; never a rejection)
+                    try:
+                        src = "\n\n".join(src for _, src in sorted(self._arc2_closure(name).items()))
+                        v["source_chars"] = len(src)
+                        v["overfit_flags"] = overfit_flags(self.arc2_task, src, tests)
+                    except Exception as exc:
+                        v["overfit_flags_error"] = repr(exc)[:200]
+            elif all(exact):
+                bad = [i for i, g in enumerate(tests) if g is None]
+                v["summary"] = (f"`{name}` is exact on all training pairs but produced no valid grid for test input(s) "
+                                f"{bad} (a rectangular list of lists of ints 0-9 is required).")
+            else:
+                bad = [i for i, e in enumerate(exact) if not e]
+                v["summary"] = (f"`{name}` is wrong on training pair(s) {bad} of {len(exact)} (clean re-run). "
+                                "Use check() to see the wrong cells." + (f" First error: {first_err}" if first_err else ""))
+            return v
+
+    return Arc2ToolAgent
+
+
+# ------------------------------------------------------------------ driver (follows HarnessSolver.play/_play_inner)
+def run_branch(agent_cls, *, task_id: str, task: dict, branch: int, queue_position: int, out_dir: Path,
+               deadline: float, base_url: str, model_id: str, save_request_logs: bool,
+               analyzer_timeout: float = 900.0, max_failures: int = 10, backoff: float = 10.0,
+               started_at: float | None = None, max_generated_tokens: int | None = None) -> dict:
+    """max_generated_tokens mirrors Duck's max_generated_tokens_per_game (None in the milestone hidden run)."""
+    TA, _, _, write_runtime_state = _import_duck()
+    run_dir = out_dir / f"{task_id}_b{branch}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_path = run_dir / TA.RUNTIME_STATE_FILENAME
+    write_runtime_state(state_path, current_frame=None, history=[])
+    agent = agent_cls(task=task, task_id=task_id, branch=branch, model=model_id, timeout=analyzer_timeout,
+                      base_url=base_url, provider="vllm", save_request_logs=save_request_logs,
+                      dispatch_index=queue_position)
+    record = {"task_id": task_id, "branch": branch, "turns": 0, "failures": 0, "note": "", "t0": time.time()}
+
+    def should_stop() -> bool:
+        if agent.arc2_accepted is not None or time.monotonic() >= deadline:
+            return True
+        return bool(max_generated_tokens and max_generated_tokens > 0
+                    and agent.generated_tokens >= max_generated_tokens)
+    gate = TA._priority_gate()
+    if gate is not None:
+        gate.configure_clock(started_at if started_at is not None else time.monotonic(), deadline)
+        gate.acquire(TA._PRIORITY_UNTRIMMED_BASE - queue_position)
+    try:
+        step, retry_step, consecutive = 0, None, 0
+        while not should_stop():
+            if retry_step is None:
+                step += 1
+            analysis_step = step if retry_step is None else retry_step
+            remaining = deadline - time.monotonic()
+            result = agent.analyze(state_path, 0, valid_actions=[], step_env=None,
+                                   transcript_path=run_dir / "transcript.txt", analysis_step=analysis_step,
+                                   request_timeout_seconds=max(0.1, min(analyzer_timeout, remaining)),
+                                   should_stop=should_stop)
+            record["turns"] += 1
+            if result is None:
+                record["note"] = "analyzer returned no result"
+                break
+            if result.retryable_failure:
+                consecutive += 1
+                record["failures"] += 1
+                if 0 <= max_failures < consecutive:
+                    record["note"] = f"analyzer failed {consecutive} times consecutively"
+                    break
+                retry_step = analysis_step
+                if should_stop():
+                    break
+                time.sleep(backoff)
+                continue
+            consecutive = 0
+            retry_step = analysis_step if (getattr(result, "yielded_control", False) and not result.step_executed) else None
+    except Exception as exc:  # one branch must never take the run down
+        record["note"] = f"{type(exc).__name__}: {exc}"[:500]
+        log.warning("%s b%d: %s", task_id, branch, record["note"])
+    finally:
+        if gate is not None:
+            gate.release()
+    record.update(t1=time.time(), generated_tokens=agent.generated_tokens, total_tokens=agent.total_tokens,
+                  submissions=agent.arc2_submissions, accepted=agent.arc2_accepted is not None, usage=agent.arc2_usage)
+    if getattr(agent, "_arc2_rev5", False):   # rev 5: harvested candidates + event counters (metrics for the analysis)
+        record.update(checked=agent.arc2_checked, rev5_events=agent.arc2_rev5_events)
+    (run_dir / "branch_result.json").write_text(json.dumps(record, default=str), encoding="utf-8")
+    return record
+
+
+# ------------------------------------------------------------------ selection (Rev 1 #6)
+def select_attempts(task: dict, branch_records: list[dict]) -> list[dict]:
+    """Per test input: host-verified train-exact programs first (grouped by identical test outputs, larger group =
+    agreement first), then the best partial program (most exact train pairs), then the test input as fallback."""
+    subs = [s for r in branch_records for s in (r.get("submissions") or [])]
+    accepted = [s for s in subs if s.get("accepted")]
+    partial = sorted([s for s in subs if not s.get("accepted")],
+                     key=lambda s: (sum(bool(e) for e in s.get("train_exact") or []), -s.get("t", 0)), reverse=True)
+    out = []
+    for qi, q in enumerate(task["test"]):
+        groups: dict[str, list[dict]] = {}
+        for s in accepted:
+            g = (s.get("test_outputs") or [None] * (qi + 1))[qi] if qi < len(s.get("test_outputs") or []) else None
+            if g is not None:
+                groups.setdefault(json.dumps(g), []).append(s)
+        ordered = sorted(groups.items(), key=lambda kv: (len(kv[1]), -min(s.get("t", 0) for s in kv[1])), reverse=True)
+        grids = [json.loads(k) for k, _ in ordered]
+        for s in partial:
+            outs = s.get("test_outputs") or []
+            g = outs[qi] if qi < len(outs) else None
+            if g is not None and g not in grids:
+                grids.append(g)
+        if not grids:
+            grids = [q["input"]]
+        a1 = grids[0]
+        # Rev 2 (GPT audit): no invented guess (the mirror is gone): next distinct candidate, else the test input
+        a2 = next((g for g in grids[1:] + [q["input"]] if g != a1), a1)
+        out.append({"attempt_1": a1, "attempt_2": a2})
+    return out
+
+
+def select_attempts_r5(task: dict, branch_records: list[dict]) -> list[dict]:
+    """rev 5 B2: candidates = host-accepted submissions + host-accepted exact checks (B1). Each branch contributes its
+    best = latest accepted submission, else its latest accepted check (EVAL30 247ef758: the latest exact version was the
+    correct one). Per test input: branch bests grouped by identical output (more branches first, then an explicit
+    submission, then the latest), then every other accepted candidate (latest first), then partial programs (most exact
+    train pairs), then the test input. attempt_2 = the next distinct grid, so two different train-exact predictions both
+    reach the two attempts (EVAL6 b5ca7ac4: one branch wrong, the other right). No truth, no confidence invented."""
+    t = lambda s: s.get("t", 0)
+    bests, others, partial = [], [], []
+    for r in branch_records:
+        acc_sub = [s for s in (r.get("submissions") or []) if s.get("accepted")]
+        acc_chk = [s for s in (r.get("checked") or []) if s.get("accepted")]
+        best = max(acc_sub, key=t) if acc_sub else (max(acc_chk, key=t) if acc_chk else None)
+        if best is not None:
+            bests.append(best)
+        others += [s for s in acc_sub + acc_chk if s is not best]
+        partial += [s for s in (r.get("submissions") or []) + (r.get("checked") or []) if not s.get("accepted")]
+    others.sort(key=t, reverse=True)
+    partial.sort(key=lambda s: (sum(bool(e) for e in s.get("train_exact") or []), t(s)), reverse=True)
+
+    def _out(s, qi):
+        outs = s.get("test_outputs") or []
+        g = outs[qi] if qi < len(outs) else None
+        return g if valid_grid(g) else None
+
+    result = []
+    for qi, q in enumerate(task["test"]):
+        groups: dict[str, list[dict]] = {}
+        for s in bests:
+            g = _out(s, qi)
+            if g is not None:
+                groups.setdefault(json.dumps(g), []).append(s)
+        ordered = sorted(groups.items(), key=lambda kv: (len(kv[1]), any(s.get("origin") != "check" for s in kv[1]),
+                                                         max(t(s) for s in kv[1])), reverse=True)
+        grids = [json.loads(k) for k, _ in ordered]
+        for s in others + partial:
+            g = _out(s, qi)
+            if g is not None and g not in grids:
+                grids.append(g)
+        if not grids:
+            grids = [q["input"]]
+        a1 = grids[0]
+        a2 = next((g for g in grids[1:] + [q["input"]] if g != a1), a1)
+        result.append({"attempt_1": a1, "attempt_2": a2})
+    return result
+
+
+def build_submission(tasks: dict, records: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Kaggle submission.json: every task, one {attempt_1, attempt_2} per test input (fallback = the test input)."""
+    sub = {}
+    select = select_attempts_r5 if _rev5() else select_attempts
+    for tid, task in tasks.items():
+        try:
+            sub[tid] = select(task, records.get(tid) or [])
+        except Exception as exc:
+            log.warning("selection failed for %s: %s", tid, exc)
+            sub[tid] = [{"attempt_1": q["input"], "attempt_2": q["input"]} for q in task["test"]]
+    return sub
+
+
+def solve_all(tasks: dict, order: list[str], *, out_dir: Path, deadline: float, base_url: str, model_id: str,
+              branches: int = 2, save_request_logs: bool = False, max_generated_tokens: int | None = None,
+              on_branch_done: Callable[[dict], None] | None = None,
+              live_branches: int | None = None) -> dict[str, list[dict]]:
+    """Every branch is admitted at once (Duck); the priority gate keeps ARC3_MAX_ACTIVE_STREAMS active.
+    Queue positions: all first branches in task order, then all second branches (untrimmed band = queue order).
+    rev 4 (E12 EVAL30 analysis): live_branches = N keeps at most N branches alive at a time (the rest wait before
+    the gate), so the resident contexts stay inside the KV pool (EVAL30: 30 live contexts evicted 8.4 M prefix tokens).
+    With it, the branches of a task start together (task-major order), so branch 1 is never starved (EVAL30: 29/30)."""
+    agent_cls = make_agent_class()
+    if live_branches:
+        jobs = [(b, i, tid) for i, tid in enumerate(order) for b in range(branches)]
+    else:
+        jobs = [(b, i, tid) for b in range(branches) for i, tid in enumerate(order)]
+    n_live = min(len(jobs), int(live_branches)) if live_branches else len(jobs)
+    records: dict[str, list[dict]] = {tid: [] for tid in order}
+    lock = threading.Lock()
+    started = time.monotonic()
+    setup_failed = [0]
+
+    def _one(job):
+        b, i, tid = job
+        try:
+            qpos = (i * branches + b) if live_branches else (b * 100000 + i)
+            # rev 4 audit (verified tool_agent.py:5265-5277: non-streaming, read timeout = min(analyzer_timeout, left)):
+            # a 60k reply at about 61 tok/s per stream needs about 980 s > the 900 s default
+            extra = {"analyzer_timeout": float(os.environ["E12_DUCK_REQUEST_TIMEOUT"])} \
+                if os.environ.get("E12_DUCK_REQUEST_TIMEOUT") else {}
+            rec = run_branch(agent_cls, task_id=tid, task=tasks[tid], branch=b, queue_position=qpos, **extra,
+                             out_dir=out_dir, deadline=deadline, base_url=base_url, model_id=model_id,
+                             save_request_logs=save_request_logs, started_at=started,
+                             max_generated_tokens=max_generated_tokens)
+        except Exception as exc:  # setup failure (before the gate): never take the run down
+            rec = {"task_id": tid, "branch": b, "accepted": False, "submissions": [],
+                   "note": f"setup {type(exc).__name__}: {exc}"[:500]}
+            log.warning("%s b%d: %s", tid, b, rec["note"])
+            with lock:
+                setup_failed[0] += 1          # never reached the gate: do not wait for it below
+        with lock:
+            records[tid].append(rec)
+        if on_branch_done is not None:
+            try:
+                on_branch_done(rec)
+            except Exception as exc:
+                log.warning("on_branch_done failed: %s", exc)
+        return rec
+
+    # Duck's gate admits whoever arrives first while slots are free, so the first ARC3_MAX_ACTIVE_STREAMS
+    # admissions would be a thread race. Hold every slot until all branches are queued, then release: the
+    # first admissions follow the queue priority too (all first branches before any second branch).
+    TA = _import_duck()[0]
+    gate = TA._priority_gate()
+    held = 0
+    if gate is not None:
+        gate.configure_clock(started, deadline)
+        for _ in range(TA._max_active_streams()):
+            gate.acquire(TA._PRIORITY_UNTRIMMED_BASE + 1)
+            held += 1
+    with ThreadPoolExecutor(max_workers=max(1, n_live)) as pool:
+        try:
+            futures = [pool.submit(_one, job) for job in jobs]
+            if gate is not None:
+                t_wait = time.monotonic() + 120
+                while len(gate._waiting) + setup_failed[0] < n_live and time.monotonic() < t_wait:
+                    time.sleep(0.05)
+        finally:   # Rev 2 (GPT audit): the held slots are always given back, or the pool would wait forever
+            while held > 0:
+                gate.release()
+                held -= 1
+        for f in futures:
+            f.result()
+    return records
+
+
+# ================================================================== rev 6 driver: sessions + coverage-first scheduler
+class BranchSession:
+    """One Duck branch that can pause at a request boundary and resume later with the SAME agent object (history,
+    retained functions, candidates, token counters, trim state). R6-Q2 / C4 (code-verified: run_branch builds a fresh
+    agent every call, so a phase change there would lose everything)."""
+
+    def __init__(self, agent_cls, *, task_id: str, task: dict, branch: int, view: str, queue_position: int, out_dir: Path,
+                 deadline: float, base_url: str, model_id: str, save_request_logs: bool, analyzer_timeout: float = 900.0,
+                 max_failures: int = 10, backoff: float = 10.0, started_at: float | None = None,
+                 max_generated_tokens: int | None = None):
+        self.agent_cls, self.task_id, self.task, self.branch, self.view = agent_cls, task_id, task, branch, view
+        self.queue_position, self.out_dir, self.deadline = queue_position, out_dir, deadline
+        self.base_url, self.model_id, self.save_request_logs = base_url, model_id, save_request_logs
+        self.analyzer_timeout, self.max_failures, self.backoff = analyzer_timeout, max_failures, backoff
+        self.started_at, self.max_generated_tokens = started_at, max_generated_tokens
+        self.agent = None
+        self._io_lock = threading.Lock()  # H6-4: one writer at a time; frozen after the scheduler's final snapshot
+        self._frozen = False
+        self.status = "new"           # new -> paused -> done
+        self.step, self.retry_step, self.consecutive = 0, None, 0
+        self.record = {"task_id": task_id, "branch": branch, "view": view, "turns": 0, "failures": 0, "note": "",
+                       "t0": None, "runs": []}
+
+    def _ensure(self):
+        TA, _, _, write_runtime_state = _import_duck()
+        if self.agent is None:
+            self.run_dir = self.out_dir / f"{self.task_id}_b{self.branch}"
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            self.state_path = self.run_dir / TA.RUNTIME_STATE_FILENAME
+            write_runtime_state(self.state_path, current_frame=None, history=[])
+            self.agent = self.agent_cls(task=self.task, task_id=self.task_id, branch=self.branch, view=self.view,
+                                        model=self.model_id, timeout=self.analyzer_timeout, base_url=self.base_url,
+                                        provider="vllm", save_request_logs=self.save_request_logs,
+                                        dispatch_index=self.queue_position)
+            self.agent._arc2_deadline = self.deadline
+            self.record["t0"] = time.time()
+        return TA
+
+    def run(self, pause_at_tokens: int | None = None, tag: dict | None = None) -> str:
+        """Drive Duck's analyze() loop (HarnessSolver.play semantics, = run_branch) until done or, with pause_at_tokens,
+        until the branch has generated that many tokens; then pause at the request boundary (Duck checks should_stop
+        before every request). Returns the new status."""
+        TA = self._ensure()
+        agent, deadline = self.agent, self.deadline
+        t_run, tok0, u0 = time.time(), agent.generated_tokens, len(agent.arc2_usage)
+        best0 = self.best_key()
+        sig0 = self.verified_signatures()
+        paused = {"v": False}
+
+        def done_now() -> bool:
+            if agent.arc2_accepted is not None or time.monotonic() >= deadline:
+                return True
+            return bool(self.max_generated_tokens and self.max_generated_tokens > 0
+                        and agent.generated_tokens >= self.max_generated_tokens)
+
+        def should_stop() -> bool:
+            if done_now():
+                return True
+            if pause_at_tokens and agent.generated_tokens >= pause_at_tokens:
+                paused["v"] = True
+                return True
+            return False
+        gate = TA._priority_gate()
+        if gate is not None:
+            gate.configure_clock(self.started_at if self.started_at is not None else time.monotonic(), deadline)
+            gate.acquire(TA._PRIORITY_UNTRIMMED_BASE - self.queue_position)
+        finished = False
+        try:
+            while not should_stop():
+                if self.retry_step is None:
+                    self.step += 1
+                analysis_step = self.step if self.retry_step is None else self.retry_step
+                remaining = deadline - time.monotonic()
+                result = agent.analyze(self.state_path, 0, valid_actions=[], step_env=None,
+                                       transcript_path=self.run_dir / "transcript.txt", analysis_step=analysis_step,
+                                       request_timeout_seconds=max(0.1, min(self.analyzer_timeout, remaining)),
+                                       should_stop=should_stop)
+                self.record["turns"] += 1
+                if result is None:
+                    self.record["note"] = "analyzer returned no result"
+                    finished = True
+                    break
+                if result.retryable_failure:
+                    self.consecutive += 1
+                    self.record["failures"] += 1
+                    if 0 <= self.max_failures < self.consecutive:
+                        self.record["note"] = f"analyzer failed {self.consecutive} times consecutively"
+                        finished = True
+                        break
+                    self.retry_step = analysis_step
+                    if should_stop():
+                        break
+                    time.sleep(min(self.backoff, max(0.0, deadline - time.monotonic())))
+                    continue
+                self.consecutive = 0
+                self.retry_step = (analysis_step if (getattr(result, "yielded_control", False) and not result.step_executed)
+                                   else None)
+        except Exception as exc:  # one branch must never take the run down
+            self.record["note"] = f"{type(exc).__name__}: {exc}"[:500]
+            log.warning("%s b%d: %s", self.task_id, self.branch, self.record["note"])
+            finished = True
+        finally:
+            if gate is not None:
+                gate.release()
+        self.status = "done" if (finished or done_now() or not paused["v"]) else "paused"
+        run = {"pause_at": pause_at_tokens, "tokens": agent.generated_tokens - tok0, "sec": round(time.time() - t_run, 1),
+               "status": self.status}
+        if pause_at_tokens:      # R6-S3: a soft pause is checked at request boundaries, so a run can overshoot it
+            run["overshoot"] = max(0, agent.generated_tokens - pause_at_tokens)
+        first = agent.arc2_usage[u0] if len(agent.arc2_usage) > u0 else None
+        if first and first.get("prompt") is not None:   # P6: re-prefill paid by this run's first request
+            run["first_uncached"] = int(first["prompt"]) - int(first.get("cached") or 0)
+        best1 = self.best_key()     # G4-12 / G4-18: did this run improve the best single-function progress?
+        run.update(best_before=list(best0), best_after=list(best1), improved=best1 > best0,
+                   # H6-14 / H7-3: new distinct verified predictions of THIS branch (the scheduler adds new_for_task)
+                   new_in_branch=len(self.verified_signatures() - sig0))
+        if tag:
+            run.update(tag)
+        if not self._frozen:
+            self.record["runs"].append(run)
+        self.write()
+        return self.status
+
+    def write(self) -> dict:
+        """H6-4 (GPT rev 6e audits, reproduced: a straggler rewrote branch_result.json after the scheduler returned):
+        once frozen, the last snapshot is returned and neither the record nor the file changes. The file is written
+        atomically (temp file + replace)."""
+        with self._io_lock:
+            return self._write_locked()
+
+    def _agent_state(self) -> dict:
+        """H7-11 (GPT rev 6f audit 3, reproduced): COPIES of the live agent's lists and dicts, so a straggler that keeps
+        running cannot change a snapshot after it was taken (a dict growing during the copy is retried)."""
+        a = self.agent
+        for _ in range(5):
+            try:
+                st = dict(
+                    t1=time.time(), generated_tokens=a.generated_tokens, total_tokens=a.total_tokens,
+                    submissions=a.arc2_submissions, accepted=a.arc2_accepted is not None, usage=a.arc2_usage,
+                    checked=a.arc2_checked, rev5_events=a.arc2_rev5_events, rev6_events=a.arc2_rev6_events,
+                    progress=a.arc2_progress, status=self.status, requests=getattr(a, "arc2_requests", []))
+                if getattr(a, "_arc2_raw_reasoning_on", False):   # E14-P counters only when the switch is on
+                    st["raw_reasoning"] = a.arc2_raw_reasoning
+                return copy.deepcopy(st)
+            except RuntimeError:          # "changed size during iteration": the agent was mid-update
+                time.sleep(0.01)
+        return {"t1": time.time(), "generated_tokens": a.generated_tokens, "status": self.status,
+                "snapshot_note": "agent state changing; counters only"}
+
+    def _write_locked(self) -> dict:
+        if self._frozen:
+            return self._final
+        rec = self.record
+        if self.agent is not None:
+            rec.update(self._agent_state())
+            f = self.run_dir / "branch_result.json"
+            tmp = f.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(rec, default=str), encoding="utf-8")
+            os.replace(tmp, f)
+        else:
+            rec.update(accepted=False, submissions=[], status=self.status)
+        return rec
+
+    def freeze(self) -> dict:
+        """H6-4 / H7-11: the scheduler's final snapshot, taken, written and frozen in ONE critical section, so the file,
+        the frozen record and the published record are the same generation. Later writes by a straggler are no-ops."""
+        with self._io_lock:
+            if not self._frozen:
+                self._final = copy.deepcopy(self._write_locked())
+                self._frozen = True
+            return self._final
+
+    # ---- evidence for the scheduler (untrusted progress + host-verified candidates; never the truth)
+    def verified_signatures(self) -> set[str]:
+        if self.agent is None:
+            return set()
+        acc = [v for v in self.agent.arc2_checked + self.agent.arc2_submissions if v.get("accepted")]
+        return {json.dumps(v.get("test_outputs")) for v in acc}
+
+    def flagged(self) -> bool:
+        """T7: a host-verified candidate carries a label-free overfit sign (generalization concern)."""
+        if self.agent is None:
+            return False
+        return any(v.get("accepted") and v.get("overfit_flags") for v in self.agent.arc2_checked + self.agent.arc2_submissions)
+
+    def best_key(self) -> tuple:
+        b = (self.agent.arc2_progress.get("best") if self.agent is not None else None) or {}
+        return (int(b.get("k", 0) or 0), float(b.get("acc", 0) or 0))
+
+    def stalled(self) -> bool:
+        """G4-12: its latest stage-2 run did not improve the best single-function progress."""
+        r2 = [r for r in self.record["runs"] if r.get("stage") == 2]
+        return bool(r2) and not r2[-1].get("improved")
+
+    def has_progress(self) -> bool:
+        b = (self.agent.arc2_progress.get("best") if self.agent is not None else None) or {}
+        return bool(b) and (b.get("k", 0) > 0 or b.get("acc", 0) > 0)
+
+
+def isolation_verdict(marks: list[str], replies: list[str]) -> dict:
+    """R6-X1 / C6-2 (rev 6c audits): PASS only when every reply holds its own marker and no other request's marker;
+    FAIL on any foreign marker; INCONCLUSIVE when markers are missing without a leak (empty or broken replies)."""
+    own = sum(1 for m, r in zip(marks, replies) if m in (r or ""))
+    leaks = [i for i, (m, r) in enumerate(zip(marks, replies)) if any(o in (r or "") for o in marks if o != m)]
+    state = "FAIL" if leaks else ("PASS" if own == len(marks) and len(replies) == len(marks) else "INCONCLUSIVE")
+    return {"isolation_requests": len(marks), "isolation_own_marker": own, "isolation_leaks": leaks,
+            "isolation_state": state, "isolation_ok": True if state == "PASS" else (False if state == "FAIL" else None)}
+
+
+def workers_for_isolation(ok, streams: int, floor: int = 6) -> int:
+    """Full concurrency only on a PASS; FAIL, INCONCLUSIVE or an error (None) -> the 6-stream floor (C6-2)."""
+    return int(streams) if ok is True else min(int(floor), int(streams))
+
+
+def p90_nearest_rank(values: list) -> float:
+    """Nearest-rank p90 (A3-F3): [100, 200, 300, 400, 800] -> 800."""
+    import math
+    v = sorted(values)
+    return v[max(0, math.ceil(0.9 * len(v)) - 1)]
+
+
+def stage2_cutoff_hit(left: float, stage2_durations: list, min_admit_sec: float, cap: float = 900.0) -> bool:
+    """User-approved option (off by default): skip a stage-2 item when the time left is below the nearest-rank p90 of the
+    stage-2 run durations seen so far (>= 5 runs, capped). Stage-1 starts never use this rule."""
+    if len(stage2_durations) < 5:
+        return False
+    return left < max(min_admit_sec, min(cap, p90_nearest_rank(stage2_durations)))
+
+
+def stage2_class(sessions: list[BranchSession]) -> int:
+    """R6-S2 / T7 order (GPT plan reviews): 0 = no verified candidate but single-function progress; 1 = nothing yet;
+    2 = one distinct verified prediction (about 1/3 of accepts are test-wrong, so a fresh attempt still pays);
+    3 = two or more distinct verified predictions (lowest)."""
+    sigs = set()
+    for s in sessions:
+        sigs |= s.verified_signatures()
+    if len(sigs) >= 2:
+        return 3
+    if len(sigs) == 1:
+        return 2
+    return 0 if any(s.has_progress() for s in sessions) else 1
+
+
+def g412_defer_b1(task_sessions: list[BranchSession], s0: BranchSession | None) -> bool:
+    """G4-12 / H6-8: a task whose branch 0 has partial progress (class 0) gets no fresh branch 1 while branch 0 is
+    paused and its latest stage-2 round improved (not stalled). Used when items are queued and again when a queued
+    branch-1 start is popped (branch 0 may have improved in between: a possible path raised by GPT audit 3; not
+    reproduced with a pop-time measurement, so the pop-time check is defensive)."""
+    return (s0 is not None and s0.status == "paused" and not s0.stalled() and stage2_class(task_sessions) == 0)
+
+
+def solve_all_r6(tasks: dict, order: list[str], *, out_dir: Path, deadline: float, base_url: str, model_id: str,
+                 branches: int = 2, save_request_logs: bool = False, max_generated_tokens: int | None = None,
+                 on_branch_done: Callable[[dict], None] | None = None, workers: int = 10,
+                 first_exposure_tokens: int | None = 28000, b1_view: str = "grids", min_admit_sec: float = 240.0,
+                 capacity_probe: Callable[[], dict | None] | None = None,
+                 agent_cls=None, analyzer_timeout: float | None = None, min_chunk_tokens: int = 12288,
+                 fair_share: bool = True, share_warmup_sec: float = 120.0,
+                 stage2_p90_cutoff: bool = False, join_grace_sec: float = 60.0, kv_admit_limit: float = 0.95,
+                 kv_poll_sec: float = 5.0, kv_stale_sec: float = 30.0) -> dict[str, list[dict]]:
+    """R6-S1..S6 (user 2026-10-21). Stage 1: branch 0 of EVERY task in `order` (ORDER2 + cells, built by the notebook)
+    before any stage-2 work; with first_exposure_tokens a branch pauses at that soft budget (a request boundary) and keeps
+    its agent. Stage 2, by class (stage2_class): resume paused branch 0 and/or start branch 1 (alternative view b1_view,
+    the representation hedge), re-ranked when popped. Job order, worker count and queue priority are independent (the S1
+    trap: n_live = len(jobs)). No item starts with less than min_admit_sec left; every request is clamped to the
+    deadline (R6-S6). G4-1 (user 2026-10-21, replaces the rev 6d queue step-down): the worker count stays fixed; the only
+    capacity rule is that no new task or branch is admitted while the server's full-attention KV usage
+    (capacity_probe()["kv_usage"], polled every kv_poll_sec) is >= kv_admit_limit. Running requests are never touched. A
+    missing, invalid or stale (> kv_stale_sec) sample admits (fail-open, counted); with nothing running a hold is released
+    (no deadlock). on_branch_done gets every pause/finish snapshot (the caller REPLACES per (task, branch)). Returns
+    {task: [latest record per branch]}.
+    R6-S3 fair share (fix list; GPT audits N1/C3/E5): a stage-2 run pauses softly (request boundary) after
+    max(min_chunk_tokens, share) more tokens, share = measured aggregate tok/s x usable time left / items still to serve,
+    and is re-queued by its class, so long branches cannot starve the rest; a pause is not a cut (the branch resumes with
+    the same agent while time remains, up to max_generated_tokens). Overshoot past a pause is recorded per run.
+    stage2_p90_cutoff (user-approved option, off by default): no stage-2 item starts when the time left is below the p90
+    of the stage-2 run durations seen so far (>= 5 runs, capped at 900 s); stage-1 starts keep min_admit_sec only, so
+    every task still gets its first exposure. Every request is deadline-clamped either way (R6-S6)."""
+    import heapq
+    agent_cls = agent_cls or make_agent_class()
+    timeout = float(analyzer_timeout or os.environ.get("E12_DUCK_REQUEST_TIMEOUT") or 900.0)
+    started = time.monotonic()
+    idx = {t: i for i, t in enumerate(order)}
+    sessions: dict[tuple[str, int], BranchSession] = {}
+
+    def sess(tid: str, b: int) -> BranchSession:
+        if (tid, b) not in sessions:
+            sessions[(tid, b)] = BranchSession(
+                agent_cls, task_id=tid, task=tasks[tid], branch=b, view=("facts" if b == 0 else b1_view),
+                queue_position=b * 100000 + idx[tid], out_dir=out_dir, deadline=deadline, base_url=base_url,
+                model_id=model_id, save_request_logs=save_request_logs, analyzer_timeout=timeout, started_at=started,
+                max_generated_tokens=max_generated_tokens)
+        return sessions[(tid, b)]
+
+    cond = threading.Condition()
+    heap: list = []
+    seq = [0]
+    state = {"running": 0, "allowed": max(1, int(workers)), "stage1_left": len(order), "stop": False,
+             "events": [], "durations": [], "shares": [], "dur2": [], "p90_skipped": 0,
+             # G4-1 KV gate + G4-15 telemetry
+             "kv": None, "kv_t": None, "kv_samples": 0, "kv_missing": 0, "kv_holds": 0, "kv_hold_waits": 0,
+             "kv_hold_sec": 0.0, "holding_since": None, "kv_idle_overrides": 0, "gauges": [], "b1_deferred_at_pop": 0,
+             "publish_seq": 0, "task_sigs": {}}
+    queued: set = set()
+    active: set = set()      # (task, branch) running now: never queued again while a worker drives its agent
+    records: dict[str, list[dict]] = {t: [] for t in order}
+
+    def push(prio: tuple, tid: str, b: int, kind: str):
+        seq[0] += 1
+        queued.add((tid, b))
+        heapq.heappush(heap, (prio, seq[0], tid, b, kind))
+
+    def rank(tid: str, b: int, sub: int) -> tuple:
+        """(1, stage-2 rounds this branch already had, class, flagged-first inside class 2, ORDER2 index, sub-order).
+        Rounds first = round robin: every queued item gets a chunk before any gets another (no starvation); inside a
+        round the evidence class decides (T7)."""
+        task_s = [s for (t, _), s in sessions.items() if t == tid]
+        cls = stage2_class(task_s)
+        flag = 0 if (cls == 2 and any(s.flagged() for s in task_s)) else 1
+        s_ = sessions.get((tid, b))
+        rounds = sum(1 for r in (s_.record["runs"] if s_ is not None else []) if r.get("stage") == 2)
+        return (1, rounds, cls, flag, idx[tid], sub)
+
+    def share_tokens() -> int | None:
+        if not fair_share:
+            return None
+        now = time.monotonic()
+        gen = sum(s.agent.generated_tokens for s in sessions.values() if s.agent is not None)
+        if now - started < share_warmup_sec or gen <= 0:      # the rate needs a short measurement first
+            return None
+        rate = gen / (now - started)
+        items = len(heap) + state["running"] + state["stage1_left"]
+        share = int(rate * max(0.0, deadline - now - min_admit_sec) / max(1, items))
+        state["shares"].append(share)
+        return max(int(min_chunk_tokens), share)
+
+    for tid in order:
+        push((0, idx[tid], 0), tid, 0, "start1")
+
+    def stage2_items(tid: str):
+        """Queue every stage-2 item of a task that is not queued yet: a paused branch 0 or 1, and branch 1's start."""
+        cls = stage2_class([s for (t, _), s in sessions.items() if t == tid])
+        order_ = {0: ("resume0", "start1"), 1: ("start1", "resume0"), 2: ("start1", "resume0"), 3: ("resume0", "start1")}[cls]
+        s0 = sessions.get((tid, 0))
+        # G4-12: a branch 0 with partial progress is refined before a fresh branch 1, until a stage-2 round of it brings
+        # no improvement (or it is done)
+        defer_b1 = g412_defer_b1([s for (t, _), s in sessions.items() if t == tid], s0)
+        for sub, kind in enumerate(order_):
+            if kind == "start1" and defer_b1:
+                continue
+            if kind == "resume0":
+                for b in range(branches):
+                    s_ = sessions.get((tid, b))
+                    if s_ is not None and s_.status == "paused" and (tid, b) not in queued and (tid, b) not in active:
+                        push(rank(tid, b, sub), tid, b, "resume")
+            elif branches > 1 and (tid, 1) not in sessions and (tid, 1) not in queued:
+                push(rank(tid, 1, sub), tid, 1, "start1")
+
+    def publish(rec: dict, final: bool = False):
+        with cond:
+            if state.get("closed") and not final:    # C6-4: a straggler after shutdown never rewrites the records
+                return
+            rec = copy.deepcopy(rec)   # C6-4: a published record never shares lists with a live (or stuck) session
+            # H7-1 (GPT rev 6f audits, ordering reproduced): callbacks run outside the lock and can finish out of order;
+            # a monotonic sequence lets a consumer drop an older record that arrives late (the final one is the highest)
+            state["publish_seq"] += 1
+            rec["publish_seq"] = state["publish_seq"]
+            rows = records.setdefault(rec["task_id"], [])
+            rows[:] = [r for r in rows if r.get("branch") != rec.get("branch")] + [rec]
+        if on_branch_done is not None:
+            try:
+                on_branch_done(copy.deepcopy(rec))
+            except Exception as exc:
+                log.warning("on_branch_done failed: %s", exc)
+
+    pstate = {"miss_since": None, "warned": False, "last_g": -1e9}
+
+    def probe_once():
+        """One G4-1 sample: the probe only feeds the KV admission gate (and the G4-15 telemetry); it never changes the
+        worker count. The G4B lesson: queue = 1 with 11 running is SGLang's steady state at 12 in flight, not pressure."""
+        try:
+            snap = capacity_probe() or {}
+        except Exception:
+            snap = {}
+        kv = _finite01(snap.get("kv_usage"))
+        now = time.monotonic()
+        with cond:
+            state["kv"], state["kv_t"] = kv, now
+            state["kv_samples"] += 1
+            if kv is None:
+                state["kv_missing"] += 1
+                if pstate["miss_since"] is None:
+                    pstate["miss_since"] = now
+                if not pstate["warned"] and now - pstate["miss_since"] >= kv_stale_sec:   # once per outage
+                    pstate["warned"] = True
+                    log.warning("KV usage metric unavailable; admitting without the KV gate")
+                    state["events"].append({"t": round(now - started), "kind": "kv_metric_missing"})
+            else:
+                pstate["miss_since"], pstate["warned"] = None, False
+            SERVER_LAST.clear()
+            SERVER_LAST.update({k: snap.get(k) for k in ("kv_usage", "mamba_usage", "running", "queue")}, t=now)
+            if now - pstate["last_g"] >= 30 and len(state["gauges"]) < 3000:   # G4-15: a sample every 30 s
+                pstate["last_g"] = now
+                state["gauges"].append([round(now - started), kv, _finite01(snap.get("mamba_usage")),
+                                        snap.get("running"), snap.get("queue"), state["running"], len(heap)])
+            cond.notify_all()
+
+    def probe_loop():
+        while not state["stop"] and capacity_probe is not None:
+            t_end = time.monotonic() + max(0.02, float(kv_poll_sec))
+            while not state["stop"] and time.monotonic() < t_end:
+                time.sleep(min(0.5, max(0.01, float(kv_poll_sec))))
+            if not state["stop"]:
+                probe_once()
+
+    def kv_blocked() -> bool:
+        """G4-1: hold new admissions while a fresh, valid KV sample is >= kv_admit_limit (called under the lock)."""
+        kv, t = state["kv"], state["kv_t"]
+        if kv is None or t is None or time.monotonic() - t > kv_stale_sec:
+            return False
+        return kv >= kv_admit_limit
+
+    def hold_end(now: float):
+        if state["holding_since"] is not None:
+            state["kv_hold_sec"] += now - state["holding_since"]
+            state["events"].append({"t": round(now - started), "kind": "kv_release", "kv": state["kv"]})
+            state["holding_since"] = None
+
+    def worker():
+        while True:
+            with cond:
+                while True:
+                    left = deadline - time.monotonic()
+                    if left < min_admit_sec or state["stop"]:
+                        return
+                    if heap and state["running"] < state["allowed"] and kv_blocked():
+                        if state["running"] == 0:     # nothing runs, so nothing can free KV: never deadlock on the gate
+                            state["kv_idle_overrides"] += 1
+                        else:
+                            if state["holding_since"] is None:
+                                state["holding_since"] = time.monotonic()
+                                state["kv_holds"] += 1
+                                state["events"].append({"t": round(time.monotonic() - started), "kind": "kv_hold",
+                                                        "kv": state["kv"], "running": state["running"]})
+                            state["kv_hold_waits"] += 1
+                            cond.wait(timeout=min(5.0, max(0.5, float(kv_poll_sec))))
+                            continue
+                    if heap and state["running"] < state["allowed"]:
+                        hold_end(time.monotonic())
+                        prio, _, tid, b, kind = heapq.heappop(heap)
+                        queued.discard((tid, b))
+                        if prio[0] == 1:          # lazy re-rank of stage-2 items on current evidence
+                            new = rank(tid, b, prio[5])
+                            if new != prio and heap and new > heap[0][0]:
+                                push(new, tid, b, kind)
+                                continue
+                        if prio[0] == 1 and state["stage1_left"] > 0:   # coverage first: stage 2 waits for stage 1 starts
+                            push(prio, tid, b, kind)
+                            cond.wait(timeout=5)
+                            continue
+                        if prio[0] == 1 and kind == "start1" and b == 1:
+                            # H6-8 (GPT rev 6e audit 3; defensive, not reproduced): branch 0 may have gained partial progress
+                            # after this branch 1 was queued; defer it again while branch 0 is queued or running (its next
+                            # run re-queues branch 1 through stage2_items once it stalls or is done)
+                            if (g412_defer_b1([x for (t, _), x in sessions.items() if t == tid], sessions.get((tid, 0)))
+                                    and ((tid, 0) in queued or (tid, 0) in active)):
+                                state["b1_deferred_at_pop"] += 1
+                                continue
+                        if prio[0] == 1 and stage2_p90_cutoff:
+                            if stage2_cutoff_hit(left, state["dur2"], min_admit_sec):
+                                state["p90_skipped"] += 1      # the item is dropped; its paused branch keeps its record
+                                continue
+                        if kind == "start1" and prio[0] == 0:
+                            state["stage1_left"] -= 1
+                        state["running"] += 1
+                        active.add((tid, b))
+                        s = sess(tid, b)          # created under the lock (stage2_class iterates the dict)
+                        tag = {"stage": prio[0] + 1}
+                        if prio[0] == 1:
+                            tag["class"] = prio[2]
+                            if kind == "start1":
+                                s.record["stage2_class"] = prio[2]   # R6-M1: branch-1 yield by class
+                        break
+                    if not heap and state["running"] == 0:
+                        state["stop"] = True
+                        cond.notify_all()
+                        return
+                    cond.wait(timeout=5)
+            t0 = time.monotonic()
+            try:
+                if s.status != "done":
+                    if kind == "start1" and b == 0:
+                        pause = first_exposure_tokens or None
+                    else:
+                        with cond:
+                            sh = share_tokens()
+                        cur = s.agent.generated_tokens if s.agent is not None else 0
+                        cap = max_generated_tokens or 0
+                        pause = (cur + sh) if (sh and (not cap or cur + sh < cap)) else None
+                    s.run(pause_at_tokens=pause, tag=tag)
+            except Exception as exc:     # setup failure: never take the run down
+                s.record["note"] = f"setup {type(exc).__name__}: {exc}"[:500]
+                s.status = "done"
+                log.warning("%s b%d: %s", tid, b, s.record["note"])
+            with cond:      # H7-3: task-global novelty, in run-completion order (concurrent branches: first to finish)
+                seen = state["task_sigs"].setdefault(tid, set())
+                sigs = s.verified_signatures()
+                if s.record["runs"] and not s._frozen:
+                    s.record["runs"][-1]["new_for_task"] = len(sigs - seen)
+                seen |= sigs
+            publish(s.write())
+            with cond:
+                state["running"] -= 1
+                active.discard((tid, b))
+                state["durations"].append(round(time.monotonic() - t0, 1))
+                if tag.get("stage") == 2:
+                    state["dur2"].append(round(time.monotonic() - t0, 1))
+                stage2_items(tid)        # branch 1 after stage 1; any paused branch is re-queued by its class
+                cond.notify_all()
+
+    if capacity_probe is not None:
+        probe_once()          # G4-1: the gate has a sample before the first admission
+    probe = threading.Thread(target=probe_loop, daemon=True)
+    probe.start()
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, int(workers)))]
+    for t in threads:
+        t.start()
+    # C6-4 (rev 6c audits): ONE absolute cutoff for all joins. Requests and verifications are deadline-clamped (R6-S6),
+    # so workers normally end right after the deadline; a worker stuck in a native call is left behind (daemon thread)
+    join_until = deadline + float(join_grace_sec)
+    for t in threads:
+        t.join(timeout=max(0.0, join_until - time.monotonic()))
+    state["stop"] = True
+    with cond:
+        hold_end(time.monotonic())
+        cond.notify_all()
+        state["closed"] = True
+        final = list(sessions.values())
+        state["stragglers"] = sum(1 for t in threads if t.is_alive())
+    for s in final:        # final snapshot of every branch (a paused one keeps its candidates); H6-4: then frozen
+        if s.agent is not None:
+            publish(s.freeze(), final=True)
+    SCHED_LAST.clear()
+    SCHED_LAST.update(events=state["events"], allowed=state["allowed"], durations=state["durations"][-500:],
+                      sessions={f"{s.task_id}_b{s.branch}": s.status for s in final},
+                      stage1_left=state["stage1_left"], heap_left=len(heap), shares=state["shares"][-200:],
+                      p90_skipped=state["p90_skipped"], stage2_p90_cutoff=bool(stage2_p90_cutoff),
+                      stragglers=state.get("stragglers", 0),
+                      tasks_exposed=len({t for (t, b), s_ in sessions.items() if b == 0 and s_.agent is not None}),
+                      # H7-7 (GPT rev 6f audit 2, reproduced): "exposed" = a branch-0 session was initialized; coverage
+                      # is claimed on a request really sent (and the report adds the response-based count)
+                      tasks_initialized=len({t for (t, b), s_ in sessions.items() if b == 0 and s_.agent is not None}),
+                      tasks_with_request_sent=len({t for (t, b), s_ in sessions.items() if b == 0 and s_.agent is not None
+                                                   and ((getattr(s_.agent, "arc2_rev6_events", {}) or {}).get("requests_started")
+                                                        or s_.agent.generated_tokens > 0)}),
+                      # G4-1 / G4-15
+                      workers=max(1, int(workers)), kv_admit_limit=kv_admit_limit, kv_samples=state["kv_samples"],
+                      kv_missing=state["kv_missing"], kv_holds=state["kv_holds"], kv_hold_waits=state["kv_hold_waits"],
+                      kv_hold_sec=round(state["kv_hold_sec"], 1), kv_idle_overrides=state["kv_idle_overrides"],
+                      b1_deferred_at_pop=state["b1_deferred_at_pop"],
+                      gauges=state["gauges"][-3000:],
+                      gauge_fields=["t", "kv", "mamba", "server_running", "server_queue", "workers_running", "heap"])
+    return records
+
+
+SCHED_LAST: dict = {}
+SERVER_LAST: dict = {}     # G4-15: the latest server gauges (set by the scheduler's probe), read at each request start

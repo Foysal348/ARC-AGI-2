@@ -1,0 +1,579 @@
+"""CPU tests for e14_sglang_patches (backport of SGLang #44401 and #41872 onto 0.5.21). No GPU, no torch, no network.
+
+The package under test is a copy of only the patched files of the local 0.5.21 source tree, at their relative paths.
+The semantic tests execute the REAL patched statements, cut out of the patched scheduler.py with `ast`, on fake
+objects: get_num_allocatable_reqs in full, and the admission-gate / empty-batch / NO_TOKEN statement blocks of
+_get_new_batch_prefill_raw. They do not run the whole scheduler (that needs torch and a GPU model runner).
+"""
+import ast
+import functools
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import textwrap
+import typing
+from enum import Enum, auto
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+REF = Path(os.environ.get("E14_SGL_SRC", "D:/ARC AGI 2/_scratch/session_1c6db7aa/sgl_src/src/sglang"))   # Kaggle CPU kit: env
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("e14_sglang_patches", HERE / "e14_sglang_patches.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+P = _load_module()
+SCHED = "srt/managers/scheduler.py"
+DLLM = "srt/dllm/mixin/scheduler.py"
+FILES = sorted({h["file"] for n in P.DEFAULT_NAMES for h in P.PATCHES[n]})     # the default (#44401 + #41872) files
+ALL_FILES = sorted({h["file"] for hs in P.PATCHES.values() for h in hs})           # + #43567 schedule_batch.py
+SBATCH = "srt/managers/schedule_batch.py"
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+@pytest.fixture
+def pkg(tmp_path):
+    """tmp copy of the patched files (+ _version.py and fake stale pyc files) of the 0.5.21 package."""
+    root = tmp_path / "site-packages" / "sglang"
+    for rel in ALL_FILES + ["_version.py"]:
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REF / rel, dst)
+    for rel in FILES:
+        cache = (root / rel).parent / "__pycache__"
+        cache.mkdir(exist_ok=True)
+        (cache / "scheduler.cpython-312.pyc").write_bytes(b"stale")
+        (cache / "scheduler_other.cpython-312.pyc").write_bytes(b"keep")  # different stem: must survive
+    return root
+
+
+def snapshot(root):
+    return {rel: (root / rel).read_bytes() for rel in FILES}
+
+
+# ------------------------------------------------------------------------------------------------ hunk literals
+def test_reference_files_are_unpatched_0_5_21():
+    for rel in ALL_FILES:
+        assert sha(REF / rel) == P.REFERENCE_FILE_SHA256[rel]
+    assert "__version__ = version = '0.5.21'" in (REF / "_version.py").read_text()
+
+
+def test_hunk_literals_are_consistent():
+    for name, hunks in P.PATCHES.items():
+        for h in hunks:
+            assert set(h) == {"file", "old", "new", "old_sha256"}
+            assert hashlib.sha256(h["old"].encode()).hexdigest() == h["old_sha256"]
+            assert h["old"] != h["new"]
+            assert h["old"] not in h["new"] and h["new"] not in h["old"]
+            text = (REF / h["file"]).read_text(encoding="utf-8")
+            assert text.count(h["old"]) == 1, (name, h["file"])
+            assert text.count(h["new"]) == 0, (name, h["file"])
+            assert "\r" not in h["old"] and "\t" not in h["old"]
+
+
+def test_hunks_do_not_overlap_across_both_patches():
+    spans = {}
+    for name, hunks in P.PATCHES.items():
+        for i, h in enumerate(hunks):
+            text = (REF / h["file"]).read_text(encoding="utf-8")
+            s = text.index(h["old"])
+            spans.setdefault(h["file"], []).append((s, s + len(h["old"]), name, i))
+    for rel, ss in spans.items():
+        ss.sort()
+        for a, b in zip(ss, ss[1:]):
+            assert a[1] <= b[0], (rel, a, b)
+
+
+# ------------------------------------------------------------------------------------------------ apply / check
+def test_check_clean_tree(pkg):
+    rep = P.check(pkg)
+    json.dumps(rep)
+    assert rep["sglang_version"] == "0.5.21"
+    assert rep["patches"]["44401"]["state"] == "not_applied"
+    assert rep["patches"]["41872"]["state"] == "not_applied"
+    assert all(f["matches_unpatched_0_5_21"] for f in rep["files"].values())
+
+
+def test_apply_both_compiles_and_reports(pkg):
+    orig = snapshot(pkg)
+    rep = P.apply(pkg)
+    json.dumps(rep)
+    assert rep["ok"] is True
+    assert rep["results"]["44401"]["status"] == "applied"
+    assert rep["results"]["41872"]["status"] == "applied"
+    for rel in FILES:
+        p = pkg / rel
+        compile(p.read_text(encoding="utf-8"), str(p), "exec", dont_inherit=True)
+        assert (pkg / (rel + ".e14bak")).read_bytes() == orig[rel]
+        cache = p.parent / "__pycache__"
+        assert not (cache / "scheduler.cpython-312.pyc").exists()
+        assert (cache / "scheduler_other.cpython-312.pyc").exists()
+    text = (pkg / SCHED).read_text(encoding="utf-8")
+    for name in ("44401", "41872"):
+        for h in P.PATCHES[name]:
+            t = (pkg / h["file"]).read_text(encoding="utf-8")
+            assert t.count(h["new"]) == 1 and t.count(h["old"]) == 0
+    assert "num_held_rows: int = 0," in text
+    rep2 = P.check(pkg)
+    assert rep2["patches"]["44401"]["state"] == "applied"
+    assert rep2["patches"]["41872"]["state"] == "applied"
+    assert all(f["matches_both_patched_0_5_21"] and f["backup_exists"] for f in rep2["files"].values())
+    for rel in FILES:
+        assert sha(pkg / rel) == P.REFERENCE_PATCHED_SHA256[rel]
+
+
+def test_apply_order_independent(pkg, tmp_path):
+    P.apply(pkg, ("44401", "41872"))
+    a = snapshot(pkg)
+    other = tmp_path / "b" / "sglang"
+    for rel in FILES:
+        (other / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REF / rel, other / rel)
+    P.apply(other, ("41872",))
+    P.apply(other, ("44401",))
+    assert snapshot(other) == a
+
+
+def test_second_apply_is_already_applied_and_byte_identical(pkg):
+    P.apply(pkg)
+    after = snapshot(pkg)
+    baks = {rel: (pkg / (rel + ".e14bak")).read_bytes() for rel in FILES}
+    mt = {rel: os.stat(pkg / rel).st_mtime_ns for rel in FILES}
+    rep = P.apply(pkg)
+    assert rep["ok"] is True
+    assert rep["results"]["44401"]["status"] == "already applied"
+    assert rep["results"]["41872"]["status"] == "already applied"
+    assert snapshot(pkg) == after
+    assert {rel: os.stat(pkg / rel).st_mtime_ns for rel in FILES} == mt
+    assert {rel: (pkg / (rel + ".e14bak")).read_bytes() for rel in FILES} == baks
+
+
+def test_revert_restores_original_bytes(pkg):
+    orig = {rel: sha(pkg / rel) for rel in FILES}
+    P.apply(pkg)
+    assert {rel: sha(pkg / rel) for rel in FILES} != orig
+    rep = P.revert(pkg)
+    json.dumps(rep)
+    assert rep["ok"] is True
+    assert sorted(r["file"] for r in rep["restored"]) == FILES
+    assert {rel: sha(pkg / rel) for rel in FILES} == orig
+    assert not any((pkg / (rel + ".e14bak")).exists() for rel in FILES)
+    assert P.check(pkg)["patches"]["44401"]["state"] == "not_applied"
+    # apply -> revert -> apply works again, and a revert with nothing to do is a no-op
+    assert P.apply(pkg)["ok"] is True
+    assert P.revert(pkg)["ok"] is True
+    assert P.revert(pkg) == {"pkg_dir": str(pkg), "restored": [], "errors": [], "ok": True}
+    assert {rel: sha(pkg / rel) for rel in FILES} == orig
+
+
+def test_backup_is_the_pristine_original_across_separate_applies(pkg):
+    orig = snapshot(pkg)
+    P.apply(pkg, ("41872",))
+    P.apply(pkg, ("44401",))
+    for rel in FILES:
+        assert (pkg / (rel + ".e14bak")).read_bytes() == orig[rel]
+    P.revert(pkg)
+    assert snapshot(pkg) == orig
+
+
+@pytest.mark.parametrize("name,idx", [(n, i) for n in P.DEFAULT_NAMES for i in range(len(P.PATCHES[n]))])
+def test_one_changed_character_refuses_that_patch_without_partial_edit(pkg, name, idx):
+    h = P.PATCHES[name][idx]
+    p = pkg / h["file"]
+    text = p.read_text(encoding="utf-8")
+    # change one letter in the middle of the last long word of the hunk (stays valid Python, only the text differs)
+    word = list(re.finditer(r"[A-Za-z_]{8,}", h["old"]))[-1]
+    pos = text.index(h["old"]) + (word.start() + word.end()) // 2
+    bad = text[:pos] + ("X" if text[pos] != "X" else "Y") + text[pos + 1:]
+    compile(bad, "bad", "exec", dont_inherit=True)
+    p.write_bytes(bad.encode("utf-8"))
+    before = snapshot(pkg)
+    rep = P.apply(pkg)
+    assert rep["ok"] is False
+    assert rep["results"][name]["status"] == "refused: source mismatch"
+    other = "41872" if name == "44401" else "44401"
+    assert rep["results"][other]["status"] == "applied"
+    # the refused patch left every one of its hunks untouched
+    for hh in P.PATCHES[name]:
+        t = (pkg / hh["file"]).read_text(encoding="utf-8")
+        assert hh["new"] not in t
+    # files only the refused patch touches are byte-identical and got no backup
+    other_files = {hh["file"] for hh in P.PATCHES[other]}
+    for rel in {hh["file"] for hh in P.PATCHES[name]} - other_files:
+        assert (pkg / rel).read_bytes() == before[rel]
+        assert not (pkg / (rel + ".e14bak")).exists()
+
+
+def test_refused_alone_writes_nothing(pkg):
+    h = P.PATCHES["44401"][2]
+    p = pkg / h["file"]
+    p.write_bytes(p.read_bytes().replace(b"candidate_beam_width,\n                running_batch=running_batch,",
+                                         b"candidate_beam_width,\n                running_batch=running_batch ,", 1))
+    before = snapshot(pkg)
+    rep = P.apply(pkg, ("44401",))
+    assert rep["results"]["44401"]["status"] == "refused: source mismatch"
+    assert snapshot(pkg) == before
+    assert not any((pkg / (rel + ".e14bak")).exists() for rel in FILES)
+
+
+def test_partially_applied_state_is_refused(pkg):
+    h = P.PATCHES["44401"][0]
+    p = pkg / h["file"]
+    p.write_text(p.read_text(encoding="utf-8").replace(h["old"], h["new"], 1), encoding="utf-8", newline="\n")
+    before = snapshot(pkg)
+    rep = P.apply(pkg, ("44401",))
+    assert rep["results"]["44401"]["state_before"] == "partial"
+    assert rep["results"]["44401"]["status"] == "refused: source mismatch"
+    assert snapshot(pkg) == before
+
+
+def test_duplicate_old_text_is_refused(pkg):
+    h = P.PATCHES["41872"][1]
+    p = pkg / h["file"]
+    p.write_text(p.read_text(encoding="utf-8") + "\n'''\n" + h["old"] + "'''\n", encoding="utf-8", newline="\n")
+    assert p.read_text(encoding="utf-8").count(h["old"]) == 2
+    before = snapshot(pkg)
+    rep = P.apply(pkg, ("41872",))
+    assert rep["results"]["41872"]["status"] == "refused: source mismatch"
+    assert rep["results"]["41872"]["hunks"][1]["old_count"] == 2
+    assert snapshot(pkg) == before
+
+
+def test_missing_file_refuses(pkg):
+    (pkg / DLLM).unlink()
+    rep = P.apply(pkg, ("44401",))
+    assert rep["results"]["44401"]["status"] == "refused: source mismatch"
+    assert not (pkg / (SCHED + ".e14bak")).exists()
+
+
+def test_compile_failure_refuses_before_writing(pkg, monkeypatch):
+    bad = [dict(h) for h in P.PATCHES["41872"]]
+    bad[0]["new"] = bad[0]["new"].replace("running_batch.batch_is_full = False\n\n", "running_batch.batch_is_full = (\n\n", 1)
+    monkeypatch.setitem(P.PATCHES, "41872", bad)
+    before = snapshot(pkg)
+    rep = P.apply(pkg, ("41872",))
+    assert rep["results"]["41872"]["status"] == "refused: compile failed"
+    assert snapshot(pkg) == before
+    assert not (pkg / (SCHED + ".e14bak")).exists()
+
+
+def test_broken_file_outside_hunks_refuses_compile(pkg):
+    p = pkg / SCHED
+    p.write_bytes(p.read_bytes() + b"\ndef broken(:\n")
+    before = snapshot(pkg)
+    rep = P.apply(pkg, ("41872",))
+    assert rep["results"]["41872"]["status"] == "refused: compile failed"
+    assert snapshot(pkg) == before
+
+
+def test_failure_after_write_rolls_back(pkg, monkeypatch):
+    real = P._compile_check
+    calls = {"n": 0}
+
+    def flaky(text, path):
+        calls["n"] += 1
+        if path.endswith(os.path.join("managers", "scheduler.py")) and calls["n"] > 2:  # after the write
+            return "SyntaxError: injected"
+        return real(text, path)
+
+    monkeypatch.setattr(P, "_compile_check", flaky)
+    before = snapshot(pkg)
+    rep = P.apply(pkg, ("44401",))
+    assert rep["results"]["44401"]["status"] == "refused: write failed (rolled back)"
+    assert snapshot(pkg) == before
+    monkeypatch.setattr(P, "_compile_check", real)
+    assert P.apply(pkg, ("44401",))["results"]["44401"]["status"] == "applied"
+    P.revert(pkg)
+    assert snapshot(pkg) == before
+
+
+def test_unknown_patch_name(pkg):
+    rep = P.apply(pkg, ("99999",))
+    assert rep["ok"] is False and rep["results"]["99999"]["status"] == "refused: unknown patch"
+
+
+def test_cli_check(pkg, capsys):
+    assert P.main(["check", str(pkg)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["patches"]["41872"]["state"] == "not_applied"
+
+
+# ------------------------------------------------------------------------------------------------ semantics
+class DisaggregationMode(Enum):  # stand-in for sglang.srt.disaggregation.utils.DisaggregationMode
+    NULL = auto()
+    PREFILL = auto()
+    DECODE = auto()
+
+
+class AddReqResult(Enum):  # stand-in for sglang.srt.managers.schedule_policy.AddReqResult
+    CONTINUE = auto()
+    NO_TOKEN = auto()
+    OTHER = auto()
+
+
+NUM_ROWS = 13  # our server: --max-running-requests 13 -> 13 req_to_token rows, pp_max_micro_batch_size 13
+
+
+def _source(patched, tmp_path):
+    root = tmp_path / ("patched" if patched else "orig") / "sglang"
+    for rel in FILES:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REF / rel, root / rel)
+    if patched:
+        assert P.apply(root)["ok"]
+    return (root / SCHED).read_text(encoding="utf-8")
+
+
+def _method(src, name):
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(name)
+
+
+def _lines(src, first, last):
+    """Exact source lines of statements first..last, dedented."""
+    lines = src.splitlines(keepends=True)
+    return textwrap.dedent("".join(lines[first.lineno - 1: last.end_lineno]))
+
+
+def _exec_fn(header, body, glb):
+    code = header + "\n" + textwrap.indent(body, "    ")
+    ns = dict(glb)
+    exec(compile(code, "<extracted>", "exec"), ns)
+    return ns[header.split("(")[0].split()[-1]]
+
+
+def _alloc_fn(src, pp=NUM_ROWS):
+    node = _method(src, "get_num_allocatable_reqs")
+    code = textwrap.dedent("".join(src.splitlines(keepends=True)[node.lineno - 1: node.end_lineno]))
+    ns = {"Optional": typing.Optional, "ScheduleBatch": object,
+          "get_parallel": lambda: SimpleNamespace(pp_max_micro_batch_size=pp)}
+    exec(compile(code, "<get_num_allocatable_reqs>", "exec"), ns)
+    return ns["get_num_allocatable_reqs"]
+
+
+def _gate_fn(src):
+    """The admission-gate statements of the waiting-queue loop, from `running_bs = ...` to the PREFILL check."""
+    fn = _method(src, "_get_new_batch_prefill_raw")
+    loop = next(n for n in fn.body if isinstance(n, ast.For) and ast.unparse(n.iter) == "self.waiting_queue")
+    first = next(i for i, s in enumerate(loop.body)
+                 if isinstance(s, ast.Assign) and ast.unparse(s.targets[0]) == "running_bs")
+    last = next(i for i, s in enumerate(loop.body)
+                if isinstance(s, ast.If) and "DisaggregationMode.PREFILL" in ast.unparse(s.test))
+    body = _lines(src, loop.body[first], loop.body[last]) + "return running_batch.batch_is_full\n"
+    return _exec_fn("def _gate(self, req, adder, running_batch):", body, {"DisaggregationMode": DisaggregationMode})
+
+
+def _entry_fn(src):
+    """The entry of _get_new_batch_prefill_raw: from the preemption reset to the early-return check."""
+    fn = _method(src, "_get_new_batch_prefill_raw")
+    first = next(i for i, s in enumerate(fn.body)
+                 if isinstance(s, ast.If) and "enable_priority_preemption" in ast.unparse(s.test))
+    last = next(i for i, s in enumerate(fn.body)
+                if isinstance(s, ast.If) and "len(self.waiting_queue) == 0" in ast.unparse(s.test))
+    body = _lines(src, fn.body[first], fn.body[last]) + "return 'admission attempted'\n"
+    return _exec_fn("def _entry(self, running_batch):", body, {})
+
+
+def _no_token_fn(src):
+    fn = _method(src, "_get_new_batch_prefill_raw")
+    node = next(n for n in ast.walk(fn) if isinstance(n, ast.If) and ast.unparse(n.test) == "res == AddReqResult.NO_TOKEN")
+    body = _lines(src, node, node) + "return running_batch.batch_is_full\n"
+    return _exec_fn("def _no_token(self, res, adder, running_batch):", body, {"AddReqResult": AddReqResult})
+
+
+class Batch:
+    def __init__(self, n, batch_is_full=False):
+        self.reqs = [Req(True) for _ in range(n)]
+        self.batch_is_full = batch_is_full
+
+    def is_empty(self):
+        return len(self.reqs) == 0
+
+
+class Req:
+    def __init__(self, holds_row):
+        self.kv = SimpleNamespace(holds_kv=holds_row)
+        self.beam_group = None
+
+
+def _sched(alloc_fn, free_rows, mode=DisaggregationMode.NULL, running=None):
+    s = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(available_size=lambda: free_rows),
+        beam_coordinator=SimpleNamespace(pending_member_rows=lambda b: 0),
+        running_batch=running,
+        disaggregation_mode=mode,
+        enable_priority_preemption=False, is_hybrid_swa=False,
+        enable_hierarchical_cache=False, enable_lmcache=False, enable_unified_cache_external_linker=False,
+    )
+    s.get_num_allocatable_reqs = functools.partial(alloc_fn, s)
+    return s
+
+
+@pytest.fixture(scope="module")
+def sources(tmp_path_factory):
+    t = tmp_path_factory.mktemp("semantics")
+    return {"orig": _source(False, t), "patched": _source(True, t)}
+
+
+def test_get_num_allocatable_reqs_gives_held_rows_back(sources):
+    orig, new = _alloc_fn(sources["orig"]), _alloc_fn(sources["patched"])
+    rb = Batch(11)
+    s_o, s_n = _sched(orig, free_rows=1, running=rb), _sched(new, free_rows=1, running=rb)
+    assert orig(s_o, 11, running_batch=rb) == 1
+    assert new(s_n, 11, running_batch=rb) == 1                      # default num_held_rows=0: unchanged
+    assert new(s_n, 11, running_batch=rb, num_held_rows=1) == 2     # the continuing chunk's own row comes back
+    assert new(s_n, 11, None, running_batch=rb, num_held_rows=1) == 2
+    assert new(s_n, 12, running_batch=rb, num_held_rows=5) == 1     # still capped by pp_budget = 13 - 12
+    with pytest.raises(TypeError):
+        orig(s_o, 11, running_batch=rb, num_held_rows=1)
+
+
+@pytest.mark.parametrize("mode", [DisaggregationMode.NULL, DisaggregationMode.PREFILL])
+def test_gate_counts_continuing_chunk_once(sources, mode):
+    """13 rows: 11 running (11 rows) + a continuing chunk (1 row) -> 1 free row, one request waiting.
+    0.5.21 counts the chunk in can_run_list AND as a consumer of the free row -> full -> the waiting request
+    is blocked. Patched: the waiting request takes the free row; a second one is still refused (no over-admit)."""
+    orig, new = _alloc_fn(sources["orig"]), _alloc_fn(sources["patched"])
+    gate_o, gate_n = _gate_fn(sources["orig"]), _gate_fn(sources["patched"])
+    chunk, w1 = Req(True), Req(False)
+
+    rb = Batch(11)
+    assert gate_o(_sched(orig, 1, mode, rb), w1, SimpleNamespace(can_run_list=[chunk]), rb) is True    # the bug
+    rb = Batch(11)
+    assert gate_n(_sched(new, 1, mode, rb), w1, SimpleNamespace(can_run_list=[chunk]), rb) is False    # fixed
+    rb = Batch(11)
+    assert gate_n(_sched(new, 1, mode, rb), Req(False), SimpleNamespace(can_run_list=[chunk, w1]), rb) is True
+
+
+@pytest.mark.parametrize("mode", [DisaggregationMode.NULL, DisaggregationMode.PREFILL])
+def test_gate_unchanged_when_nothing_holds_a_row(sources, mode):
+    orig, new = _alloc_fn(sources["orig"]), _alloc_fn(sources["patched"])
+    gate_o, gate_n = _gate_fn(sources["orig"]), _gate_fn(sources["patched"])
+    for running, free, can_run in [(12, 1, []), (12, 1, [Req(False)]), (10, 3, [Req(False), Req(False)]),
+                                   (0, 13, []), (11, 0, []), (5, 8, [Req(False)] * 8)]:
+        out = []
+        for alloc, gate in ((orig, gate_o), (new, gate_n)):
+            rb = Batch(running)
+            out.append(gate(_sched(alloc, free, mode, rb), Req(False), SimpleNamespace(can_run_list=list(can_run)), rb))
+        assert out[0] == out[1], (running, free, len(can_run))
+
+
+def test_entry_empty_latched_batch_still_admits(sources):
+    e_o, e_n = _entry_fn(sources["orig"]), _entry_fn(sources["patched"])
+    s = SimpleNamespace(enable_priority_preemption=False, is_hybrid_swa=False, waiting_queue=[Req(False)],
+                        chunked_req=None)
+    rb = Batch(0, batch_is_full=True)
+    assert e_o(s, rb) == (None, rb) and rb.batch_is_full is True       # 0.5.21: latched shut forever
+    rb = Batch(0, batch_is_full=True)
+    assert e_n(s, rb) == "admission attempted" and rb.batch_is_full is False
+    rb = Batch(3, batch_is_full=True)                                  # non-empty batch: unchanged
+    assert e_n(s, rb) == (None, rb) and rb.batch_is_full is True
+    s.waiting_queue = []
+    rb = Batch(0, batch_is_full=False)
+    assert e_n(s, rb) == (None, rb)                                    # nothing waiting: still returns early
+
+
+def _delayer_fn(src):
+    """The min-free-slots delay statements of _get_new_batch_prefill_raw (from `running_bs = ...` to its If)."""
+    fn = _method(src, "_get_new_batch_prefill_raw")
+    first = next(i for i, s in enumerate(fn.body)
+                 if isinstance(s, ast.Assign) and ast.unparse(s.targets[0]) == "running_bs")
+    last = next(i for i, s in enumerate(fn.body)
+                if isinstance(s, ast.If) and "min_free_slots_delayer" in ast.unparse(s.test))
+    body = _lines(src, fn.body[first], fn.body[last]) + "return 'not delayed'\n"
+    return _exec_fn("def _delay(self, running_batch):", body, {})
+
+
+def _min_free_slots_module():
+    spec = importlib.util.spec_from_file_location("mfs", REF / "srt/managers/min_free_slots_delayer.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+@pytest.mark.parametrize("mrr,running,delayed", [(12, 11, True), (13, 11, True), (13, 10, False),
+                                                  (14, 11, False), (15, 11, False)])
+def test_dflash_min_free_slots_delayer_is_not_changed_by_the_backport(sources, mrr, running, delayed):
+    """Documents a SEPARATE gate the backport does not touch: with DFlash and --min-free-slots-delay unset, 0.5.21
+    auto-enables MinFreeSlotsDelayer(min(4, max(2, (mrr + 5) // 6))) (scheduler.py L1183-1193). With 12 client
+    streams, one finished request leaves 11 running + 1 waiting and no chunk; allocatable = mrr - 11. For mrr 12 and 13
+    that is below the threshold (2 and 3), so the 12th request waits for a second slot, patched or not."""
+    mfs = _min_free_slots_module()
+    thr = mfs.resolve_min_free_slots(None, mrr, is_dflash_family=True)
+    assert mfs.resolve_min_free_slots(1, mrr, is_dflash_family=True) is None    # --min-free-slots-delay 1 disables
+    for which in ("orig", "patched"):
+        alloc = _alloc_fn(sources[which], pp=mrr)               # pp_max_micro_batch_size = mrr (pp_size 1)
+        delay = _delayer_fn(sources[which])
+        rb = Batch(running)
+        s = _sched(alloc, free_rows=mrr - running, running=rb)  # mrr rows, one held per running request
+        s.chunked_req = None
+        s.min_free_slots_delayer = mfs.MinFreeSlotsDelayer(min_free_slots=thr)
+        out = delay(s, rb)
+        assert (out == (None, rb)) is delayed, (which, mrr, running, thr, out)
+
+
+def test_no_token_only_latches_when_something_can_be_served(sources):
+    n_o, n_n = _no_token_fn(sources["orig"]), _no_token_fn(sources["patched"])
+    s = _sched(lambda *a, **k: 0, 0)
+    for running, can_run, want_new in [(0, [], False), (3, [], True), (0, [Req(False)], True), (2, [Req(True)], True)]:
+        rb = Batch(running)
+        assert n_o(s, AddReqResult.NO_TOKEN, SimpleNamespace(can_run_list=can_run), rb) is True
+        rb = Batch(running)
+        assert n_n(s, AddReqResult.NO_TOKEN, SimpleNamespace(can_run_list=can_run), rb) is want_new
+
+
+# ------------------------------------------------------------------------------------------------ #43567 (opt-in)
+def test_43567_is_not_a_default_patch():
+    assert "43567" in P.PATCHES and "43567" not in P.DEFAULT_NAMES
+
+
+def test_43567_apply_check_revert_exact_upstream_lines(pkg):
+    orig = (pkg / SBATCH).read_bytes()
+    rep = P.apply(pkg, ("43567",))
+    assert rep["ok"] is True and rep["results"]["43567"]["status"] == "applied"
+    t = (pkg / SBATCH).read_text(encoding="utf-8")
+    compile(t, "sb", "exec", dont_inherit=True)
+    # both lazy functions now invalidate the keep slot's checkpoint when the pending slot cannot be allocated
+    pre = t[t.index("def mamba_lazy_prealloc_at_boundary"):t.index("def mamba_lazy_spec_prepare")]
+    spec = t[t.index("def mamba_lazy_spec_prepare"):t.index("self.mamba_lazy_spec_track_positions_cpu = track_positions")]
+    for body in (pre, spec):
+        assert body.count("req.kv.mamba_last_track_seqlen = None") == 1
+        i, j = body.index("if new_slot is not None:"), body.index("req.kv.mamba_last_track_seqlen = None")
+        assert i < body.index("else:", i) < j
+    assert P.check(pkg, ("43567",))["patches"]["43567"]["state"] == "applied"
+    assert P.apply(pkg, ("43567",))["results"]["43567"]["status"] == "already applied"
+    # the default patches are independent of it
+    assert P.apply(pkg)["ok"] is True
+    assert P.revert(pkg)["ok"] is True
+    assert (pkg / SBATCH).read_bytes() == orig
+
+
+@pytest.mark.parametrize("idx", range(len(P.PATCHES["43567"])))
+def test_43567_one_changed_character_refuses_without_partial_edit(pkg, idx):
+    h = P.PATCHES["43567"][idx]
+    p = pkg / h["file"]
+    text = p.read_text(encoding="utf-8")
+    word = list(re.finditer(r"[A-Za-z_]{8,}", h["old"]))[-1]
+    pos = text.index(h["old"]) + (word.start() + word.end()) // 2
+    bad = text[:pos] + ("X" if text[pos] != "X" else "Y") + text[pos + 1:]
+    p.write_bytes(bad.encode("utf-8"))
+    rep = P.apply(pkg, ("43567",))
+    assert rep["ok"] is False
+    assert p.read_bytes() == bad.encode("utf-8")
+    assert not (pkg / (h["file"] + ".e14bak")).exists()

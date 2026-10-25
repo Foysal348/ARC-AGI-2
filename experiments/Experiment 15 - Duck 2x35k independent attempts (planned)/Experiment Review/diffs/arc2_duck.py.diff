@@ -1,0 +1,597 @@
+--- "D:/ARC AGI 2/experiments/Experiment 12 - Duck REPL agent for ARC-AGI-2 (planned)/duck_arc2/arc2_duck.py"	2026-10-23 10:47:56.828029100 +0600
++++ src/duck_b/arc2_duck.py	2026-10-24 22:41:32.554927300 +0600
+@@ -74,6 +74,11 @@
+     # rev 6 R6-S5 (GPT plan review 2): history drain sized for 10 streams (Duck reads the drain at call time)
+     if os.environ.get("E12_DUCK_DRAIN_TOKENS"):
+         env["ARC3_CONTEXT_DRAIN_TOKENS"] = str(int(os.environ["E12_DUCK_DRAIN_TOKENS"]))
++    # E15B (Notes/02 #10, #14): finish a reply's remaining tool calls before a yield (no turn rollback); the sandbox's
++    # safe sys shim, `time`, and clear import messages
++    if os.environ.get("E12_B_MODE") == "1":
++        env["ARC3_YIELD_AFTER_BATCH"] = "1"
++        env["ARC2_SANDBOX_SYS_SHIM"] = "1"
+     return env
+ 
+ 
+@@ -82,6 +87,15 @@
+     return os.environ.get("E12_ARC2_REV6", "") == "1"
+ 
+ 
++def _b_mode() -> bool:
++    """E15B switch (Experiment 15, user 2026-10-24: config B = 2 x 35k independent attempts per task, attempt 1 on every
++    task first). On top of rev 6: one attempt = one branch with a fixed generated-token budget (E12_B_ATTEMPT_TOKENS) and
++    no pause / resume; the request cap is the remaining budget minus a reserve (E12_B_RESERVE) kept for a final commit
++    turn; tool contract and budget in the prompt; submit/check called as tools are routed to python; reasoning-only code
++    is harvested at the end (Exp 15 Notes/02)."""
++    return _rev6() and os.environ.get("E12_B_MODE", "") == "1"
++
++
+ def _raw_reasoning_history() -> bool:
+     """E14-P switch (user 2026-10-23): history keeps the server's raw reasoning (blank lines included). Off by default."""
+     return os.environ.get("E12_RAW_REASONING_HISTORY", "0").strip() == "1"
+@@ -1017,6 +1031,8 @@
+ 
+ ARC2_R6_ALLOWED_IMPORTS = ("bisect, collections, copy, difflib, fractions, functools, heapq, itertools, json, math, "
+                            "operator, random, re, statistics, string")
++# E15B #14: the sandbox's extra names (time, and a sys subset: setrecursionlimit, getrecursionlimit, maxsize, stdout)
++ARC2_B_ALLOWED_IMPORTS = ARC2_R6_ALLOWED_IMPORTS + ", time, and `sys` (only setrecursionlimit, getrecursionlimit, maxsize)"
+ 
+ 
+ def arc2_system_prompt_r6(task: dict, DP, tool_output_tokens: int, view: str = "facts") -> str:
+@@ -1098,7 +1114,39 @@
+             p.append(f"\nTraining pair {i} input:\n{grid_rows(q['input'])}\nTraining pair {i} output:\n{grid_rows(q['output'])}\n")
+         for j, q in enumerate(task["test"]):
+             p.append(f"\nTest input {j}:\n{grid_rows(q['input'])}\n")
+-    return "".join(p)
++    return b_system_prompt("".join(p)) if _b_mode() else "".join(p)
++
++
++# E15B (Exp 15 Notes/02): prompt edits of config B. Each (old, new) must match exactly once (tested).
++B_PROMPT_EDITS = (
++    # #13: the auto-check names
++    ("When you define or change a function named `transform...`, `solve...` or `..._alt`, the harness checks it "
++     "automatically after your code runs.",
++     "When you define or change a one-grid function named `transform...`, `solve...`, `candidate...`, `trans`, "
++     "`trans_...` or `..._alt`, the harness checks it automatically after your code runs."),
++    # #14: the sandbox's extra modules
++    ("The only importable standard-library modules are: " + ARC2_R6_ALLOWED_IMPORTS + ".",
++     "The only importable standard-library modules are: " + ARC2_B_ALLOWED_IMPORTS + ". The helpers above are "
++     "already defined in every call: call them, never import them."),
++    # #12: the tool contract; #22: bounded search; #48: the attempt budget
++    ("- You have exactly one tool: `python`.\n",
++     "- You have exactly one tool: `python`. `check(...)`, `check_many(...)` and `submit(...)` are Python functions "
++     "inside it, not tools: call them inside python code, e.g. `check(transform)`.\n"
++     "- Bound any search or backtracking (for example a node counter) so a call stays well under the time limit; run a "
++     "new `transform` on one training input before `check` when it might be slow.\n"
++     "- This attempt has a budget of about {budget} generated tokens, thinking included. Write and check a provisional "
++     "`transform` well before it runs out; near the end you will be asked to commit your best version.\n"),
++)
++
++
++def b_system_prompt(text: str) -> str:
++    budget = _env_int("E12_B_ATTEMPT_TOKENS", 35000)
++    for old, new in B_PROMPT_EDITS:
++        if text.count(old) == 1:
++            text = text.replace(old, new.replace("{budget}", f"{budget:,}"))
++        else:
++            log.warning("E15B prompt edit not applied (%d matches): %s", text.count(old), old[:60])
++    return text
+ 
+ 
+ def _indexed_rows(g: list[list[int]]) -> str:
+@@ -1175,6 +1223,71 @@
+                  "counts or layouts that the test inputs do not share. Do not reject a fixed rule just because it is fixed; "
+                  "if another plausible rule predicts a different test output, keep it as an alternative under its own name.")
+ _R6_AUTOCHECK_RE = re.compile(r"^(transform|solve|solution|predict)\w*$|^\w+_(alt\w*|v\d+)$")
++# E15B #13 (GPT Notes/44 Cause B, cbebaa4b): also candidate*, trans, trans<n>, trans_* (not transpose / translate)
++_R6_AUTOCHECK_RE_B = re.compile(r"^(transform|solve|solution|predict|candidate)\w*$|^trans(\d*|_\w*)$|^\w+_(alt\w*|v\d+)$")
++
++
++def _autocheck_re():
++    return _R6_AUTOCHECK_RE_B if _b_mode() else _R6_AUTOCHECK_RE
++
++
++def b_code_blocks(text: str) -> list[str]:
++    """E15B #50: Python code the model wrote in its reasoning or content (fenced blocks, and unfenced top-level `def`
++    blocks with their indented bodies). Untrusted text; only compiled and run in the sandbox."""
++    blocks = [b for b in re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", text, re.S) if "def " in b]
++    lines = text.splitlines()
++    i = 0
++    while i < len(lines):
++        if re.match(r"def [A-Za-z_]\w*\(", lines[i]):
++            j = i + 1
++            while j < len(lines) and (not lines[j].strip() or lines[j][:1] in " \t"
++                                      or re.match(r"(def |import |from |@)", lines[j])):
++                j += 1
++            blk = "\n".join(lines[i:j]).rstrip()
++            if not any(blk in b for b in blocks):
++                blocks.append(blk)
++            i = j
++        else:
++            i += 1
++    return blocks
++
++
++def b_harvest_source(texts: list[str], max_chars: int = 24000) -> tuple[str, list[str]]:
++    """E15B #50: one module from every compiling block in order (later definitions win): only function / class
++    definitions and imports are kept (no top-level calls or prints). Returns (source, solution names to check: one-grid
++    functions matching the auto-check pattern, the last defined first, at most 2)."""
++    import ast
++    keep, names = [], []
++    for t in texts:
++        for blk in b_code_blocks(t):
++            try:
++                tree = ast.parse(blk)
++            except SyntaxError:
++                continue
++            for node in tree.body:
++                if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
++                    try:
++                        keep.append(ast.unparse(node))
++                    except Exception:
++                        continue
++                    if isinstance(node, ast.FunctionDef) and _autocheck_re().match(node.name) \
++                            and _r6_single_grid_arg(keep[-1]):
++                        names = [n for n in names if n != node.name] + [node.name]
++    src = "\n\n".join(keep)
++    if len(src) > max_chars:                 # keep the newest definitions
++        src = src[-max_chars:]
++        src = src[src.find("\ndef ") + 1:] if "\ndef " in src else ""
++    return src, list(reversed(names))[:2]
++
++
++# E15B texts (Notes/02 #48): the attempt budget and the final commit turn
++R6_TEXT_B = {
++    "first_budget": (" This attempt has a budget of about {budget} generated tokens (thinking included); test a "
++                     "provisional `transform` early."),
++    "commit": ("Your token budget for this attempt is almost spent: about {left} tokens remain. Do not start a new "
++               "analysis. Keep your reasoning to a few lines and, in this reply, call `python` once with your best "
++               "complete `transform(grid)` and `check(transform)`."),
++}
+ R6_PRELUDE_NAMES = PRELUDE_NAMES | R6_EXPLORE_NAMES | frozenset({"_arc2_brief", "_arc2_verdict", "_arc2_detail"})
+ 
+ 
+@@ -1280,6 +1393,15 @@
+                               # G4-2: branch 1 (a grids view) makes its first call at 12.4-18.0k (G4B), so its first cap
+                               # is the approved 24,576; branch 0 keeps 12,288
+                               "first_b1": _env_int("E12_R6_CAP_FIRST_B1", 24576)}
++            # E15B (Notes/02 #3-#5, #48): one attempt = this agent; a fixed generated-token budget, the last part reserved
++            # for one commit turn (the request cap = remaining - reserve, then the remaining tokens)
++            self._arc2_b = _b_mode()
++            self._arc2_b_budget = _env_int("E12_B_ATTEMPT_TOKENS", 35000)
++            self._arc2_b_reserve = _env_int("E12_B_RESERVE", 4096)
++            self._arc2_b_commit_sent = False
++            self.arc2_b_events = {"commit_at_tokens": None, "commit_via": None, "commit_requests": 0,
++                                  "commit_tool_call": None, "submit_tool_routed": 0, "reasoning_harvest": None,
++                                  "end_tokens": None}
+             self._arc2_first_transform_tokens: int | None = None     # G4-14 / G4-6
+             self._arc2_nudge_sent = False                             # G4-6
+             # H6-1 (GPT rev 6e audits; G4B: 0 of 12 branch-0 runs had a new turn at >= 27k before the 28k pause, so an
+@@ -1379,6 +1501,31 @@
+             tools[0]["function"]["description"] = ARC2_TOOL_DESCRIPTION
+             return tools
+ 
++        def _dispatch_tool(self, state_path: Path, name: str, arguments: dict[str, Any]):
++            """E15B #11 (EVAL120: `Unknown tool: submit` in 22 / 27 / 23 branches, one wasted request each): the model
++            calls the python helpers submit / check / check_many as tools, with {'code': 'submit(transform)'} or
++            {'transform': 'transform'} or an empty argument. Route them to the python tool; the result says so."""
++            if not self._arc2_b or name not in ("submit", "check", "check_many"):
++                return super()._dispatch_tool(state_path, name, arguments)
++            args = arguments if isinstance(arguments, dict) else {}
++            code = args.get("code")
++            if not (isinstance(code, str) and code.strip()):
++                fn = next((str(v).strip() for k, v in args.items() if k != "code" and isinstance(v, str) and v.strip()),
++                          "transform")
++                fn = fn if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", fn) else "transform"
++                code = f"{'check' if name == 'check_many' else name}({fn})"   # check_many needs a dict
++            self.arc2_b_events["submit_tool_routed"] += 1
++            res = self._run_python_tool(state_path, {"code": code})
++            try:
++                body = json.loads(res.content)
++                body["harness_note_tool"] = (f"`{name}` is a Python function inside the `python` tool, not a tool; this "
++                                             f"call was run as python code: {code[:200]}")
++                res = TA._ToolDispatchResult(json.dumps(body, indent=2), step_executed=res.step_executed,
++                                             made_progress=res.made_progress)
++            except Exception:
++                pass
++            return res
++
+         # the task lives in the system prompt, which is never trimmed; openers stay short
+         def _build_user_prompt(self, action_num, *, valid_actions, current_frame=None, history_entries=None,
+                                previous_step_summary=None) -> str:
+@@ -1420,12 +1567,17 @@
+                 state, text = "rejected", R6_TEXT["rejected"].format(name=last["name"], summary=last["summary"])
+             elif not getattr(self, "_resume_after_yield", False):
+                 state, text = "first", R6_TEXT["first"]
++                if self._arc2_b:
++                    text += R6_TEXT_B["first_budget"].format(budget=f"{self._arc2_b_budget:,}")
+             else:
+                 reason = str(getattr(self, "_resume_reason", "") or "yield_bare")
+                 cut, self._arc2_cut_pending = self._arc2_cut_pending, False
+                 length, self._arc2_length_pending = self._arc2_length_pending, False
+                 sstate, stext = self._arc2_r6_status()
+-                if cut:
++                if self._arc2_b and self._arc2_b_in_commit():
++                    # E15B #48: the last turn of the attempt (covers a length cut, a cut call and a bare yield)
++                    state, text = "commit", self._arc2_b_commit_text("opener")
++                elif cut:
+                     state, text = "cut", R6_TEXT["cut"]
+                 elif length:
+                     state, text = "length", R6_TEXT["length"]
+@@ -1444,6 +1596,19 @@
+             ev[state] = ev.get(state, 0) + 1
+             return text + R6_COMPLETE
+ 
++        def _arc2_b_left(self) -> int:
++            return int(self._arc2_b_budget - self.generated_tokens)
++
++        def _arc2_b_in_commit(self) -> bool:
++            """E15B #48: the remaining budget is within the reserve (+1,024 so the commit request is not tiny)."""
++            return self._arc2_b and self._arc2_b_left() <= self._arc2_b_reserve + 1024
++
++        def _arc2_b_commit_text(self, via: str) -> str:
++            if not self._arc2_b_commit_sent:
++                self._arc2_b_commit_sent = True
++                self.arc2_b_events.update(commit_at_tokens=self.generated_tokens, commit_via=via)
++            return R6_TEXT_B["commit"].format(left=f"{max(0, self._arc2_b_left()):,}")
++
+         def _arc2_mark_nudge(self, via: str) -> None:
+             self._arc2_nudge_sent = True
+             self.arc2_rev6_events["provisional_nudge_tokens"] = self.generated_tokens
+@@ -1536,6 +1701,12 @@
+             c = self._arc2_cap
+             first = c["first_b1"] if self.arc2_view != "facts" else c["first"]
+             cap = c["rescue"] if self._arc2_nocall_cuts >= 2 else (c["progress"] if self._arc2_tool_ok else first)
++            if self._arc2_b:
++                # E15B #4 / #48: no 12k / 24k / 32k caps. A request may use the attempt's remaining budget minus the
++                # commit reserve; inside the reserve, the rest. With the fixed ~100k window (#46) the context budget
++                # window - cap - margin stays above the attempt's whole history, so nothing is trimmed (#5).
++                left = self._arc2_b_left()
++                cap = (left - self._arc2_b_reserve) if left > self._arc2_b_reserve + 1024 else max(256, left)
+             self._max_output_tokens = cap
+             self._reply_reserve_tokens = cap
+             self._context_budget_tokens = max(1024, self._arc2_window - cap - self._request_safety_margin_tokens)
+@@ -1724,6 +1895,11 @@
+                             fn["arguments"] = '{"code": "<cut off at the output limit>'   # unterminated: invalid JSON
+                     self.arc2_rev5_events["cut_tool_calls_dropped"] += 1
+                     self._arc2_cut_pending = True
++            if self._arc2_b and self._arc2_b_commit_sent:    # E15B #48: did the commit request produce a tool call?
++                _m = getattr(result, "message", None)
++                self.arc2_b_events["commit_requests"] += 1
++                if self.arc2_b_events["commit_tool_call"] is None or not self.arc2_b_events["commit_tool_call"]:
++                    self.arc2_b_events["commit_tool_call"] = bool(isinstance(_m, dict) and _m.get("tool_calls"))
+             return result
+ 
+         def _arc2_request_begin(self, messages, kwargs=None) -> dict:
+@@ -1849,7 +2025,7 @@
+             before_kept = dict(self._kept_functions or {})
+             self._record_retained_functions(sandbox_result, payload)
+             if self._arc2_rev6 and self._arc2_first_transform_tokens is None and any(
+-                    _R6_AUTOCHECK_RE.match(n) and before_kept.get(n) != src and _r6_single_grid_arg(src)
++                    _autocheck_re().match(n) and before_kept.get(n) != src and _r6_single_grid_arg(src)
+                     for n, src in (self._kept_functions or {}).items()):
+                 # G4-14 / G4-6; H6-2: a one-grid function only (the auto-check predicate), so transform(a, b) or a helper
+                 # solve_row(r, i) neither suppresses the nudge nor counts as the first transform
+@@ -1913,6 +2089,11 @@
+                 if self._arc2_pending_submit is None and self._arc2_wants_nudge():
+                     payload["harness_note"] = R6_TEXT["provisional"]          # H6-1: mid-turn, before the 28k pause
+                     self._arc2_mark_nudge("tool")
++                if self._arc2_b:
++                    # E15B #21: the functions now defined in this session (NameError in 19 / 22 / 23 EVAL120 branches)
++                    payload["defined_functions"] = sorted(self._kept_functions or {})[:40]
++                    if self._arc2_pending_submit is None and self._arc2_b_in_commit():
++                        payload["harness_note"] = self._arc2_b_commit_text("tool")      # E15B #48
+             step_executed = False
+             accepted = False
+             if self._arc2_pending_submit is not None:
+@@ -1987,7 +2168,7 @@
+             the host verifies them in a clean sandbox (the authority). Never submits, never stops the branch."""
+             kept = self._kept_functions or {}
+             todo = [n for n, src in kept.items()
+-                    if _R6_AUTOCHECK_RE.match(n) and before_kept.get(n) != src and n not in already
++                    if _autocheck_re().match(n) and before_kept.get(n) != src and n not in already
+                     and self._arc2_autochecked.get(n) != src and _r6_single_grid_arg(src)]
+             todo = todo[:_env_int("E12_AUTOCHECK_PER_CALL", 3)]
+             if not todo:
+@@ -2030,6 +2211,77 @@
+                     note += "\n" + " ".join(notes)
+             payload["auto_check"] = note
+ 
++        def arc2_b_reasoning_harvest(self, state_path: Path) -> dict:
++            """E15B #50 (GPT Notes/44 Cause D: db0c5428 wrote `def transform` only inside its thinking). At the end of an
++            attempt without a host-verified candidate: the functions written in the assistant messages (reasoning and
++            content) are run in the sandbox and check()ed; an exact one goes through the normal host verification."""
++            out = {"ran": False}
++            if any(v.get("accepted") for v in self.arc2_checked + self.arc2_submissions):
++                out["skipped"] = "verified candidate exists"
++                return out
++            left = ((self._arc2_deadline + getattr(self, "_arc2_verify_grace", 0.0) - time.monotonic())
++                    if self._arc2_deadline is not None else 60.0)
++            if left < 20:
++                out["skipped"] = f"{left:.0f} s left"
++                return out
++            texts = []
++            for m in (getattr(self, "_history_messages", None) or []):
++                if isinstance(m, dict) and str(m.get("role", "")).strip() == "assistant":
++                    for k in list(TA._reasoning_history_keys()) + ["content"]:
++                        r = m.get(k)
++                        if isinstance(r, str) and "def " in r:
++                            texts.append(r)
++            src, names = b_harvest_source(texts)
++            out.update(texts=len(texts), names=names, chars=len(src))
++            if not src or not names:
++                out["skipped"] = "no one-grid solution function in the text"
++                return out
++            accepted0 = sum(1 for v in self.arc2_checked if v.get("accepted"))
++            try:
++                self._run_python_tool(state_path, {"code": src + "\n" + "".join(f"check({n})\n" for n in names)})
++                out["ran"] = True
++            except Exception as exc:
++                out["error"] = f"{type(exc).__name__}: {exc}"[:300]
++            out["new_accepted"] = sum(1 for v in self.arc2_checked if v.get("accepted")) - accepted0
++            return out
++
++        def arc2_b_candidate_fields(self) -> dict:
++            """E15B #31 (GPT Notes/44): separate stages, so 'never wrote a candidate', 'wrote but never ran',
++            'ran but timed out' and 'verified' are not confused."""
++            kept = self._kept_functions or {}
++            sol = [n for n, s in kept.items() if _autocheck_re().match(n) and _r6_single_grid_arg(s)]
++            ev6, ev5 = self.arc2_rev6_events, self.arc2_rev5_events
++            best = self.arc2_progress.get("best") or {}
++            return {"candidate_source_written": bool(sol) or bool(ev6.get("first_transform_tokens") is not None),
++                    "candidate_retained": len(sol),
++                    "check_attempted": int(ev5.get("checks_signalled", 0)) + int(ev6.get("autocheck_functions", 0)),
++                    "check_executed": int(self.arc2_progress.get("runs") or 0),
++                    "check_timeout": int(ev6.get("infra_errors", 0)),
++                    "train_pairs_exact": bool(best) and best.get("k") == best.get("n") and bool(best.get("n")),
++                    "best_k_n": [best.get("k"), best.get("n")] if best else None,
++                    "host_verified": sum(1 for v in self.arc2_checked + self.arc2_submissions if v.get("accepted")),
++                    "harvested": sum(1 for v in self.arc2_checked if v.get("accepted")),
++                    "submitted_accepted": sum(1 for v in self.arc2_submissions if v.get("accepted"))}
++
++        def arc2_b_partial_test(self) -> dict:
++            """E15B #7 (EVAL120: pass2 = 0; select_attempts_r5's partial tier was empty because only train-exact
++            programs are host-run): with no host-verified candidate, the best partial function (most exact train pairs,
++            then changed-cell accuracy; untrusted progress report) is host-run once on train + test. The verdict is kept
++            in `checked`; unless the clean re-run is exact on every train pair (then the normal acceptance applies) it is
++            a NON-accepted candidate, so it can only fill attempt_2 / an empty attempt_1 before the test input."""
++            if any(v.get("accepted") for v in self.arc2_checked + self.arc2_submissions):
++                return {"skipped": "verified candidate exists"}
++            best = self.arc2_progress.get("best") or {}
++            name = best.get("name")
++            if not name or name not in (self._kept_functions or {}) or not (best.get("k", 0) > 0 or best.get("acc", 0) > 0):
++                return {"skipped": "no partial program"}
++            v = self._verify_submission(name)
++            v["origin"] = "partial_test"          # the host verdict stands: accepted only if really exact on train
++            self.arc2_checked.append(v)
++            return {"name": name, "k": best.get("k"), "n": best.get("n"),
++                    "test_outputs": sum(1 for g in (v.get("test_outputs") or []) if g is not None),
++                    "train_exact": sum(bool(e) for e in v.get("train_exact") or []), "skipped": v.get("skipped")}
++
+         def _arc2_harvest_checks(self, names: list[str], *, skip: str | None = None) -> list[str]:
+             if self._arc2_rev6:
+                 return self._arc2_harvest_r6(names, skip=skip)
+@@ -2140,7 +2392,8 @@
+             budget_end = time.monotonic() + 2 * self._python_timeout   # all grids (one 30 s call before Rev 2)
+             if self._arc2_rev6 and self._arc2_deadline is not None:
+                 # R6-S6 (GPT plan review 1 P4, code-verified): the verify budget obeys the run deadline too
+-                budget_end = min(budget_end, self._arc2_deadline - 1.0)
++                # (E15B #54: + the final-harvest grace, 0 outside it)
++                budget_end = min(budget_end, self._arc2_deadline - 1.0 + getattr(self, "_arc2_verify_grace", 0.0))
+                 if budget_end - time.monotonic() < 1.0:
+                     self.arc2_rev6_events["verify_skipped_deadline"] += 1
+                     v.update(skipped=True, summary=f"verification of `{name}` skipped: the run deadline is reached.")
+@@ -2298,6 +2551,90 @@
+     return out
+ 
+ 
++def _rl_rot90(g):
++    return [list(r) for r in zip(*g[::-1])]
++
++
++def _rl_flip_h(g):
++    return [list(r[::-1]) for r in g]
++
++
++def _rl_flip_v(g):
++    return [list(r) for r in g[::-1]]
++
++
++def _rl_transpose(g):
++    return [list(r) for r in zip(*g)]
++
++
++def _rl_modal(g):
++    from collections import Counter
++    return Counter(v for r in g for v in r).most_common(1)[0][0]
++
++
++def _rl_crop(g):
++    bg = _rl_modal(g)
++    cells = [(i, j) for i, r in enumerate(g) for j, v in enumerate(r) if v != bg]
++    if not cells:
++        return None
++    r0, r1 = min(i for i, _ in cells), max(i for i, _ in cells)
++    c0, c1 = min(j for _, j in cells), max(j for _, j in cells)
++    return [list(r[c0:c1 + 1]) for r in g[r0:r1 + 1]]
++
++
++def _rl_scale(k):
++    return lambda g: [[v for v in r for _ in range(k)] for r in g for _ in range(k)]
++
++
++def _rl_tile(a, b):
++    return lambda g: [list(r) * b for _ in range(a) for r in g]
++
++
++RULES = {"rot90": _rl_rot90, "rot180": lambda g: _rl_rot90(_rl_rot90(g)), "rot270": lambda g: _rl_rot90(_rl_rot90(_rl_rot90(g))),
++         "flip_h": _rl_flip_h, "flip_v": _rl_flip_v, "transpose": _rl_transpose,
++         "anti_transpose": lambda g: _rl_rot90(_rl_rot90(_rl_transpose(g))), "crop_bbox": _rl_crop,
++         "scale2": _rl_scale(2), "scale3": _rl_scale(3), "tile_1x2": _rl_tile(1, 2), "tile_2x1": _rl_tile(2, 1),
++         "tile_2x2": _rl_tile(2, 2), "tile_3x3": _rl_tile(3, 3),
++         "mirror_h": lambda g: [list(r) + list(r[::-1]) for r in g], "mirror_v": lambda g: [list(r) for r in g] + _rl_flip_v(g),
++         "mirror_4": lambda g: [list(r) + list(r[::-1]) for r in g] + [list(r) + list(r[::-1]) for r in g[::-1]]}
++
++
++def _rl_color_map(task):
++    """A global per-color map (same shape in and out) consistent on every train pair, else None."""
++    m = {}
++    for p in task["train"]:
++        a, b = p["input"], p["output"]
++        if len(a) != len(b) or any(len(x) != len(y) for x, y in zip(a, b)):
++            return None
++        for ra, rb in zip(a, b):
++            for x, y in zip(ra, rb):
++                if m.setdefault(x, y) != y:
++                    return None
++    if all(k == v for k, v in m.items()):
++        return None                       # the identity: the test-input fallback already covers it
++    return lambda g: [[m.get(v, v) for v in r] for r in g]
++
++
++def rule_library_outputs(task: dict) -> list[list]:
++    """E15B #20 (4-day review D A7: +0.5-1.5 LB, no downside): cheap pure-Python rules (rotations, flips, transposes,
++    bounding-box crop, integer scales, tilings, mirrors, a global color map) that are exact on EVERY training pair;
++    returns their test outputs (one list per rule). Gold-free; used only after every program candidate."""
++    out = []
++    rules = dict(RULES)
++    cm = _rl_color_map(task)
++    if cm is not None:
++        rules["color_map"] = cm
++    for name, f in rules.items():
++        try:
++            if all(f(p["input"]) == p["output"] for p in task["train"]):
++                outs = [f(q["input"]) for q in task["test"]]
++                if all(valid_grid(o) for o in outs) and any(o != q["input"] for o, q in zip(outs, task["test"])):
++                    out.append(outs)
++        except Exception:
++            continue
++    return out
++
++
+ def select_attempts_r5(task: dict, branch_records: list[dict]) -> list[dict]:
+     """rev 5 B2: candidates = host-accepted submissions + host-accepted exact checks (B1). Each branch contributes its
+     best = latest accepted submission, else its latest accepted check (EVAL30 247ef758: the latest exact version was the
+@@ -2317,6 +2654,7 @@
+         partial += [s for s in (r.get("submissions") or []) + (r.get("checked") or []) if not s.get("accepted")]
+     others.sort(key=t, reverse=True)
+     partial.sort(key=lambda s: (sum(bool(e) for e in s.get("train_exact") or []), t(s)), reverse=True)
++    rules = rule_library_outputs(task) if _b_mode() else []
+ 
+     def _out(s, qi):
+         outs = s.get("test_outputs") or []
+@@ -2337,6 +2675,11 @@
+             g = _out(s, qi)
+             if g is not None and g not in grids:
+                 grids.append(g)
++        if _b_mode():                     # E15B #20: train-exact CPU rules (never ahead of any program candidate)
++            for outs in rules:
++                g = outs[qi] if qi < len(outs) else None
++                if valid_grid(g) and g not in grids:
++                    grids.append(g)
+         if not grids:
+             grids = [q["input"]]
+         a1 = grids[0]
+@@ -2515,6 +2858,17 @@
+                     finished = True
+                     break
+                 if result.retryable_failure:
++                    if SERVER_DOWN.is_set() and getattr(agent, "_arc2_b", False):
++                        # E15B #15: the server is being relaunched: wait for it (bounded by the deadline), retry the
++                        # same step, count nothing
++                        _w0 = time.monotonic()
++                        while SERVER_DOWN.is_set() and time.monotonic() < deadline:
++                            time.sleep(2.0)
++                        SERVER_WAITS["waits"] += 1
++                        SERVER_WAITS["sec"] += time.monotonic() - _w0
++                        self.record["server_down_waits"] = self.record.get("server_down_waits", 0) + 1
++                        self.retry_step = analysis_step
++                        continue
+                     self.consecutive += 1
+                     self.record["failures"] += 1
+                     if 0 <= self.max_failures < self.consecutive:
+@@ -2536,6 +2890,25 @@
+         finally:
+             if gate is not None:
+                 gate.release()
++        if getattr(agent, "_arc2_b", False) and (finished or done_now()) and not self._frozen:
++            # E15B #50 / #7 / #54: the attempt is over (budget, deadline or failures). Within a short grace after the
++            # deadline (E12_B_FINAL_GRACE_SEC; the scheduler's join grace is longer), (1) harvest code written only in the
++            # text, (2) run the best partial program on the test inputs (the attempt_2 tier of select_attempts_r5)
++            agent._arc2_verify_grace = float(_env_int("E12_B_FINAL_GRACE_SEC", 30))
++            try:
++                if agent.arc2_b_events.get("reasoning_harvest") is None and agent.arc2_accepted is None:
++                    try:
++                        agent.arc2_b_events["reasoning_harvest"] = agent.arc2_b_reasoning_harvest(self.state_path)
++                    except Exception as exc:
++                        agent.arc2_b_events["reasoning_harvest"] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
++                if agent.arc2_b_events.get("partial_test") is None:
++                    try:
++                        agent.arc2_b_events["partial_test"] = agent.arc2_b_partial_test()
++                    except Exception as exc:
++                        agent.arc2_b_events["partial_test"] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
++            finally:
++                agent._arc2_verify_grace = 0.0
++            agent.arc2_b_events["end_tokens"] = agent.generated_tokens
+         self.status = "done" if (finished or done_now() or not paused["v"]) else "paused"
+         run = {"pause_at": pause_at_tokens, "tokens": agent.generated_tokens - tok0, "sec": round(time.time() - t_run, 1),
+                "status": self.status}
+@@ -2575,6 +2948,10 @@
+                     progress=a.arc2_progress, status=self.status, requests=getattr(a, "arc2_requests", []))
+                 if getattr(a, "_arc2_raw_reasoning_on", False):   # E14-P counters only when the switch is on
+                     st["raw_reasoning"] = a.arc2_raw_reasoning
++                if getattr(a, "_arc2_b", False):                  # E15B per-attempt record (Notes/02 #29)
++                    st["b_events"] = a.arc2_b_events
++                    st["b_budget"] = a._arc2_b_budget
++                    st["b_candidate"] = a.arc2_b_candidate_fields()      # #31
+                 return copy.deepcopy(st)
+             except RuntimeError:          # "changed size during iteration": the agent was mid-update
+                 time.sleep(0.01)
+@@ -2861,6 +3238,19 @@
+             state["holding_since"] = None
+ 
+     def worker():
++        # E15B #18 (code audit M5): a worker never dies silently; an unexpected error is counted and the loop restarts
++        while True:
++            try:
++                return _worker_body()
++            except Exception as exc:
++                with cond:
++                    state["worker_errors"] = state.get("worker_errors", 0) + 1
++                    state["events"].append({"t": round(time.monotonic() - started), "kind": "worker_error",
++                                            "error": f"{type(exc).__name__}: {exc}"[:200]})
++                log.warning("scheduler worker error (restarting): %s", exc)
++                time.sleep(1.0)
++
++    def _worker_body():
+         while True:
+             with cond:
+                 while True:
+@@ -2942,7 +3332,10 @@
+                 if s.record["runs"] and not s._frozen:
+                     s.record["runs"][-1]["new_for_task"] = len(sigs - seen)
+                 seen |= sigs
+-            publish(s.write())
++            try:
++                publish(s.write())
++            except Exception as exc:          # E15B #18: the running count below must always be released
++                log.warning("%s b%d: publish failed: %s", tid, b, exc)
+             with cond:
+                 state["running"] -= 1
+                 active.discard((tid, b))
+@@ -2980,6 +3373,7 @@
+                       stage1_left=state["stage1_left"], heap_left=len(heap), shares=state["shares"][-200:],
+                       p90_skipped=state["p90_skipped"], stage2_p90_cutoff=bool(stage2_p90_cutoff),
+                       stragglers=state.get("stragglers", 0),
++                      worker_errors=state.get("worker_errors", 0),   # E15B #18
+                       tasks_exposed=len({t for (t, b), s_ in sessions.items() if b == 0 and s_.agent is not None}),
+                       # H7-7 (GPT rev 6f audit 2, reproduced): "exposed" = a branch-0 session was initialized; coverage
+                       # is claimed on a request really sent (and the report adds the response-based count)
+@@ -2998,4 +3392,8 @@
+ 
+ 
+ SCHED_LAST: dict = {}
++# E15B #15 (Exp 15 Notes/02; code audit H1): set by the notebook's server watchdog while it relaunches a dead SGLang.
++# A branch whose request fails while it is set waits (no failure counted) instead of burning its 10 consecutive failures.
++SERVER_DOWN = threading.Event()
++SERVER_WAITS = {"waits": 0, "sec": 0.0}
+ SERVER_LAST: dict = {}     # G4-15: the latest server gauges (set by the scheduler's probe), read at each request start

@@ -21,9 +21,30 @@ DUCK = E12 / "duck_arc2"
 SRC_NB = Path(r"D:/ARC AGI 2/experiments/Experiment 11 - SGLang 0.5.21 + RedHat INT4 + DFlash2 (planned)/Experiment Notebooks/"
               r"Q27-XHIGH-v1_4_4_E11_06_P1_60K_SGLANG_INT4_DFLASH2_EVAL14.ipynb")
 SRC_SHA = "f0575ff38e85cbfbb6d1da133b5cdf53307a49b42ca9120e13459ceb23e6f28e"   # = the pushed E11-06 EVAL14 commit
-VARIANT = "EVAL30" if "--eval30" in sys.argv else "SMOKE1"
+VARIANT = ("EVAL6R5" if "--eval6r5" in sys.argv else "EVAL30R5" if "--eval30r5" in sys.argv else
+           "EVAL12R5" if "--eval12r5" in sys.argv else
+           "EVAL12R6G4B" if "--eval12r6g4b" in sys.argv else "PARITYR6" if "--parity" in sys.argv else
+           "EVAL12R6" if "--eval12r6" in sys.argv else "EVAL30R6" if "--eval30r6" in sys.argv else
+           "EVAL6" if "--eval6" in sys.argv else "EVAL30" if "--eval30" in sys.argv else "SMOKE1")
+REV6_BUILD = "R6" in VARIANT        # rev 6 (user 2026-10-21: code-first view + coverage scheduler; fix list "Rev 6 gap check")
+REV5_BUILD = VARIANT.endswith("R5") or REV6_BUILD   # rev 5 (E12 weakness analysis + 3 GPT reports, validated 2026-10-21)
+EFFORT = "low" if "--low" in sys.argv else ""   # user 2026-10-21: the same rev 5 notebook with reasoning_effort low
+assert not EFFORT or REV5_BUILD, "--low is only for the rev 5 builds"
+# user 2026-10-21: 12 live = 12 streams (rev 5 --s12); rev 6: 12 (user 2026-10-21, after 10 in the first rev 6 build)
+LIVE = 12 if ("--s12" in sys.argv or REV6_BUILD) else 6
+assert LIVE == 6 or REV5_BUILD, "--s12 is only for the rev 5 builds"
 VLLM = "--vllm" in sys.argv   # E12-V (user 2026-10-19): the same Duck notebook, engine = our best vLLM (S1-60K) as a server
-NAME = f"Q27-XHIGH-E12_DUCK_REPL_{'VLLM' if VLLM else 'SGLANG'}_{VARIANT}.ipynb"
+NAME = (f"Q27-XHIGH-E12_DUCK_REPL_{'VLLM' if VLLM else 'SGLANG'}_{VARIANT}{'_' + EFFORT.upper() if EFFORT else ''}"
+        f"{'_S12' if '--s12' in sys.argv else ''}.ipynb")
+if VARIANT in ("SMOKE1", "EVAL30"):   # rev 4: never overwrite the Kaggle-run SMOKE1 / EVAL30 notebooks (E13 builds on them)
+    NAME = NAME.replace(".ipynb", "_REV4.ipynb")
+elif VARIANT == "EVAL6":               # rev 5: the rev 4 EVAL6 notebook ran on Kaggle (sha 53a66856...): never overwrite it
+    NAME = NAME.replace(".ipynb", "_REBUILD.ipynb")
+# rev 6: notebooks that ran on Kaggle are never overwritten by a rebuild (EVAL12R5_LOW 26fff41e ran and was submitted as
+# ref 57456562; EVAL6R5 f4fed1ac ran). A rebuild of these variants goes to *_REBUILD.ipynb.
+if NAME in ("Q27-XHIGH-E12_DUCK_REPL_SGLANG_EVAL12R5_LOW.ipynb", "Q27-XHIGH-E12_DUCK_REPL_SGLANG_EVAL6R5.ipynb",
+            "Q27-XHIGH-E12_DUCK_REPL_SGLANG_EVAL12R6G4B.ipynb"):   # rev 6e: G4B rev 6d (1bdadd82) ran on Kaggle
+    NAME = NAME.replace(".ipynb", "_REBUILD.ipynb")
 DUCK_COMMIT = "10882e332d883af3e61616df8c8a17d03a328a75"   # da-fr/arc-agi-3-solution (fork of Tufalabs/duck-harness @ 7652836)
 
 
@@ -71,6 +92,50 @@ c1 = once(c1, '    "PROXY56":', '''    # E12 step 3.5: GPU smoke, 1 fast task (2
     "EVAL30":    {"source": "eval", "n_tasks": 30, "time_budget_sec": 4.0 * 3600,
                   "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60, "verify_margin_sec": 1 * 60,
                   "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60},
+    # E12 rev 4 (user 2026-10-20): EVAL6 = 6 tasks that S49/R5/DIRECT solved and E12 EVAL30 did not (accuracy test)
+    "EVAL6":     {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd"],
+                  "time_budget_sec": 125 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 90 * 60},   # audits: the 100k cap is soft; 12 x ~120k = 1.44 M at 368 tok/s = 65 min + prefill
+    # E12 rev 5 (user 2026-10-21): the same 6 tasks with every validated fix (A/B against rev 4 EVAL6: 3/6, 4/8)
+    "EVAL6R5":   {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd"],
+                  "time_budget_sec": 125 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 90 * 60},
+    # E12 rev 5 (user 2026-10-21): EVAL6R5 + 6 informative EVAL30 tasks: 4 Duck rev 1 solved (247ef758 Duck-only on
+    # query 1 and first-exact-wrong; bf45cf4b 9.5k; f931b4a8 38.8k; 65b59efc 67k) + 2 mid ones it missed (9385bd28 and
+    # cbebaa4b, ledger solve rate 0.25). 24 branches / 6 live; 150 min solving, 185 min budget
+    "EVAL12R5":  {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd",
+                                                  "247ef758", "bf45cf4b", "f931b4a8", "65b59efc", "9385bd28", "cbebaa4b"],
+                  "time_budget_sec": 185 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 150 * 60},
+    # E12 rev 5: the E12 EVAL30 tasks (same seed sample) with every fix (A/B against rev 1 EVAL30 7/48 and Poetiq R5 16/48).
+    # Capacity: rev 4 EVAL6 measured about 10.4 min per task at 6 live -> 30 tasks about 5.2 h of solving
+    "EVAL30R5":  {"source": "eval", "n_tasks": 30, "time_budget_sec": 6.0 * 3600, "admit_frac": 0.90, "drain_frac": 0.94,
+                  "hard_margin_sec": 2 * 60, "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 330 * 60},
+    # E12 rev 6 (user 2026-10-21): the EVAL12R5 tasks with rev 6 (A/B: rev 5 xhigh EVAL6R5 5/8, low EVAL12R5 10/19)
+    "EVAL12R6":  {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd",
+                                                  "247ef758", "bf45cf4b", "f931b4a8", "65b59efc", "9385bd28", "cbebaa4b"],
+                  "time_budget_sec": 185 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 150 * 60},
+    "EVAL30R6":  {"source": "eval", "n_tasks": 30, "time_budget_sec": 6.0 * 3600, "admit_frac": 0.90, "drain_frac": 0.94,
+                  "hard_margin_sec": 2 * 60, "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 330 * 60},
+    # gate 4b (user 2026-10-21): the EVAL12R6 tasks at the hidden run's compute share. CELL 6 sets the solve window to
+    # n_tasks x (hidden solve seconds / 240), the hidden solve end taken from RERUN_ALL and the start measured in this run
+    "EVAL12R6G4B": {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd",
+                                                    "247ef758", "bf45cf4b", "f931b4a8", "65b59efc", "9385bd28", "cbebaa4b"],
+                    "time_budget_sec": 80 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                    "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                    "hidden_equiv": True},
+    # R6-X1 (user 2026-10-21): target-only vs DFlash2 parity on 4 tasks (no solving): DFlash2 twice (control), then the
+    # same server without --speculative-*, the same requests at T 0, one at a time, thinking on and off
+    "PARITYR6":  {"source": "eval", "task_list": ["136b0064", "bf45cf4b", "247ef758", "b5ca7ac4"],
+                  "time_budget_sec": 75 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60, "parity": True},
     "PROXY56":''', "profiles")
 c1 += '''
 
@@ -78,8 +143,68 @@ c1 += '''
 # (= dfranzen milestone-2 cell 4): 12,288 output per request, yield at 2,048 generated tokens, preserved thinking,
 # 128 Ki context with drain to 58 Ki. Approved exception to the 60k-per-request floor (thinking accumulates in context).
 E12_BRANCHES = int(os.environ.get("E12_BRANCHES", 2))                 # independent branches per task -> attempt_1/2
-E12_STREAMS = int(os.environ.get("E12_STREAMS", 0))                   # Duck ARC3_MAX_ACTIVE_STREAMS; 0 = engine concurrency
-E12_MAX_GEN_PER_BRANCH = int(os.environ.get("E12_MAX_GEN", 0)) or None   # Duck max_generated_tokens_per_game (milestone: none)
+_E12_REV5 = ''' + str(REV5_BUILD) + '''                                # rev 5 build: every profile (incl. the hidden rerun) runs the fixes
+_E12_REV6 = ''' + str(REV6_BUILD) + '''                                # rev 6 build (user 2026-10-21): code-first view + coverage scheduler
+_E12_REV4 = PROFILE == "EVAL6" or _E12_REV5                            # rev 4 defaults (pre-run capacity check, 2026-10-20)
+E12_STREAMS = int(os.environ.get("E12_STREAMS", ''' + str(LIVE) + ''' if _E12_REV4 else 0))   # Duck ARC3_MAX_ACTIVE_STREAMS; 0 = engine concurrency
+E12_MAX_GEN_PER_BRANCH = int(os.environ.get("E12_MAX_GEN", 100000 if _E12_REV4 else 0)) or None   # Duck max_generated_tokens_per_game
+# rev 4: at most N branches alive (resident contexts <= KV 867k / 128k context = 6; EVAL30: 30 live -> 8.4 M re-prefill),
+# branches of a task start together; and up to 60,000 output per request (EVAL30: 29/30 first requests cut at 12,288)
+E12_LIVE_BRANCHES = int(os.environ.get("E12_LIVE", ''' + str(LIVE) + ''' if _E12_REV4 else 0)) or None   # 6 x 131k = 786k <= KV 867k; S12 (user): 12 x rev 5 context p50 58k = 697k
+# rev 5 B5 (evidence, 2026-10-21): no productive EVAL6 reply exceeded 44,779 tokens; the 7 replies that hit 60,000 made no
+# tool call; at 49,152 the input budget is 81,408 (4 of the 6 real-overflow trims would have fitted). 40k would have cut one.
+E12_DUCK_MAX_OUTPUT = int(os.environ.get("E12_DUCK_MAX_OUTPUT", (12288 if _E12_REV6 else 49152 if _E12_REV5 else 60000)
+                                         if _E12_REV4 else 0)) or None   # rev 6: the first-request cap; later caps are per request
+# rev 5 B9 (user 2026-10-21): Qwen3.8 model-card thinking temperature 1.0 (Duck milestone 0.7)
+E12_DUCK_TEMPERATURE = float(os.environ.get("E12_DUCK_TEMPERATURE", 1.0 if _E12_REV5 else 0)) or None
+E12_REASONING_EFFORT = os.environ.get("E12_REASONING_EFFORT", "''' + EFFORT + '''").strip().lower()   # "" = model default (xhigh)
+if E12_REASONING_EFFORT:   # user 2026-10-21: low-effort variant of rev 5 (Qwen3.8 template: xhigh / medium / low)
+    assert E12_REASONING_EFFORT in ("xhigh", "medium", "low"), E12_REASONING_EFFORT
+    os.environ["E12_REASONING_EFFORT"] = E12_REASONING_EFFORT
+if _E12_REV5:   # B1-B4, B6-B8 in arc2_duck (E12_ARC2_REV5); B3 counts reasoning with the served model's tokenizer
+    os.environ["E12_ARC2_REV5"] = "1"
+    os.environ["E12_TOKENIZER_JSON"] = str(SGL_MODEL_PATH / "tokenizer.json")
+# rev 6 (user 2026-10-21; fix list "Rev 6 gap check", both plan reviews): facts view + trusted helpers + auto-check +
+# state-aware resumes (arc2_duck E12_ARC2_REV6); request caps 12,288 -> 24,576 after the first successful Python call,
+# 32,768 after two no-call cuts (thinking kept in history, branch allowance >= 60k, soft cap 100k); first exposure: branch 0
+# of every task in ORDER2 order, paused at about 28k generated tokens, then stage 2 by evidence (resume / branch 1 with the
+# grid view = the representation hedge); 10 workers, context window sized to the KV pool in CELL 6; per-request deadline.
+E12_R6 = {"E12_R6_CAP_FIRST": 12288, "E12_R6_CAP_PROGRESS": 24576, "E12_R6_CAP_RESCUE": 32768,
+          "E12_R6_FIRST_EXPOSURE": 28000, "E12_R6_B1_VIEW": "indexed", "E12_R6_MIN_ADMIT_SEC": 240,
+          "E12_CHECK_VERIFY_CAP": 24, "E12_AUTOCHECK_CAP": 24, "E12_AUTOCHECK_PER_CALL": 3, "E12_DUCK_DRAIN_TOKENS": 16384,
+          # rev 6c (user 2026-10-21: 12 streams): the per-stream window = 1.0 x KV / 12 (= 73.4k at 881k). 0.9 would give
+          # 66.1k (history 41.5k at the 24,576 cap); D66 ran 12 slots at context 155,648 with KV peak 90 % and 0 preemptions,
+          # rev 6e G4-1 (user 2026-10-21): workers stay 12; no new task or branch while KV usage >= 0.95
+          "E12_R6_FACTS_MAX_CHARS": 3600, "E12_R6_SHOW_MAX_CELLS": 900, "E12_R6_KV_FRACTION": 1.0,
+          "E12_R6_P90_CUTOFF": 0,
+          # rev 6b (gap check vs the problem->fix map): facts <= 800 Qwen tokens (Q-5; 120 eval tasks: full p50 1,237 ->
+          # bounded p50 736 / p90 837 / max 1,396), fair-share stage 2 (R6-S3) with a 24,576-token minimum chunk
+          "E12_R6_FACTS_MAX_TOKENS": 800, "E12_R6_FAIR_SHARE": 1,
+          # rev 6e (user 2026-10-21: "take all", fix list G4-1..G4-18; G4B evidence): KV gate 0.95 polled every 5 s (G4-1);
+          # branch-1 first cap 24,576 (G4-2; G4B b1 first calls at 12.4-18.0k); show() up to 900 cells per grid, 1,000 per
+          # call (G4-4; 30x30 = 2,033 Qwen tokens of the 3,072 tool cap); provisional nudge (G4-6: 27,000 in rev 6e; 24,000 since rev 6f, H6-1; G4B
+          # solved branches defined transform at 18,383 / 26,228); branch-1 indexed view <= 12,000 tokens (G4-11);
+          # minimum stage-2 chunk 12,288 (G4-17: every G4B share 3.8-7.5k was below 24,576); cache diagnostic (G4-8)
+          "E12_R6_KV_ADMIT": 0.95, "E12_R6_KV_POLL": 5.0, "E12_R6_CAP_FIRST_B1": 24576, "E12_R6_SHOW_CALL_CELLS": 1000,
+          "E12_R6_NUDGE_TOKENS": 24000, "E12_R6_B1_GRID_MAX_TOKENS": 12000, "E12_R6_MIN_CHUNK": 12288,
+          "E12_R6_CACHE_DIAG": 1}
+# rev 6f (user 2026-10-22, the H6 set of the three GPT rev 6e audits): the provisional nudge at 24,000 tokens, sent in the
+# next tool result (H6-1: in G4B no branch 0 started a new turn at >= 27k before the 28k pause); the cache diagnostic
+# runs AFTER solving (H6-3); every commit window starts after the preflight (H6-6); one isolation retry (H6-17)
+if _E12_REV6:
+    os.environ["E12_ARC2_REV6"] = "1"
+    for _k, _v in E12_R6.items():
+        E12_R6[_k] = type(_v)(os.environ.get(_k, _v))
+        os.environ[_k] = str(E12_R6[_k])
+# audits (verified): non-streaming read timeout 900 s < a 60k reply at ~61 tok/s per stream (978 s) -> 1,800 s.
+# The 100k per-branch cap is soft (checked after each request). max_tokens 60,000 is a ceiling, not a minimum thinking.
+# The milestone context (131,072, drain 58 Ki) is kept: input budget 70,560, trim target 35,280. Only the last message is protected:
+# a tool-less reply before the resume opener could be dropped (EVAL6: 5 resets; rev 5 B3 counts reasoning correctly).
+E12_DUCK_REQUEST_TIMEOUT = int(os.environ.get("E12_DUCK_REQUEST_TIMEOUT", 1800 if _E12_REV4 else 0)) or None
+for _k, _v in (("E12_DUCK_MAX_OUTPUT", E12_DUCK_MAX_OUTPUT), ("E12_DUCK_REQUEST_TIMEOUT", E12_DUCK_REQUEST_TIMEOUT),
+               ("E12_DUCK_TEMPERATURE", E12_DUCK_TEMPERATURE)):
+    if _v:
+        os.environ[_k] = str(_v)                                         # read by arc2_duck (CELL 3 / CELL 6)
 E12_SOLVE_WINDOW_SEC = P.get("solve_window_sec")                      # SMOKE1 only
 E12_STOP_BEFORE_HARD_SEC = 180   # branches stop; outputs are written after it. rev 3 (GPT re-audit): a submit at the
                                  # deadline can still verify for <= 60 s, then CELL 6/7 write; 60 s left no margin
@@ -89,8 +214,12 @@ E12_MAMBA_TRACK_64 = os.environ.get("E12_MAMBA_TRACK_64", "0") == "1"  # Duck's 
 E12_REQUEST_LOGS = os.environ.get("E12_REQUEST_LOGS", "1" if PROFILE == "SMOKE1" else "0") == "1"
 E12_SANDBOX_MEM_MB = int(os.environ.get("E12_SANDBOX_MEM_MB", 4096))
 CONFIG["e12"] = {k: globals()[k] for k in ("E12_BRANCHES", "E12_STREAMS", "E12_MAX_GEN_PER_BRANCH", "E12_SOLVE_WINDOW_SEC",
+                                           "E12_LIVE_BRANCHES", "E12_DUCK_MAX_OUTPUT", "E12_DUCK_REQUEST_TIMEOUT",
+                                           "E12_DUCK_TEMPERATURE", "_E12_REV5", "E12_REASONING_EFFORT",
                                            "E12_STOP_BEFORE_HARD_SEC", "E12_MAMBA_TRACK_64", "E12_REQUEST_LOGS",
-                                           "E12_SANDBOX_MEM_MB")}
+                                           "E12_SANDBOX_MEM_MB", "_E12_REV6")}
+if _E12_REV6:
+    CONFIG["e12"]["rev6"] = dict(E12_R6)
 CONFIG["e12"]["duck_commit"] = "''' + DUCK_COMMIT + '''"
 print("E12:", json.dumps(CONFIG["e12"]))
 '''
@@ -167,6 +296,9 @@ if E12_SANDBOX_MEM_MB > 0 and not _mem.get("ok"):
         E10_SANDBOX_SELFTEST["error"] = "memory limit not verified (fail closed): " + json.dumps(_mem)[:300]
         print("E12: solver disabled (fail closed); CELL 0 fallback submission stays", flush=True)
 CONFIG["e12"]["sandbox_selftest"] = E10_SANDBOX_SELFTEST
+if _E12_REV5:   # rev 5 R5-4: is B3 counting reasoning with the tokenizer (else a fallback ratio)? recorded, never fatal
+    CONFIG["e12"]["rev5_tokenizer"] = E12A.tokenizer_status()
+    print("E12 rev 5 reasoning tokenizer:", json.dumps(CONFIG["e12"]["rev5_tokenizer"]), flush=True)
 print("E12 package OK:", len(_E12_MANIFEST), "files | sandbox self-test:", json.dumps(E10_SANDBOX_SELFTEST), flush=True)
 '''
 
@@ -525,6 +657,15 @@ if ENGINE_READY and E10_SANDBOX_SELFTEST.get("ok"):
         _end = HARD_STOP - E12_STOP_BEFORE_HARD_SEC
         if E12_SOLVE_WINDOW_SEC:
             _end = min(_end, time.perf_counter() + E12_SOLVE_WINDOW_SEC)
+        if P.get("hidden_equiv"):   # gate 4b (user 2026-10-21): this run gets the hidden run's compute per task
+            _ra = PROFILE_TABLE["RERUN_ALL"]
+            _hid_end = _ra["time_budget_sec"] - _ra["hard_margin_sec"] - E12_STOP_BEFORE_HARD_SEC
+            _start = time.perf_counter() - NOTEBOOK_T0
+            _per, _ = _e12_g4b_window(_hid_end, _start, len(TASK_IDS))          # hidden test = 240 tasks
+            E12_RUN["g4b"] = {"hidden_solve_end_sec": _hid_end, "solve_start_sec": round(_start), "hidden_tasks": 240,
+                              "sec_per_task": round(_per, 1), "tasks": len(TASK_IDS), "window_sec": round(_per * len(TASK_IDS))}
+            _end = min(_end, time.perf_counter() + _per * len(TASK_IDS))
+            print("E12 gate 4b:", json.dumps(E12_RUN["g4b"]), flush=True)
         E12_RUN["deadline_in_sec"] = round(_end - time.perf_counter())
         E12_RUN["started_sec"] = round(time.perf_counter() - NOTEBOOK_T0)
         print("E12 solving:", len(E12_ORDER), "tasks x", E12_BRANCHES, "branches | streams", E12_RUN["streams"],
@@ -533,7 +674,8 @@ if ENGINE_READY and E10_SANDBOX_SELFTEST.get("ok"):
         E12A.solve_all({t: CHALLENGES[t] for t in E12_ORDER}, E12_ORDER, out_dir=E12_OUT,
                        deadline=time.monotonic() + max(0.0, _end - time.perf_counter()), base_url=SGL_URL + "/v1",
                        model_id=E12_RUN["model_id"], branches=E12_BRANCHES, max_generated_tokens=E12_MAX_GEN_PER_BRANCH,
-                       save_request_logs=E12_REQUEST_LOGS, on_branch_done=_e12_branch_done)
+                       save_request_logs=E12_REQUEST_LOGS, on_branch_done=_e12_branch_done,
+                       live_branches=E12_LIVE_BRANCHES)
     except BaseException:
         E12_RUN["error"] = traceback.format_exc()[-3000:]
         print("E12 solver error (submission.json keeps what was written):", E12_RUN["error"], flush=True)
@@ -571,7 +713,11 @@ try:
                              "total_tokens": r.get("total_tokens"), "sec": round((r.get("t1") or 0) - (r.get("t0") or 0), 1),
                              "submissions": len(subs), "train_exact_per_submission": [sum(map(bool, s.get("train_exact") or []))
                                                                                        for s in subs],
-                             "usage": _usage_summary(r.get("usage") or [])})
+                             "usage": _usage_summary(r.get("usage") or []),
+                             # rev 5 metrics (absent before rev 5): harvested check() candidates and event counters
+                             "checked_verified": len(r.get("checked") or []),
+                             "checked_kept": sum(1 for s in (r.get("checked") or []) if s.get("accepted")),
+                             "rev5_events": r.get("rev5_events")})
     _all_u = [x for t in TASK_IDS for r in _recs.get(t, []) for x in (r.get("usage") or [])]
     report = {"run_id": RUN_ID, "profile": PROFILE, "rerun": RERUN, "configuration": CONFIG, "engine": ENGINE_INFO,
               "e12_run": E12_RUN, "order": E12_ORDER, "branches": branches, "usage_all": {k: v for k, v in _usage_summary(_all_u).items()
@@ -585,10 +731,14 @@ try:
                 gold = SOLUTIONS[t][qi]; a = att["attempt_1"] == gold; b = att["attempt_2"] == gold
                 hits += a or b; pass1 += a; pass2 += b; total += 1; th += a or b
                 acc = [s for r in _recs.get(t, []) for s in (r.get("submissions") or []) if s.get("accepted")]
+                harv = [s for r in _recs.get(t, []) for s in (r.get("checked") or []) if s.get("accepted")]
                 recs_eval.append({"task": t, "query": qi, "hit": bool(a or b), "pass1": bool(a), "pass2": bool(b),
                                   "accepted_programs": len(acc),
                                   "accepted_programs_correct": sum(1 for s in acc if qi < len(s.get("test_outputs") or [])
-                                                                   and s["test_outputs"][qi] == gold)})
+                                                                   and s["test_outputs"][qi] == gold),
+                                  "harvested_programs": len(harv),
+                                  "harvested_programs_correct": sum(1 for s in harv if qi < len(s.get("test_outputs") or [])
+                                                                    and s["test_outputs"][qi] == gold)})
             task_norm += th / max(1, len(_gen[t]))
         report.update(eval_query_hits=hits, eval_query_total=total, eval_pass1_hits=pass1, eval_pass2_hits=pass2,
                       eval_task_norm_pct=round(100 * task_norm / max(1, len(TASK_IDS)), 2), eval_unit_records=recs_eval)
@@ -598,6 +748,19 @@ try:
                          "server_log": str(E11_SERVER.log_path) if E11_SERVER is not None else None}
     except Exception as _e11e:
         report["e11"] = {"error": repr(_e11e)[:300]}
+    if _E12_REV6 and isinstance(report.get("rev6"), dict):      # rev 6g H7-12 (GPT rev 6f audit 2): per GPU-hour
+        try:
+            _gh = 4 * max(1, (E12_RUN.get("finished_sec") or 0) - (E12_RUN.get("started_sec") or 0)) / 3600.0
+            _solved = len({u["task"] for u in (report.get("eval_unit_records") or [])}
+                          - {u["task"] for u in (report.get("eval_unit_records") or []) if not u.get("hit")})
+            _yt = (((report["rev6"].get("metrics") or {}).get("verified_yield") or {}).get("all") or {}).get("new_for_task")
+            report["rev6"]["per_gpu_hour"] = {
+                "gpu_hours": round(_gh, 3),
+                "correct_inputs": round(report["eval_query_hits"] / _gh, 3) if report.get("eval_query_hits") is not None else None,
+                "tasks_solved": round(_solved / _gh, 3) if report.get("eval_unit_records") else None,
+                "new_for_task_predictions": round(_yt / _gh, 3) if _yt is not None else None}
+        except Exception as _e:
+            report["rev6"]["per_gpu_hour"] = {"error": repr(_e)[:200]}
     write_json_atomic(OUT / "e12_run_report.json", report)
     print("E12 RUN REPORT:", OUT / "e12_run_report.json", "| eval", report.get("eval_query_hits"), "/", report.get("eval_query_total"),
           "| task-norm", report.get("eval_task_norm_pct"), "| accepted branches", E12_RUN["branches_accepted"],
@@ -650,13 +813,619 @@ if VLLM:
                                           if x.get("prompt") and x.get("cached") is not None else None''',
                  "vllm cache per request")
 
+if REV6_BUILD:
+    # rev 6 CELL 6 (applied to R6 builds only, so the rev 5 notebooks stay byte-identical): KV-sized context window,
+    # a serving preflight (R6-X1), the session scheduler (R6-S1..S6) and per-(task, branch) record replacement.
+    c_solve = once(c_solve, """def _e12_branch_done(rec):""", """def _e12_branch_done_r6(rec):   # rev 6: a branch reports every pause and its finish; keep the latest per branch
+    with _E12_LOCK:
+        rows = E12_RECORDS.setdefault(rec["task_id"], [])
+        # rev 6g H7-1 (GPT rev 6f audits): callbacks can finish out of order; never let an older record replace a newer one
+        _old = next((r for r in rows if r.get("branch") == rec.get("branch")), None)
+        if _old is not None and int(rec.get("publish_seq") or 0) <= int(_old.get("publish_seq") or 0):
+            E12_RUN["stale_callbacks_dropped"] = E12_RUN.get("stale_callbacks_dropped", 0) + 1
+            return
+        new = rec.get("branch") not in {r.get("branch") for r in rows}
+        rows[:] = [r for r in rows if r.get("branch") != rec.get("branch")] + [rec]
+        E12_RUN["branches_started"] = E12_RUN.get("branches_started", 0) + int(new)
+        E12_RUN["branches_done"] = sum(1 for v in E12_RECORDS.values() for r in v if r.get("status") == "done")
+        E12_RUN["branches_accepted"] = sum(1 for v in E12_RECORDS.values() for r in v if r.get("accepted"))
+    try:
+        e12_write_submission()
+    except Exception as _e:
+        print("E12 submission write failed:", repr(_e)[:200], flush=True)
+
+
+def _e12_g4b_window(hidden_solve_end_sec, solve_start_sec, n_tasks, hidden_tasks=240):
+    # gate 4b (user 2026-10-21): this run gets the hidden run's compute per task. H6-16: a function so the real
+    # values (42,720 / 1,463 / 12 -> 2,063 s) are unit-tested, not only under the harness's 300 s cap
+    per = max(0.0, float(hidden_solve_end_sec) - float(solve_start_sec)) / float(hidden_tasks)
+    return per, per * int(n_tasks)
+
+
+def _e12_shifted_end(end, setup_sec, hard_end):
+    # SA-1 / H6-6: a commit window starts after the preflight (and nothing else runs before solving since H6-3); the end
+    # moves by the setup time, never past the hard stop
+    return min(float(hard_end), float(end) + max(0.0, float(setup_sec)))
+
+
+def _e12_capacity_probe():   # rev 6e G4-1: exact names; the max over TP ranks; never sglang:token_usage (max of pools)
+    try:
+        rows = [r for r in e11_prom() if getattr(r, "value", None) is not None]
+    except Exception:
+        rows = []
+    pick = lambda name: [float(r.value) for r in rows if r.name == name]
+    out = {}
+    for key, name in (("kv_usage", "sglang:full_token_usage"), ("mamba_usage", "sglang:mamba_usage"),
+                      ("running", "sglang:num_running_reqs"), ("queue", "sglang:num_queue_reqs")):
+        v = pick(name)
+        out[key] = max(v) if v else None
+    return out
+
+
+def _e12_cache_diag(budget_sec=240.0):
+    # rev 6e G4-8 (GPT G4B audits): a bounded exact-prompt replay for the prefix-cache misses (G4B: 20/180 requests with
+    # 0 cached tokens while KV <= 0.44; suspects SGLang #22935 split 0-hit and #36935 mamba checkpoint eviction).
+    # Prompt A (about 9k tokens) warm -> exact replay -> two divergent suffixes -> 12 distinct long prompts at once
+    # (churn) -> replay and a divergent suffix again. max_tokens 1, thinking off. Commit mode only.
+    import random as _rnd, concurrent.futures as _cf
+    t_end = time.monotonic() + float(budget_sec)
+
+    def _blob(seed, rows=150):
+        r = _rnd.Random(seed)
+        return "\\n".join(" ".join(str(r.randrange(10)) for _ in range(30)) for _ in range(rows))
+
+    def _ask(msgs):
+        body = {"model": E12_RUN["model_id"], "max_tokens": 1, "temperature": 0.0, "messages": msgs,
+                "chat_template_kwargs": {"enable_thinking": False}}
+        t0 = time.monotonic()
+        req = _urlreq.Request(SGL_URL + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
+                              headers={"Content-Type": "application/json"})
+        r = json.loads(_urlreq.urlopen(req, timeout=max(5.0, t_end - time.monotonic())).read())
+        u = r.get("usage") or {}
+        det = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
+        return {"prompt": u.get("prompt_tokens"), "cached": int(det.get("cached_tokens") or 0),
+                "cached_reported": "cached_tokens" in det, "sec": round(time.monotonic() - t0, 2)}
+
+    A = {"role": "system", "content": "E12-CACHE-DIAG reference A\\n" + _blob(1)}
+    q = lambda text: {"role": "user", "content": text}
+    steps = []
+
+    def step(name, msgs):
+        if time.monotonic() > t_end - 5:
+            steps.append({"step": name, "skipped": "budget"})
+            return
+        try:
+            res = _ask(msgs)
+        except Exception as _e:
+            res = {"error": repr(_e)[:200]}
+        res["step"] = name
+        res.update({"g_" + k: v for k, v in _e12_capacity_probe().items()})
+        steps.append(res)
+    step("warm", [A, q("Reply with one word.")])
+    step("replay_exact", [A, q("Reply with one word.")])
+    step("divergent_1", [A, q("Divergent continuation one. Reply with one word.")])
+    step("divergent_2", [A, q("Divergent continuation two. Reply with one word.")])
+    if time.monotonic() < t_end - 30:
+        churn = [[{"role": "system", "content": f"E12-CACHE-DIAG churn {i}\\n" + _blob(100 + i)}, q("Reply with one word.")]
+                 for i in range(max(1, int(E12_RUN.get("streams") or 12)))]
+
+        def _safe(m):
+            try:
+                return _ask(m)
+            except Exception as _e:
+                return {"error": repr(_e)[:120]}
+        with _cf.ThreadPoolExecutor(len(churn)) as _ex:
+            cr = list(_ex.map(_safe, churn))
+        steps.append({"step": "churn", "n": len(cr), "errors": sum(1 for x in cr if "error" in x),
+                      "prompt_sum": sum(int(x.get("prompt") or 0) for x in cr),
+                      "sec_max": max((x.get("sec") or 0) for x in cr),
+                      **{"g_" + k: v for k, v in _e12_capacity_probe().items()}})
+    step("replay_after_churn", [A, q("Reply with one word.")])
+    step("divergent_after_churn", [A, q("Divergent continuation three. Reply with one word.")])
+    by = {x["step"]: x for x in steps if "prompt" in x}
+    pa = (by.get("warm") or {}).get("prompt")
+    out = {"budget_sec": budget_sec, "prompt_tokens_A": pa, "steps": steps,
+           "summary": {k: (by[k]["cached"], by[k]["prompt"]) for k in ("warm", "replay_exact", "divergent_1", "divergent_2",
+                                                                         "replay_after_churn", "divergent_after_churn")
+                       if k in by}}
+    print("E12 cache diag (cached, prompt):", json.dumps(out["summary"]), flush=True)
+    return out
+
+
+def _e12_no_spec(cmd):   # the same server command without --speculative-* (each takes one value)
+    out, skip = [], False
+    for x in cmd:
+        if skip:
+            skip = False
+            continue
+        if str(x).startswith("--speculative-"):
+            skip = True
+            continue
+        out.append(x)
+    return out
+
+
+def _e12_parity():
+    # R6-X1 target-only parity (user 2026-10-21): the rev 6 system prompt + first opener of each task, with tools, T 0,
+    # one request at a time, max_tokens 2,048, thinking on and off. DFlash2 twice (control), then a relaunch without
+    # speculative decoding. Judged on equality and on what Duck acts on (tool-call presence and arguments, finish).
+    global E11_SERVER
+    TA, _, _, wrs = E12A._import_duck()
+    Agent = E12A.make_agent_class()
+    probes = []
+    for tid in TASK_IDS:
+        ag = Agent(task=CHALLENGES[tid], task_id=tid, branch=0, view="facts", model=E12_RUN["model_id"],
+                   base_url=SGL_URL + "/v1", provider="vllm")
+        d = E12_OUT / f"parity_{tid}"
+        d.mkdir(parents=True, exist_ok=True)
+        sp = d / TA.RUNTIME_STATE_FILENAME
+        wrs(sp, current_frame=None, history=[])
+        for think in (True, False):
+            probes.append((tid, think, {"model": E12_RUN["model_id"], "max_tokens": 2048, "temperature": 0.0, "top_p": 1.0,
+                                        "messages": [{"role": "system", "content": ag._system_prompt},
+                                                     {"role": "user", "content": E12A.R6_TEXT["first"] + E12A.R6_COMPLETE}],
+                                        "tools": ag._tools(sp), "tool_choice": "auto",
+                                        "chat_template_kwargs": {"preserve_thinking": True, "enable_thinking": think}}))
+
+    def _ask(body):
+        req = _urlreq.Request(SGL_URL + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
+                              headers={"Content-Type": "application/json"})
+        r = json.loads(_urlreq.urlopen(req, timeout=900).read())
+        m = r["choices"][0]["message"]
+        return {"reasoning": str(m.get("reasoning_content") or ""), "content": str(m.get("content") or ""),
+                "calls": [str((tc.get("function") or {}).get("arguments", "")) for tc in (m.get("tool_calls") or [])],
+                "finish": r["choices"][0].get("finish_reason"), "tokens": (r.get("usage") or {}).get("completion_tokens")}
+
+    def _round(tag):
+        rows = []
+        for tid, think, body in probes:
+            try:
+                rows.append(_ask(body))
+            except Exception as _e:
+                rows.append({"error": repr(_e)[:300]})
+        (E12_OUT / f"parity_{tag}.json").write_text(json.dumps(rows), encoding="utf-8")
+        return rows
+    out = {"probes": [{"task": t, "thinking": k} for t, k, _ in probes]}
+    a, b = _round("dflash_a"), _round("dflash_b")
+    try:
+        cmd, env = list(E11_SERVER.cmd), E11_SERVER.env
+        e11_kill_server(wait=True)
+        srv = E11Server(_e12_no_spec(cmd), env, "target_only")
+        srv.start()
+        ok, why = srv.wait_ready(min(SGL_RELAUNCH_TIMEOUT_SEC, max(60, HARD_STOP - time.perf_counter() - 600)))
+        E11_SERVER = srv
+        out["target_only_launch"] = {"ok": ok, "why": why, "spec_flags_removed": [x for x in cmd if str(x).startswith("--speculative-")]}
+        t = _round("target_only") if ok else [{"error": "target-only launch failed"} for _ in probes]
+    except Exception as _e:
+        out["target_only_launch"] = {"ok": False, "why": repr(_e)[:300]}
+        t = [{"error": "target-only launch failed"} for _ in probes]
+
+    def _pre(x, y):
+        n = 0
+        for c1, c2 in zip(x, y):
+            if c1 != c2:
+                break
+            n += 1
+        return n
+    cmp_ = []
+    for (tid, think, _), ra, rb, rt in zip(probes, a, b, t):
+        row = {"task": tid, "thinking": think}
+        if "error" not in ra and "error" not in rb:
+            row["control_identical"] = ra == rb
+        if "error" not in ra and "error" not in rt:
+            ta, tt = ra["reasoning"] + ra["content"], rt["reasoning"] + rt["content"]
+            row.update(target_identical=ra == rt, common_prefix_chars=_pre(ta, tt), dflash_chars=len(ta), target_chars=len(tt),
+                       same_tool_call_presence=bool(ra["calls"]) == bool(rt["calls"]), same_tool_args=ra["calls"] == rt["calls"],
+                       same_finish=ra["finish"] == rt["finish"], dflash_tokens=ra["tokens"], target_tokens=rt["tokens"])
+        cmp_.append(row)
+    out["compare"] = cmp_
+    ok_rows = [r for r in cmp_ if "target_identical" in r]
+    out["summary"] = {"probes": len(cmp_), "control_identical": sum(1 for r in cmp_ if r.get("control_identical")),
+                      "target_identical": sum(1 for r in ok_rows if r["target_identical"]),
+                      "same_tool_call_presence": sum(1 for r in ok_rows if r["same_tool_call_presence"]),
+                      "same_finish": sum(1 for r in ok_rows if r["same_finish"]), "compared": len(ok_rows)}
+    print("E12 parity:", json.dumps(out["summary"]), flush=True)
+    return out
+
+
+def _e12_r6_preflight(n):
+    # R6-X1 (bounded, inside this session): the drafter's tap-layer config (SGLang #37475) and an isolation smoke for
+    # #36548 (n concurrent requests with distinct markers; a marker in another request's reply = contamination).
+    out = {}
+    try:
+        _cfg = json.loads((SGL_DRAFT_PATH / "config.json").read_text(encoding="utf-8"))
+        _flat = dict(_cfg)
+        for _v in list(_cfg.values()):
+            if isinstance(_v, dict):
+                _flat.update(_v)
+        out["drafter_target_layer_config"] = {k: v for k, v in _flat.items() if "layer" in k.lower()
+                                              and ("target" in k.lower() or "tap" in k.lower())}
+    except Exception as _e:
+        out["drafter_config_error"] = repr(_e)[:200]
+    try:
+        import concurrent.futures as _cf, random as _rnd
+        marks = ["ZQ" + str(_rnd.randrange(10 ** 6, 10 ** 7)) + "K" + str(i) for i in range(n)]
+
+        def _one(m):
+            body = {"model": E12_RUN["model_id"], "max_tokens": 24, "temperature": 0.0,
+                    "messages": [{"role": "user", "content": "Reply with exactly this code and nothing else: " + m}],
+                    "chat_template_kwargs": {"enable_thinking": False}}
+            req = _urlreq.Request(SGL_URL + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                  headers={"Content-Type": "application/json"})
+            r = json.loads(_urlreq.urlopen(req, timeout=180).read())
+            return str(r["choices"][0]["message"].get("content") or "")
+        with _cf.ThreadPoolExecutor(n) as _ex:
+            replies = list(_ex.map(_one, marks))
+        out.update(E12A.isolation_verdict(marks, replies))     # C6-2: PASS / FAIL / INCONCLUSIVE
+    except Exception as _e:
+        out.update(isolation_error=repr(_e)[:300], isolation_state="INCONCLUSIVE", isolation_ok=None)
+    try:   # R6-X1 parity CONTROL: the same request twice at T 0, one at a time; equal replies = a deterministic baseline.
+        # A target-only (no DFlash) comparison needs a separate server launch and is never run beside production.
+        pc = []
+        for _m in ("PARITY-A-" + str(n), "PARITY-B-" + str(n)):
+            _a, _b = _one(_m), _one(_m)
+            pc.append({"same": _a == _b, "own_marker": _m in _a})
+        out["parity_control"] = {"pairs": len(pc), "identical": sum(x["same"] for x in pc),
+                                 "own_marker": sum(x["own_marker"] for x in pc),
+                                 "note": "same config, batch size 1, T 0; target-only parity = separate launch (not run)"}
+    except Exception as _e:
+        out["parity_control"] = {"error": repr(_e)[:300]}
+    print("E12 rev 6 preflight:", json.dumps(out)[:800], flush=True)
+    return out
+
+
+def _e12_branch_done(rec):""", "r6 callbacks")
+    c_solve = once(c_solve, """        threading.Thread(target=_e12_heartbeat, daemon=True).start()
+        E12A.solve_all({t: CHALLENGES[t] for t in E12_ORDER}, E12_ORDER, out_dir=E12_OUT,
+                       deadline=time.monotonic() + max(0.0, _end - time.perf_counter()), base_url=SGL_URL + "/v1",
+                       model_id=E12_RUN["model_id"], branches=E12_BRANCHES, max_generated_tokens=E12_MAX_GEN_PER_BRANCH,
+                       save_request_logs=E12_REQUEST_LOGS, on_branch_done=_e12_branch_done,
+                       live_branches=E12_LIVE_BRANCHES)""", """        threading.Thread(target=_e12_heartbeat, daemon=True).start()
+        # rev 6 R6-S5 (GPT plan review 2): per-stream allowance = 90 % of the KV pool / streams, so 10 resident histories
+        # plus their reply reserve fit; the reserve itself follows each request's cap (R6-D1)
+        _kv = int(ENGINE_INFO.get("kv_tokens") or 866744)
+        E12_RUN["rev6_kv_tokens"] = _kv
+        E12_RUN["rev6_window"] = min(131072, int(E12_R6["E12_R6_KV_FRACTION"] * _kv / max(1, E12_RUN["streams"])))
+        os.environ["E12_DUCK_CONTEXT_WINDOW"] = str(E12_RUN["rev6_window"])
+        E12_RUN["rev6_preflight"] = _e12_r6_preflight(E12_RUN["streams"])
+        if E12_RUN["rev6_preflight"].get("isolation_state") == "INCONCLUSIVE":
+            # H6-17 (GPT rev 6e audit 3; user 2026-10-22): a missing marker without a leak is retried once before the
+            # 6-stream fail-safe; a FAIL never is
+            _first = E12_RUN["rev6_preflight"]
+            E12_RUN["rev6_preflight"] = _e12_r6_preflight(E12_RUN["streams"])
+            E12_RUN["rev6_preflight"]["retry_of"] = {k: _first.get(k) for k in ("isolation_state", "isolation_own_marker",
+                                                                                  "isolation_leaks")}
+        # C6-2 (rev 6c audits): full concurrency only on an isolation PASS; FAIL / INCONCLUSIVE / error -> 6 streams
+        _workers = E12A.workers_for_isolation(E12_RUN["rev6_preflight"].get("isolation_ok"), E12_RUN["streams"])
+        if E12_RUN["rev6_preflight"].get("isolation_state") != "PASS":
+            print("E12 rev 6 WARNING: isolation preflight", E12_RUN["rev6_preflight"].get("isolation_state"),
+                  "-> workers", _workers, flush=True)
+        E12_RUN["rev6_workers"] = _workers
+        print("E12 rev 6: window", E12_RUN["rev6_window"], "| workers", _workers, "| first exposure",
+              E12_R6["E12_R6_FIRST_EXPOSURE"], "| branch 1 view", E12_R6["E12_R6_B1_VIEW"], flush=True)
+        if not RERUN and (E12_SOLVE_WINDOW_SEC or (P.get("hidden_equiv") and E12_RUN.get("g4b"))):
+            # SA-1 + H6-6 (GPT rev 6e audit 2): every commit window (gate 4b and the plain solve window) starts after the
+            # preflight, bounded by the hard stop; the per-task compute of gate 4b stays the hidden run's. The hidden
+            # rerun keeps its absolute end (no window). H6-3: nothing else runs before solving
+            _shift = (time.perf_counter() - NOTEBOOK_T0) - E12_RUN["started_sec"]     # started_sec: set when _end was fixed
+            _end = _e12_shifted_end(_end, _shift, HARD_STOP - E12_STOP_BEFORE_HARD_SEC)
+            E12_RUN["window_shift"] = {"shift_sec": round(_shift, 1),
+                                       "window_start_sec": round(time.perf_counter() - NOTEBOOK_T0)}
+            if E12_RUN.get("g4b"):
+                E12_RUN["g4b"].update(window_start_sec=E12_RUN["window_shift"]["window_start_sec"], shift_sec=round(_shift, 1))
+            E12_RUN["deadline_in_sec"] = round(_end - time.perf_counter())
+            print("E12: the solve window starts after the preflight (shift", round(_shift, 1), "s), stops in",
+                  E12_RUN["deadline_in_sec"], "s", flush=True)
+        if P.get("parity"):          # R6-X1 diagnostic profile: no solving (the fallback submission stays)
+            E12_RUN["parity"] = _e12_parity()
+        else:
+          E12A.solve_all_r6({t: CHALLENGES[t] for t in E12_ORDER}, E12_ORDER, out_dir=E12_OUT,
+                          deadline=time.monotonic() + max(0.0, _end - time.perf_counter()), base_url=SGL_URL + "/v1",
+                          model_id=E12_RUN["model_id"], branches=E12_BRANCHES, max_generated_tokens=E12_MAX_GEN_PER_BRANCH,
+                          save_request_logs=E12_REQUEST_LOGS, on_branch_done=_e12_branch_done_r6, workers=_workers,
+                          first_exposure_tokens=E12_R6["E12_R6_FIRST_EXPOSURE"] or None, b1_view=E12_R6["E12_R6_B1_VIEW"],
+                          min_admit_sec=E12_R6["E12_R6_MIN_ADMIT_SEC"], capacity_probe=_e12_capacity_probe,
+                          kv_admit_limit=E12_R6["E12_R6_KV_ADMIT"], kv_poll_sec=E12_R6["E12_R6_KV_POLL"],
+                          min_chunk_tokens=E12_R6["E12_R6_MIN_CHUNK"],
+                          fair_share=bool(E12_R6["E12_R6_FAIR_SHARE"]),
+                          stage2_p90_cutoff=bool(E12_R6["E12_R6_P90_CUTOFF"]))
+        E12_RUN["rev6_scheduler"] = dict(E12A.SCHED_LAST)
+        # H6-3 (GPT rev 6e audits): the cache diagnostic runs AFTER solving, so the solver starts from the same server
+        # state as the hidden rerun (which never runs it). Its time comes from what is left before the output margin;
+        # the solve deadline never moves for it. Skipped when under 90 s are left
+        if not RERUN and not P.get("parity") and E12_R6.get("E12_R6_CACHE_DIAG"):
+            _left = HARD_STOP - E12_STOP_BEFORE_HARD_SEC - time.perf_counter() - 30
+            if (E12_RUN.get("rev6_scheduler") or {}).get("stragglers"):      # rev 6g H7-4
+                E12_RUN["cache_diag"] = {"skipped": "a solver straggler may still be sending requests"}
+            elif _left >= 90:
+                try:
+                    E12_RUN["cache_diag"] = _e12_cache_diag(budget_sec=min(240.0, _left))
+                    E12_RUN["cache_diag"]["ran"] = "after solving"
+                except Exception as _e:
+                    E12_RUN["cache_diag"] = {"error": repr(_e)[:300]}
+            else:
+                E12_RUN["cache_diag"] = {"skipped": "less than 90 s before the output margin", "left_sec": round(_left)}""", "r6 solve call")
+    # CELL 7: rev 6 metrics (R6-M1 report contract)
+    c_rep = once(c_rep, """                             "rev5_events": r.get("rev5_events")})""", """                             "rev5_events": r.get("rev5_events"),
+                             # rev 6 (absent before rev 6)
+                             "view": r.get("view"), "status": r.get("status"), "runs": r.get("runs"),
+                             "progress_best": (r.get("progress") or {}).get("best"), "rev6_events": r.get("rev6_events"),
+                             "stage2_class": r.get("stage2_class"),
+                             "overfit_flags": sorted({f for v in (r.get("checked") or []) + (r.get("submissions") or [])
+                                                      if v.get("accepted") for f in (v.get("overfit_flags") or [])})})""",
+                 "r6 branch fields")
+    c_rep = once(c_rep, """    if SOLUTIONS is not None:
+        hits = pass1 = pass2 = total = 0""", """    def _r6_metrics(rows):   # R6-M1: one report contract (censored first-check = the branch total)
+        import statistics as _st
+        med = lambda v: _st.median(v) if v else None
+        ev = [r.get("rev6_events") or {} for r in rows]
+        tot = lambda k: sum(int(e.get(k) or 0) for e in ev)
+        ft = [e.get("first_tool_tokens") for e in ev if e.get("first_tool_tokens") is not None]
+        fc = [(e.get("first_check_tokens") if e.get("first_check_tokens") is not None else r.get("generated_tokens") or 0)
+              for e, r in zip(ev, rows)]
+        hist = lambda k: {kk: sum(int((e.get(k) or {}).get(kk, 0)) for e in ev)
+                          for kk in sorted({x for e in ev for x in (e.get(k) or {})})}
+        vs = sorted(x for e in ev for x in (e.get("verify_sec") or []))
+        b0 = [r for r in rows if r.get("branch") == 0]
+        return {"branches": len(rows),
+                "tasks_exposed": len({r.get("task") for r in b0 if (r.get("generated_tokens") or 0) > 0}),
+                "tasks_meaningful": len({r.get("task") for r in rows
+                                         if (r.get("rev6_events") or {}).get("first_tool_tokens") is not None}),
+                "first_tool_tokens_median": med(ft), "first_check_tokens_median_censored": med(fc),
+                # G4-13 (GPT G4B audit 1 M1-B): the observed median is over checked branches only (selection bias)
+                "first_check_tokens_median_observed": med([e["first_check_tokens"] for e in ev
+                                                           if e.get("first_check_tokens") is not None]),
+                "first_check_tokens_median_observed_b0": med([e["first_check_tokens"] for e, r in zip(ev, rows)
+                                                              if e.get("first_check_tokens") is not None and r.get("branch") == 0]),
+                "checked_branches": sum(1 for e in ev if e.get("first_check_tokens") is not None),
+                "never_checked": sum(1 for e in ev if e.get("first_check_tokens") is None),
+                "autocheck_calls": tot("autocheck_calls"), "autocheck_functions": tot("autocheck_functions"),
+                "grid_rows_suppressed": tot("grid_rows_suppressed"), "length_cut_no_call": tot("length_cut_no_call"),
+                "nudges_replaced": tot("nudges_replaced"), "timeouts_clamped": tot("timeouts_clamped"),
+                "verify_skipped_deadline": tot("verify_skipped_deadline"),
+                "accepted_duplicate_outputs": tot("accepted_duplicate_outputs"),
+                "resumes": hist("resumes"), "caps": hist("caps"),
+                "verify_sec_p50": vs[len(vs) // 2] if vs else None, "verify_sec_p90": vs[int(len(vs) * 0.9)] if vs else None,
+                "status": {s: sum(1 for r in rows if r.get("status") == s) for s in ("paused", "done", "new")},
+                **_r6_metrics_more([dict(r, task=t) for t in TASK_IDS for r in _recs.get(t, [])])}
+
+    def _r6_metrics_more(rows):   # rev 6b additions (fix-list R6-M1; raw branch records; label-free, no truth)
+        ev = [r.get("rev6_events") or {} for r in rows]
+        q = lambda v, f: sorted(v)[min(len(v) - 1, int(f * len(v)))] if v else None
+        tot = lambda k: sum(int(e.get(k) or 0) for e in ev)
+        rc = tot("reasoning_chars")
+        ft = [e.get("facts_tokens") for e in ev if e.get("facts_tokens") is not None]
+        acc = [(r, v) for r in rows for v in (r.get("checked") or []) + (r.get("submissions") or []) if v.get("accepted")]
+        # G4-7 / G4-13 (GPT G4B audits): a check() and a submit() of one program are 2 events, 1 program
+        uniq, preds, progs = {}, {}, {}
+        for r, v in acc:
+            uniq.setdefault((r.get("task"), r.get("branch"), v.get("name"), json.dumps(v.get("test_outputs"))), v)
+            preds.setdefault(r.get("task"), set()).add(json.dumps(v.get("test_outputs")))
+            # H6-9 (GPT rev 6e audits 2/3): a program = its source + retained dependencies (src_key), across branches
+            progs.setdefault(r.get("task"), set()).add(v.get("src_key") or (r.get("branch"), v.get("name"),
+                                                                             json.dumps(v.get("test_outputs"))))
+        flags = {}
+        for v in uniq.values():
+            for f in v.get("overfit_flags") or []:
+                flags[f] = flags.get(f, 0) + 1
+        by_task = {}
+        for r, v in acc:
+            by_task.setdefault(r.get("task"), {}).setdefault(r.get("branch"), set()).add(json.dumps(v.get("test_outputs")))
+        both = [t for t, d in by_task.items() if len(d) >= 2]
+        agree = sum(1 for t in both if set.intersection(*by_task[t].values()))
+        b1 = {}
+        for r in rows:
+            if r.get("branch") == 1 and r.get("stage2_class") is not None:
+                own = by_task.get(r.get("task"), {})
+                new = len(own.get(1, set()) - own.get(0, set()))
+                c = b1.setdefault(str(r["stage2_class"]), {"branches": 0, "new_distinct_verified": 0, "tokens": 0})
+                c["branches"] += 1
+                c["new_distinct_verified"] += new
+                c["tokens"] += int(r.get("generated_tokens") or 0)
+        runs = [x for r in rows for x in (r.get("runs") or [])]
+        osh = [x["overshoot"] for x in runs if "overshoot" in x]
+        rp = [x["first_uncached"] for x in runs if x.get("stage") == 2 and "first_uncached" in x]
+        pe = [a / b for r in rows for a, b in ((r.get("rev5_events") or {}).get("prompt_estimates") or []) if b]
+        us = [u for r in rows for u in (r.get("usage") or [])]
+        try:
+            dec = e11_decode_summary() or {}
+        except Exception:
+            dec = {}
+        rh = dec.get("running_hist") or {}
+        return {"facts_tokens_p50": q(ft, .5), "facts_tokens_p90": q(ft, .9), "facts_tokens_max": max(ft) if ft else None,
+                "hand_reading_grid_row_share": round(tot("reasoning_grid_row_chars") / rc, 4) if rc else None,
+                "reasoning_digit_share": round(tot("reasoning_digit_chars") / rc, 4) if rc else None,
+                "reasoning_repeat_share": round(tot("reasoning_repeat_chars") / rc, 4) if rc else None,
+                "tool_calls": tot("tool_calls"), "redefinition_share": round(tot("redefinitions") / max(1, tot("tool_calls")), 4),
+                "infra_errors": tot("infra_errors"), "trim_reasoning_only_blocks": tot("trim_reasoning_only_blocks"),
+                "facts_over_target": sum(1 for e in ev if e.get("facts_over_target")),
+                "accepted_events": len(acc), "accepted_candidates": len(uniq), "unique_verified_programs": len(uniq),
+                # H7-5: the field above is keyed (task, branch, name, outputs), i.e. name / output candidates; the program
+                # count by source + dependencies is verified_programs_by_source
+                "unique_name_output_candidates": len(uniq),
+                "distinct_test_predictions": sum(len(v) for v in preds.values()),
+                # H6-9: the old field counted distinct predictions; both are reported now
+                "verified_programs_by_source": sum(len(v) for v in progs.values()),
+                "verified_programs_per_task": {t: len(v) for t, v in sorted(progs.items())},
+                "distinct_predictions_per_task": {t: len(v) for t, v in sorted(preds.items())},
+                "overfit_flags": flags, "overfit_flags_counted_on": "unique programs",
+                "tasks_with_two_branch_candidates": len(both), "tasks_where_branches_agree": agree,
+                "branch1_yield_by_stage2_class": b1,
+                "overshoot_p50": q(osh, .5), "overshoot_max": max(osh) if osh else None,
+                "stage2_resume_uncached_p50": q(rp, .5), "stage2_resume_uncached_p90": q(rp, .9),
+                "prompt_estimate_over_actual_p50": round(q(pe, .5), 3) if pe else None,
+                "uncached_prompt_tokens": sum(int(u.get("prompt") or 0) - int(u.get("cached") or 0) for u in us),
+                "generated_tokens": sum(int(r.get("generated_tokens") or 0) for r in rows),
+                "real_running_max": max((int(k) for k, v in rh.items() if v), default=None) if rh else None,
+                "accept_len_median": dec.get("accept_len_median"),
+                "fair_share_last": ((E12_RUN.get("rev6_scheduler") or {}).get("shares") or [None])[-1],
+                **_r6e_metrics(rows, ev, b1, us)}
+
+    def _r6e_metrics(rows, ev, b1, us):   # rev 6e: G4-14 / G4-15 / G4-18 (label-free, no truth)
+        import statistics as _st
+        med = lambda v: round(_st.median(v), 1) if v else None
+        n = len(rows)
+        ftt = [e.get("first_transform_tokens") for e in ev]
+        obs = [x for x in ftt if x is not None]
+        cens = [x if x is not None else int(r.get("generated_tokens") or 0) for x, r in zip(ftt, rows)]
+        best = {}
+        for r in rows:
+            b = ((r.get("progress") or {}).get("best") or {})
+            k = f"{b.get('k')}/{b.get('n')}" if b else "none"
+            best[k] = best.get(k, 0) + 1
+        b1_tok = sum(c["tokens"] for c in b1.values())
+        b1_new = sum(c["new_distinct_verified"] for c in b1.values())
+        reqs = [q for r in rows for q in (r.get("requests") or [])]
+        later = [q for q in reqs if q.get("i", 0) > 0 and q.get("prompt")]
+        zero = [q for q in later if not q.get("cached")]
+        runs2 = [x for r in rows for x in (r.get("runs") or []) if x.get("stage") == 2]
+
+        def _yield(sel):   # H6-14 / H7-3: new verified predictions per 100k generated tokens (all / b0 / b1, by stage)
+            rr = [(x, r) for r in rows for x in (r.get("runs") or []) if sel(x, r)]
+            tok = sum(int(x.get("tokens") or 0) for x, _ in rr)
+            nb = sum(int(x.get("new_in_branch") or 0) for x, _ in rr)
+            nt = sum(int(x.get("new_for_task") or 0) for x, _ in rr)
+            return {"runs": len(rr), "tokens": tok, "new_in_branch": nb, "new_for_task": nt,
+                    "per_100k_for_task": round(1e5 * nt / tok, 3) if tok else None,
+                    "per_100k_in_branch": round(1e5 * nb / tok, 3) if tok else None}
+        nud = [(e, r) for e, r in zip(ev, rows) if e.get("provisional_nudge_tokens") is not None]
+        gap = lambda k: [e[k] - e["provisional_nudge_tokens"] for e, _ in nud if e.get(k) is not None]
+        return {
+            # H6-14 (GPT rev 6e audits): the allocation question is decided on these
+            "verified_yield": {"all": _yield(lambda x, r: True), "b0": _yield(lambda x, r: r.get("branch") == 0),
+                               "b1": _yield(lambda x, r: r.get("branch") == 1),
+                               "stage1": _yield(lambda x, r: x.get("stage") == 1),
+                               "stage2": _yield(lambda x, r: x.get("stage") == 2)},
+            # H6-18: nudge efficacy (H6-1: sent in a tool result at 24k, else in an opener)
+            "nudge": {"branches": len(nud), "via": {k: sum(1 for e, _ in nud if e.get("provisional_nudge_via") == k)
+                                                     for k in ("tool", "opener")},
+                      # H7-10: emitted (above) vs seen by the model in a later request
+                      "seen": sum(1 for e, _ in nud if e.get("provisional_nudge_seen_request") is not None),
+                      "emitted_not_seen": sum(1 for e, _ in nud if e.get("provisional_nudge_seen_request") is None),
+                      "tokens_p50": med([e["provisional_nudge_tokens"] for e, _ in nud]),
+                      "transform_after": len(gap("first_transform_after_nudge")),
+                      "tokens_to_transform_p50": med(gap("first_transform_after_nudge")),
+                      "check_after": len(gap("first_check_after_nudge")),
+                      "tokens_to_check_p50": med(gap("first_check_after_nudge")),
+                      "accepted": sum(1 for _, r in nud if r.get("accepted")
+                                      or any(v.get("accepted") for v in (r.get("checked") or [])))},
+            "progress_same_name_new_source": sum(int(e.get("progress_same_name_new_source") or 0) for e in ev),
+            "indexed_view_over_target": sum(1 for e in ev if e.get("view_over_target")),             # H7-8
+            "tasks_with_response": len({r.get("task") for r in rows if r.get("branch") == 0
+                                        and (r.get("generated_tokens") or 0) > 0}),                  # H7-7
+            # G4-14
+            "first_transform_tokens_median_observed": med(obs), "first_transform_tokens_median_censored": med(cens),
+            "branches_with_transform": len(obs), "branches_with_transform_within_20k": sum(1 for x in obs if x <= 20000),
+            "share_with_transform_within_20k": round(sum(1 for x in obs if x <= 20000) / n, 3) if n else None,
+            "best_single_function_pairs": dict(sorted(best.items())),
+            "b1_new_distinct_verified_per_100k_tokens": round(1e5 * b1_new / b1_tok, 3) if b1_tok else None,
+            "provisional_nudges": sum(1 for e in ev if e.get("provisional_nudge_tokens") is not None),
+            # G4-18
+            "progress_reports": sum(int(e.get("progress_reports") or 0) for e in ev),
+            "progress_same_improved": sum(int(e.get("progress_same_improved") or 0) for e in ev),
+            "progress_new_hypothesis": sum(int(e.get("progress_new_hypothesis") or 0) for e in ev),
+            "stage2_runs": len(runs2), "stage2_runs_improved": sum(1 for x in runs2 if x.get("improved")),
+            # G4-15 (null prompt_tokens_details = 0 cached: SGLang 0.5.21 omits it when nothing was cached)
+            "requests_instrumented": len(reqs), "later_requests": len(later), "later_zero_hit": len(zero),
+            "later_zero_hit_prefix_intact": sum(1 for q in zero if q.get("prefix_ok")),
+            "later_zero_hit_trimmed": sum(1 for q in zero if q.get("trimmed")),
+            "later_zero_hit_idle_sec_p50": med([q["idle_sec"] for q in zero if q.get("idle_sec") is not None]),
+            "later_idle_sec_p50": med([q["idle_sec"] for q in later if q.get("idle_sec") is not None]),
+            "later_zero_hit_mamba_p50": med([q["mamba"] for q in zero if q.get("mamba") is not None]),
+            "later_prefix_intact_share": round(sum(1 for q in later if q.get("prefix_ok")) / len(later), 3) if later else None,
+            # H6-10: character-prefix share and tools / template changes for the zero-hit later requests (still a proxy)
+            "later_zero_hit_char_prefix_full": sum(1 for q in zero if q.get("serialized_char_prefix") is not None
+                                                   and q.get("prev_chars") and q["serialized_char_prefix"] >= q["prev_chars"] - 2),
+            # H7-13 (GPT rev 6f audit 3): unexplained = the serialized prompt kept its prefix, tools / template unchanged,
+            # not trimmed, and still 0 cached; otherwise the prompt changed (reason). A proxy, never proof of eviction
+            "later_zero_hit_class": _zero_classes(zero),
+            "later_zero_hit_tools_or_template_changed": sum(1 for q in zero if q.get("tools_same") is False
+                                                            or q.get("template_same") is False),
+            "cached_not_reported_requests": sum(1 for q in reqs if q.get("cached_reported") is False),
+            "cache_null_detail_requests": sum(1 for u in us if u.get("cached") is None),
+            "cache_note": "aggregate over all requests; a missing prompt_tokens_details means 0 cached (SGLang 0.5.21)",
+            "concurrency": _r6e_concurrency()}
+
+    def _zero_classes(zero):   # H7-13
+        out = {}
+        for q in zero:
+            full = (q.get("serialized_char_prefix") is not None and q.get("prev_chars")
+                    and q["serialized_char_prefix"] >= q["prev_chars"] - 2)
+            if q.get("trimmed"):
+                k = "prompt_changed:trimmed"
+            elif q.get("tools_same") is False:
+                k = "prompt_changed:tools"
+            elif q.get("template_same") is False:
+                k = "prompt_changed:template"
+            elif not full:
+                k = "prompt_changed:prefix"
+            else:
+                k = "unexplained_cache_miss"
+            out[k] = out.get(k, 0) + 1
+        return out
+
+    def _r6e_concurrency():   # G4-15 / Q5: decode rate by running count, split by "a prefill batch ran just before"
+        import re as _re, statistics as _st
+        try:
+            text = E11_SERVER.log_text() if E11_SERVER is not None else ""
+        except Exception:
+            return None
+        g = lambda pat, ln: (lambda m: float(m.group(1)) if m else None)(_re.search(pat, ln))
+        by, after = {}, False
+        for ln in text.splitlines():
+            if "TP0]" not in ln:
+                continue
+            if "Prefill batch" in ln:
+                after = True
+                continue
+            if "Decode batch" not in ln:
+                continue
+            n = g(r"#running-req: (\\d+)", ln)
+            row = by.setdefault(str(int(n)) if n is not None else "?", {"lines": 0, "tok": [], "tok_after_prefill": [],
+                                                                         "accept": [], "mamba": []})
+            row["lines"] += 1
+            t = g(r"gen throughput \\(token/s\\): ([\\d.]+)", ln)
+            if t is not None:
+                (row["tok_after_prefill"] if after else row["tok"]).append(t)
+            for k, pat in (("accept", r"accept len: ([\\d.]+)"), ("mamba", r"mamba usage: ([\\d.]+)")):
+                v = g(pat, ln)
+                if v is not None:
+                    row[k].append(v)
+            after = False
+        m = lambda v: round(_st.median(v), 2) if v else None
+        return {k: {"lines": v["lines"], "tok_s_p50_clean": m(v["tok"]), "tok_s_p50_after_prefill": m(v["tok_after_prefill"]),
+                    "share_after_prefill": round(len(v["tok_after_prefill"]) / max(1, len(v["tok"]) + len(v["tok_after_prefill"])), 3),
+                    "accept_len_p50": m(v["accept"]), "mamba_usage_p50": m(v["mamba"])}
+                for k, v in sorted(by.items(), key=lambda kv: (len(kv[0]), kv[0]))}
+    if _E12_REV6:
+        report["rev6"] = {"metrics": _r6_metrics(branches), "scheduler": E12_RUN.get("rev6_scheduler"),
+                          "window": E12_RUN.get("rev6_window"), "workers": E12_RUN.get("rev6_workers"),
+                          "preflight": E12_RUN.get("rev6_preflight"), "g4b": E12_RUN.get("g4b"),
+                          "parity": E12_RUN.get("parity"), "cache_diag": E12_RUN.get("cache_diag")}
+    if SOLUTIONS is not None:
+        hits = pass1 = pass2 = total = 0""", "r6 report")
+    c_rep = once(c_rep, """    print("E12 RUN REPORT:", OUT / "e12_run_report.json",""", """    if _E12_REV6:
+        print("E12 rev 6 metrics:", json.dumps(report["rev6"]["metrics"])[:1500], flush=True)
+        _sc = report["rev6"].get("scheduler") or {}
+        # A3-F4 (rev 6c audits): full coverage is claimed only when stage1_left == 0
+        print("E12 rev 6 coverage: tasks initialized", _sc.get("tasks_initialized"), "| request sent",
+              _sc.get("tasks_with_request_sent"), "| response", (report["rev6"].get("metrics") or {}).get("tasks_with_response"),
+              "/", len(TASK_IDS), "| stage-1 starts left",
+              _sc.get("stage1_left"), "| workers", report["rev6"].get("workers"), "(fixed)", "| KV holds", _sc.get("kv_holds"),
+              "for", _sc.get("kv_hold_sec"), "s | idle overrides", _sc.get("kv_idle_overrides"),
+              "| KV samples", _sc.get("kv_samples"), "missing", _sc.get("kv_missing"),
+              "| stragglers", _sc.get("stragglers"), flush=True)
+    print("E12 RUN REPORT:", OUT / "e12_run_report.json",""", "r6 print")
+
 MD = ("# E12 · Duck REPL agent for ARC-AGI-2 on "
       + ("vLLM 0.19 FP8 + MTP-3 (the S1-60K engine) as an OpenAI server" if VLLM else "SGLang 0.5.21 + RedHat INT4 + DFlash2")
       + f" ({VARIANT})\n\n"
       "**What runs:** Tufa Labs' Duck harness (Daniel Franzen's milestone-2 fork, vendored byte-identical, Apache-2.0) with "
       "a thin ARC-2 adapter: the task is in the system prompt; the model works in a Python REPL with `train`, `test_inputs`, "
       "`check(transform)` and `submit(transform)`; the host re-runs each submitted function in a clean sandbox and accepts "
-      "it only when every train pair is exact. Duck settings = the milestone notebook (12,288 output per request, yield at "
+      "it only when every train pair is exact. " + ("Duck donor defaults (the milestone notebook; rev 6 overrides them, "
+                                                     "see Modes) = " if REV6_BUILD else "Duck settings = the milestone notebook ")
+      + "(12,288 output per request, yield at "
       "2,048 tokens, preserved thinking, 128 Ki context with drain to 58 Ki, T 0.7 / top-p 0.95 / top-k 20). 2 independent "
       "branches per task; selection: host-verified > agreement > distinct second grid > best partial > test input.\n\n"
       + ("**Engine:** Duck's own Kaggle vLLM launcher (vLLM 0.19.0 OpenAI server: qwen3_coder tool parser, qwen3 reasoning "
@@ -667,7 +1436,34 @@ MD = ("# E12 · Duck REPL agent for ARC-AGI-2 on "
          "serving flags (qwen3 reasoning parser, qwen3_coder tool parser, preserve_thinking default, lpm, cache report).\n\n")
       +
       "**Modes:** commit = " + ("SMOKE1 (1 task, 2 branches, 15 min; step 3.5)" if VARIANT == "SMOKE1" else
-                                "EVAL30 (the E11-05 EVAL30 tasks, 4 h; step 4)")
+                                "EVAL30 (the E11-05 EVAL30 tasks, 4 h; step 4)" if VARIANT == "EVAL30" else
+                                "EVAL6 (rev 4 accuracy test: 6 tasks Poetiq solved and EVAL30 Duck did not; 60k output per "
+                                "request (a ceiling), request timeout 1,800 s, 6 live branches = 6 streams, 100k soft cap per branch, 90 min solving)"
+                                if VARIANT == "EVAL6" else
+                                ("EVAL12R6 (the EVAL12R5 tasks, 150 min solving)" if VARIANT == "EVAL12R6" else
+                                 "EVAL12R6G4B (gate 4b: the selected EVAL12R5 tasks at the hidden run's average compute "
+                                 "per task; a screening test, not an LB projection)"
+                                 if VARIANT == "EVAL12R6G4B" else
+                                 "PARITYR6 (target-only vs DFlash2 parity on 4 tasks, no solving)" if VARIANT == "PARITYR6" else
+                                 "EVAL30R6 (the E12 EVAL30 tasks, 330 min solving)" if VARIANT == "EVAL30R6" else
+                                 "EVAL6R5 (the rev 4 EVAL6 tasks, 90 min solving)" if VARIANT == "EVAL6R5" else
+                                 "EVAL12R5 (the EVAL6 tasks + 6 informative EVAL30 tasks, 150 min solving)"
+                                 if VARIANT == "EVAL12R5" else
+                                 "EVAL30R5 (the E12 EVAL30 tasks, 330 min solving)")
+                                + (" with rev 6f (fix list 'Rev 6' sections + G4-1..G4-18 + H6-1..H6-19): facts view without raw grids "
+                                   "(branch 1: indexed grids), trusted grid helpers, whole-grid show() with paging, auto-check, "
+                                   "state-aware resumes and one provisional-transform nudge at 24,000 tokens (sent in the next "
+                                   "tool result), coverage-first scheduler with "
+                                   "fair-share stage 2 (12,288 minimum chunk), request caps 12,288 / 24,576 / 32,768 (branch 1 "
+                                   "first 24,576), 12 fixed workers with a KV admission gate (no new task while KV >= 0.95), "
+                                   "deadline clamp per request, the cache diagnostic after solving (commit only), straggler-proof "
+                                   "branch records, temperature 1.0, 100k soft cap per branch, all rev 5 fixes"
+                                   if REV6_BUILD else
+                                " with rev 5: exact check() candidates host-verified and kept (no auto-stop), two attempts from "
+                                "distinct candidates, reasoning counted with the tokenizer for trimming, truthful resume, cut "
+                                "tool calls not executed, short code-first prompt wording; 49,152 output per request; "
+                                "temperature 1.0; 6 live branches; 100k soft cap; request timeout 1,800 s")
+                                + ("; reasoning_effort " + EFFORT + " (user 2026-10-21)" if EFFORT else ""))
       + " with score; competition rerun = every hidden task, 12 h clock. Inputs = the E11-06 notebook's.\n")
 
 

@@ -1,0 +1,62 @@
+--- "D:/ARC AGI 2/experiments/Experiment 12 - Duck REPL agent for ARC-AGI-2 (planned)/duck_arc2/vendor/inference/agent/python_tool_sandbox.py"	2026-10-19 01:08:02.028054400 +0600
++++ src/duck_b/python_tool_sandbox.py	2026-10-24 22:23:10.136682500 +0600
+@@ -69,6 +69,8 @@
+         "statistics",
+         "string",
+     }
++    if os.environ.get("ARC2_SANDBOX_SYS_SHIM") == "1":   # E15B #14: time (blocked in EVAL120 transcripts); harmless here
++        SAFE_MODULES.add("time")
+     SAFE_BUILTINS = {
+         # Exception types. Only four were present, so anything narrower than
+         # `except Exception` failed at the except clause and took the snippet
+@@ -275,9 +277,41 @@
+         return "\n".join(lines)
+ 
+ 
++    class _SysShim:
++        # E15B #14 (EVAL120: `import sys` blocked 21 / 21 / 13 times, mostly for setrecursionlimit in flood fill / DFS):
++        # a safe subset of sys only. No modules, path, exit or frames.
++        maxsize = sys.maxsize
++        version_info = sys.version_info
++
++        @staticmethod
++        def setrecursionlimit(n):
++            sys.setrecursionlimit(max(100, min(int(n), 20000)))
++
++        @staticmethod
++        def getrecursionlimit():
++            return sys.getrecursionlimit()
++
++        @property
++        def stdout(self):
++            return sys.stdout
++
++        @property
++        def stderr(self):
++            return sys.stdout
++
++    _SYS_SHIM = _SysShim()
++
+     def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+         root = str(name or "").split(".", 1)[0]
++        if root == "sys" and os.environ.get("ARC2_SANDBOX_SYS_SHIM") == "1":
++            return _SYS_SHIM
+         if root not in SAFE_MODULES:
++            if os.environ.get("ARC2_SANDBOX_SYS_SHIM") == "1":
++                if isinstance(globals, dict) and root in globals:
++                    raise ImportError(f"'{root}' is not a module: it is already defined in this python session. "
++                                      f"Call it directly (no import needed).")
++                if root == "numpy":
++                    raise ImportError("Module 'numpy' is not available in the sandbox: use pure Python lists.")
+             raise ImportError(f"Module '{name}' is not allowed in the sandbox.")
+         return builtins.__import__(name, globals, locals, fromlist, level)
+ 
+@@ -770,6 +804,8 @@
+         "HOME": "/tmp",
+         "TMPDIR": "/tmp",
+         "PATH": os.environ.get("PATH", ""),
++        # E15B #14: the child's safe sys shim / time / import messages (read inside the bootstrap)
++        "ARC2_SANDBOX_SYS_SHIM": "1" if os.environ.get("ARC2_SANDBOX_SYS_SHIM") == "1" else "0",
+     }
+ 
+ 

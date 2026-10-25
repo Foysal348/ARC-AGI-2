@@ -355,3 +355,31 @@ ARC Prize XHigh, 120 tasks:
 - Poetiq solved 13 tasks that had never been solved before (tier D before R5): `142ca369`, `28a6681f`, `2c181942`, `45a5af55`, `62593bfd`, `6e4f6532`, `88bcf3b4`, `8b7bacbf`, `8b9c3697`, `a251c730`, `aa4ec2a5`, `c7f57c3e`, `fc7cae8d`.
 - **A better method moved the "never solved" set. It is not a model ceiling.**
 - The pre-R5 oracle is kept in the session scratchpad (`oracle_order_120_before_R5.csv`).
+
+## Oracle by method family (2026-10-25; `oracle_by_family.py`)
+
+**Oracle** = a test query counts as solved if any run of the group solved it. The task-norm is out of 120.
+
+**Outputs:**
+- `oracle_by_family.json`: per group, the runs, counts, and the Duck-only / ARC-Prize-only lists.
+- `oracle_units_by_family.csv`: a 0/1 table, one row per query, one column per group.
+
+| Group | Runs | **Oracle queries (of 172)** | **Oracle task-norm** | % |
+|---|---|---|---|---|
+| Duck REPL agent (ours) | 14 | 71 | 52.00 | 43.3 |
+| Poetiq / code + train verify | 8 | 122 | 88.33 | 73.6 |
+| Direct reasoning | 8 | 60 | 45.33 | 37.8 |
+| Other code / agent (R6 loop, REPL v1.8-1.9) | 3 | 2 (of 22) | 1.50 | 1.2 |
+| ARC Prize verified run (xhigh / medium / low / none, task level) | 4 | 68 | 51.00 | 42.5 |
+| Our non-Duck runs | 19 | 125 | 90.33 | 75.3 |
+| **All our runs** | 33 | **128** | **92.33** | **76.9** |
+| **Total oracle (ours + ARC Prize)** | 37 | **132** | **94.17** | **78.5** |
+
+**Overlaps:**
+- Duck-only queries: 3 (269e22fb#0, 269e22fb#1, de809cff#0).
+- Duck ∩ our other methods: 68.
+- Our other methods only: 34 (22.67 task-norm).
+- ARC Prize only: 4 (20a9e565#0/#1, 581f7754#0, d35bdbdc#0).
+- Solved by nobody: 40 queries.
+
+The Poetiq oracle includes the deep HARD66 runs (D66 77.8k, L66 122.9k) and R5 EVAL120 (78 / 172). The Duck oracle includes the 3 EVAL120 G4B runs and the E15B commits.

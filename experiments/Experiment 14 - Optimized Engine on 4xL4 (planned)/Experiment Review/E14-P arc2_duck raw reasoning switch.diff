@@ -1,0 +1,100 @@
+--- arc2_duck.py (rev 6g, sha 7644aa06)
++++ arc2_duck.py (+E14-P raw reasoning switch)
+@@ -82,6 +82,11 @@
+     return os.environ.get("E12_ARC2_REV6", "") == "1"
+ 
+ 
++def _raw_reasoning_history() -> bool:
++    """E14-P switch (user 2026-10-23): history keeps the server's raw reasoning (blank lines included). Off by default."""
++    return os.environ.get("E12_RAW_REASONING_HISTORY", "0").strip() == "1"
++
++
+ def _rev5() -> bool:
+     """Rev 5 behaviour switch (read at call time; the builder sets it for the R5 profiles only). Rev 6 includes it."""
+     return os.environ.get("E12_ARC2_REV5", "") == "1" or _rev6()
+@@ -1289,6 +1294,10 @@
+             self._arc2_tool_ok = False
+             self._arc2_nocall_cuts = 0
+             self._arc2_length_pending = False
++            # E14-P (user 2026-10-23): raw reasoning in history, off by default (see _append_context_message)
++            self._arc2_raw_reasoning_on = _raw_reasoning_history()
++            self._arc2_last_raw_reasoning: str | None = None
++            self.arc2_raw_reasoning = {"kept": 0, "same": 0, "mismatch": 0, "markup": 0}
+             self.arc2_progress = {"best": None, "first_check_tokens": None, "runs": 0}
+             self._arc2_verdicts: dict[str, dict] = {}
+             self._arc2_accepted_sigs: dict[str, str] = {}
+@@ -1460,8 +1469,42 @@
+             mine = self._kept_functions or {}
+             return [src for name, src in R6_HELPERS.items() if name not in mine] + list(own)
+ 
++        def _arc2_raw_reasoning_message(self, message):
++            """E14-P (Notes/11; user 2026-10-23). Duck stores TA._normalize_message_content(reasoning) in history: every
++            blank line is deleted and the ends are stripped (tool_agent.py L3414-3418). The next prompt then differs from
++            the tokens the model generated at the first paragraph break, and the server can reuse only the end-of-prefill
++            state, so the whole reply is prefilled again (G4B rev 6d: 68/150 requests, 217,541 tokens; 0/180 THINKING
++            blocks contain a blank line). With E12_RAW_REASONING_HISTORY=1 the assistant message of the latest reply
++            carries the server's raw reasoning instead. Only when it is the same reply (normalize(raw) == the stored
++            text) and Duck did not strip tool-call markup out of it; transcript, metrics and token counts are unchanged."""
++            if not (self._arc2_raw_reasoning_on and isinstance(message, dict)
++                    and str(message.get("role", "")).strip() == "assistant"):
++                return message                                # a user/tool message never consumes the capture
++            raw, self._arc2_last_raw_reasoning = self._arc2_last_raw_reasoning, None
++            if not raw:
++                return message
++            keys = [k for k in TA._reasoning_history_keys() if isinstance(message.get(k), str) and message.get(k)]
++            if not keys:
++                return message
++            norm = TA._normalize_message_content(raw)
++            if TA._contains_tool_call_markup(raw, ""):
++                self.arc2_raw_reasoning["markup"] += 1        # Duck stripped recovered call markup: keep its text
++                return message
++            if any(message[k] != norm for k in keys):
++                self.arc2_raw_reasoning["mismatch"] += 1      # not the reply we captured: never guess
++                return message
++            if raw == norm:
++                self.arc2_raw_reasoning["same"] += 1
++                return message
++            message = dict(message)
++            for k in keys:
++                message[k] = raw
++            self.arc2_raw_reasoning["kept"] += 1
++            return message
++
+         # Rev 1 #8: keep Duck's generic nudge prefix, replace only its game tail
+         def _append_context_message(self, messages, message) -> None:
++            message = self._arc2_raw_reasoning_message(message)
+             if (self._arc2_rev6 and isinstance(message, dict) and message.get(TA._CONTROL_MESSAGE_KEY) == "nudge"
+                     and isinstance(message.get("content"), str)):
+                 # T6: Duck's prefix "You have not acted yet. Investigate first." contradicts R6-P1
+@@ -1635,6 +1678,14 @@
+             result = super()._chat_completion(messages, **kwargs)
+             if meta is not None:
+                 self._arc2_request_end(meta, result)
++            if self._arc2_raw_reasoning_on:      # E14-P: the server's reasoning as generated, before Duck normalizes it
++                msg = getattr(result, "message", None)
++                raw = None
++                if isinstance(msg, dict):
++                    raw = msg.get("reasoning")          # the same key precedence as TA._extract_reasoning_text
++                    if raw in (None, ""):
++                        raw = msg.get("reasoning_content")
++                self._arc2_last_raw_reasoning = raw if isinstance(raw, str) and raw else None
+             if self._arc2_rev6:     # R6-Q1 rescue cap / R6-P2 "length cut, no call" state
+                 finish = str(getattr(result, "finish_reason", "") or "").strip()
+                 msg = getattr(result, "message", None)
+@@ -2517,11 +2568,14 @@
+         a = self.agent
+         for _ in range(5):
+             try:
+-                return copy.deepcopy(dict(
++                st = dict(
+                     t1=time.time(), generated_tokens=a.generated_tokens, total_tokens=a.total_tokens,
+                     submissions=a.arc2_submissions, accepted=a.arc2_accepted is not None, usage=a.arc2_usage,
+                     checked=a.arc2_checked, rev5_events=a.arc2_rev5_events, rev6_events=a.arc2_rev6_events,
+-                    progress=a.arc2_progress, status=self.status, requests=getattr(a, "arc2_requests", [])))
++                    progress=a.arc2_progress, status=self.status, requests=getattr(a, "arc2_requests", []))
++                if getattr(a, "_arc2_raw_reasoning_on", False):   # E14-P counters only when the switch is on
++                    st["raw_reasoning"] = a.arc2_raw_reasoning
++                return copy.deepcopy(st)
+             except RuntimeError:          # "changed size during iteration": the agent was mid-update
+                 time.sleep(0.01)
+         return {"t1": time.time(), "generated_tokens": a.generated_tokens, "status": self.status,

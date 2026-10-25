@@ -1,3 +1,9 @@
+# >>> rev 5 (2026-10-20, user): SIMPLE PATH. Supersedes the Stage-1 probe below (FN-PROBE-2 notebook kept, not used).
+# E13 = the E12 Duck SMOKE1 notebook unchanged except CELL 5 (engine) and the engine inputs/limits in CELL 1.
+# Engine = Franzen launch + D1-D7 + memory items (NEXTN off, chunk 2048, mem 0.93, 4 running); FA2 for QSA decode;
+# patch #3; the user-mandated top-k test (recorded only); a host-RAM guard; an '!!!!' smoke; Duck streams = min(4, KV // 60k).
+# Builder: Experiment Notebooks/Build/build_e13_duck.py. Audit request: Experiment Review/E13 simple SMOKE1 - audit request (2026-10-20).md
+
 # Experiment 13: Qwen3.8-Flash-Next in the same Duck harness on 4xL4 (plan rev 4, 2026-10-19)
 
 ## Goal and principle (user, 2026-10-19)

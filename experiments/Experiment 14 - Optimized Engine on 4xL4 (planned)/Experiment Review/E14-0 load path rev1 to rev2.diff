@@ -1,0 +1,1255 @@
+--- rev1/e14_loadpath.py
++++ rev2/e14_loadpath.py
+@@ -1,22 +1,29 @@
+-"""E14-0 load path for the SGLang server on Kaggle 4xL4 (2026-10-23).
++"""E14-0 load path for the SGLang server on Kaggle 4xL4 (rev 2, 2026-10-23).
+ 
+ Why (research 2026-10-23, Notes/Research - 4xL4 engine bottleneck validation/startup_load_environment.md):
+ - Since ~2026-10-21 part of /kaggle/input is FUSE.GCSFUSE and NFS slowed too: ~10.5 MB/s single-stream vs ~107 MB/s
+   with 16 readers (amn, topic 751344). Our INT4 shard took 657 s on 10-21 (12.8-58.7 s before).
+ - SGLang 0.5.21's loader reads per file (our target is one 18.6 GB file), so its own prefetch is one stream.
+-- A fixed 30-min first-launch timeout killed nothing yet, but at 10.5 MB/s a single-stream read of 23.3 GB takes ~37 min,
+-  and a timeout ends in E11Fail -> fallback submission (~0 LB).
++- At 10.5 MB/s a single-stream read of 23.3 GB takes ~37 min; a fixed 30-min first-launch timeout then ends in
++  E11Fail -> fallback submission (~0 LB).
++
++Rev 2 follows GPT notes 08/09 as validated in Notes/10: write loop (short writes), `.partial` dir + atomic rename,
++per-range blake2b + destination re-read, full sha256 per shard, strict safetensors layout check, cgroup memory, adaptive
++worker ramp 4 -> 8 -> 16 (cap 24), an off switch, a phase record (E14State), a fixed JIT manifest.
+ 
+ What this module gives the notebook (stdlib only, no GPU, works on Windows for the CPU tests):
+-- env_report()         one-shot facts: mount type per path, df, RAM, nproc, CPU model
++- env_report()         one-shot facts: mount type per path, df, RAM, cgroup memory, nproc, CPU model
+ - read_probe()         timed 64 MiB read of the largest input file (MB/s per stream)
+-- parallel_copy()      ranged multi-reader copy of a model dir to /dev/shm (fallback /tmp), verified, stall-aware
+-- warm_page_cache()    the same ranged readers without writing (fallback when no space)
+-- StallMonitor         launch watchdog: progress = server log growth OR rchar of the server's process tree; never kills
+-                       a server that is still making progress; gives up only on a stall, a dead process or give_up_at
+-- jit_cache_env(), save_jit_cache(), restore_jit_cache()   compile caches without the CUDA driver cache (nv/), which
+-                       caused SGLang #42917 (PPL 9.98 vs 6.05); restore must be followed by a known-answer check
++- parallel_copy()      ranged multi-reader copy of a model dir, verified, published atomically, stall-aware
++- warm_page_cache()    the same ranged readers without writing (fallback when no space or the copy failed)
++- stage_models()/Staging   the notebook entry point (never raises; fails open to the original paths)
++- StallMonitor         launch watchdog: progress = log growth OR the server tree's read() bytes + page faults; never
++                       kills a server that is still making progress; gives up only on a stall, a dead process, give_up_at
++- E14State             PREPARE -> COPY -> VALIDATE -> LAUNCH -> READY record with deadlines and a terminal reason
++- jit_manifest(), save_jit_cache(), restore_jit_cache(), known_answer_ok()   compile caches without the CUDA driver
++                       cache (nv/, SGLang #42917), restored only on an exact fingerprint match + a known-answer check
+ """
++import hashlib
+ import io
+ import json
+ import os
+@@ -29,7 +36,8 @@
+ from pathlib import Path
+ 
+ MIB = 1 << 20
+-PROC = "/proc"  # module constant: the CPU tests point it at a fake /proc tree
++PROC = "/proc"            # module constants: the CPU tests point them at fake trees
++CGROUP = "/sys/fs/cgroup"
+ 
+ 
+ # --------------------------------------------------------------------------------------------- environment facts
+@@ -57,8 +65,50 @@
+         return {"error": repr(e)[:80]}
+ 
+ 
++def _mem_available():
++    try:
++        for line in Path(PROC, "meminfo").read_text().splitlines():
++            if line.startswith("MemAvailable:"):
++                return int(line.split()[1]) * 1024
++    except Exception:
++        pass
++    return None
++
++
++def _read_int(p):
++    try:
++        t = Path(p).read_text().strip()
++        return None if t in ("", "max") else int(t)
++    except Exception:
++        return None
++
++
++def cgroup_memory():
++    """(limit, usage) in bytes of this container's memory cgroup, v2 then v1; None where unknown or unlimited.
++    /proc/meminfo inside a container can show the HOST, and tmpfs (/dev/shm) pages are charged to the cgroup."""
++    lim, use = _read_int(Path(CGROUP, "memory.max")), _read_int(Path(CGROUP, "memory.current"))
++    if lim is None and use is None:
++        lim = _read_int(Path(CGROUP, "memory", "memory.limit_in_bytes"))
++        use = _read_int(Path(CGROUP, "memory", "memory.usage_in_bytes"))
++        if lim is not None and lim >= 1 << 60:         # v1 reports "unlimited" as a huge number
++            lim = None
++    return lim, use
++
++
++def host_headroom():
++    """Bytes that can still be allocated: the smaller of MemAvailable and (cgroup limit - cgroup usage)."""
++    vals = []
++    ma = _mem_available()
++    if ma is not None:
++        vals.append(ma)
++    lim, use = cgroup_memory()
++    if lim is not None:
++        vals.append(max(0, lim - (use or 0)))
++    return min(vals) if vals else None
++
++
+ def env_report(paths):
+-    """Facts the 10-22 ERROR post-mortem lacked (startup_load_environment.md): mounts, free space, RAM, CPU."""
++    """Facts the 10-22 ERROR post-mortem lacked (startup_load_environment.md): mounts, free space, RAM, cgroup, CPU."""
+     rep = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "nproc": os.cpu_count(), "paths": {}, "df": {}}
+     for p in paths:
+         mp, fs = _mount_of(p)
+@@ -71,6 +121,8 @@
+         rep["mem_gb"] = {"total": round(mi.get("MemTotal", 0) / 1e6, 1), "available": round(mi.get("MemAvailable", 0) / 1e6, 1)}
+     except Exception:
+         rep["mem_gb"] = None
++    lim, use = cgroup_memory()
++    rep["cgroup_gb"] = {"limit": None if lim is None else round(lim / 1e9, 1), "usage": None if use is None else round(use / 1e9, 1)}
+     try:
+         rep["cpu_model"] = next((l.split(":", 1)[1].strip() for l in Path(PROC, "cpuinfo").read_text().splitlines()
+                                  if l.startswith("model name")), None)
+@@ -100,6 +152,44 @@
+     return {"file": f.name, "bytes": done, "sec": round(dt, 3), "mb_s": round(done / dt / 1e6, 1)}
+ 
+ 
++# --------------------------------------------------------------------------------------------- phase record
++class E14State:
++    """PREPARE -> COPY -> VALIDATE -> LAUNCH -> READY (or a terminal FAILED/FALLBACK). Every change is written to a JSON
++    file at once (write + rename), so a run killed mid-phase still shows where it stopped and why."""
++
++    def __init__(self, path=None, now=time.perf_counter):
++        self.path, self.now = (Path(path) if path else None), now
++        self.t0 = now()
++        self.rec = {"phases": [], "current": None, "terminal_reason": None}
++
++    def enter(self, phase, deadline=None, **info):
++        e = {"phase": phase, "t": round(self.now() - self.t0, 1),
++             "deadline_in": None if deadline is None else round(deadline - self.now(), 1), **info}
++        self.rec["phases"].append(e)
++        self.rec["current"] = phase
++        self._flush()
++
++    def note(self, **info):
++        if self.rec["phases"]:
++            self.rec["phases"][-1].update(info)
++            self._flush()
++
++    def end(self, reason):
++        self.rec["terminal_reason"] = reason
++        self.rec["t_end"] = round(self.now() - self.t0, 1)
++        self._flush()
++
++    def _flush(self):
++        if not self.path:
++            return
++        try:
++            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
++            tmp.write_text(json.dumps(self.rec, indent=1, default=str), encoding="utf-8")
++            os.replace(tmp, self.path)
++        except Exception:
++            pass
++
++
+ # --------------------------------------------------------------------------------------------- ranged readers
+ class CopyStalled(RuntimeError):
+     pass
+@@ -107,26 +197,52 @@
+ 
+ class _Progress:
+     def __init__(self, total):
+-        self.total, self.done, self.lock = total, 0, threading.Lock()
++        self.total, self.done, self.retries, self.lock = total, 0, 0, threading.Lock()
+         self.last_change = time.perf_counter()
+         self.abort = threading.Event()
++        self.hashes = {}                                   # (dst file, offset) -> blake2b of the source bytes
+ 
+     def add(self, n):
+         with self.lock:
+             self.done += n
+             self.last_change = time.perf_counter()
+ 
++    def retry(self):
++        with self.lock:
++            self.retries += 1
++
++
++def _backoff(attempt):
++    """Seconds to wait before retry `attempt` (0-based) of one range: 1, 2, 4, 8 (cap 30)."""
++    return min(30, 2 ** attempt)
++
+ 
+ def _ranges(size, chunk):
+-    return [(o, min(chunk, size - o)) for o in range(0, size, chunk)] or [(0, 0)]
++    """Disjoint ranges that cover [0, size) exactly (asserted: a gap would leave preallocated zeros in the copy)."""
++    rs = [(o, min(chunk, size - o)) for o in range(0, size, chunk)] or [(0, 0)]
++    assert rs[0][0] == 0 and sum(n for _, n in rs) == size
++    assert all(a[0] + a[1] == b[0] for a, b in zip(rs, rs[1:]))
++    return rs
++
++
++def _write_all(fo, b):
++    """A raw (buffering=0) write may write fewer bytes than asked; loop until all are written."""
++    mv, done = memoryview(b), 0
++    while done < len(mv):
++        n = fo.write(mv[done:])
++        if not n:
++            raise IOError("write returned 0 bytes")
++        done += n
+ 
+ 
+ def _copy_range(src, dst, off, n, prog, retries=4):
+-    """One 64 MiB range: own handles (portable: seek+read/write; os.pread is not on Windows)."""
++    """One range with its own handles (portable seek+read/write; os.pread is not on Windows). Short reads raise and are
++    retried; short writes loop; the blake2b of the bytes read is kept for the destination re-read."""
+     for a in range(retries + 1):
+         if prog.abort.is_set():
+             return
+         try:
++            h = hashlib.blake2b(digest_size=16)
+             with open(src, "rb", buffering=0) as fi, open(dst, "r+b", buffering=0) as fo:
+                 fi.seek(off)
+                 fo.seek(off)
+@@ -137,14 +253,17 @@
+                     b = fi.read(min(left, 8 * MIB))
+                     if not b:
+                         raise IOError(f"short read at {off + n - left} in {src}")
+-                    fo.write(b)
++                    _write_all(fo, b)
++                    h.update(b)
+                     left -= len(b)
+                     prog.add(len(b))
++            prog.hashes[(str(dst), off)] = h.digest()
+             return
+         except Exception:
+             if a == retries:
+                 raise
+-            time.sleep(min(30, 2 ** a))
++            prog.retry()
++            time.sleep(_backoff(a))
+ 
+ 
+ def _read_range(src, off, n, prog, retries=4):
+@@ -167,24 +286,46 @@
+         except Exception:
+             if a == retries:
+                 raise
+-            time.sleep(min(30, 2 ** a))
++            prog.retry()
++            time.sleep(_backoff(a))
+ 
+ 
+-def _run_ranged(jobs, prog, workers, stall_sec, deadline, report_every, log):
+-    """jobs: callables, run by `workers` DAEMON threads; aborts on a stall (no byte for stall_sec) or at deadline (a
++def _levels(workers, levels):
++    out = sorted({min(int(x), workers) for x in levels if int(x) >= 1} | {workers})
++    return [x for x in out if x <= workers] or [workers]
++
++
++def _run_ranged(jobs, prog, workers, stall_sec, deadline, report_every, log, levels=(4, 8, 16, 24),
++                ramp_bytes=512 * MIB, ramp_gain=1.15):
++    """jobs: callables, run by DAEMON threads; aborts on a stall (no byte for stall_sec) or at deadline (a
+     time.perf_counter() value, the clock of the notebook's SGL_GIVE_UP_AT). Hung threads are never joined: a read stuck
+-    inside FUSE would block a join (and, with ThreadPoolExecutor's non-daemon workers, interpreter exit) forever - the
+-    case the stall timeout exists for."""
++    inside FUSE would block a join (and, with ThreadPoolExecutor's non-daemon workers, interpreter exit) forever.
++
++    Worker ramp (GPT note 08: no fixed 16-32 default): start at the first level; after ramp_bytes at a level, go up only
++    if MB/s rose by ramp_gain over the previous level, else drop back one level and stay. A retry (transient error) at a
++    level drops back one level and stays. Returns {"levels": [(workers, MB/s), ...], "final_workers": n}."""
++    lv = _levels(workers, levels)
+     todo = queue.SimpleQueue()
+     for j in jobs:
+         todo.put(j)
+     errors = []
++    cond = threading.Condition()
++    allowed = [lv[0]]
++    finished = threading.Event()
+ 
+-    def worker():
++    def worker(idx):
+         while not prog.abort.is_set():
++            with cond:
++                while idx >= allowed[0] and not prog.abort.is_set() and not finished.is_set():
++                    cond.wait(0.5)
++            if prog.abort.is_set() or finished.is_set():
++                return
+             try:
+                 job = todo.get_nowait()
+             except queue.Empty:
++                finished.set()
++                with cond:
++                    cond.notify_all()
+                 return
+             try:
+                 job()
+@@ -193,87 +334,198 @@
+                 prog.abort.set()
+                 return
+ 
+-    threads = [threading.Thread(target=worker, name=f"e14load{i}", daemon=True) for i in range(max(1, min(workers, len(jobs))))]
++    threads = [threading.Thread(target=worker, args=(i,), name=f"e14load{i}", daemon=True)
++               for i in range(max(1, min(lv[-1], len(jobs))))]
+     for t in threads:
+         t.start()
++    li, frozen = 0, len(lv) == 1
++    lvl_t, lvl_b, lvl_r, prev_rate = time.perf_counter(), prog.done, prog.retries, None
++    hist = []
+     last_report = time.perf_counter()
+-    while True:
+-        if errors:
+-            raise errors[0]
+-        if not any(t.is_alive() for t in threads):
+-            return
+-        now = time.perf_counter()
+-        if now - prog.last_change > stall_sec:
+-            prog.abort.set()
+-            raise CopyStalled(f"no progress for {stall_sec:.0f} s at {prog.done / 1e9:.2f}/{prog.total / 1e9:.2f} GB")
+-        if deadline is not None and now > deadline:
+-            prog.abort.set()
+-            raise CopyStalled(f"deadline reached at {prog.done / 1e9:.2f}/{prog.total / 1e9:.2f} GB")
+-        if log and now - last_report >= report_every:
+-            log(f"E14 load: {prog.done / 1e9:.2f}/{prog.total / 1e9:.2f} GB")
+-            last_report = now
+-        time.sleep(0.2)
++
++    def set_level(i):
++        with cond:
++            allowed[0] = lv[i]
++            cond.notify_all()
++
++    try:
++        while True:
++            if errors:
++                raise errors[0]
++            if not any(t.is_alive() for t in threads):
++                return {"levels": hist, "final_workers": lv[li]}
++            now = time.perf_counter()
++            if now - prog.last_change > stall_sec:
++                raise CopyStalled(f"no progress for {stall_sec:.0f} s at {prog.done / 1e9:.2f}/{prog.total / 1e9:.2f} GB")
++            if deadline is not None and now > deadline:
++                raise CopyStalled(f"deadline reached at {prog.done / 1e9:.2f}/{prog.total / 1e9:.2f} GB")
++            if not frozen:
++                if prog.retries > lvl_r:
++                    hist.append((lv[li], None))
++                    li = max(0, li - 1)
++                    set_level(li)
++                    frozen = True
++                elif prog.done - lvl_b >= ramp_bytes:
++                    rate = (prog.done - lvl_b) / max(1e-6, now - lvl_t)
++                    hist.append((lv[li], round(rate / 1e6, 1)))
++                    if prev_rate is not None and rate < prev_rate * ramp_gain:
++                        li = max(0, li - 1)
++                        set_level(li)
++                        frozen = True
++                    elif li + 1 < len(lv):
++                        li += 1
++                        set_level(li)
++                        prev_rate, lvl_t, lvl_b, lvl_r = rate, now, prog.done, prog.retries
++                    else:
++                        frozen = True
++            if log and now - last_report >= report_every:
++                log(f"E14 load: {prog.done / 1e9:.2f}/{prog.total / 1e9:.2f} GB, {allowed[0]} workers")
++                last_report = now
++            time.sleep(0.2)
++    except BaseException:
++        prog.abort.set()
++        with cond:
++            cond.notify_all()
++        raise
+ 
+ 
+ # --------------------------------------------------------------------------------------------- verification
++_DTYPE_BYTES = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "U16": 2, "I16": 2, "F16": 2,
++                "BF16": 2, "U32": 4, "I32": 4, "F32": 4, "U64": 8, "I64": 8, "F64": 8}
++
++
++def safetensors_layout(path):
++    """(ok, why). The format rule: an 8-byte LE header length, a JSON header, and a byte buffer that is fully indexed
++    without holes. Checks: sorted by begin, first begin == 0, each end == the next begin, last end == buffer size, and
++    end - begin == dtype bytes x prod(shape) for known dtypes."""
++    try:
++        size = Path(path).stat().st_size
++        with open(path, "rb") as f:
++            raw = f.read(8)
++            if len(raw) < 8:
++                return False, "file shorter than 8 bytes"
++            hl = struct.unpack("<Q", raw)[0]
++            if hl <= 0 or 8 + hl > size:
++                return False, f"bad header length {hl}"
++            hdr = json.loads(f.read(hl))
++        buf = size - 8 - hl
++        ts = sorted(((v["data_offsets"][0], v["data_offsets"][1], k, v) for k, v in hdr.items()
++                     if k != "__metadata__" and isinstance(v, dict)), key=lambda x: (x[0], x[1]))
++        if not ts:
++            return buf == 0, f"no tensors, buffer {buf} bytes"
++        if ts[0][0] != 0:
++            return False, f"first tensor starts at {ts[0][0]}"
++        for (b0, e0, k0, _), (b1, _e1, k1, _v1) in zip(ts, ts[1:]):
++            if e0 != b1:
++                return False, f"{'overlap' if e0 > b1 else 'hole'} between {k0} and {k1}"
++        for b, e, k, v in ts:
++            if e < b:
++                return False, f"negative extent in {k}"
++            db = _DTYPE_BYTES.get(v.get("dtype"))
++            if db is not None:
++                n = db
++                for d in v.get("shape", []):
++                    n *= int(d)
++                if e - b != n:
++                    return False, f"{k}: {e - b} bytes for {v.get('dtype')}{v.get('shape')}"
++        if ts[-1][1] != buf:
++            return False, f"tensors end at {ts[-1][1]}, buffer is {buf} bytes"
++        return True, "ok"
++    except Exception as e:
++        return False, f"{type(e).__name__}: {e}"[:200]
++
++
+ def verify_safetensors(path):
+-    """size and header check: 8-byte LE header length, JSON header, last tensor end == file size."""
+-    size = Path(path).stat().st_size
+-    with open(path, "rb") as f:
+-        hl = struct.unpack("<Q", f.read(8))[0]
+-        if hl <= 0 or 8 + hl > size:
+-            return False, f"bad header length {hl}"
+-        hdr = json.loads(f.read(hl))
+-    ends = [v["data_offsets"][1] for k, v in hdr.items() if k != "__metadata__" and isinstance(v, dict)]
+-    want = 8 + hl + (max(ends) if ends else 0)
+-    return (want == size), f"expected {want} bytes, file has {size}"
+-
+-
+-def _same_bytes(a, b, off, n):
+-    with open(a, "rb") as fa, open(b, "rb") as fb:
+-        fa.seek(off)
+-        fb.seek(off)
+-        return fa.read(n) == fb.read(n)
+-
+-
+-def _verify_tree(src, dst, sample=1 * MIB):
+-    """Sizes alone prove nothing here (destinations are preallocated with truncate), so the first and last `sample`
+-    bytes of every file are compared too; a range that failed raises earlier, in _run_ranged."""
++    """Kept for the rev-1 callers: the strict layout check."""
++    return safetensors_layout(path)
++
++
++def _hash_range(path, off, n):
++    h = hashlib.blake2b(digest_size=16)
++    with open(path, "rb", buffering=0) as f:
++        f.seek(off)
++        left = n
++        while left > 0:
++            b = f.read(min(left, 8 * MIB))
++            if not b:
++                raise IOError(f"short read while verifying {path} at {off + n - left}")
++            h.update(b)
++            left -= len(b)
++    return h.digest()
++
++
++def sha256_file(path, chunk=8 * MIB):
++    h = hashlib.sha256()
++    with open(path, "rb", buffering=0) as f:
++        while True:
++            b = f.read(chunk)
++            if not b:
++                return h.hexdigest()
++            h.update(b)
++
++
++def _verify_tree(src, dst, prog=None, ranged=(), workers=8, sha256=False, expected_sha256=None):
++    """Everything must hold before the copy is published:
++    - every file exists with the source size;
++    - ranged files: the re-read blake2b of every destination range == the hash of the source bytes copied into it;
++    - small files: byte-identical to the source;
++    - .safetensors: strict layout (a failure that the SOURCE shares is accepted as published, and reported);
++    - optional full sha256 per shard, compared to expected_sha256 {file name: hex} when given."""
++    src, dst = Path(src), Path(dst)
++    info = {"layout_as_published": [], "sha256": {}}
++    ranged = {str(g): rs for g, rs in ranged}
+     for f in _files(src):
+-        g = Path(dst) / f.relative_to(src)
++        g = dst / f.relative_to(src)
+         size = f.stat().st_size
+         if not g.exists() or g.stat().st_size != size:
+-            return False, f"size mismatch: {f.name}"
+-        if not (_same_bytes(f, g, 0, sample) and _same_bytes(f, g, max(0, size - sample), sample)):
+-            return False, f"content mismatch: {f.name}"
++            return False, f"size mismatch: {f.name}", info
++        if str(g) not in ranged and Path(f).read_bytes() != Path(g).read_bytes():
++            return False, f"content mismatch: {f.name}", info
++    if ranged:
++        if prog is None:
++            return False, "ranged files without copy hashes", info
++        bad = []
++        jobs = [(g, off, n) for g, rs in ranged.items() for off, n in rs]
++        lock = threading.Lock()
++
++        def check(g, off, n):
++            if _hash_range(g, off, n) != prog.hashes.get((g, off)):
++                with lock:
++                    bad.append((Path(g).name, off))
++
++        vprog = _Progress(sum(n for _, _, n in jobs))
++        wrapped = [lambda g=g, off=off, n=n: (check(g, off, n), vprog.add(n)) for g, off, n in jobs]
++        _run_ranged(wrapped, vprog, workers, 600.0, None, 1e9, None, levels=(workers,))
++        if bad:
++            return False, f"range hash mismatch: {bad[0][0]} at offset {bad[0][1]} ({len(bad)} ranges)", info
++    for f in _files(src):
++        g = dst / f.relative_to(src)
+         if g.suffix == ".safetensors":
+-            ok, why = verify_safetensors(g)
++            ok, why = safetensors_layout(g)
+             if not ok:
+-                return False, f"{g.name}: {why}"
+-    return True, "ok"
++                ok_src, why_src = safetensors_layout(f)
++                if ok_src or why_src != why:
++                    return False, f"{g.name}: {why}", info
++                info["layout_as_published"].append(f"{g.name}: {why}")
++        if sha256 and g.suffix == ".safetensors":
++            d = sha256_file(g)
++            info["sha256"][g.name] = d
++            if expected_sha256 and g.name in expected_sha256 and expected_sha256[g.name] != d:
++                return False, f"sha256 mismatch: {g.name}", info
++    return True, "ok", info
+ 
+ 
+ # --------------------------------------------------------------------------------------------- copy / warm
+-def _mem_available():
+-    try:
+-        for line in Path(PROC, "meminfo").read_text().splitlines():
+-            if line.startswith("MemAvailable:"):
+-                return int(line.split()[1]) * 1024
+-    except Exception:
+-        pass
+-    return None
+-
+-
+ def choose_dest(total_bytes, candidates=("/dev/shm", "/tmp"), margin_bytes=2 * (1 << 30), ram_headroom=24 * (1 << 30)):
+-    """First candidate with free space for the copy. /dev/shm is RAM (tmpfs): it also needs MemAvailable to keep
+-    ram_headroom after the copy for the server, the 4 TP workers and the agent (pages there cannot be evicted)."""
++    """First candidate with free space for the copy. /dev/shm is RAM (tmpfs, charged to the cgroup): it also needs
++    host_headroom() >= copy + ram_headroom, left for the server, the 4 TP workers and the agent."""
+     for d in candidates:
+         try:
+             if not Path(d).is_dir() or shutil.disk_usage(d).free < total_bytes * 1.02 + margin_bytes:
+                 continue
+             if str(d).startswith("/dev/shm"):
+-                ma = _mem_available()
+-                if ma is None or ma < total_bytes + ram_headroom:
++                hr = host_headroom()
++                if hr is None or hr < total_bytes + ram_headroom:
+                     continue
+             return d
+         except Exception:
+@@ -282,80 +534,120 @@
+ 
+ 
+ def parallel_copy(src, dst_root, *, workers=24, chunk=64 * MIB, stall_sec=600.0, deadline=None, report_every=30.0,
+-                  log=print, small_bytes=256 * MIB):
+-    """Copy every file of src into dst_root/<src name>/ with ranged readers, verify, return (dst_dir, stats).
+-    Raises CopyStalled on a stall or deadline (the caller then launches from src: fail open)."""
++                  log=print, small_bytes=256 * MIB, levels=(4, 8, 16, 24), ramp_bytes=512 * MIB, sha256=True,
++                  expected_sha256=None):
++    """Copy every file of src into dst_root/<src name>.partial/ with ranged readers, verify, then publish it with one
++    atomic rename to dst_root/<src name>/. Returns (dst_dir, stats). Raises (CopyStalled, IOError, ...) after deleting
++    the partial copy: no launch can ever see an unverified directory. The caller then launches from src (fail open)."""
+     src = Path(src)
+     files = _files(src)
+     total = sum(f.stat().st_size for f in files)
+-    dst = Path(dst_root) / src.name
+-    dst.mkdir(parents=True, exist_ok=True)
++    final = Path(dst_root) / src.name
++    work = Path(dst_root) / (src.name + ".partial")
++    for d in (work, final):                           # a stale copy from an earlier attempt is never trusted
++        shutil.rmtree(d, ignore_errors=True)
+     prog = _Progress(total)
+     t0 = time.perf_counter()
+-    jobs = []
+-    for f in files:          # largest first (sorted by _files)
+-        g = dst / f.relative_to(src)
+-        g.parent.mkdir(parents=True, exist_ok=True)
+-        size = f.stat().st_size
+-        if size <= small_bytes:
+-            jobs.append(lambda f=f, g=g, size=size: (shutil.copyfile(f, g), prog.add(size)))
+-            continue
+-        with open(g, "wb") as h:                     # preallocate (sparse) so ranged writers can seek anywhere
+-            h.truncate(size)
+-        for off, n in _ranges(size, chunk):
+-            jobs.append(lambda f=f, g=g, off=off, n=n: _copy_range(f, g, off, n, prog))
++    jobs, ranged = [], []
+     try:
+-        _run_ranged(jobs, prog, workers, stall_sec, deadline, report_every, log)
++        work.mkdir(parents=True)
++        for f in files:          # largest first (sorted by _files)
++            g = work / f.relative_to(src)
++            g.parent.mkdir(parents=True, exist_ok=True)
++            size = f.stat().st_size
++            if size <= small_bytes:
++                jobs.append(lambda f=f, g=g, size=size: (shutil.copyfile(f, g), prog.add(size)))
++                continue
++            with open(g, "wb") as h:                  # preallocate (sparse) so ranged writers can seek anywhere
++                h.truncate(size)
++            rs = _ranges(size, chunk)
++            ranged.append((g, rs))
++            for off, n in rs:
++                jobs.append(lambda f=f, g=g, off=off, n=n: _copy_range(f, g, off, n, prog))
++        ramp = _run_ranged(jobs, prog, workers, stall_sec, deadline, report_every, log, levels=levels,
++                           ramp_bytes=ramp_bytes)
++        t_copy = time.perf_counter() - t0
++        ok, why, vinfo = _verify_tree(src, work, prog, ranged, workers=min(workers, 16), sha256=sha256,
++                                      expected_sha256=expected_sha256)
++        if not ok:
++            raise IOError("copy verification failed: " + why)
++        os.replace(work, final)                       # atomic publish (same filesystem)
+     except BaseException:
+-        shutil.rmtree(dst, ignore_errors=True)        # never leave a partial copy that a later launch could mmap
++        shutil.rmtree(work, ignore_errors=True)
++        shutil.rmtree(final, ignore_errors=True)
+         raise
+-    ok, why = _verify_tree(src, dst)
+-    if not ok:
+-        shutil.rmtree(dst, ignore_errors=True)
+-        raise IOError("copy verification failed: " + why)
+     dt = max(1e-6, time.perf_counter() - t0)
+-    return dst, {"bytes": total, "sec": round(dt, 1), "mb_s": round(total / dt / 1e6, 1), "files": len(files),
+-                 "workers": workers, "chunk_mib": chunk // MIB, "dst": str(dst)}
++    return final, {"bytes": total, "sec": round(dt, 1), "copy_sec": round(t_copy, 1),
++                   "mb_s": round(total / max(1e-6, t_copy) / 1e6, 1), "files": len(files), "workers_max": workers,
++                   "ramp": ramp, "retries": prog.retries, "chunk_mib": chunk // MIB, "dst": str(final), **vinfo}
+ 
+ 
+-def warm_page_cache(src, *, workers=24, chunk=64 * MIB, stall_sec=600.0, deadline=None, report_every=30.0, log=print):
++def warm_page_cache(src, *, workers=24, chunk=64 * MIB, stall_sec=600.0, deadline=None, report_every=30.0, log=print,
++                    levels=(4, 8, 16, 24), ramp_bytes=512 * MIB):
+     files = _files(src)
+     total = sum(f.stat().st_size for f in files)
+     prog = _Progress(total)
+     t0 = time.perf_counter()
+     jobs = [lambda f=f, off=off, n=n: _read_range(f, off, n, prog)
+             for f in files for off, n in _ranges(f.stat().st_size, chunk)]
+-    _run_ranged(jobs, prog, workers, stall_sec, deadline, report_every, log)
++    ramp = _run_ranged(jobs, prog, workers, stall_sec, deadline, report_every, log, levels=levels, ramp_bytes=ramp_bytes)
+     dt = max(1e-6, time.perf_counter() - t0)
+-    return {"bytes": total, "sec": round(dt, 1), "mb_s": round(total / dt / 1e6, 1), "files": len(files)}
++    return {"bytes": total, "sec": round(dt, 1), "mb_s": round(total / dt / 1e6, 1), "files": len(files), "ramp": ramp}
++
++
++def loadpath_enabled():
++    """Off switch: E14_LOADPATH=0 keeps the old single-stream `cat` prefetch path in the notebook."""
++    return os.environ.get("E14_LOADPATH", "1").strip() != "0"
+ 
+ 
+ def stage_models(model_dirs, *, workers=24, stall_sec=600.0, deadline=None, log=print,
+-                 dest_candidates=("/dev/shm", "/tmp")):
+-    """The notebook entry point: copy every model dir to the first destination with space; on any failure fall back
+-    to warming the page cache in place (still ranged and parallel); never raises. Returns (path map, report)."""
++                 dest_candidates=("/dev/shm", "/tmp"), state=None, enabled=None, **copy_kw):
++    """The notebook entry point: copy every model dir to the first destination with space; on any failure delete the
++    partial copy, warm the page cache in place (ranged, parallel) and launch from the original paths. Never raises
++    (except KeyboardInterrupt/SystemExit). A model copied successfully is never read from the source again.
++    Returns (path map, report)."""
+     model_dirs = [Path(m) for m in model_dirs]
+-    total = sum(sum(f.stat().st_size for f in _files(m)) for m in model_dirs)
+-    rep = {"total_gb": round(total / 1e9, 2), "dest": None, "copies": {}, "warm": None, "error": None}
+     out = {str(m): str(m) for m in model_dirs}
++    if not (loadpath_enabled() if enabled is None else enabled):
++        if state:
++            state.enter("PREPARE", disabled=True)
++        return out, {"disabled": True}
++    total = sum(sum(f.stat().st_size for f in _files(m)) for m in model_dirs)
++    hr = host_headroom()
++    rep = {"total_gb": round(total / 1e9, 2), "dest": None, "copies": {}, "warm": None, "error": None,
++           "headroom_gb": None if hr is None else round(hr / 1e9, 1)}
+     dest = choose_dest(total, dest_candidates)
+     rep["dest"] = dest
++    if state:
++        state.enter("PREPARE", deadline=deadline, dest=dest, total_gb=rep["total_gb"], headroom_gb=rep["headroom_gb"])
++    copied = set()
+     if dest:
+         try:
+             root = Path(dest) / "e14-weights"
+             for m in model_dirs:
+-                d, st = parallel_copy(m, root, workers=workers, stall_sec=stall_sec, deadline=deadline, log=log)
++                if state:
++                    state.enter("COPY", deadline=deadline, model=m.name)
++                d, st = parallel_copy(m, root, workers=workers, stall_sec=stall_sec, deadline=deadline, log=log, **copy_kw)
+                 out[str(m)] = str(d)
+                 rep["copies"][str(m)] = st
++                copied.add(str(m))
++                if state:
++                    state.note(validated=True, mb_s=st["mb_s"], ramp=st["ramp"])
++            if state:
++                state.enter("VALIDATE", ok=True)
+             return out, rep
+         except BaseException as e:
+             rep["error"] = f"{type(e).__name__}: {e}"[:300]
+-            out = {str(m): str(m) for m in model_dirs}          # fail open: launch from the original paths
++            if state:
++                state.note(error=rep["error"])
+             if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                 raise
++    rest = [m for m in model_dirs if str(m) not in copied]   # a verified copy stays in use
++    if state:
++        state.enter("FALLBACK", deadline=deadline, warm=[m.name for m in rest])
+     try:
+         rep["warm"] = {str(m): warm_page_cache(m, workers=workers, stall_sec=stall_sec, deadline=deadline, log=log)
+-                       for m in model_dirs}
++                       for m in rest}
+     except BaseException as e:
+         rep["warm"] = {"error": f"{type(e).__name__}: {e}"[:300]}
+         if isinstance(e, (KeyboardInterrupt, SystemExit)):
+@@ -506,10 +798,50 @@
+ 
+ _NEVER_SHIP = ("sglang/nv", "cuda")     # CUDA driver compute caches: SGLang #42917 (stale nv/ -> PPL 9.98)
+ 
++# GPT note 08: nv/ exclusion is no compatibility proof. Every field must be present and match exactly.
++JIT_MANIFEST_KEYS = ("sglang", "sgl_kernel", "flashinfer", "torch", "triton", "cuda_runtime", "nvcc", "driver",
++                     "gpu_name", "sm", "wheels", "jit_sources", "env")
++_KERNEL_ENV_PREFIXES = ("TORCH_CUDA_ARCH_LIST", "SGLANG_", "FLASHINFER_", "TRITON_", "NVCC_", "CUDA_HOME")
++_CACHE_ENV_KEYS = set(jit_cache_env())
++
++
++def wheel_inventory(wheel_dir):
++    """[[file name, size], ...] of the wheelhouse: names carry version + build tag. (Hashing 5 GB on GCSFUSE would cost
++    minutes; the installed JIT sources are hashed instead, by source_fingerprint.)"""
++    return sorted([p.name, p.stat().st_size] for p in Path(wheel_dir).glob("*.whl"))
++
++
++def source_fingerprint(dirs, suffixes=(".py", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".c", ".jinja", ".txt")):
++    """sha256 over (relative path, content) of the kernel-source files of the installed packages (local venv disk)."""
++    h = hashlib.sha256()
++    for d in dirs:
++        d = Path(d)
++        if not d.exists():
++            h.update(b"missing:" + str(d.name).encode())
++            continue
++        for p in sorted(x for x in d.rglob("*") if x.is_file() and x.suffix in suffixes and "__pycache__" not in x.parts):
++            h.update(p.relative_to(d.parent).as_posix().encode() + b"\0")
++            h.update(p.read_bytes())
++    return h.hexdigest()
++
++
++def kernel_env(env):
++    """The env vars that can change compiled kernels (cache-location vars excluded: they differ per run by design)."""
++    return {k: v for k, v in sorted(env.items()) if k.startswith(_KERNEL_ENV_PREFIXES) and k not in _CACHE_ENV_KEYS}
++
++
++def jit_manifest(**fields):
++    """A complete manifest or ValueError: a cache is never saved or restored against a partial fingerprint."""
++    missing = [k for k in JIT_MANIFEST_KEYS if fields.get(k) in (None, "", [], {})]
++    extra = [k for k in fields if k not in JIT_MANIFEST_KEYS]
++    if missing or extra:
++        raise ValueError(f"jit manifest: missing {missing}, unknown {extra}")
++    return json.loads(json.dumps({k: fields[k] for k in JIT_MANIFEST_KEYS}, sort_keys=True))
++
+ 
+ def save_jit_cache(base, out_tar, manifest):
+-    """tar the compile caches without the driver caches; manifest = versions (sglang/torch/triton/flashinfer/sm, wheel
+-    hashes) written inside as MANIFEST.json."""
++    """tar the compile caches without the driver caches, with the (complete) manifest inside as MANIFEST.json."""
++    manifest = jit_manifest(**manifest)
+     base = Path(base)
+     out_tar = Path(out_tar)
+     with tarfile.open(out_tar, "w") as tf:
+@@ -527,13 +859,16 @@
+ 
+ 
+ def restore_jit_cache(tar_path, base, expect_manifest):
+-    """Untar only when the manifest matches exactly; returns (restored, why). Paths are checked against traversal."""
++    """Untar only when both manifests are complete and identical; returns (restored, why). Paths are checked against
++    traversal. After a restore, known_answer_ok must pass, or the caller wipes the caches and compiles cold."""
+     base = Path(base)
+     try:
++        expect = jit_manifest(**expect_manifest)
+         with tarfile.open(tar_path) as tf:
+             m = json.loads(tf.extractfile("MANIFEST.json").read())
+-            if m != expect_manifest:
+-                return False, "manifest mismatch"
++            if m != expect:
++                diff = sorted(k for k in set(m) | set(expect) if m.get(k) != expect.get(k))
++                return False, f"manifest mismatch: {diff}"
+             for mem in tf.getmembers():
+                 if not mem.name.startswith("cache/") or not mem.isfile():
+                     continue
+--- rev1/test_e14_loadpath.py
++++ rev2/test_e14_loadpath.py
+@@ -67,7 +67,7 @@
+     data = bytearray(g.read_bytes())
+     data[-100:] = b"\0" * 100
+     g.write_bytes(bytes(data))
+-    ok, why = L._verify_tree(model, dst)
++    ok, why, _ = L._verify_tree(model, dst)
+     assert not ok and "content mismatch" in why
+ 
+ 
+@@ -87,7 +87,7 @@
+     with pytest.raises(L.CopyStalled):
+         L.parallel_copy(model, tmp_path / "dst", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, stall_sec=1.0, log=None)
+     assert time.monotonic() - t0 < 5
+-    assert not (tmp_path / "dst" / "model").exists()
++    assert not (tmp_path / "dst" / "model").exists() and not (tmp_path / "dst" / "model.partial").exists()
+     release.set()
+ 
+ 
+@@ -116,7 +116,7 @@
+         return real_open(p, mode, *a, **k)
+ 
+     monkeypatch.setattr("builtins.open", flaky_open)
+-    monkeypatch.setattr(L.time, "sleep", lambda s: None)
++    monkeypatch.setattr(L, "_backoff", lambda a: 0)
+     dst, _ = L.parallel_copy(model, tmp_path / "dst", workers=1, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
+     monkeypatch.undo()
+     assert sha(dst / "model.safetensors") == sha(model / "model.safetensors")
+@@ -161,6 +161,7 @@
+ 
+ 
+ def test_choose_dest_dev_shm_needs_ram(monkeypatch):
++    monkeypatch.setattr(L, "cgroup_memory", lambda: (None, None))
+     monkeypatch.setattr(L, "_mem_available", lambda: 30 * (1 << 30))
+     monkeypatch.setattr(L.Path, "is_dir", lambda self: True)
+ 
+@@ -271,6 +272,14 @@
+ 
+ 
+ # ------------------------------------------------------------------------------------------- JIT cache
++def full_manifest(**over):
++    m = {"sglang": "0.5.21", "sgl_kernel": "0.4.2", "flashinfer": "0.6.18", "torch": "2.11.0", "triton": "3.6.0",
++         "cuda_runtime": "13.0", "nvcc": "13.0.88", "driver": "580.95", "gpu_name": "NVIDIA L4", "sm": "8.9",
++         "wheels": [["sglang-0.5.21-py3-none-any.whl", 123]], "jit_sources": "ab" * 32, "env": {"TORCH_CUDA_ARCH_LIST": "8.9"}}
++    m.update(over)
++    return m
++
++
+ def test_jit_cache_roundtrip_excludes_driver_cache(tmp_path):
+     base = tmp_path / "cache"
+     for rel in ("sglang/jit/a.so", "sglang_jit/k/b.so", "triton/x/c.cubin", "torch_ext/d.so",
+@@ -278,7 +287,7 @@
+         p = base / rel
+         p.parent.mkdir(parents=True, exist_ok=True)
+         p.write_text(rel)
+-    man = {"sglang": "0.5.21", "torch": "2.11", "sm": "8.9"}
++    man = full_manifest()
+     tar = L.save_jit_cache(base, tmp_path / "jit.tar", man)
+     with tarfile.open(tar) as tf:
+         names = tf.getnames()
+@@ -295,17 +304,55 @@
+     base = tmp_path / "cache"
+     (base / "triton").mkdir(parents=True)
+     (base / "triton" / "a").write_text("a")
+-    tar = L.save_jit_cache(base, tmp_path / "jit.tar", {"sglang": "0.5.21"})
+-    ok, why = L.restore_jit_cache(tar, tmp_path / "new", {"sglang": "0.5.22"})
+-    assert not ok and why == "manifest mismatch" and not (tmp_path / "new").exists()
++    tar = L.save_jit_cache(base, tmp_path / "jit.tar", full_manifest())
++    for over in ({"sglang": "0.5.22"}, {"driver": "590.10"}, {"jit_sources": "cd" * 32}, {"env": {"TORCH_CUDA_ARCH_LIST": "9.0"}}):
++        ok, why = L.restore_jit_cache(tar, tmp_path / "new", full_manifest(**over))
++        assert not ok and why == f"manifest mismatch: {list(over)}" and not (tmp_path / "new").exists(), (over, why)
++
++
++def test_jit_manifest_must_be_complete(tmp_path):
++    with pytest.raises(ValueError, match="missing"):
++        L.jit_manifest(sglang="0.5.21")
++    with pytest.raises(ValueError, match="unknown"):
++        L.jit_manifest(**full_manifest(), extra=1)
++    with pytest.raises(ValueError):
++        L.save_jit_cache(tmp_path, tmp_path / "x.tar", {"sglang": "0.5.21"})
++    base = tmp_path / "c"
++    (base / "triton").mkdir(parents=True)
++    (base / "triton" / "a").write_text("a")
++    tar = L.save_jit_cache(base, tmp_path / "jit.tar", full_manifest())
++    ok, why = L.restore_jit_cache(tar, tmp_path / "new", {"sglang": "0.5.21"})     # partial expectation: never restore
++    assert not ok and "missing" in why
++
++
++def test_kernel_env_and_fingerprints(tmp_path):
++    env = {"TORCH_CUDA_ARCH_LIST": "8.9", "SGLANG_JIT_CACHE_DIR": "/tmp/x", "SGLANG_CACHE_DIR": "/tmp/y",
++           "SGLANG_ENABLE_FOO": "1", "HOME": "/root", "TRITON_CACHE_DIR": "/tmp/z", "FLASHINFER_JIT_VERBOSE": "0"}
++    assert L.kernel_env(env) == {"FLASHINFER_JIT_VERBOSE": "0", "SGLANG_ENABLE_FOO": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
++    pkg = tmp_path / "site" / "sgl_kernel"
++    (pkg / "csrc").mkdir(parents=True)
++    (pkg / "csrc" / "k.cu").write_text("__global__ void k(){}")
++    (pkg / "__init__.py").write_text("x = 1")
++    a = L.source_fingerprint([pkg])
++    (pkg / "csrc" / "k.cu").write_text("__global__ void k(){ }")
++    assert L.source_fingerprint([pkg]) != a
++    (pkg / "data.bin").write_bytes(b"ignored")
++    b = L.source_fingerprint([pkg])
++    (pkg / "data.bin").write_bytes(b"changed")
++    assert L.source_fingerprint([pkg]) == b                  # only source suffixes count
++    wh = tmp_path / "wh"
++    wh.mkdir()
++    (wh / "b-1.whl").write_bytes(b"12")
++    (wh / "a-1.whl").write_bytes(b"1")
++    assert L.wheel_inventory(wh) == [["a-1.whl", 1], ["b-1.whl", 2]]
+ 
+ 
+ def test_jit_cache_rejects_traversal(tmp_path):
+     import io
+     tar = tmp_path / "evil.tar"
+-    man = {"v": 1}
++    man = full_manifest()
+     with tarfile.open(tar, "w") as tf:
+-        for name, data in (("MANIFEST.json", json.dumps(man).encode()), ("cache/../../evil.txt", b"x"),
++        for name, data in (("MANIFEST.json", json.dumps(man, sort_keys=True).encode()), ("cache/../../evil.txt", b"x"),
+                            ("cache/ok.txt", b"y")):
+             ti = tarfile.TarInfo(name)
+             ti.size = len(data)
+@@ -418,7 +465,8 @@
+ 
+     monkeypatch.setattr(L, "_copy_range", per_stream_limited)
+     _, s1 = L.parallel_copy(model, tmp_path / "d1", workers=1, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
+-    _, s10 = L.parallel_copy(model, tmp_path / "d10", workers=10, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    _, s10 = L.parallel_copy(model, tmp_path / "d10", workers=10, chunk=1 * MIB, small_bytes=64 * 1024, log=None,
++                             levels=(10,))                 # fixed level: this test is about parallelism, not the ramp
+     assert s1["sec"] >= 2.5 * s10["sec"], (s1, s10)
+ 
+ 
+@@ -481,3 +529,346 @@
+     ok, why, _ = mon(FakeProc(pid=100), log, load_stall_sec=0.5, compile_stall_sec=5).wait(lambda: False,
+                                                                                             time.perf_counter() + 10)
+     assert not ok and "phase 1" in why
++
++
++# =========================================================================== rev 2 (GPT notes 08/09, Notes/10)
++class _Proxy:
++    """Wraps a real file object; subclasses override read/write to inject faults."""
++
++    def __init__(self, f):
++        self.f = f
++
++    def __getattr__(self, k):
++        return getattr(self.f, k)
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *a):
++        self.f.close()
++
++
++def inject_open(monkeypatch, wrapper, when):
++    """Make the module's open() return wrapper(real file) when when(path, mode) holds."""
++    import builtins
++    real = builtins.open
++
++    def o(p, mode="r", *a, **k):
++        f = real(p, mode, *a, **k)
++        return wrapper(f) if when(str(p), mode) else f
++
++    monkeypatch.setattr(L, "open", o, raising=False)
++
++
++def no_dirs_left(root, name="model"):
++    return not (Path(root) / name).exists() and not (Path(root) / (name + ".partial")).exists()
++
++
++def test_short_writes_still_give_an_exact_copy(model, tmp_path, monkeypatch):
++    """GPT gap 2 item 2: a raw write may write fewer bytes than asked. Rev 1 ignored the count (bug)."""
++    class ShortWriter(_Proxy):
++        def write(self, b):
++            return self.f.write(bytes(memoryview(b)[:max(1, len(b) // 3)]))
++
++    inject_open(monkeypatch, ShortWriter, lambda p, m: m == "r+b")
++    dst, _ = L.parallel_copy(model, tmp_path / "dst", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert sha(dst / "model.safetensors") == sha(model / "model.safetensors")
++    assert sha(dst / "draft.safetensors") == sha(model / "draft.safetensors")
++
++
++def test_write_all_zero_write_raises():
++    class Zero:
++        def write(self, b):
++            return 0
++    with pytest.raises(IOError):
++        L._write_all(Zero(), b"abc")
++
++
++def test_zero_byte_read_once_is_retried(model, tmp_path, monkeypatch):
++    state = {"left": 1}
++
++    class ZeroOnce(_Proxy):
++        def read(self, n=-1):
++            if state["left"] > 0:
++                state["left"] -= 1
++                return b""
++            return self.f.read(n)
++
++    monkeypatch.setattr(L, "_backoff", lambda a: 0)
++    inject_open(monkeypatch, ZeroOnce, lambda p, m: m == "rb" and p.endswith("model.safetensors") and "src" in p)
++    dst, st = L.parallel_copy(model, tmp_path / "dst", workers=2, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert sha(dst / "model.safetensors") == sha(model / "model.safetensors") and st["retries"] == 1
++
++
++def test_zero_byte_reads_forever_leave_no_directory(model, tmp_path, monkeypatch):
++    class Zero(_Proxy):
++        def read(self, n=-1):
++            return b""
++
++    monkeypatch.setattr(L, "_backoff", lambda a: 0)
++    inject_open(monkeypatch, Zero, lambda p, m: m == "rb" and p.endswith("model.safetensors") and "src" in p)
++    with pytest.raises(IOError, match="short read"):
++        L.parallel_copy(model, tmp_path / "dst", workers=2, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert no_dirs_left(tmp_path / "dst")
++
++
++def test_enospc_leaves_no_directory_and_stage_fails_open(model, tmp_path, monkeypatch):
++    import errno
++
++    class Full(_Proxy):
++        def write(self, b):
++            raise OSError(errno.ENOSPC, "No space left on device")
++
++    monkeypatch.setattr(L, "_backoff", lambda a: 0)
++    inject_open(monkeypatch, Full, lambda p, m: m == "r+b")
++    with pytest.raises(OSError):
++        L.parallel_copy(model, tmp_path / "dst", workers=2, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert no_dirs_left(tmp_path / "dst")
++    d = tmp_path / "shm"
++    d.mkdir()
++    out, rep = L.stage_models([model], workers=2, log=None, dest_candidates=(str(d),), chunk=1 * MIB,
++                              small_bytes=64 * 1024)
++    assert out[str(model)] == str(model) and "No space" in rep["error"] and rep["warm"][str(model)]["bytes"] > 0
++    assert no_dirs_left(d / "e14-weights")
++
++
++def test_one_byte_flip_is_caught_by_range_hash(model, tmp_path, monkeypatch):
++    """A byte changed in the destination after the write (any write-path bug) must fail verification."""
++    real = L._copy_range
++
++    def flip(src, dst, off, n, prog, retries=4):
++        real(src, dst, off, n, prog, retries)
++        if Path(dst).name == "model.safetensors" and off == 4 * MIB:
++            with open(dst, "r+b") as f:
++                f.seek(off + 100)
++                b = f.read(1)
++                f.seek(off + 100)
++                f.write(bytes([b[0] ^ 1]))
++
++    monkeypatch.setattr(L, "_copy_range", flip)
++    with pytest.raises(IOError, match="range hash mismatch: model.safetensors at offset 4194304"):
++        L.parallel_copy(model, tmp_path / "dst", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert no_dirs_left(tmp_path / "dst")
++
++
++def test_worker_exception_leaves_no_directory(model, tmp_path, monkeypatch):
++    real = L._copy_range
++
++    def bug(src, dst, off, n, prog, retries=4):
++        if off == 3 * MIB:
++            raise RuntimeError("bug in a worker")
++        return real(src, dst, off, n, prog, retries)
++
++    monkeypatch.setattr(L, "_copy_range", bug)
++    with pytest.raises(RuntimeError, match="bug in a worker"):
++        L.parallel_copy(model, tmp_path / "dst", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert no_dirs_left(tmp_path / "dst")
++
++
++def test_stale_partial_and_final_are_replaced(model, tmp_path):
++    root = tmp_path / "dst"
++    for d in ("model", "model.partial"):
++        (root / d).mkdir(parents=True)
++        (root / d / "model.safetensors").write_bytes(b"junk")
++        (root / d / "junk.txt").write_text("old")
++    dst, _ = L.parallel_copy(model, root, workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert sha(dst / "model.safetensors") == sha(model / "model.safetensors")
++    assert not (dst / "junk.txt").exists() and not (root / "model.partial").exists()
++
++
++def test_sha256_recorded_and_expected_checked(model, tmp_path):
++    dst, st = L.parallel_copy(model, tmp_path / "d1", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert st["sha256"]["model.safetensors"] == sha(model / "model.safetensors")
++    with pytest.raises(IOError, match="sha256 mismatch: model.safetensors"):
++        L.parallel_copy(model, tmp_path / "d2", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None,
++                        expected_sha256={"model.safetensors": "0" * 64})
++    assert no_dirs_left(tmp_path / "d2")
++    L.parallel_copy(model, tmp_path / "d3", workers=4, chunk=1 * MIB, small_bytes=64 * 1024, log=None,
++                    expected_sha256={"model.safetensors": st["sha256"]["model.safetensors"]})
++
++
++def test_ranges_cover_exactly():
++    for size, chunk in ((0, 4), (1, 4), (8, 4), (9, 4), (64 * MIB + 1, MIB)):
++        rs = L._ranges(size, chunk)
++        assert sum(n for _, n in rs) == size and rs[0][0] == 0
++
++
++def make_multi(path, tensors, buf_len, fill=b"\x07"):
++    """tensors: [(name, dtype, shape, begin, end)]; header as given, buffer of buf_len bytes."""
++    hdr = json.dumps({n: {"dtype": d, "shape": s, "data_offsets": [b, e]} for n, d, s, b, e in tensors}).encode()
++    hdr += b" " * (-len(hdr) % 8)
++    Path(path).write_bytes(struct.pack("<Q", len(hdr)) + hdr + fill * buf_len)
++
++
++def test_safetensors_layout_rules(tmp_path):
++    p = tmp_path / "x.safetensors"
++    # header order differs from offset order (GPT: "last JSON entry" is unsafe) -> still fine
++    make_multi(p, [("b", "F16", [4], 8, 16), ("a", "F32", [2], 0, 8)], 16)
++    assert L.safetensors_layout(p) == (True, "ok")
++    make_multi(p, [("a", "F32", [2], 0, 8), ("b", "F16", [4], 10, 18)], 18)
++    assert "hole" in L.safetensors_layout(p)[1]
++    make_multi(p, [("a", "F32", [2], 0, 8), ("b", "F16", [4], 6, 14)], 14)
++    assert "overlap" in L.safetensors_layout(p)[1]
++    make_multi(p, [("a", "F32", [3], 0, 8)], 8)
++    assert "bytes for F32" in L.safetensors_layout(p)[1]
++    make_multi(p, [("a", "U8", [8], 2, 10)], 10)
++    assert "first tensor starts" in L.safetensors_layout(p)[1]
++    make_multi(p, [("a", "U8", [8], 0, 8)], 12)
++    assert "buffer is 12" in L.safetensors_layout(p)[1]
++    p.write_bytes(b"\x01\x02")
++    assert not L.safetensors_layout(p)[0]
++    p.write_bytes(struct.pack("<Q", 5) + b"{bad}")
++    assert not L.safetensors_layout(p)[0]
++
++
++def test_layout_problem_of_the_source_is_accepted_as_published(tmp_path):
++    """If the published file itself breaks the strict rule, the copy is not rejected for it (it is reported)."""
++    m = tmp_path / "src" / "model"
++    m.mkdir(parents=True)
++    make_multi(m / "w.safetensors", [("a", "U8", [3 * MIB], 0, 3 * MIB), ("b", "U8", [8], 3 * MIB + 8, 3 * MIB + 16)],
++               3 * MIB + 16)
++    dst, st = L.parallel_copy(m, tmp_path / "dst", workers=2, chunk=1 * MIB, small_bytes=64 * 1024, log=None)
++    assert st["layout_as_published"] and "hole" in st["layout_as_published"][0]
++
++
++# ------------------------------------------------------------------------------------------- worker ramp
++def _synthetic(prog, n_jobs, mib=1, delay=0.04, sem=None, live=None):
++    def job():
++        if live is not None:                   # counted before the storage limit: this is the worker concurrency
++            with live["lock"]:
++                live["now"] += 1
++                live["max"] = max(live["max"], live["now"])
++        try:
++            if sem:
++                sem.acquire()
++            try:
++                time.sleep(delay)
++                prog.add(mib * MIB)
++            finally:
++                if sem:
++                    sem.release()
++        finally:
++            if live is not None:
++                with live["lock"]:
++                    live["now"] -= 1
++    return [job] * n_jobs
++
++
++def test_ramp_goes_up_while_throughput_scales():
++    prog = L._Progress(400 * MIB)
++    r = L._run_ranged(_synthetic(prog, 400), prog, 8, 10, None, 1e9, None, levels=(2, 4, 8), ramp_bytes=12 * MIB)
++    assert [lv for lv, _ in r["levels"]][:2] == [2, 4] and r["final_workers"] == 8, r
++
++
++def test_ramp_falls_back_when_storage_saturates():
++    """Storage that serves only 2 streams at a time: going 2 -> 4 brings no gain, so it returns to 2 and stays.
++    Active workers never exceed the level that was allowed."""
++    prog = L._Progress(300 * MIB)
++    live = {"lock": threading.Lock(), "now": 0, "max": 0}
++    sem = threading.Semaphore(2)
++    r = L._run_ranged(_synthetic(prog, 300, sem=sem, live=live), prog, 8, 10, None, 1e9, None, levels=(2, 4, 8),
++                      ramp_bytes=12 * MIB)
++    assert r["final_workers"] == 2 and [lv for lv, _ in r["levels"]] == [2, 4], r
++    assert live["max"] <= 4
++
++
++def test_ramp_backs_off_on_retry():
++    """Level 2 is measured at the first 0.2 s poll (~10 MiB >= 4 MiB) -> level 4; a transient error fires at 14 MiB,
++    i.e. inside the level-4 window -> back to 2 and stay."""
++    prog = L._Progress(300 * MIB)
++    fired = {"x": False}
++    lock = threading.Lock()
++
++    def job():
++        with lock:
++            if not fired["x"] and prog.done >= 14 * MIB:
++                fired["x"] = True
++                prog.retry()
++        time.sleep(0.04)
++        prog.add(MIB)
++
++    r = L._run_ranged([job] * 300, prog, 8, 10, None, 1e9, None, levels=(2, 4, 8), ramp_bytes=4 * MIB)
++    assert r["final_workers"] == 2 and r["levels"][-1] == (4, None), r
++
++
++# ------------------------------------------------------------------------------------------- cgroup, state, switch
++@pytest.fixture
++def fake_cgroup(tmp_path, monkeypatch):
++    cg = tmp_path / "cgroup"
++    cg.mkdir()
++    monkeypatch.setattr(L, "CGROUP", str(cg))
++    return cg
++
++
++def test_cgroup_v2_v1_and_headroom(fake_cgroup, fake_proc):
++    (fake_cgroup / "memory.max").write_text("8000000000\n")
++    (fake_cgroup / "memory.current").write_text("3000000000\n")
++    assert L.cgroup_memory() == (8_000_000_000, 3_000_000_000)
++    assert L.host_headroom() == 5_000_000_000            # smaller than MemAvailable (184 GB in the fake /proc)
++    (fake_cgroup / "memory.max").write_text("max\n")
++    assert L.cgroup_memory() == (None, 3_000_000_000) and L.host_headroom() == 180000000 * 1024
++    for f in ("memory.max", "memory.current"):
++        (fake_cgroup / f).unlink()
++    (fake_cgroup / "memory").mkdir()
++    (fake_cgroup / "memory" / "memory.limit_in_bytes").write_text(str(1 << 62))
++    (fake_cgroup / "memory" / "memory.usage_in_bytes").write_text("100")
++    assert L.cgroup_memory() == (None, 100)
++    (fake_cgroup / "memory" / "memory.limit_in_bytes").write_text("40000000000")
++    assert L.cgroup_memory() == (40_000_000_000, 100)
++
++
++def test_dev_shm_skipped_when_cgroup_is_tight(fake_cgroup, fake_proc, monkeypatch):
++    (fake_cgroup / "memory.max").write_text(str(40 * (1 << 30)))
++    (fake_cgroup / "memory.current").write_text(str(2 * (1 << 30)))
++    monkeypatch.setattr(L.Path, "is_dir", lambda self: True)
++
++    class U:
++        free = 100 * (1 << 30)
++
++    monkeypatch.setattr(L.shutil, "disk_usage", lambda d: U)
++    assert L.choose_dest(int(23.3e9), ("/dev/shm", "/tmp")) == "/tmp"   # 38 GiB headroom < 23.3 GB + 24 GiB
++
++
++def test_state_record_written_at_every_change(tmp_path, model):
++    p = tmp_path / "e14_state.json"
++    st = L.E14State(p)
++    d = tmp_path / "shm"
++    d.mkdir()
++    L.stage_models([model], workers=2, log=None, dest_candidates=(str(d),), state=st, chunk=1 * MIB,
++                   small_bytes=64 * 1024)
++    st.enter("LAUNCH", deadline=time.perf_counter() + 60)
++    st.end("ready")
++    rec = json.loads(p.read_text())
++    assert [x["phase"] for x in rec["phases"]] == ["PREPARE", "COPY", "VALIDATE", "LAUNCH"]
++    assert rec["phases"][1]["validated"] is True and rec["terminal_reason"] == "ready"
++    assert 0 < rec["phases"][3]["deadline_in"] <= 60
++
++
++def test_off_switch(model, tmp_path, monkeypatch):
++    monkeypatch.setenv("E14_LOADPATH", "0")
++    d = tmp_path / "shm"
++    d.mkdir()
++    out, rep = L.stage_models([model], log=None, dest_candidates=(str(d),))
++    assert rep == {"disabled": True} and out[str(model)] == str(model) and not any(d.iterdir())
++
++
++def test_copied_model_is_not_read_again_after_a_later_failure(model, tmp_path, monkeypatch):
++    second = tmp_path / "src" / "draft"
++    second.mkdir()
++    make_safetensors(second / "d.safetensors", 2 * MIB, seed=3)
++    real = L.parallel_copy
++    calls = []
++
++    def first_ok_then_fail(m, *a, **k):
++        calls.append(Path(m).name)
++        if Path(m).name == "draft":
++            raise L.CopyStalled("stalled on the draft")
++        return real(m, *a, **k)
++
++    monkeypatch.setattr(L, "parallel_copy", first_ok_then_fail)
++    d = tmp_path / "shm"
++    d.mkdir()
++    out, rep = L.stage_models([model, second], workers=2, log=None, dest_candidates=(str(d),), chunk=1 * MIB,
++                              small_bytes=64 * 1024)
++    assert out[str(model)] == str(d / "e14-weights" / "model") and out[str(second)] == str(second)
++    assert list(rep["warm"]) == [str(second)] and calls == ["model", "draft"]

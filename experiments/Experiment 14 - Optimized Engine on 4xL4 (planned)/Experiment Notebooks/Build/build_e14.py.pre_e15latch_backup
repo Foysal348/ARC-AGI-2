@@ -1,0 +1,1165 @@
+"""Experiment 14 notebook builder: E14-A, the single optimized-engine notebook (plan: Notes/13; user 2026-10-23: one
+notebook, change the pipeline as needed, the base stays preserved).
+
+How it is built (the base is never touched):
+- The E12 builder (`build_e12_duck.py`, rev 6g) is EXECUTED IN MEMORY with the G4B arguments up to the line where it would
+  write its notebook. Its cell strings (CELL 0-7, verbatim Duck package, rev 6g solver) are taken from that run; nothing is
+  written into the E12 folder.
+- The Duck package it embeds is the workspace duck_arc2 (arc2_duck with the E14-P raw-reasoning switch, off by default;
+  this notebook turns it on).
+- E14 changes are applied here with the same `once()` guard (each patch must match exactly once) plus new cells:
+  CELL 1b (first-line facts, phase record, staging, E14 modules), CELL 5b (A1 measurements), CELL 6b (A2 measurements),
+  CELL 7b (E14 report, JIT cache, bundle).
+    python build_e14.py            # E14A (commit = measurements + a short Duck run; rerun = every hidden task)
+"""
+import base64
+import hashlib
+import io
+import json
+import sys
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+E14 = HERE.parents[1]
+SRC = E14 / "src"
+E12_BUILDER = Path(r"D:/ARC AGI 2/experiments/Experiment 12 - Duck REPL agent for ARC-AGI-2 (planned)/Experiment Notebooks/"
+                   r"Build/build_e12_duck.py")
+VARIANT = "E14S"
+# E14S (2026-10-24): the submission notebook. R2 adopted DFlash width 6 + CUDA graphs 1..13 (Notes/30); the rerun runs
+# no measurements, so that arm is set in the launch flags; commit = a 25-min Duck smoke on the G4B tasks with the arm.
+NAME = "Q27-XHIGH-E14S_SUBMIT_W6G13_DUCK_SGLANG.ipynb"
+# --eval120g4b (user 2026-10-24: "the hidden run's time per task"): the same notebook, default commit profile
+# E14SEVAL120G4B = all 120 evaluation tasks at the hidden run's compute share (gate 4b) -> coverage + score
+EVAL120G4B = "--eval120g4b" in sys.argv
+if EVAL120G4B:
+    NAME = "Q27-XHIGH-E14S_EVAL120G4B_W6G13_DUCK_SGLANG.ipynb"
+DEFAULT_PROFILE = "E14SEVAL120G4B" if EVAL120G4B else "E14S"
+# --effort medium|low (user 2026-10-24: three full runs = xhigh + medium + low): the Duck's reasoning_effort for every
+# request (E12_REASONING_EFFORT, the rev 5 LOW switch, LB 17.50 ran through it); THINK budget / caps unchanged
+EFFORT = sys.argv[sys.argv.index("--effort") + 1] if "--effort" in sys.argv else ""
+assert EFFORT in ("", "medium", "low"), EFFORT
+if EFFORT:
+    NAME = NAME.replace("Q27-XHIGH-", f"Q27-{EFFORT.upper()}-")
+# --e16 (user 2026-10-24, E16 zip "verified program generation + cache-safe text preservation"): the Duck adapter
+# arc2_duck_e16.py is overlaid from sha-pinned compressed bytes in the notebook after the payload's own sha check and
+# before `import arc2_duck`; the payload dataset is unchanged. Flags: one early inspection-only nudge (2 successful
+# read-only calls, >= 4k tokens) + raw assistant content kept when normalize(raw) == stored.
+E16 = "--e16" in sys.argv
+# --e15 (user 2026-10-24: "the next experiment for coverage"; Notes/25, 29, 35): engine arms on the submission engine -
+# reference W6 + graphs13, W8, built-in MTP (EAGLE 3/1/4 with an explicit draft path = the INT4 dir), mem 0.86, 2/1/3,
+# ReplaySSM fp32 / fp16, 14 and 16 really running - each gated, 8k + 40k windows; then a 15-min Duck run on the best arm
+E15 = "--e15" in sys.argv
+if E15:
+    NAME = "Q27-XHIGH-E15_MTP_ENGINE_DUCK_SGLANG.ipynb"
+    DEFAULT_PROFILE = "E15"
+E16_ADAPTER = E14 / "src" / "e16" / "arc2_duck_e16.py"
+if E16:
+    NAME = NAME.replace("_SUBMIT_", "_E16_SUBMIT_").replace("_EVAL120G4B_", "_E16_EVAL120G4B_")
+# never overwrite a notebook that was pushed to Kaggle (memory: never-rebuild-run-notebooks); register shas here
+PUSHED = {"a5318ddab1ee692535a7417c9452f9e758c4fb3c290b668cd8c1b0ca0a54c6ea",   # the 745 kB embedded E14A (never started)
+          "3c67794e1b1f30f1c496dc2a6c9c478bbfdd497a554f11244f8e01df151b47a3",   # SLIM run1 (A1-2 crashed: Sampler._stop)
+          "2298d827ea3925bbdd7cc5c93a472b68461205982cbfddb2e7d08c0d8395d754",   # SLIM R2 (hosen42 run, Notes/30)
+          "3dde5cbd1fa88e0f07d690929ebdef4639d15b43d5798ba6d4adfdcf5b96b237",   # E14S SUBMIT (hosen42 commit 2026-10-24)
+          "234d091933ac91cecb07118aa9b92f9f9ef18cefd866ef87d81a4154d1865217",   # E14S E16 EVAL120G4B (hosen42 commit 2026-10-24)
+          "44e11cf6741780f4c12d81c8a2366e8f8b06d015c97afe07121b2af5df923d81",   # E14S EVAL120G4B (hosen42 commit 2026-10-24)
+          "f87c548892e834f164c0f75fbe725244407881ea846b19e7d950a605a5c1b267"}   # E14S E16 LOW EVAL120G4B (foysal commit 2026-10-24)
+# Notes/21: Kaggle COMMIT runs of the 745 kB notebook never started (INT4 mount error 3/3; a 727 kB padded diag did not
+# start in 11 min, the same notebook ran interactively; 444 kB rev 6g ran). The two big payloads (E14 modules, the Duck
+# package zip) therefore live in the private dataset PAYLOAD_SLUG; the notebook keeps their names + sha256 only.
+PAYLOAD_SLUG = "foysalemonshanto/q27-e14a-payload"
+PAYLOAD_DIR = HERE / "payload"
+NB_LIMIT = 400_000
+
+# ------------------------------------------------------------------ 1. the E12 builder in memory (G4B variant)
+_src = E12_BUILDER.read_text(encoding="utf-8")
+_cut = _src.index("out = HERE.parent / NAME")
+_argv = sys.argv
+sys.argv = ["build_e12_duck.py", "--eval12r6g4b"]
+G = {"__file__": str(E12_BUILDER), "__name__": "e12_builder_in_memory"}
+exec(compile(_src[:_cut], str(E12_BUILDER), "exec"), G)
+sys.argv = _argv
+once = G["once"]
+cells, c1, c_pkg, c_eng, c_solve, c_rep = G["cells"], G["c1"], G["c_pkg"], G["c_eng"], G["c_solve"], G["c_rep"]
+src_nb, code = G["src"], G["code"]
+assert G["VARIANT"] == "EVAL12R6G4B" and G["REV6_BUILD"] and G["LIVE"] == 12
+DUCK_SHA = G["MANIFEST"]["arc2_duck.py"]
+
+
+MODULES = {n: SRC / n for n in ("e14_loadpath.py", "e14_measure.py", "e14_sglang_patches.py", "e14_nccl_bench.py",
+                                "e14_trace_summary.py")}
+missing = [n for n, p in MODULES.items() if not p.is_file()]
+if missing:
+    raise SystemExit(f"E14 modules missing: {missing}")
+MOD_SHA = {n: hashlib.sha256(p.read_bytes()).hexdigest() for n, p in MODULES.items()}
+
+
+def _zip(files):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for k in sorted(files):
+            zi = zipfile.ZipInfo(k, date_time=(2026, 10, 23, 0, 0, 0))
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(zi, files[k])
+    return buf.getvalue()
+
+
+PAYLOAD = {}                                            # stem -> (file name, sha256, bytes); names carry the sha
+for _stem, _data in (("q27x_e14_modules", _zip({n: p.read_bytes() for n, p in MODULES.items()})),
+                     ("q27x_e12_duck", base64.b64decode(G["ZIP_B64"]))):
+    _h = hashlib.sha256(_data).hexdigest()
+    PAYLOAD[_stem] = (f"{_stem}_{_h[:12]}.bin", _h, _data)   # .bin: a zip inside, kept out of Kaggle's archive unpacking
+MOD_ZIP, MOD_ZIP_SHA = PAYLOAD["q27x_e14_modules"][:2]
+DUCK_ZIP, DUCK_ZIP_SHA = PAYLOAD["q27x_e12_duck"][:2]
+
+# ------------------------------------------------------------------ 2. CELL 1: the E14A profile and its defaults
+c1 = once(c1, 'os.environ.get("Q27X_PROFILE", "EVAL12R6G4B")', 'os.environ.get("Q27X_PROFILE", "' + DEFAULT_PROFILE + '")', "default profile")
+c1 = once(c1, '    "PROXY56":', '''    # E14-A (user 2026-10-23: one notebook; plan Notes/13): engine measurements (A1), a 25-minute Duck run with the
+    # adopted levers on the G4B tasks (raw reasoning on), more engine arms (A2). Every phase has its own deadline;
+    # whatever does not fit before the hard stop is skipped and reported, never squeezed.
+    "E14A":      {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd",
+                                                  "247ef758", "bf45cf4b", "f931b4a8", "65b59efc", "9385bd28", "cbebaa4b"],
+                  "time_budget_sec": 200 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 25 * 60, "e14": True},
+    # E14S (Notes/30, 31; user 2026-10-24: a short commit): a valid version + a GPU smoke of the submission arm (DFlash
+    # width 6 + CUDA graphs 1..13) at 12 streams, no measurements. 36 min, not 30: R2 was READY at ~12.5 min (install
+    # 3 + staging 2 + first launch 502 s) and the SGLang give-up is admit - 5 min (30 min -> 13 min, 36 min -> 19 min)
+    "E14S":      {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd",
+                                                  "247ef758", "bf45cf4b", "f931b4a8", "65b59efc", "9385bd28", "cbebaa4b"],
+                  "time_budget_sec": 36 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 8 * 60},
+    # E14S EVAL120 gate 4b (user 2026-10-24): every evaluation task (120 / 172 inputs) with the hidden run's compute per
+    # task: CELL 6 sets the window to 120 x (hidden solve seconds / 240) = about 5.8 h; the coverage of the hidden run
+    # (stage-1 starts, branch 1 starts, pass1 / pass2) on eval difficulty. 6.5 h budget = start + window + margins
+    # E15 (Notes/35): engine arms (no E14A measurements: E14_DO_MEASURE stays False, so the first launch = the submission
+    # arm W6 + graphs13 = the reference), then a 15-min Duck run on the G4B tasks with the adopted arm. 130 min budget
+    "E15":       {"source": "eval", "task_list": ["136b0064", "898e7135", "135a2760", "b5ca7ac4", "4c3d4a41", "62593bfd",
+                                                  "247ef758", "bf45cf4b", "f931b4a8", "65b59efc", "9385bd28", "cbebaa4b"],
+                  "time_budget_sec": 130 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60,
+                  "solve_window_sec": 15 * 60, "e15": True},
+    "E14SEVAL120G4B": {"source": "eval", "n_tasks": 120, "time_budget_sec": 6.5 * 3600, "admit_frac": 0.90,
+                       "drain_frac": 0.94, "hard_margin_sec": 2 * 60, "verify_margin_sec": 1 * 60,
+                       "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60, "hidden_equiv": True},
+    "PROXY56":''', "E14A + E14S profiles")
+
+if EFFORT:
+    c1 = once(c1, 'E12_REASONING_EFFORT = os.environ.get("E12_REASONING_EFFORT", "").strip().lower()',
+              'E12_REASONING_EFFORT = os.environ.get("E12_REASONING_EFFORT", "' + EFFORT + '").strip().lower()   # E14S --effort',
+              "reasoning effort default")
+
+if E16:
+    c1 = once(c1, "# ---- E12: Duck REPL agent", """# E16 (2026-10-24): one early inspection-only nudge; raw assistant content whitespace kept only when the
+# normalized text is identical (tool-call markup never modified). E12_E16_EARLY_NUDGE=0 / E12_E16_RAW_CONTENT=0 disable.
+# Threshold 12,000 (user 2026-10-24; R2 replay, agent C: 4k lands before the natural transform in all 4 solved branches,
+# 12k spares b5ca7ac4 and keeps bf45cf4b_b0 and the never-transform branches)
+E16_FLAGS = {"E12_E16_EARLY_NUDGE": 1, "E12_E16_INSPECTION_CALLS": 2, "E12_E16_NUDGE_TOKENS": 12000,
+             "E12_E16_RAW_CONTENT": 1}
+for _e16_key, _e16_val in E16_FLAGS.items():
+    os.environ.setdefault(_e16_key, str(_e16_val))
+# ---- E12: Duck REPL agent""", "E16 flags")
+
+# ------------------------------------------------------------------ 3. CELL 1b (new): first-line facts, staging, modules
+c1b = r'''# ==================================================================== CELL 1b — E14: first-line facts, phase record, staging
+# Experiment 14 (Notes/07, 11-13). Runs before any heavy work: what the machine is (mounts / GCSFUSE, df, RAM, cgroup,
+# CPU, a timed 64 MiB read), a phase record written at every change (e14_state.json) and a heartbeat, then the model
+# copy to RAM/local disk with ranged parallel readers (verified, published atomically, fail open). The E14-P fix (raw
+# reasoning in Duck's history, Notes/12) is switched on for every profile of this notebook.
+import io as _e14_io
+E14_DIR = Path(os.environ.get("E14_DIR", "/tmp/e14")); E14_DIR.mkdir(parents=True, exist_ok=True)
+Q27X_PAYLOAD_SLUG = "''' + PAYLOAD_SLUG + r'''"
+
+
+def q27x_payload(name, sha):
+    """One file of the payload dataset (Notes/21: Kaggle commit runs of a 745 kB notebook never started, so the big
+    payloads live in a dataset), found by its exact name under Q27X_PAYLOAD_DIR or /kaggle/input (at most 3 directory
+    levels deep) and verified by sha256 before use."""
+    roots = [Path(x) for x in os.environ.get("Q27X_PAYLOAD_DIR", "").split(os.pathsep) if x] + [Path("/kaggle/input")]
+    seen = []
+    for r in roots:
+        for pat in (name, "*/" + name, "*/*/" + name, "*/*/*/" + name):
+            for f in (sorted(r.glob(pat)) if r.is_dir() else []):
+                b = f.read_bytes()
+                if hashlib.sha256(b).hexdigest() == sha:
+                    return b
+                seen.append(str(f))
+    raise FileNotFoundError(f"payload {name} (sha256 {sha[:12]}) not found or wrong under {[str(r) for r in roots]}; "
+                            f"seen {seen}; attach the dataset {Q27X_PAYLOAD_SLUG}")
+
+
+_E14_MOD_SHA = ''' + json.dumps(MOD_SHA) + r'''
+with zipfile.ZipFile(_e14_io.BytesIO(q27x_payload("''' + MOD_ZIP + '''", "''' + MOD_ZIP_SHA + r'''"))) as _z:
+    for _n, _h in _E14_MOD_SHA.items():
+        (E14_DIR / _n).write_bytes(_z.read(_n))
+        assert hashlib.sha256((E14_DIR / _n).read_bytes()).hexdigest() == _h, _n
+sys.path.insert(0, str(E14_DIR))
+import e14_loadpath as E14L, e14_measure as E14M, e14_sglang_patches as E14P, e14_trace_summary as E14T
+E14_OUT = OUT / "e14"; E14_OUT.mkdir(parents=True, exist_ok=True)
+E14_RESULTS = {"build": {"variant": "''' + VARIANT + r'''", "arc2_duck_sha": "''' + DUCK_SHA + r'''", "modules": _E14_MOD_SHA,
+                         "payload": {"dataset": Q27X_PAYLOAD_SLUG, "''' + MOD_ZIP + '''": "''' + MOD_ZIP_SHA + '''",
+                                     "''' + DUCK_ZIP + '''": "''' + DUCK_ZIP_SHA + r'''"}},
+               "phases": {}, "decisions": {}}
+E14_DO_MEASURE = bool(P.get("e14")) and not RERUN
+E14_STATE = E14L.E14State(WORKING / "e14_state.json")
+E14_STATE.enter("PREPARE", deadline=HARD_STOP, profile=PROFILE, rerun=RERUN, measure=E14_DO_MEASURE)
+
+
+def e14_save():
+    try:
+        write_json_atomic(E14_OUT / "e14_results.json", E14_RESULTS)
+        write_json_atomic(WORKING / "e14_results.json", E14_RESULTS)
+    except Exception as _e:
+        print("E14 results write failed:", repr(_e)[:200], flush=True)
+
+
+def _e14_heartbeat(every=60):
+    while True:
+        try:
+            with open(WORKING / "e14_heartbeat.log", "a", encoding="utf-8") as _f:
+                _f.write(f"{time.strftime('%H:%M:%S')} +{(time.perf_counter() - NOTEBOOK_T0) / 60:.1f} min "
+                         f"phase {E14_STATE.rec.get('current')}\n")
+        except Exception:
+            pass
+        time.sleep(every)
+
+
+threading.Thread(target=_e14_heartbeat, daemon=True).start()
+E14_RESULTS["env"] = E14L.env_report([str(SGL_MODEL_PATH), str(SGL_DRAFT_PATH), str(SGL_WHEELHOUSE), str(MODEL_PATH),
+                                      "/kaggle/input"])
+try:
+    E14_RESULTS["read_probe"] = E14L.read_probe(SGL_MODEL_PATH) if ENGINE_BACKEND == "sglang" else None
+except Exception as _e:
+    E14_RESULTS["read_probe"] = {"error": repr(_e)[:200]}
+print("E14 env:", json.dumps(E14_RESULTS["env"])[:1500], "| probe:", json.dumps(E14_RESULTS["read_probe"]), flush=True)
+E14_STAGING = None
+if ENGINE_BACKEND == "sglang" and E14L.loadpath_enabled():
+    _e14_dest = tuple(x for x in os.environ.get("E14_DEST", "/dev/shm,/tmp").split(",") if x)
+    E14_STAGING = E14L.Staging([SGL_MODEL_PATH, SGL_DRAFT_PATH], workers=24, stall_sec=600.0,
+                               deadline=NOTEBOOK_T0 + 45 * 60, log=print, state=E14_STATE, dest_candidates=_e14_dest)
+    E14_STAGING.start()
+    print("E14 staging started ->", _e14_dest, flush=True)
+os.environ["E12_RAW_REASONING_HISTORY"] = "1"          # E14-P (Notes/12): Duck keeps the server's raw reasoning
+E14_VENV = {}
+
+
+def e14_after_install(vpy, env):
+    """After the SGLang venv exists: the NCCL bench (commit measurement only; the GPUs are idle while the copy runs),
+    then the staged model paths (fail open: the original /kaggle/input paths)."""
+    global SGL_MODEL_PATH, SGL_DRAFT_PATH
+    E14_VENV.update(vpy=str(vpy), env=dict(env))
+    if E14_DO_MEASURE and not E11_HARNESS_E14:
+        E14_STATE.enter("NCCL_BENCH")
+        _t = time.perf_counter()
+        _o = E14_OUT / "nccl_bench.json"
+        try:
+            _r = subprocess.run([str(vpy), str(E14_DIR / "e14_nccl_bench.py"), "--out", str(_o),
+                                 "--arms", "baseline,p2p_sys,shm_memcpy", "--timeout-per-arm", "240"],
+                                env=env, capture_output=True, text=True, timeout=900)
+            E14_RESULTS["nccl"] = json.loads(_o.read_text()) if _o.exists() else {"rc": _r.returncode,
+                                                                                  "stderr": (_r.stderr or "")[-2000:]}
+        except Exception as _e:
+            E14_RESULTS["nccl"] = {"error": repr(_e)[:300]}
+        E14_RESULTS["nccl_sec"] = round(time.perf_counter() - _t, 1)
+        e14_save()
+        print("E14 NCCL bench:", json.dumps((E14_RESULTS.get("nccl") or {}).get("summary"))[:800], flush=True)
+    elif E14_DO_MEASURE and E11_HARNESS_E14:
+        _o = E14_OUT / "nccl_bench.json"
+        subprocess.run([sys.executable, str(E14_DIR / "e14_nccl_bench.py"), "--out", str(_o), "--fake"], timeout=120)
+        E14_RESULTS["nccl"] = json.loads(_o.read_text()) if _o.exists() else {"error": "fake bench wrote nothing"}
+    if E14_STAGING is not None:
+        E14_STATE.enter("STAGING_JOIN")
+        E14_STAGING.join(timeout=max(0.0, SGL_GIVE_UP_AT - 20 * 60 - time.perf_counter()))
+        res = E14_STAGING.result
+        if res is None:
+            E14_RESULTS["staging"] = {"still_running": True, "note": "launch from the original paths"}
+        else:
+            paths, rep = res
+            E14_RESULTS["staging"] = rep
+            SGL_MODEL_PATH = Path(paths.get(str(SGL_MODEL_PATH), str(SGL_MODEL_PATH)))
+            SGL_DRAFT_PATH = Path(paths.get(str(SGL_DRAFT_PATH), str(SGL_DRAFT_PATH)))
+        E14_RESULTS["launch_paths"] = {"model": str(SGL_MODEL_PATH), "draft": str(SGL_DRAFT_PATH)}
+        e14_save()
+        print("E14 staging:", json.dumps(E14_RESULTS["staging"])[:1200], flush=True)
+    E14_STATE.enter("LAUNCH", deadline=SGL_GIVE_UP_AT)
+
+
+E11_HARNESS_E14 = os.environ.get("E11_HARNESS") == "1"
+E14_TS = float(os.environ.get("E14_TIME_SCALE", "1"))    # the CPU harness shortens every window and phase cap; 1 on Kaggle
+_ts = lambda s: max(1.5, float(s) * E14_TS)
+CONFIG["e14"] = {"measure": E14_DO_MEASURE, "staging": E14_STAGING is not None, "raw_reasoning": True,
+                 "submit_arm": None if E14_DO_MEASURE else "DFlash width 6 + CUDA graphs 1..13 (Notes/30)",
+                 "modules": _E14_MOD_SHA, "arc2_duck_sha": "''' + DUCK_SHA + r'''"}
+e14_save()
+'''
+
+# ------------------------------------------------------------------ 3b. CELL 3: the Duck package zip from the payload dataset
+c_pkg = once(c_pkg, '_E12_ZIP = "' + G["ZIP_B64"] + '"',
+             '_E12_ZIP_BYTES = q27x_payload("' + DUCK_ZIP + '", "' + DUCK_ZIP_SHA + '")   # Notes/21: payload dataset',
+             "Duck zip from the payload dataset")
+c_pkg = once(c_pkg, "with zipfile.ZipFile(_io.BytesIO(_b64.b64decode(_E12_ZIP))) as _z:",
+             "with zipfile.ZipFile(_io.BytesIO(_E12_ZIP_BYTES)) as _z:", "Duck zip extract")
+
+if E16:
+    import zlib
+    _e16 = E16_ADAPTER.read_bytes()
+    E16_SHA = hashlib.sha256(_e16).hexdigest()
+    _e16_b64 = base64.b64encode(zlib.compress(_e16, 9)).decode("ascii")
+    c_pkg = once(c_pkg, "import arc2_duck as E12A", '''# E16: overlay ONLY arc2_duck.py (sha-pinned, compressed in this notebook) after the payload's sha check, before
+# the import; the payload dataset is unchanged
+import zlib as _e16_zlib
+_e16_adapter = _e16_zlib.decompress(_b64.b64decode("''' + _e16_b64 + '''"))
+assert hashlib.sha256(_e16_adapter).hexdigest() == "''' + E16_SHA + '''", "E16 adapter sha"
+(E12_DIR / "arc2_duck.py").write_bytes(_e16_adapter)
+assert hashlib.sha256((E12_DIR / "arc2_duck.py").read_bytes()).hexdigest() == "''' + E16_SHA + '''"
+_E12_MANIFEST["arc2_duck.py"] = "''' + E16_SHA + '''"
+E14_RESULTS["build"]["arc2_duck_sha"] = "''' + E16_SHA + '''"
+E14_RESULTS["build"]["e16_adapter_overlay"] = True
+print("E16 adapter OK:", "''' + E16_SHA[:12] + '''", flush=True)
+import arc2_duck as E12A''', "E16 adapter overlay")
+
+# ------------------------------------------------------------------ 4. CELL 2: the single-stream prefetch only without staging
+c2 = once(cells[3], '''if os.environ.get("Q27X_SKIP_INSTALL") != "1":
+    try:
+        import shlex as _shlex''', '''if os.environ.get("Q27X_SKIP_INSTALL") != "1" and E14_STAGING is None:   # E14: ranged staging replaces the cat
+    try:
+        import shlex as _shlex''', "prefetch off with staging")
+
+# ------------------------------------------------------------------ 5. CELL 5: install env, watchdog, launch cap, hook
+c_eng = once(c_eng, '''    shims.update(cuda_home=str(cuda_home), venv_python=str(vpy), sec=round(time.perf_counter() - t0, 1))''',
+             '''    env.update(E14L.jit_cache_env())      # E14: SGLANG_JIT_CACHE_DIR set explicitly (it is not under SGLANG_CACHE_DIR)
+    shims.update(cuda_home=str(cuda_home), venv_python=str(vpy), sec=round(time.perf_counter() - t0, 1))''', "jit env")
+c_eng = once(c_eng, '''    def wait_ready(self, timeout):
+        while time.perf_counter() - self.t0 < timeout:
+            if not self.alive():
+                return False, f"server exited rc={self.proc.returncode}"
+            try:
+                _urlreq.urlopen(SGL_URL + "/health", timeout=10).read()
+                return True, f"ready in {time.perf_counter() - self.t0:.0f}s"
+            except Exception:
+                time.sleep(2 if E11_HARNESS else 5)
+        return False, "timeout"''', '''    def wait_ready(self, timeout):
+        # E14-0 (Notes/07, 11): stall-based. Progress = log growth or the server tree's read() bytes + page faults (the
+        # mmap weight load is silent in the log); stalls: 900 s while loading, 720 s while compiling (> the ~6 min silent
+        # first verify-graph capture); a progressing server is never given up before t0 + timeout
+        def _health():
+            _urlreq.urlopen(SGL_URL + "/health", timeout=10).read()
+            return True
+        mon = E14L.StallMonitor(self.proc, self.log_path, poll_sec=2 if E11_HARNESS else 5, log=print)
+        ok, why, self.e14_stats = mon.wait(_health, give_up_at=self.t0 + timeout)
+        return ok, why''', "stall watchdog")
+c_eng = once(c_eng, '''        ok, why = srv.wait_ready(min(SGL_LAUNCH_TIMEOUT_SEC if i == 0 else SGL_RELAUNCH_TIMEOUT_SEC, left))''',
+             '''        # E14-0: the first launch may use the time up to the give-up (the stall rule decides), relaunches keep 20 min
+        ok, why = srv.wait_ready(left if i == 0 else min(SGL_RELAUNCH_TIMEOUT_SEC, left))''', "first launch cap")
+c_eng = once(c_eng, '''    vpy, env, E11_SGL["install"] = e11_install()
+    launch = [str(vpy), "-m", "sglang.launch_server"] if not E11_HARNESS else [sys.executable, os.environ["E11_FAKE_SERVER"]]''',
+             '''    vpy, env, E11_SGL["install"] = e11_install()
+    launch = [str(vpy), "-m", "sglang.launch_server"] if not E11_HARNESS else [sys.executable, os.environ["E11_FAKE_SERVER"]]
+    e14_after_install(vpy, env)             # E14: NCCL bench while the copy runs, then the staged model paths
+    E14_VENV["launch"] = list(launch)''', "after-install hook")
+c_eng = once(c_eng, '''    E11_SGL["launch_flags"] = e11_flags(cfg)''', '''    E11_SGL["launch_flags"] = e11_flags(cfg)
+    E14_VENV["cfg"] = dict(cfg)
+    E14_STATE.enter("READY", ready=getattr(E11_SERVER, "e14_stats", None))''', "ready state")
+
+c_eng = once(c_eng, '''def e11_next(cfg, tail, used):''', '''# E14S (Notes/30, R2): the adopted arm = DFlash width 6 (531 vs 505 tok/s, gate PASS) on CUDA graphs 1..13 (captured
+# 12 and 13, gate PASS). Set in every launch unless the E14A measurements run (they start from W1 and set each arm per
+# launch).
+E14_SUBMIT_ARM = {"--cuda-graph-bs-decode": [str(b) for b in range(1, SGL_SERVER_MAX_RUNNING + 1)],
+                  "--speculative-num-draft-tokens": ["6"]}
+E14_SUBMIT_DROP = ("--cuda-graph-max-bs-decode",)
+_e11_flags_w1 = e11_flags
+
+
+def e11_flags(cfg):
+    f = _e11_flags_w1(cfg)
+    if E14_DO_MEASURE:
+        return f
+    out, i, names = [], 0, set(E14_SUBMIT_ARM) | set(E14_SUBMIT_DROP)
+    while i < len(f):
+        if f[i] in names:
+            i += 1
+            while i < len(f) and not str(f[i]).startswith("--"):
+                i += 1
+            continue
+        out.append(f[i])
+        i += 1
+    for k, v in E14_SUBMIT_ARM.items():
+        out += [k] + list(v)
+    return out
+
+
+def e11_next(cfg, tail, used):''', "submission arm")
+
+C_E15 = r'''# ==================================================================== CELL 5c — E15: MTP and engine arms (Notes/35)
+# Reference = the submission arm (W6 + graphs13, the first launch). Arms, each its own launch, gate first (large-margin
+# flips vs the reference A/A), then 8k / 40k windows at the measured level: W8; MTP EAGLE 3/1/4 (explicit draft path =
+# the INT4 dir: without it 0.5.21 sizes KV without the draft layer); MTP + mem 0.86; MTP 2/1/3; MTP + ReplaySSM fp32 / fp16;
+# the best MTP at 14 and 16 really running (mrr 15 / 17, mamba 60 / 68, graphs 1..15 / 1..17). The Duck run (CELL 6)
+# starts on a fresh launch of the fastest gated arm whose long window is not worse than the reference's.
+E15_ON = bool(P.get("e15")) and ENGINE_READY and not RERUN
+if E15_ON:
+    import statistics
+    E14_CTX = E14M.Ctx(SGL_URL, lambda: E11_SERVER.log_text() if E11_SERVER is not None else "", E14_OUT,
+                       model_id=_e14_model_id(), deadline=HARD_STOP - 8 * 60, log=print, encode=None,
+                       normalize=_E12_TA._normalize_message_content)
+    E14_CTX.scale = E14_TS
+    _rs = {"solve_window": float(E12_SOLVE_WINDOW_SEC or 900), "stop_before_hard": float(E12_STOP_BEFORE_HARD_SEC),
+           "preflight": _ts(300), "artifacts": _ts(600), "duck_relaunch": _ts(400)}
+    E14_RESERVE = round(sum(_rs.values()), 1)
+    E15R = {"reserve": dict(_rs, total=E14_RESERVE), "arms": {}, "launches": {}}
+    E14_RESULTS["e15"] = E15R
+    try:
+        E14_PROMPTS = e14_prompts()
+    except Exception as _e:
+        E14_PROMPTS = {"short": [], "long": [], "duck": [], "tool_text": "", "tokens": {"error": repr(_e)[:300]}}
+    E15R["prompts"] = E14_PROMPTS["tokens"]
+    _S, _L = E14_PROMPTS["short"], E14_PROMPTS["long"]
+    _SPEC = ("--speculative-algorithm", "--speculative-draft-model-path", "--speculative-draft-model-quantization",
+             "--speculative-num-draft-tokens", "--speculative-num-steps", "--speculative-eagle-topk")
+
+    def _mtp(steps=3, draft=4, extra=None):
+        d = {"--speculative-algorithm": "EAGLE", "--speculative-draft-model-path": str(SGL_MODEL_PATH),
+             "--speculative-num-steps": steps, "--speculative-eagle-topk": 1, "--speculative-num-draft-tokens": draft}
+        d.update(extra or {})
+        return d
+
+    def _ref_gate():
+        a = E14M.parity_pass(E14_CTX, _S[:6], max_new=256, tag="e15ref_serial_a")
+        b = E14M.parity_pass(E14_CTX, _S[:6], max_new=256, tag="e15ref_serial_b")
+        c = E14M.parity_pass(E14_CTX, _S, max_new=256, concurrent=True, tag="e15ref_conc_a")
+        c2 = E14M.parity_pass(E14_CTX, _S, max_new=256, concurrent=True, tag="e15ref_conc_b")
+        globals()["E15_REF"] = E14M.gate_reference(a, b, c, c2)
+        return {"serial_aa": E14M.compare_passes(a, b, "E15 ref serial A/A"),
+                "conc_aa": E14M.compare_passes(c, c2, "E15 ref all-at-once A/A")}
+
+    def _windows(tag, level, gate=True):
+        def run():
+            out = {}
+            if gate:
+                out["gate"] = E14M.arm_gate(E14_CTX, _S, E15_REF, tag="gate_" + tag, identity=False)
+                if not out["gate"].get("ok"):
+                    out["windows_skipped"] = "the correctness gate did not pass"
+                    return out
+                out["flush_after_gate"] = E14M.flush_cache(E14_CTX)
+            out["short"] = E14M.steady_window(E14_CTX, _S, level=level, secs=_ts(75), tag=tag + "short")
+            out["long"] = E14M.steady_window(E14_CTX, _L, level=level, secs=_ts(75), tag=tag + "long")
+            return out
+        return run
+
+    def _tok(r, band):
+        return ((r or {}).get(band) or {}).get("tok_s_p50")      # e14_measure.window_stats key
+
+    def _arm(name, set_=None, drop=(), level=None, gate=True, cap=12 * 60):
+        _ok, _rec = e14_launch(name, set_=set_ or {}, drop=drop)
+        E15R["launches"][name] = {k: _rec.get(k) for k in ("ok", "why", "sec", "caps", "skipped")}
+        _r = e14_phase("E15_" + name, _windows(name, level or SGL_MAX_RUNNING, gate=gate), _ts(cap)) if _ok else None
+        _er = E14M.log_errors((_r or {}).get("server_log_signs"))
+        E15R["arms"][name] = {"ok": bool(_ok and _r and not _r.get("error")),
+                             "gate": ((_r or {}).get("gate") or {}).get("verdict", "reference" if not gate else None),
+                             "short_tok_s": _tok(_r, "short"), "long_tok_s": _tok(_r, "long"),
+                             "accept_short": ((_r or {}).get("short") or {}).get("accept_p50"),
+                             "step_ms_short": ((_r or {}).get("short") or {}).get("step_ms_p50"),
+                             "step_ms_long": ((_r or {}).get("long") or {}).get("step_ms_p50"),
+                             "accept_long": ((_r or {}).get("long") or {}).get("accept_p50"),
+                             "level_short": ((_r or {}).get("short") or {}).get("measured_level"),
+                             "level_long": ((_r or {}).get("long") or {}).get("measured_level"),
+                             "kv_tokens": ((_rec or {}).get("caps") or {}).get("kv_tokens"),
+                             "mamba_cache": ((_rec or {}).get("caps") or {}).get("mamba_cache_size"),
+                             "capped_to": ((_rec or {}).get("caps") or {}).get("capped_to"),
+                             "log_errors": _er, "set": set_ or {}, "drop": list(drop)}
+        e14_save()
+        print("E15 arm", name, json.dumps(E15R["arms"][name], default=str)[:600], flush=True)
+        return E15R["arms"][name]
+
+    def _gated(a):
+        return bool(a and a.get("ok") and a.get("gate") in ("PASS", "reference") and not a.get("log_errors"))
+
+    # reference = the running submission arm (first launch); its A/A builds the gate reference
+    E14_STATE.enter("E15_REF")
+    e14_phase("E15_ref_aa", _ref_gate, _ts(8 * 60))
+    _r0 = e14_phase("E15_ref_windows", _windows("ref", SGL_MAX_RUNNING, gate=False), _ts(8 * 60))
+    E15R["arms"]["ref_w6g13"] = {"ok": bool(_r0 and not _r0.get("error")), "gate": "reference",
+                                "short_tok_s": _tok(_r0, "short"), "long_tok_s": _tok(_r0, "long"),
+                                "accept_short": ((_r0 or {}).get("short") or {}).get("accept_p50"),
+                                "accept_long": ((_r0 or {}).get("long") or {}).get("accept_p50"),
+                                "kv_tokens": ENGINE_INFO.get("kv_tokens"), "set": {}, "drop": []}
+    e14_save()
+    _arm("w8", set_={"--speculative-num-draft-tokens": 8})
+    _mtp_drop = _SPEC
+    _arm("mtp_3_1_4", set_=_mtp(), drop=_mtp_drop)
+    _arm("mtp_3_1_4_mem86", set_=_mtp(extra={"--mem-fraction-static": "0.86"}), drop=_mtp_drop)
+    _arm("mtp_2_1_3", set_=_mtp(steps=2, draft=3), drop=_mtp_drop)
+    _arm("mtp_replay_fp32", set_=_mtp(extra={"--enable-linear-replayssm-spec": None, "--mamba-ssm-dtype": "float32"}),
+         drop=_mtp_drop)
+    _arm("mtp_replay_fp16", set_=_mtp(extra={"--enable-linear-replayssm-spec": None}), drop=_mtp_drop)
+    # the best gated MTP arm at 12 (short tok/s) -> 14 and 16 really running
+    _mtps = {k: v for k, v in E15R["arms"].items() if k.startswith("mtp_") and _gated(v) and v.get("short_tok_s")}
+    _best_mtp = max(_mtps, key=lambda k: _mtps[k]["short_tok_s"]) if _mtps else None
+    E15R["best_mtp_at_12"] = _best_mtp
+    if _best_mtp:
+        _bs = dict(E15R["arms"][_best_mtp]["set"])
+        for _lvl, _mrr, _mc in ((14, 15, 60), (16, 17, 68)):
+            _arm(f"{_best_mtp}_at{_lvl}", set_=dict(_bs, **{"--max-running-requests": _mrr, "--max-mamba-cache-size": _mc,
+                                                          "--cuda-graph-bs-decode": list(range(1, _mrr + 1))}),
+                 drop=_mtp_drop, level=_lvl)
+    # the Duck arm: the fastest gated arm at 12 (the 14 / 16 arms change the Duck's admission, so they are reported only)
+    _ref = E15R["arms"]["ref_w6g13"]
+    _cand = {k: v for k, v in E15R["arms"].items() if "_at1" not in k and (_gated(v) or k == "ref_w6g13")
+             and v.get("short_tok_s") and (v.get("long_tok_s") or 0) >= 0.98 * (_ref.get("long_tok_s") or 0)}
+    _duck = max(_cand, key=lambda k: _cand[k]["short_tok_s"]) if _cand else "ref_w6g13"
+    E15R["duck_arm"] = _duck
+    E14_RESERVE = 0.0
+    _da = E15R["arms"].get(_duck) or {}
+    e14_launch("duck_" + _duck, set_=_da.get("set") or {}, drop=tuple(_da.get("drop") or ()), force=True)
+    E14_RESULTS["decisions"]["e15"] = {"duck_arm": _duck, "best_mtp_at_12": _best_mtp,
+                                       "table": {k: {f: v.get(f) for f in ("gate", "short_tok_s", "long_tok_s", "accept_short",
+                                                                          "accept_long", "kv_tokens", "level_short")}
+                                                 for k, v in E15R["arms"].items()}}
+    E14_STATE.enter("DUCK", arm=_duck)
+    e14_save()
+    print("E15 decisions:", json.dumps(E14_RESULTS["decisions"]["e15"], default=str)[:2500], flush=True)
+'''
+
+# ------------------------------------------------------------------ 6. CELL 5b / 6b / 7b (new)
+c_meas_common = r'''
+# ---- E14 shared helpers (CELL 5b and 6b)
+def e14_edit_flags(flags, drop=(), set_=None, add=()):
+    """drop: flag names removed with their value(s); set_: {flag: value | [values]} replaced or added; add: extra args."""
+    out, i, set_ = [], 0, dict(set_ or {})
+    names = set(drop) | set(set_)
+    while i < len(flags):
+        f = flags[i]
+        if f in names:
+            i += 1
+            while i < len(flags) and not str(flags[i]).startswith("--"):
+                i += 1
+            continue
+        out.append(f)
+        i += 1
+    for k, v in set_.items():
+        out += [k] + ([str(x) for x in v] if isinstance(v, (list, tuple)) else ([str(v)] if v is not None else []))
+    return out + list(add)
+
+
+def e14_spec_drop(flags):
+    return e14_edit_flags(flags, drop=[f for f in flags if str(f).startswith("--speculative-")])
+
+
+E14_ARM = {"name": "W1", "set": {}, "drop": (), "env": {}, "spec": True}    # what the server runs now
+E14_KEPT = dict(E14_ARM)        # the last ADOPTED arm: next arms build on it; failures and the Duck launch restore it
+E14_KEPT_WIN = {}               # the kept arm's windows (short / long / latch): the reference for the next arm
+E14_RESERVE = 0.0               # seconds kept for later work (the 25-min Duck run while A1 measures; GPT audits 17-19)
+E14_DIRTY = False               # a step left requests running on the server: relaunch before the next phase
+E14_GATE_REF = None             # baseline greedy rows for the per-arm correctness gate
+E14_LOG_SIGNS = ("runs out of memory", "Not enough space", "Retract", "out of memory", "Traceback", "Exception")
+
+
+def e14_launch(name, set_=None, drop=(), env=None, spec=True, patches=None, force=False):
+    """Kill the current server, launch W1 + this arm's changes, wait (stall watchdog), record caps. A launch that
+    could eat the Duck reserve is skipped (force=True: a launch that restores the kept arm or starts the Duck run).
+    On a failure the KEPT arm is launched again (never the last launched one, which may have been rejected).
+    Returns (ok, record)."""
+    global E11_SERVER, E14_ARM, E14_DIRTY
+    rec = {"arm": name, "set": set_ or {}, "drop": list(drop), "env": env or {}, "patches": patches, "force": force}
+    if not E14M.launch_allowed(time.perf_counter(), HARD_STOP, reserve=0.0 if force else E14_RESERVE, force=force):
+        rec["skipped"] = "would eat the Duck reserve" if (not force and E14_RESERVE) else "less than 15 min before the hard stop"
+        E14_RESULTS.setdefault("launches", []).append(rec)
+        e14_save()
+        print(f"E14 launch {name}: skipped ({rec['skipped']})", flush=True)
+        return False, rec
+    E14_STATE.enter("LAUNCH:" + name, deadline=HARD_STOP)
+    t0 = time.perf_counter()
+    try:
+        e11_kill_server(wait=True)
+    except Exception:
+        pass
+    rec["gpu_free"] = _e11_gpu_free()
+    flags = e11_flags(E14_VENV["cfg"])
+    flags = e14_edit_flags(flags, drop=drop, set_=set_)
+    if not spec:
+        flags = e14_spec_drop(flags)
+    envx = dict(E14_VENV["env"])
+    envx.update(env or {})
+    srv = E11Server(E14_VENV["launch"] + flags, envx, "e14_" + name)
+    srv.start()
+    # a measurement arm may not wait into the Duck reserve (review 3); the Duck / restore launches keep the old bound
+    _room = HARD_STOP - time.perf_counter() - (10 * 60 if force else E14_RESERVE + 8 * 60)
+    ok, why = srv.wait_ready(min(SGL_RELAUNCH_TIMEOUT_SEC, max(60.0, _room)))
+    rec.update(ok=ok, why=why, sec=round(time.perf_counter() - t0, 1), flags=flags, watchdog=getattr(srv, "e14_stats", None))
+    if ok:
+        E11_SERVER = srv
+        caps = e11_caps(srv.log_text())
+        rec["caps"] = caps
+        if caps.get("kv_tokens"):
+            ENGINE_INFO["kv_tokens"] = caps["kv_tokens"]
+        E14_ARM = {"name": name, "set": set_ or {}, "drop": tuple(drop), "env": env or {}, "spec": spec}
+        E14_DIRTY = False
+    else:
+        rec["log_tail"] = srv.log_text()[-3000:]
+        srv.kill()
+        if force and E14_KEPT["name"] != name and not name.startswith("kept_"):
+            okb, rb = e14_launch("kept_" + E14_KEPT["name"], set_=E14_KEPT["set"], drop=E14_KEPT["drop"],
+                                 env=E14_KEPT["env"], spec=E14_KEPT["spec"], force=True)
+            rec["relaunched_kept"] = {"ok": okb, "arm": E14_KEPT["name"], "sec": rb.get("sec")}
+    E14_RESULTS.setdefault("launches", []).append(rec)
+    e14_save()
+    print(f"E14 launch {name}: {why} ({rec['sec']} s)", flush=True)
+    return ok, rec
+
+
+def e14_keep(**windows):
+    """Adopt the arm the server runs now: later arms build on it and failures restore it."""
+    global E14_KEPT
+    E14_KEPT = dict(E14_ARM)
+    E14_KEPT_WIN.update({k: v for k, v in windows.items() if v})
+
+
+def _e14_dirty(obj):
+    """True if any cleanup inside a phase result says requests were still running on the server."""
+    if isinstance(obj, dict):
+        if obj.get("server_idle") is False or obj.get("server_not_idle") is True:
+            return True
+        return any(_e14_dirty(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_e14_dirty(v) for v in obj[:20])
+    return False
+
+
+def e14_phase(name, fn, cap_sec):
+    """Run one phase with its own deadline: min(cap, time left before the hard stop - 8 min - E14_RESERVE); skipped
+    (recorded) when less than 2 min would be left. A dirty server from the previous step is relaunched first (no
+    carry-over into this phase's windows). Every result and error is recorded and saved at once."""
+    global E14_DIRTY
+    cap = E14M.phase_budget(time.perf_counter(), HARD_STOP, cap_sec, reserve=E14_RESERVE, margin=8 * 60)
+    if cap is not None and E14_DIRTY:       # never measure on a server with leftover requests (review 4: not forced)
+        e14_launch(E14_ARM["name"].split("_clean")[0] + "_clean", set_=E14_ARM["set"], drop=E14_ARM["drop"],
+                   env=E14_ARM["env"], spec=E14_ARM["spec"])
+        cap = E14M.phase_budget(time.perf_counter(), HARD_STOP, cap_sec, reserve=E14_RESERVE, margin=8 * 60)
+    if cap is None or E14_DIRTY:
+        E14_RESULTS["phases"][name] = {"skipped": "dirty server" if E14_DIRTY else "Duck reserve / hard stop",
+                                       "reserve_sec": E14_RESERVE, "left_sec": round(HARD_STOP - time.perf_counter())}
+        e14_save()
+        print(f"E14 phase {name}: skipped {E14_RESULTS['phases'][name]}", flush=True)
+        return None
+    E14_CTX.deadline = time.perf_counter() + cap
+    E14_STATE.enter("PHASE:" + name, deadline=E14_CTX.deadline, arm=E14_ARM["name"])
+    t0 = time.perf_counter()
+    _srv = E11_SERVER
+    _off = len(_srv.log_text()) if _srv is not None else 0
+    try:
+        res = fn()
+    except BaseException as _e:
+        res = {"error": f"{type(_e).__name__}: {_e}"[:500], "traceback": traceback.format_exc()[-1500:]}
+    if isinstance(res, dict):
+        res.setdefault("arm", E14_ARM["name"])
+        res["phase_sec"] = round(time.perf_counter() - t0, 1)
+        res["budget"] = {"cap_sec": round(cap, 1), "reserve_sec": E14_RESERVE,
+                         "end_before_hard_stop_sec": round(HARD_STOP - E14_CTX.deadline, 1)}
+        if _srv is not None:                 # over-admission / eviction signs (substring diagnostic, not a classifier)
+            _new = _srv.log_text()[_off:]
+            res["server_log_signs"] = {s: _new.count(s) for s in E14_LOG_SIGNS if s in _new}
+        if _e14_dirty(res):
+            E14_DIRTY = True
+            res["server_not_idle_after"] = True
+    E14_RESULTS["phases"][name] = res
+    e14_save()
+    print(f"E14 phase {name}: {json.dumps(res, default=str)[:900]}", flush=True)
+    return res
+
+
+def e14_decide(name, conds, **extra):
+    """conds: [(label, bool)]: adopted only if all hold; the first failing label is the recorded reason."""
+    why = next((lab for lab, ok in conds if not ok), None)
+    E14_RESULTS["decisions"][name] = dict(adopt=why is None, reason="all conditions met" if why is None else why,
+                                          conditions={lab: bool(ok) for lab, ok in conds}, **extra)
+    return why is None
+
+
+def _e14_model_id():
+    try:
+        return json.loads(_urlreq.urlopen(SGL_URL + "/v1/models", timeout=30).read())["data"][0]["id"]
+    except Exception:
+        return str(SGL_MODEL_PATH)
+
+
+def _e14_rows(g):
+    return "\n".join(" ".join(str(v) for v in r) for r in g)
+
+
+def _e14_task_text(t):
+    s = "".join(f"\nExample {i + 1}\nInput:\n{_e14_rows(p['input'])}\nOutput:\n{_e14_rows(p['output'])}\n"
+                for i, p in enumerate(t["train"]))
+    return s + "".join(f"\nTest input {j + 1}:\n{_e14_rows(q['input'])}\n" for j, q in enumerate(t["test"]))
+
+
+def _e14_chat_ids(messages, tools=None, think=True):
+    txt = tokenizer.apply_chat_template(messages, tools=tools, tokenize=False, add_generation_prompt=True,
+                                        enable_thinking=think, reasoning_effort=REASONING_EFFORT)
+    return tokenizer.encode(txt, add_special_tokens=False)
+
+
+def e14_prompts():
+    """short: one real task per stream (the ARC text the model reasons about); long: a shared ~36k-token block of other
+    eval tasks + the task (the 40k band); parity: the 12 task prompts, thinking on; Duck: system prompt + tools + first
+    opener exactly as the solver sends them."""
+    ask = "Find the transformation rule of this ARC-AGI-2 task and describe it, then give the test output grids."
+    short = [_e14_chat_ids([{"role": "user", "content": ask + "\n" + _e14_task_text(CHALLENGES[t])}]) for t in TASK_IDS]
+    try:
+        _all = _load_json(ARC_ROOT / "arc-agi_evaluation_challenges.json")
+    except Exception:
+        _all = dict(CHALLENGES)
+    bg, n = [], 0
+    for t in sorted(_all):
+        if t in CHALLENGES:
+            continue
+        txt = _e14_task_text(_all[t])
+        bg.append(txt)
+        n += len(tokenizer.encode(txt, add_special_tokens=False))
+        if n >= int(os.environ.get("E14_LONG_TOKENS", 36000)):
+            break
+    block = "Reference tasks (not to be solved):\n" + "\n".join(bg)
+    long_ = [_e14_chat_ids([{"role": "system", "content": block},
+                            {"role": "user", "content": ask + "\n" + _e14_task_text(CHALLENGES[t])}]) for t in TASK_IDS]
+    TA, _, _, wrs = E12A._import_duck()
+    Agent = E12A.make_agent_class()
+    duck = []
+    for t in TASK_IDS:
+        ag = Agent(task=CHALLENGES[t], task_id=t, branch=0, view="facts", model=E14_CTX.model_id, base_url=SGL_URL + "/v1",
+                   provider="vllm")
+        d = E14_OUT / f"duck_probe_{t}"
+        d.mkdir(parents=True, exist_ok=True)
+        sp = d / TA.RUNTIME_STATE_FILENAME
+        wrs(sp, current_frame=None, history=[])
+        duck.append((ag._system_prompt, E12A.R6_TEXT["first"] + E12A.R6_COMPLETE, ag._tools(sp)))
+    tool_text = "Tool output:\n" + _e14_rows(CHALLENGES[TASK_IDS[0]]["train"][0]["input"])
+    return {"short": short, "long": long_, "duck": duck, "tool_text": tool_text,
+            "tokens": {"short_p50": statistics.median(len(x) for x in short) if short else None,
+                       "long_p50": statistics.median(len(x) for x in long_) if long_ else None}}
+'''
+
+c_meas1 = r'''# ==================================================================== CELL 5b — E14-A1: engine measurements before the Duck run
+# Plan: Notes/13, corrected after GPT audits 17-19 (Notes/20). Arms in order, each its own launch: W1 unchanged
+# (baseline: windows 8k/40k, profiler, latch test, E14-P token replay, greedy parity serial / A/A / 12 at once), then
+# +#44401 (+#41872) backport, +nodelay, + CUDA graphs 1..13. Every arm runs a short correctness gate against the W1
+# greedy rows and is adopted only if every recorded condition holds (decisions[*].reason). A1 never eats the reserve of
+# the 25-min Duck run; the Duck run (CELL 6) starts on a fresh launch of the kept arm.
+import statistics
+''' + c_meas_common + r'''
+E14_CTX = None
+if E14_DO_MEASURE and ENGINE_READY:
+    E14_CTX = E14M.Ctx(SGL_URL, lambda: E11_SERVER.log_text() if E11_SERVER is not None else "", E14_OUT,
+                       model_id=_e14_model_id(), deadline=HARD_STOP - 8 * 60, log=print, encode=None,
+                       normalize=_E12_TA._normalize_message_content)
+    E14_CTX.scale = E14_TS
+    E14_KEPT = dict(E14_ARM)
+    # Duck reserve (GPT audits 17 HIGH-2, 18 P0, 19 HIGH-E): A1 phases and A1 relaunches never eat the 25-min Duck run:
+    # its window + the solver stop margin + preflight + final artifacts + one conservative (cold capture) relaunch
+    _rs = {"solve_window": float(E12_SOLVE_WINDOW_SEC or 1500), "stop_before_hard": float(E12_STOP_BEFORE_HARD_SEC),
+           "preflight": _ts(300), "artifacts": _ts(600), "duck_relaunch": _ts(400)}
+    E14_RESERVE = round(sum(_rs.values()), 1)
+    E14_RESULTS["a1_reserve"] = dict(_rs, total=E14_RESERVE)
+    _t = time.perf_counter()
+    try:
+        E14_PROMPTS = e14_prompts()
+    except Exception as _e:           # review 13: never let a prompt-builder error stop the notebook before the Duck run
+        E14_PROMPTS = {"short": [], "long": [], "duck": [], "tool_text": "", "tokens": {"error": repr(_e)[:300]}}
+    E14_RESULTS["prompts"] = dict(E14_PROMPTS["tokens"], sec=round(time.perf_counter() - _t, 1))
+    _S, _L = E14_PROMPTS["short"], E14_PROMPTS["long"]
+    _summ = lambda d, s: E14T.summarize(d, s)
+    _latch = lambda: E14M.latch_test(E14_CTX, _S, _L, decodes=SGL_MAX_RUNNING - 1, arrivals=3, secs=_ts(60),
+                                     server_cap=SGL_SERVER_MAX_RUNNING, level=SGL_MAX_RUNNING)
+
+    def _a1_baseline():
+        out = {"short": E14M.steady_window(E14_CTX, _S, level=SGL_MAX_RUNNING, secs=_ts(75), tag="w1short"),
+               "long": E14M.steady_window(E14_CTX, _L, level=SGL_MAX_RUNNING, secs=_ts(75), tag="w1long")}
+        out["profile"] = E14M.steady_window(E14_CTX, _S, level=SGL_MAX_RUNNING, secs=_ts(60), tag="w1prof",
+                                            during=lambda c: E14M.profile_steps(c, steps=20, summarize=_summ))
+        out["latch"] = _latch()
+        return out
+    E14_BASE = e14_phase("A1-2_baseline_W1", _a1_baseline, _ts(15 * 60))
+    e14_keep(**{k: (E14_BASE or {}).get(k) for k in ("short", "long", "latch")})
+    e14_phase("A1-3_replay_E14P", lambda: E14M.replay_check(E14_CTX, E14_PROMPTS["duck"][:3]), _ts(8 * 60))
+
+    def _a1_parity():
+        a = E14M.parity_pass(E14_CTX, _S, max_new=512, tag="d_serial_a")
+        b = E14M.parity_pass(E14_CTX, _S, max_new=512, tag="d_serial_b")
+        c = E14M.parity_pass(E14_CTX, _S, max_new=512, concurrent=True, tag="d_c12")
+        c2 = E14M.parity_pass(E14_CTX, _S, max_new=512, concurrent=True, tag="d_c12_b")
+        _dirty = any(x and x[0].get("server_not_idle") for x in (a, b, c, c2))
+        # every later arm gate compares with these; a reference taken beside leftover requests is no reference (review 12)
+        globals()["E14_GATE_REF"] = None if _dirty else E14M.gate_reference(a, b, c, c2)
+        # batching alone changes greedy tokens (E12: 152-166 of 512 shared, no fault): concurrency 12 gets its own A/A;
+        # the decision rests on large-margin flips (> 1 nat) judged against the A/A, never on raw token equality
+        return {"aa": E14M.compare_passes(a, b, "D serial A vs D serial B (A/A)"),
+                "aa_c12": E14M.compare_passes(c, c2, "D c12 vs D c12 (A/A under batching)"),
+                "contamination": E14M.compare_passes(a, c, "D serial vs D at concurrency 12"),
+                "server_not_idle": _dirty, "gate_reference": "invalid (dirty server)" if _dirty else "ok"}
+    E14_PAR = e14_phase("A1-4_parity_D", _a1_parity, _ts(12 * 60))
+    if isinstance(E14_PAR, dict) and "aa" in E14_PAR:
+        E14_RESULTS["decisions"]["dflash_contamination"] = E14M.parity_ok(E14_PAR["contamination"], E14_PAR["aa_c12"],
+                                                                          allowance=2, identity="ignore")
+
+    def _arm_windows(tag, latch=True, extra=None):
+        """The correctness gate FIRST (audits 17-19: correctness before any throughput arm; a gate placed after the
+        windows was once starved of time and rejected a good arm as INCOMPLETE), then the windows only if it passed."""
+        def run():
+            # identity=False: DFlash2 greedy output is byte-identical within one process but can differ across a
+            # restart (#38009, Notes/Research - 4xL4 ...); every arm is a new process, so large-margin flips vs the
+            # A/A decide (a corrupt arm still fails: 2.4-nat flips) and identity is only recorded (review 1)
+            out = {"gate": E14M.arm_gate(E14_CTX, _S, E14_GATE_REF, tag="gate_" + tag, identity=False)}
+            if not out["gate"].get("ok"):
+                out["windows_skipped"] = "the correctness gate did not pass"
+                return out
+            out["flush_after_gate"] = E14M.flush_cache(E14_CTX)   # the windows start uncached like W1's (review 14)
+            out["short"] = E14M.steady_window(E14_CTX, _S, level=SGL_MAX_RUNNING, secs=_ts(75), tag=tag + "short")
+            out["long"] = E14M.steady_window(E14_CTX, _L, level=SGL_MAX_RUNNING, secs=_ts(75), tag=tag + "long")
+            if latch:
+                out["latch"] = _latch()
+            out.update((extra or (lambda: {}))())
+            return out
+        return run
+
+    # ---- arm 1: #44401 + #41872 backport (source-hash guarded; refused = arm skipped). Adopted only with a real
+    # occupancy gain at the same offered load, a passing correctness gate and no server error signs.
+    _site = None
+    if not E11_HARNESS:
+        try:
+            _site = subprocess.run([E14_VENV["vpy"], "-c", "import sglang, os; print(os.path.dirname(sglang.__file__))"],
+                                   capture_output=True, text=True, timeout=120).stdout.strip()
+        except Exception as _e:
+            _site, E14_RESULTS["patch_site_error"] = None, repr(_e)[:200]
+    else:
+        _site = os.environ.get("E14_FAKE_SGLANG_PKG")
+    _pr = E14P.apply(_site, names=("44401", "41872")) if _site else {"error": "sglang package path unknown"}
+    E14_RESULTS["patches"] = _pr
+    _applied = [n for n, v in (_pr.get("results") or {}).items() if v.get("status") in ("applied", "already applied")]
+    if "44401" in _applied:
+        _ok, _ = e14_launch("p44401", set_=E14_KEPT["set"], drop=E14_KEPT["drop"], env=E14_KEPT["env"], patches=_applied)
+        _pp = e14_phase("A1-5_p44401", _arm_windows("p44401"), _ts(14 * 60)) if _ok else None
+        _sp = E14M.adopt_speed(E14_KEPT_WIN.get("short"), (_pp or {}).get("short"), occupancy=True, per_step=True)
+        _lg = E14M.latch_gain(E14_KEPT_WIN.get("latch"), (_pp or {}).get("latch"))
+        _gt = (_pp or {}).get("gate") or {"ok": False, "why": "not run"}
+        _er = E14M.log_errors((_pp or {}).get("server_log_signs"))
+        if e14_decide("p44401", [("launched and measured", bool(_ok and _pp and not _pp.get("error"))),
+                                 ("correctness gate", _gt.get("ok")),
+                                 ("occupancy gain", _lg["gain"]), ("speed not worse", _sp["adopt"]),
+                                 ("no server error signs", not _er)],
+                      speed=_sp, latch_gain=_lg, gate=_gt, log_errors=_er):
+            e14_keep(**{k: _pp.get(k) for k in ("short", "long", "latch")})
+    else:
+        e14_decide("p44401", [("patch applied", False)], report=_pr)
+    if _applied and not (E14_RESULTS["decisions"].get("p44401") or {}).get("adopt"):
+        # every applied hunk that was not adopted is reverted (#41872 alone included; review 7); the revert is checked
+        _rv = E14P.revert(_site)
+        E14_RESULTS["patches_reverted"] = _rv
+        if not (isinstance(_rv, dict) and _rv.get("ok")):
+            E14_RESULTS["patch_state"] = "revert NOT confirmed: later launches may still run patched files"
+
+    # ---- arm 1b: the DFlash min-free-slots delayer off (Notes/14; source: managers/min_free_slots_delayer.py +
+    # scheduler.py L1182-1193). Unset + DFlash -> threshold min(4, max(2, (13 + 5) // 6)) = 3: with 11 running only 2
+    # slots are allocatable, so a returning stream waits until a second one finishes = the 11 running + 1 queued state.
+    # --min-free-slots-delay 1 disables it ("<= 1 disables"). Needs a real 11 -> 12 gain (latch_gain), not a tie.
+    _ok, _ = e14_launch("nodelay", set_=dict(E14_KEPT["set"], **{"--min-free-slots-delay": 1}), drop=E14_KEPT["drop"],
+                        env=E14_KEPT["env"])
+    _np = e14_phase("A1-5b_nodelay", _arm_windows("nodelay"), _ts(14 * 60)) if _ok else None
+    _sp = E14M.adopt_speed(E14_KEPT_WIN.get("short"), (_np or {}).get("short"), occupancy=True, per_step=True)
+    _lg = E14M.latch_gain(E14_KEPT_WIN.get("latch"), (_np or {}).get("latch"))
+    _gt = (_np or {}).get("gate") or {"ok": False, "why": "not run"}
+    _er = E14M.log_errors((_np or {}).get("server_log_signs"))
+    if e14_decide("nodelay", [("launched and measured", bool(_ok and _np and not _np.get("error"))),
+                              ("correctness gate", _gt.get("ok")),
+                              ("occupancy gain", _lg["gain"]), ("speed not worse", _sp["adopt"]),
+                              ("no server error signs", not _er)],
+                  speed=_sp, latch_gain=_lg, gate=_gt, log_errors=_er):
+        e14_keep(**{k: _np.get(k) for k in ("short", "long", "latch")})
+
+    # ---- arm 2: CUDA graphs for every batch size 1..13 (13 = the server's admission limit), on top of the kept arms;
+    # adopted only if the server really captured 12 and 13 (fail closed on an unparsed list)
+    _gbs = {"--cuda-graph-bs-decode": list(range(1, SGL_SERVER_MAX_RUNNING + 1))}
+    _ok, _grec = e14_launch("graphs13", set_=dict(E14_KEPT["set"], **_gbs),
+                            drop=tuple(E14_KEPT["drop"]) + ("--cuda-graph-max-bs-decode",), env=E14_KEPT["env"])
+    _gcap = ((_grec or {}).get("caps") or {}).get("verify_graph_bs")      # what the server really captured
+    _gp = e14_phase("A1-6_graphs13", _arm_windows("g13", latch=False, extra=lambda: {
+        "short13": E14M.steady_window(E14_CTX, _S, level=SGL_SERVER_MAX_RUNNING, secs=_ts(60), tag="g13at13")}),
+        _ts(12 * 60)) if _ok else None
+    _gs = E14M.adopt_speed(E14_KEPT_WIN.get("short"), (_gp or {}).get("short"), per_step=True)
+    _gcov = bool(_gcap) and {12, SGL_SERVER_MAX_RUNNING} <= set(_gcap)
+    _gt = (_gp or {}).get("gate") or {"ok": False, "why": "not run"}
+    _er = E14M.log_errors((_gp or {}).get("server_log_signs"))
+    if e14_decide("graphs13", [("launched and measured", bool(_ok and _gp and not _gp.get("error"))),
+                               ("correctness gate", _gt.get("ok")),
+                               ("captured 12 and 13", _gcov), ("speed not worse", _gs["adopt"]),
+                               ("no server error signs", not _er)],
+                  speed=_gs, gate=_gt, log_errors=_er, captured_bs=_gcap):
+        e14_keep(**{k: _gp.get(k) for k in ("short", "long")})
+
+    # ---- the Duck run starts on a FRESH launch of the kept arm: an empty radix cache and Mamba state like the hidden
+    # run, and the kept arm restored after a rejected one (audit 17 HIGH-4 / 18 Q3 / 19 §3). /flush_cache only when the
+    # relaunch did not happen; its plain-text reply is classified, never assumed.
+    E14_RESERVE = 0.0
+    _okf, _ = e14_launch("duck_" + E14_KEPT["name"], set_=E14_KEPT["set"], drop=E14_KEPT["drop"], env=E14_KEPT["env"],
+                         spec=E14_KEPT["spec"], force=True)
+    _fresh = bool(_okf) or (E14_ARM["name"].startswith("kept_") and bool((E14_RESULTS.get("launches") or [{}])[-1].get("ok")))
+    _clean = {"method": "relaunch" if _okf else ("relaunch (kept arm after a failed Duck launch)" if _fresh else "relaunch failed"),
+              "ok": _fresh, "arm": E14_ARM["name"]}
+    if not _fresh:
+        E14_CTX.deadline = time.perf_counter() + max(5.0, min(120.0, HARD_STOP - time.perf_counter() - 8 * 60))
+        _idle = E14M.server_idle(E14_CTX, wait=30.0)
+        try:
+            _msg = (E14M.post_json(E14_CTX, "/flush_cache", {}, timeout=60) or {}).get("text") or ""   # http_server.py:987
+        except Exception as _e:
+            _msg = "error: " + repr(_e)[:200]
+        _fl = _msg.strip().startswith("Cache flushed")
+        _clean = {"method": "flush", "idle_before": _idle, "ok": _fl, "reply": _msg.strip()[:300], "arm": E14_ARM["name"]}
+    _clean["cold_start_unverified"] = not _clean["ok"]
+    _clean["kept_arm_running"] = E14_ARM["set"] == E14_KEPT["set"] and E14_ARM["drop"] == E14_KEPT["drop"] and \
+        E14_ARM["env"] == E14_KEPT["env"]
+    E14_RESULTS["duck_clean_start"] = _clean
+    _clean["server_reachable_and_idle"] = E14M.server_idle(E14_CTX, wait=5.0)
+    _avail = HARD_STOP - E12_STOP_BEFORE_HARD_SEC - time.perf_counter()
+    E14_RESULTS["duck_window"] = {"planned_sec": E12_SOLVE_WINDOW_SEC, "available_sec": round(_avail),
+                                  "status": "full" if _avail >= (E12_SOLVE_WINDOW_SEC or 0) + _ts(300)
+                                  else "solver_window_unavailable"}
+    E14_RESULTS["duck_arm"] = dict(E14_ARM)
+    E14_STATE.enter("DUCK", arm=E14_ARM["name"])
+    e14_save()
+    print("E14-A1 decisions:", json.dumps({k: (v.get("adopt", v.get("ok")), v.get("reason", v.get("verdict")))
+                                           for k, v in E14_RESULTS["decisions"].items()
+                                           if isinstance(v, dict)}, default=str)[:1500],
+          "| Duck runs on", E14_ARM["name"], "| clean start", _clean, "| window", E14_RESULTS["duck_window"], flush=True)
+elif E14_DO_MEASURE:
+    E14_RESULTS["phases"]["A1"] = {"skipped": f"engine not ready (ENGINE_READY={ENGINE_READY})"}
+    e14_save()
+'''
+
+c_meas2 = r'''# ==================================================================== CELL 6b — E14-A2: more engine arms after the Duck run
+# Plan: Notes/13. The Duck run's server was stopped by CELL 7. Phases (each its own launch): the Duck arm again with an
+# agent-like replay (Mamba checkpoint eviction, E14-M) and a cache-hit parity pass; + int8 Mamba checkpoints (same
+# replay + the cache-hit parity); target-only (DFlash correctness); DFlash width 6 and 4; the NCCL env arm if the bench
+# found one >= 20 % faster at 983,040 B. Nothing here changes the submission.
+if E14_DO_MEASURE and E14_CTX is not None:
+    E14_RESERVE = 0.0
+    _S = E14_PROMPTS["short"]
+    _sess = [(s, u) for s, u, _t in E14_PROMPTS["duck"]] * 2
+    _base_arm = dict(E14_KEPT)          # the adopted arm (the Duck may have run on another one in a failure path)
+
+    def _cache_hit_parity(tag):
+        globals()["E14_LAST_FLUSH"] = E14M.flush_cache(E14_CTX)     # review 9: these prompts were sent already
+        a = E14M.parity_pass(E14_CTX, _S[:6], max_new=384, tag=tag + "_cold")
+        b = E14M.parity_pass(E14_CTX, _S[:6], max_new=384, tag=tag + "_cached")
+        return E14M.compare_passes(a, b, tag + ": fresh vs cached prefix")
+
+    def _a2_reference():
+        """The matched width-8 control (audit 18 E14-8): greedy rows of the arm the Duck ran, on THIS launch; every A2
+        arm gate below compares with these (int8 cross-arm, target-only, widths, NCCL)."""
+        a = E14M.parity_pass(E14_CTX, _S[:6], max_new=256, tag="a2ref_serial_a")
+        b = E14M.parity_pass(E14_CTX, _S[:6], max_new=256, tag="a2ref_serial_b")
+        c = E14M.parity_pass(E14_CTX, _S, max_new=256, concurrent=True, tag="a2ref_conc_a")
+        c2 = E14M.parity_pass(E14_CTX, _S, max_new=256, concurrent=True, tag="a2ref_conc_b")
+        globals()["E14_A2_REF"] = E14M.gate_reference(a, b, c, c2)
+        return {"serial_aa": E14M.compare_passes(a, b, "A2 base serial A/A"),
+                "conc_aa": E14M.compare_passes(c, c2, "A2 base all-at-once A/A")}
+
+    E14_A2_REF = None
+    _gate = lambda tag, identity=False: E14M.arm_gate(E14_CTX, _S, E14_A2_REF, tag="gate_" + tag, identity=identity)
+
+    def _gated(tag, windows):
+        """The gate first; the throughput windows only when it passed (correctness before speed)."""
+        out = {"gate": _gate(tag)}
+        if not out["gate"].get("ok"):
+            out["windows_skipped"] = "the correctness gate did not pass"
+            return out
+        out.update(windows())
+        return out
+    _ok, _ = e14_launch("a2_duck_arm", set_=_base_arm["set"], drop=_base_arm["drop"], env=_base_arm["env"])
+    e14_phase("A2-0_reference", _a2_reference, _ts(8 * 60)) if _ok else None
+    _r0 = e14_phase("A2-1_agent_replay_default", lambda: {
+        "replay": E14M.agent_replay(E14_CTX, _sess, turns=6, admit=SGL_MAX_RUNNING, tool_text=E14_PROMPTS["tool_text"],
+                                    tag="default"),
+        "cache_parity": _cache_hit_parity("default")}, _ts(14 * 60)) if _ok else None
+    _ok, _ = e14_launch("int8_mamba", set_=dict(_base_arm["set"], **{"--enable-int8-mamba-checkpoint": None}),
+                        drop=_base_arm["drop"], env=_base_arm["env"])
+    _r1 = e14_phase("A2-2_int8_mamba", lambda: _gated("int8", lambda: {   # cross-arm: default vs int8, same ids
+        "replay": E14M.agent_replay(E14_CTX, _sess, turns=6, admit=SGL_MAX_RUNNING, tool_text=E14_PROMPTS["tool_text"],
+                                    tag="int8"),
+        "cache_parity": _cache_hit_parity("int8")}), _ts(16 * 60)) if _ok else None
+    try:
+        _c0 = ((_r0 or {}).get("replay") or {}).get("classes") or {}
+        _c1 = ((_r1 or {}).get("replay") or {}).get("classes") or {}
+        _miss = lambda c: (c.get("deeper_miss", 0) + c.get("lost_at_prefill_end", 0)) / max(1, sum(c.values()))
+        _pa = E14M.parity_ok((_r1 or {}).get("cache_parity"), (_r0 or {}).get("cache_parity"))
+        e14_decide("int8_mamba", [("measured", bool(_r1 and _r0)),
+                                  ("cross-arm correctness gate", ((_r1 or {}).get("gate") or {}).get("ok")),
+                                  ("fewer cache misses", bool(_c1) and _miss(_c1) < _miss(_c0)),
+                                  ("cache-hit parity", _pa["ok"]),
+                                  ("no server error signs", not E14M.log_errors((_r1 or {}).get("server_log_signs")))],
+                   miss_share_default=round(_miss(_c0), 3), miss_share_int8=round(_miss(_c1), 3), cache_parity=_pa,
+                   gate=(_r1 or {}).get("gate"))
+    except Exception as _e:
+        E14_RESULTS["decisions"]["int8_mamba"] = {"adopt": False, "error": repr(_e)[:200]}
+
+    _ok, _ = e14_launch("target_only", set_=_base_arm["set"], drop=_base_arm["drop"], env=_base_arm["env"], spec=False)
+    _rt = e14_phase("A2-3_target_only", lambda: _gated("target", lambda: {
+        "short": E14M.steady_window(E14_CTX, _S, level=SGL_MAX_RUNNING, secs=_ts(60), tag="tonly", spec=False)}),
+        _ts(14 * 60)) if _ok else None
+    E14_RESULTS["decisions"]["dflash_vs_target"] = ((_rt or {}).get("gate") or {"ok": False, "why": "not run"})
+
+    _ref_short = E14_KEPT_WIN.get("short")      # the kept arm's window = the arm the Duck run used
+    for _w in (6, 4):
+        _ok, _ = e14_launch(f"width{_w}", set_=dict(_base_arm["set"], **{"--speculative-num-draft-tokens": _w}),
+                            drop=_base_arm["drop"], env=_base_arm["env"])
+        _rw = e14_phase({6: "A2-4_width6", 4: "A2-5_width4"}[_w], lambda w=_w: _gated(f"w{w}", lambda: {
+            "short": E14M.steady_window(E14_CTX, _S, level=SGL_MAX_RUNNING, secs=_ts(75), tag=f"w{w}short")}),
+            _ts(12 * 60)) if _ok else None
+        _sp = E14M.adopt_speed(_ref_short, (_rw or {}).get("short"), min_gain=0.05)
+        _acc = ((_rw or {}).get("short") or {}).get("accept_p50")
+        e14_decide(f"width{_w}", [("measured", bool(_rw)),
+                                  ("correctness gate", ((_rw or {}).get("gate") or {}).get("ok")),
+                                  ("speed >= +5 %", _sp["adopt"]),
+                                  ("accept <= width", _acc is not None and _acc <= _w),
+                                  ("no server error signs", not E14M.log_errors((_rw or {}).get("server_log_signs")))],
+                   speed=_sp, accept_p50=_acc, gate=(_rw or {}).get("gate"))
+    # NCCL env arm: only if the bench found an arm >= 20 % faster per call at 983,040 B inside CUDA graphs (eager AND
+    # graph results correct); adopted only with a real-window gain and a passing correctness gate (transport safety)
+    _nb = (E14_RESULTS.get("nccl") or {}).get("summary") or {}
+    _win = _nb.get("adopt_candidate")
+    _envs = {"p2p_sys": {"NCCL_P2P_LEVEL": "SYS"}, "shm_memcpy": {"NCCL_SHM_USE_CUDA_MEMCPY": "1"}}
+    if _win in _envs:
+        _ok, _ = e14_launch("nccl_" + _win, set_=_base_arm["set"], drop=_base_arm["drop"],
+                            env=dict(_base_arm["env"], **_envs[_win]))
+        _rn = e14_phase("A2-6_nccl_" + _win, lambda: _gated("nccl", lambda: {
+            "short": E14M.steady_window(E14_CTX, _S, level=SGL_MAX_RUNNING, secs=_ts(75), tag="nccl")}),
+            _ts(12 * 60)) if _ok else None
+        _sp = E14M.adopt_speed(_ref_short, (_rn or {}).get("short"), min_gain=0.05, per_step=True)
+        e14_decide("nccl_" + _win, [("measured", bool(_rn)),
+                                    ("correctness gate", ((_rn or {}).get("gate") or {}).get("ok")),
+                                    ("speed >= +5 %", _sp["adopt"]),
+                                    ("no server error signs", not E14M.log_errors((_rn or {}).get("server_log_signs")))],
+                   speed=_sp, gate=(_rn or {}).get("gate"))
+    else:
+        E14_RESULTS["decisions"]["nccl_env"] = {"adopt": False, "why": "no bench arm >= 20 % faster at 983,040 B",
+                                                "bench_summary": _nb}
+    try:
+        e11_kill_server(wait=True)
+    except Exception:
+        pass
+    E14_STATE.enter("A2_DONE")
+    e14_save()
+'''
+
+c_rep2 = r'''# ==================================================================== CELL 7b — E14: report, JIT cache, bundle
+try:
+    E14_STATE.enter("REPORT")
+    if E14_DO_MEASURE:
+        E14_RESULTS["duck_run"] = {"e12_run": E12_RUN, "usage_all": (report or {}).get("usage_all") if "report" in globals() else None,
+                                   "eval": {k: (report or {}).get(k) for k in ("eval_query_hits", "eval_query_total",
+                                                                                "eval_task_norm_pct")} if "report" in globals() else None,
+                                   "raw_reasoning": [r.get("raw_reasoning") for v in E12_RECORDS.values() for r in v]}
+    # JIT / compile caches for the next runs (Notes/07, 11): nv/ and cuda/ never shipped; a 13-field manifest
+    if E14_DO_MEASURE and E14_VENV.get("vpy") and not E11_HARNESS and HARD_STOP - time.perf_counter() > 600:
+        try:
+            _q = subprocess.run([E14_VENV["vpy"], "-c", "import importlib.metadata as m, json, torch; print(json.dumps({k: m.version(k) "
+                                 "for k in ('sglang', 'sgl-kernel', 'flashinfer-python', 'torch', 'triton')} | "
+                                 "{'cuda_runtime': torch.version.cuda, 'gpu': torch.cuda.get_device_name(0), "
+                                 "'sm': '.'.join(map(str, torch.cuda.get_device_capability(0)))}))"],
+                                capture_output=True, text=True, timeout=180, env=E14_VENV["env"])
+            _v = json.loads(_q.stdout.strip().splitlines()[-1])
+            _nv = subprocess.run([str(Path(E14_VENV["env"]["CUDA_HOME"]) / "bin" / "nvcc"), "--version"], capture_output=True,
+                                 text=True, timeout=60).stdout.strip().splitlines()[-1:]
+            _drv = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], capture_output=True,
+                                  text=True, timeout=60).stdout.strip().splitlines()[:1]
+            _site = Path(subprocess.run([E14_VENV["vpy"], "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                                        capture_output=True, text=True, timeout=60).stdout.strip())
+            _man = E14L.jit_manifest(sglang=_v["sglang"], sgl_kernel=_v["sgl-kernel"], flashinfer=_v["flashinfer-python"],
+                                     torch=_v["torch"], triton=_v["triton"], cuda_runtime=_v["cuda_runtime"],
+                                     nvcc=" ".join(_nv) or "unknown", driver=" ".join(_drv) or "unknown", gpu_name=_v["gpu"],
+                                     sm=_v["sm"], wheels=E14L.wheel_inventory(SGL_WHEELHOUSE),
+                                     jit_sources=E14L.source_fingerprint([_site / "sglang" / "jit_kernel", _site / "sgl_kernel",
+                                                                          _site / "flashinfer"]),
+                                     env=E14L.kernel_env(E14_VENV["env"]))
+            _tar = E14L.save_jit_cache("/tmp/e11-cache", WORKING / "e14_jit_cache.tar", _man)
+            E14_RESULTS["jit_cache"] = {"tar": str(_tar), "bytes": _tar.stat().st_size, "manifest": _man}
+        except Exception as _e:
+            E14_RESULTS["jit_cache"] = {"error": repr(_e)[:300]}
+    E14_STATE.end("done")
+    e14_save()
+    _lines = ["# E14-A results", "", f"profile {PROFILE}, rerun {RERUN}", "", "## Decisions", ""]
+    for _k, _v in (E14_RESULTS.get("decisions") or {}).items():
+        _lines.append(f"- {_k}: adopt={_v.get('adopt', _v.get('ok'))} | reason: {_v.get('reason', _v.get('verdict'))} | "
+                      f"{json.dumps(_v, default=str)[:400]}")
+    _lines += ["", "## Duck run", "", f"- A1 reserve: {E14_RESULTS.get('a1_reserve')}",
+               f"- clean start: {E14_RESULTS.get('duck_clean_start')}", f"- window: {E14_RESULTS.get('duck_window')}",
+               f"- arm: {E14_RESULTS.get('duck_arm')}", "", "## Phases", ""]
+    for _k, _v in (E14_RESULTS.get("phases") or {}).items():
+        _lines.append(f"- {_k}: {json.dumps(_v, default=str)[:600]}")
+    (E14_OUT / "e14_report.md").write_text("\n".join(_lines), encoding="utf-8")
+    _pack = WORKING / "Q27X_E14A_BUNDLE.zip"
+    with zipfile.ZipFile(_pack, "w", zipfile.ZIP_DEFLATED) as z:
+        for fp in sorted(E14_OUT.rglob("*")):
+            if fp.is_file() and fp.stat().st_size < 300e6:
+                z.write(fp, arcname="e14/" + fp.relative_to(E14_OUT).as_posix())
+        for fp in sorted(OUT.glob("sglang_server_*.log")):
+            z.write(fp, arcname="logs/" + fp.name)
+        for fp in (WORKING / "e14_state.json", WORKING / "e14_heartbeat.log", OUT / "e12_run_report.json"):
+            if fp.exists():
+                z.write(fp, arcname=fp.name)
+    print("E14 report:", E14_OUT / "e14_report.md", "| bundle", _pack, round(_pack.stat().st_size / 1e6, 1), "MB", flush=True)
+    print("E14 decisions:", json.dumps(E14_RESULTS.get("decisions"), default=str)[:2000], flush=True)
+except BaseException:
+    print("E14 report error:", traceback.format_exc()[-2000:], flush=True)
+try:
+    e11_kill_server(wait=False)
+except Exception:
+    pass
+'''
+
+# CELL 7 keeps its own final kill; CELL 6b relaunches after it. CELL 7's report must see the Duck server's log, so it
+# runs right after CELL 6 (order below).
+
+MD = ("# E14-A · optimized engine on 4xL4: measurements + a Duck run (SGLang 0.5.21 + RedHat INT4 + DFlash2)\n\n"
+      "**Base (unchanged):** the E12 rev 6g G4B notebook built in memory by build_e12_duck.py (Duck rev 6g solver, W1 engine).\n\n"
+      "**E14 changes (Notes/07, 11, 12, 13):** ranged parallel model copy to RAM/local disk (verified, atomic, fail open), "
+      "a stall-based launch watchdog (log + read bytes + page faults; 75-min give-up kept), JIT cache dir + a cache tar "
+      "without nv/, the raw-reasoning fix in Duck's history (E12_RAW_REASONING_HISTORY=1), a phase record and heartbeat.\n\n"
+      "**Commit (profile E14A):** NCCL bench while the copy runs; W1 baseline windows (8k / 40k at 12 really running), "
+      "profiler, latch test, E14-P token replay, greedy parity (A/A and 12 at once); +#44401 backport; +nodelay "
+      "(--min-free-slots-delay 1); +CUDA graphs 1..13 - each with a correctness gate, adopted only on every recorded "
+      "condition; a 25-minute Duck run (reserved) on a fresh launch of the kept arm (G4B tasks); then a matched reference, "
+      "int8 Mamba checkpoints with an agent-like replay, target-only, DFlash width 6 and 4, the NCCL env arm if the bench "
+      "found one (each gated). Hard stop at 198 min.\n\n"
+      "**Competition rerun:** every hidden task with the rev 6g Duck solver + the E14 load path + raw reasoning; engine = "
+      "W1 + DFlash width 6 + CUDA graphs 1..13 (adopted in R2, Notes/30).\n\n"
+      "**Commit (profile E14S, the default):** the 25-min Duck run on the G4B tasks with the same engine arm, no "
+      "measurements. Profile E14A = the R2 measurements.\n\n"
+      "**Inputs:** the E14 modules and the Duck package come from the private dataset `" + PAYLOAD_SLUG + "` (files "
+      "named by their sha256 and verified before use). It must be attached, for commits and for the submission. Reason: "
+      "Kaggle commit runs of the 745 kB embedded notebook never started (Notes/21).\n")
+
+nb = {"cells": [{"cell_type": "markdown", "metadata": {}, "source": MD.splitlines(keepends=True)},
+                code(cells[1]), code(c1), code(c1b), code(c2), code(c_pkg), code(cells[4]), code(c_eng), code(c_meas1)]
+               + ([code(C_E15)] if E15 else []) + [code(c_solve), code(c_rep), code(c_meas2), code(c_rep2)],
+      "metadata": src_nb.get("metadata", {}), "nbformat": src_nb.get("nbformat", 4),
+      "nbformat_minor": src_nb.get("nbformat_minor", 5)}
+for _i, _c in enumerate(nb["cells"]):                  # every generated cell must compile before the notebook is written
+    if _c["cell_type"] == "code":
+        compile("".join(_c["source"]), f"<e14 cell {_i}>", "exec")
+        assert "\r" not in "".join(_c["source"]), f"CR line ending in cell {_i}"
+_text = json.dumps(nb, indent=1, ensure_ascii=False)
+assert len(_text.encode("utf-8")) < NB_LIMIT, f"notebook {len(_text.encode('utf-8'))} B >= {NB_LIMIT} B (Notes/21)"
+assert "_E12_ZIP = " not in _text and "_E14_MODULES" not in _text, "an embedded payload is still in the notebook"
+out = HERE.parent / NAME
+if out.exists() and hashlib.sha256(out.read_bytes()).hexdigest() in PUSHED:
+    out = out.with_name(out.stem + "_REBUILD.ipynb")
+out.write_text(_text, encoding="utf-8")
+# the payload dataset folder (a new dataset version = this folder): the current payload files are added; older ones are
+# KEPT, so a notebook built earlier still finds its own files (names carry the sha) in the newest dataset version
+PAYLOAD_DIR.mkdir(exist_ok=True)
+for _name, _h, _data in PAYLOAD.values():
+    (PAYLOAD_DIR / _name).write_bytes(_data)
+    assert hashlib.sha256((PAYLOAD_DIR / _name).read_bytes()).hexdigest() == _h
+(PAYLOAD_DIR / "dataset-metadata.json").write_text(json.dumps(
+    {"title": "Q27 E14A payload", "id": PAYLOAD_SLUG, "licenses": [{"name": "apache-2.0"}]}, indent=1), encoding="utf-8")
+print(out.name, hashlib.sha256(out.read_bytes()).hexdigest(), round(out.stat().st_size / 1e3), "kB | arc2_duck", DUCK_SHA[:12],
+      "| modules", {k: v[:8] for k, v in MOD_SHA.items()})
+print("payload", PAYLOAD_DIR, {v[0]: (v[1][:12], len(v[2])) for v in PAYLOAD.values()})
