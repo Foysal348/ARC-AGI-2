@@ -138,6 +138,13 @@ if MODE == "kvgate":
 nb = json.load(open(NB, encoding="utf-8"))
 code = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
 assert len(code) == 9 and "CELL EMS —" in code[7] and "CELL EMS-R" in code[8], [c.splitlines()[0][:70] for c in code]
+# rev 2f: HARNESS_EMS_PART=ALL (default) runs every arm (EMS_PART=ALL) with the full checks; SAFE / RISKY run the
+# notebook with its baked-in part and check the part split
+HPART = os.environ.get("HARNESS_EMS_PART", "ALL")
+if HPART == "ALL":
+    os.environ["EMS_PART"] = "ALL"
+else:
+    os.environ.pop("EMS_PART", None)
 G = {"__name__": "__main__"}
 cell_sec = []
 for i, c in enumerate(code):
@@ -166,10 +173,48 @@ def val(f, k, n=1):
     return f[f.index(k) + 1:f.index(k) + 1 + n] if k in f else None
 
 
+def finish():
+    check("report table + bundle written; no server left running",
+          (WORK / "q27x" / "e14" / "ems_report.md").exists() and any(WORK.glob("Q27X_EMS*_BUNDLE.zip"))
+          and (G.get("E11_SERVER") is None or not G["E11_SERVER"].alive()))
+    sub = json.load(open(WORK / "submission.json", encoding="utf-8"))
+    check("submission.json is the cell-0 fallback for every test task", set(sub) == set(TEST))
+    print("cell seconds:", cell_sec)
+    print((WORK / "q27x" / "e14" / "ems_report.md").read_text(encoding="utf-8") if (WORK / "q27x" / "e14" / "ems_report.md").exists() else "no report")
+    for label, ok, info in checks:
+        print(("PASS " if ok else "FAIL ") + label + ("" if ok else "  <-- " + info))
+    nf = sum(not ok for _, ok, _ in checks)
+    print(chr(10) + (f"{nf} failed of {len(checks)}" if nf else f"ALL {len(checks)} CHECKS PASS (EMS {HPART})"))
+    sys.stdout.flush()
+    os._exit(1 if nf else 0)
+
+
+if HPART != "ALL":
+    _pa = set(G["EMS_PART_ARMS"][HPART]) | {"ref_dflash_w6_s16", "target_only"}
+    _ran = {k for k, v in A.items() if not v.get("skipped")}
+    # rev 2g: both parts run their own best MTP at 20 after the plan; RISKY also runs 2 x TP2
+    _dyn = {k for k in _ran if (k.startswith(("mtp", "ntn")) and k.endswith("_s20"))} |         ({k for k in _ran if k.startswith("tp2x2_")} if HPART == "RISKY" else set())
+    check(f"rev 2f part {HPART}: EMS_PART baked in", G["EMS_PART"] == HPART and EM.get("part") == HPART, (G.get("EMS_PART"), EM.get("part")))
+    check(f"rev 2f part {HPART}: exactly its arms ran, plus the oracle and reference and "
+          + ("the best MTP at 20" if HPART == "SAFE" else "the best MTP at 20 and 2 x TP2 (DFlash + the best MTP)"),
+          _ran - _dyn == _pa and len(_dyn) == (1 if HPART == "SAFE" else 3), (sorted(_ran), sorted(_dyn)))
+    check(f"rev 2f part {HPART}: every arm that ran is ok; every other arm recorded OTHER_PART",
+          all(A[k].get("ok") for k in _ran) and all(str(A[k].get("skipped", "")).startswith("OTHER_PART") for k in A if k not in _ran)
+          and any(k not in _ran for k in A), {k: (A[k].get("ok"), A[k].get("skipped")) for k in A})
+    check(f"rev 2f part {HPART}: no EMS cell error; patch / overlay / TP2 reserve only in RISKY",
+          not EM.get("error") and (("SAFE part" in str(EM["pr45151_patch"].get("why")) and "SAFE part" in str(EM["fi07_overlay"].get("why")))
+                                   if HPART == "SAFE" else "SAFE part" not in str(EM.get("pr45151_patch"))),
+          (EM.get("error"), EM.get("pr45151_patch"), EM.get("fi07_overlay")))
+    check(f"rev 2f part {HPART}: the reference is adoptable (probe_complete_vs_target set), the oracle canary clean",
+          A["ref_dflash_w6_s16"].get("adoptable") and (EM.get("canary_oracle") or {}).get("foreign_leaks") == 0,
+          {x: A["ref_dflash_w6_s16"].get(x) for x in ("adoptable", "gate", "probe_complete_vs_target", "canary_leaks", "xl_gate")})
+    finish()
+
+
 check("mode: profile EMS, not a rerun, the matrix ran", G["PROFILE"] == "EMS" and G["EMS_ON"] and not G["RERUN"], G["PROFILE"])
 want = ["ref_dflash_w6_s16", "target_only", "mtp_3_1_4", "ntn_fp8", "ntn_int4", "dflash_w6_s20", "dflash_w6_s24",
         "mtp_2_1_3", "mtp_3_1_4_mem86", "mtp_replay_fp16", "mtp_replay_fp32", "dflash_w4", "dflash_w8",
-        "tp2x2_dflash_w6"]
+        "tp2x2_dflash_w6", "dflash_w6_pcie", "mtp_3_1_4_pr45151", "mtp_3_1_4_pcie"]
 check("every planned arm was run and recorded ok", all(k in A and A[k].get("ok") for k in want),
       {k: (A.get(k) or {}).get("ok") for k in want})
 check("measured tok/s for every single-server arm (8k and 40k bands)",
@@ -259,19 +304,64 @@ check("rev 2c: the PR #45151 arm ran with EMS_PR45151=1 (the patch itself is ski
       A.get("mtp_3_1_4_pr45151", {}).get("ok") and A["mtp_3_1_4_pr45151"].get("env") == {"EMS_PR45151": "1"}
       and (EM.get("pr45151_patch") or {}).get("why") == "harness: no SGLang install" and ("p2p_read" in (EM.get("topology") or {}) or "error" in (EM.get("topology") or {})),   # no nvidia-smi locally
       (A.get("mtp_3_1_4_pr45151"), EM.get("pr45151_patch"), (EM.get("topology") or {}).keys()))
+_rep = (WORK / "q27x" / "e14" / "ems_report.md").read_text(encoding="utf-8") if (WORK / "q27x" / "e14" / "ems_report.md").exists() else ""
+check("rev 2d-b: the report carries the rev 2b / 2d lines (oracle flag, cell error none, overlay, XL / PCIe columns) and the cell is "
+      "inside try / except", "oracle flag: target_only" in _rep and "EMS cell error: none" in _rep and "FlashInfer 0.7 overlay" in _rep
+      and "XL tok/s" in _rep and "PCIe-IPC workspace built" in _rep and "EMS cell error:" in code[7] and code[7].count(chr(10) + "try:" + chr(10) + "    if EMS_ON and ENGINE_READY:") == 1,
+      _rep[:1500])
+check("rev 2d: XL band (~85k prompts) on every single-server arm at the streams the KV holds; none on 2 x TP2; budget 260 min",
+      # rev 2e-e: an arm whose own phase cap ran out records xl {"skipped": "deadline"} (time-scaled harness jitter);
+      # that is allowed, a silent miss is not; the core arms must be measured
+      all((A[k].get("xl_tok_s") and A[k].get("level_xl"))
+          or str(((G["E14_RESULTS"]["phases"].get("EMS_" + k) or {}).get("xl") or {}).get("skipped", "")).startswith("deadline")
+          for k in want if k in A and not k.startswith("tp2x2"))
+      and all(A[k].get("xl_tok_s") for k in ("ref_dflash_w6_s16", "target_only", "mtp_3_1_4", "mtp_3_1_4_pr45151", "dflash_w6_s20"))
+      and not any(A[k].get("xl_tok_s") for k in A if k.startswith("tp2x2")) and (EM.get("prompts") or {}).get("xl_p50", 0) > 60000
+      and G["P"]["time_budget_sec"] == 260 * 60,
+      ({k: (A[k].get("xl_tok_s"), A[k].get("level_xl")) for k in A}, EM.get("prompts"), G["P"].get("time_budget_sec")))
+check("rev 2d: PCIe-IPC arms carry the overlay env (PYTHONPATH + SGLANG_ENABLE_PCIE_IPC_ALLREDUCE); the overlay is skipped in "
+      "the harness; no other arm has it", all((A.get(k, {}).get("env") or {}).get("SGLANG_ENABLE_PCIE_IPC_ALLREDUCE") == "1"
+                                              and (A[k]["env"].get("PYTHONPATH") or "").endswith("ems-fi07") for k in ("dflash_w6_pcie", "mtp_3_1_4_pcie"))
+      and (EM.get("fi07_overlay") or {}).get("why") == "harness: no SGLang install"
+      and not any((A[k].get("env") or {}).get("SGLANG_ENABLE_PCIE_IPC_ALLREDUCE") for k in A if not k.endswith("_pcie")),
+      ({k: A.get(k, {}).get("env") for k in ("dflash_w6_pcie", "mtp_3_1_4_pcie")}, EM.get("fi07_overlay")))
+check("rev 2e: oracle canary + XL A/A; INT4 arms (DFlash ref, MTP, widths) PASS_EXACT, XL gate PASS, 0 canary leaks, adoptable; "
+      "ntn_fp8 after the 20 / 24 arms", (EM.get("canary_oracle") or {}).get("foreign_leaks") == 0
+      and all(A[k].get("gate_class") == "PASS_EXACT" and A[k].get("xl_gate") == "PASS" and A[k].get("canary_leaks") == 0 and A[k].get("adoptable")
+              for k in ("ref_dflash_w6_s16", "mtp_3_1_4", "mtp_3_1_4_pr45151", "dflash_w4", "dflash_w6_s20"))
+      and not A["ntn_fp8"].get("adoptable") and EM["order"].index("ntn_fp8") > EM["order"].index("dflash_w6_s24"),
+      {k: (A[k].get("gate_class"), A[k].get("xl_gate"), A[k].get("canary_leaks"), A[k].get("adoptable")) for k in A})
+check("rev 2e-d: certified_exact = adoptable and PASS_EXACT on every arm; the radix-cache hit rate is recorded on "
+      "every measured band (the fake server reports #cached-token 0)",
+      all(bool(A[k].get("certified_exact")) == bool(A[k].get("adoptable") and A[k].get("gate_class") == "PASS_EXACT") for k in A)
+      and A["mtp_3_1_4"].get("certified_exact") and A["ref_dflash_w6_s16"].get("prefix_hit_short") is not None
+      and A["ref_dflash_w6_s16"].get("prefix_hit_long") is not None,
+      {k: (A[k].get("certified_exact"), A[k].get("prefix_hit_short"), A[k].get("prefix_hit_long")) for k in A})
+# rev 2g: the GPT rev 2f audit negative tests on _gated / _text_bad (synthetic copies of a real arm)
+import copy as _cp
+_gd, _txb = G["_gated"], G["_text_bad"]
+_good = _cp.deepcopy(A["mtp_3_1_4"])
+def _gt(**mut):
+    a = _cp.deepcopy(_good); a.update(mut); return bool(_gd(a))
+_oc = _cp.deepcopy(G["EMSR"].get("canary_oracle"))
+_neg = {"base adoptable": _gt(), "missing XL": not _gt(xl_gate=None), "XL INCOMPLETE": not _gt(xl_gate="INCOMPLETE"),
+        "PCIe unverified": not _gt(env={"SGLANG_ENABLE_PCIE_IPC_ALLREDUCE": "1"}, pcie_ipc={"workspace_built": False})}
+G["EMSR"]["canary_oracle"] = dict(_oc or {}, errors=1); _neg["oracle canary errors"] = not _gt()
+G["EMSR"]["canary_oracle"] = None; _neg["no oracle canary"] = not _gt()
+G["EMSR"]["canary_oracle"] = _oc
+_g30 = chr(10).join(" ".join("0" for _ in range(30)) for _ in range(30))
+_neg["text 0*250 bad"] = _txb("0" * 250); _neg["text 0+!+0 bad"] = _txb("0" * 40 + "!" * 60 + "0" * 60)
+_neg["text 0 0 0 x200 bad"] = _txb(" ".join("0" * 200)); _neg["text grids ok"] = not any(_txb(x) for x in ("[[0,0],[0,0]]", "0 0 1" + chr(10) + "0 0 0", _g30))
+_neg["canary classification recorded"] = (G["EMSR"].get("canary_oracle") or {}).get("classification") in ("PASS_NO_OBSERVED_LEAK", "INCONCLUSIVE")
+_neg["every arm has production_approved False"] = all(A[k].get("production_approved") is False for k in A if "adoptable" in A[k])
+check("rev 2g negative tests (GPT rev 2f audit R2F-02 / R6 / R2F-06 / R2F-07): fail-closed _gated, structural grid rule",
+      all(_neg.values()), {k: v for k, v in _neg.items() if not v})
+_tb = G["_tail_bad"]
+_enc = lambda s: G["tokenizer"].encode(s, add_special_tokens=False)
+check("rev 2e-c negative tests: the tail check flags repeated punctuation and passes an ARC grid and normal prose",
+      _tb(_enc("!" * 2000)) and _tb(_enc(", " * 400)) and not _tb(_enc(chr(10).join(" ".join("0" for _ in range(30)) for _ in range(12))))
+      and not _tb(_enc("Let me look at the first example carefully. The input grid has a red line. " * 6)), None)
 check("2 x TP2 also ran on the best MTP", any(k.startswith("tp2x2_mtp_") and A[k].get("ok") for k in A), list(A))
 check("the 2 x TP2 slot was not skipped (reserved slot)", not any((v or {}).get("skipped") for k, v in (R.get("phases") or {}).items()
                                                                   if k.startswith("EMS_tp2")), R.get("phases", {}).get("EMS_tp2x2_dflash_w6"))
-check("report table + bundle written; no server left running",
-      (WORK / "q27x" / "e14" / "ems_report.md").exists() and (WORK / "Q27X_EMS_BUNDLE.zip").exists()
-      and (G.get("E11_SERVER") is None or not G["E11_SERVER"].alive()))
-sub = json.load(open(WORK / "submission.json", encoding="utf-8"))
-check("submission.json is the cell-0 fallback for every test task", set(sub) == set(TEST))
-print("cell seconds:", cell_sec)
-print((WORK / "q27x" / "e14" / "ems_report.md").read_text(encoding="utf-8") if (WORK / "q27x" / "e14" / "ems_report.md").exists() else "no report")
-for label, ok, info in checks:
-    print(("PASS " if ok else "FAIL ") + label + ("" if ok else "  <-- " + info))
-nf = sum(not ok for _, ok, _ in checks)
-print(f"\n{nf} failed of {len(checks)}" if nf else f"\nALL {len(checks)} CHECKS PASS (EMS)")
-sys.stdout.flush()
-os._exit(1 if nf else 0)
+finish()

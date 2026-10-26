@@ -59,6 +59,18 @@ Kernel sum is 116 ms per step:
   - Poetiq S1-60K: 34.58.
   - Duck E15B 40K35K: 22.92.
 
+### 1.3b SGLang radix-cache hits in real runs (log evidence, 2026-10-26)
+
+Summed from the TP0 `Prefill batch, #new-token: X, #cached-token: Y` lines of our real Kaggle server logs:
+
+| Runs | Radix-cache hit (cached / (new + cached)) |
+|---|---|
+| E15B EVAL120 R3K1 / R3K2 and the E15B SUBMIT commits | 91-93 % |
+| EVAL120 G4B (LOW E16, XHIGH E16, XHIGH noE16) | 76-82 % |
+| E14A SLIM R2 arms (the int8-mamba arm excluded: 1.1 % on 9 lines) | 59-78 % |
+
+So the "hybrid prefix cache silently hits 0 %" concern (vLLM #45238 / #51250) has not been seen on our SGLang stack. EMS rev 2e-d still measures it per arm and band.
+
 ### 1.4 Concurrency
 
 - **The 11-of-12 loss under churn is DFlash's min-free-slots delayer, not #44401.** Under the latch test, W1 was stuck at 11 running in 100 % of samples (Notes/30).
@@ -133,12 +145,12 @@ Kernel sum is 116 ms per step:
 
 | Issue | What | Applies? | Action |
 |---|---|---|---|
-| SGLang #36548 / #38009 | DFlash2 greedy output differs from plain decoding, worse when concurrent (other GPUs) | not reproduced on L4 | target-only identity oracle in EMS; every arm gets a verdict vs it and vs the DFlash reference |
+| SGLang #36548 / #38009 | DFlash2 greedy output differs from plain decoding, worse when concurrent (other GPUs) | not reproduced on L4 | target-only identity oracle in EMS; every arm gets a verdict vs it and vs the DFlash reference. rev 2e adds three guards: fail closed without the oracle, a cross-request sentinel canary, and an ~85k-context XL parity |
 | SGLang #44145 / PR #45151 | the EAGLE/MTP draft keeps a duplicate BF16 embed + lm_head (~4.74 GiB, ~1.19 GiB/GPU at TP4) while the target KV pool is sized | **yes**: proven in 0.5.21 `scheduler.py:1049-1075`, `eagle_worker_v2.py:226-241`; PR open | env-gated patch + the arm `mtp_3_1_4_pr45151` (EMS rev 2c) |
 | SGLang #43029 | mamba track boundary under grammar truncation | no (we use no grammar) | none |
 | SGLang #42917 | stale CUDA driver cache → wrong W4A16 output | low (Kaggle starts clean; we never ship `nv/`) | E14 `_NEVER_SHIP` |
 | SGLang #39597 | FlashInfer autotune non-determinism | guarded | `--disable-flashinfer-autotune` in every arm |
-| vLLM #53912 | hybrid MTP + prefix cache → empty / punctuation output | not proven on 0.32.0 | VMS oracle with prefix caching off + a degenerate-output count |
+| vLLM #53912 | hybrid MTP + prefix cache → empty / punctuation output | not proven on 0.32.0 | VMS oracle with prefix caching off; a grid-aware degenerate count over every started stream, with empty outputs counted separately (rev 2e / 2e-c) |
 | vLLM #58807 | W4A16 + dense MTP load crash | no (see 2.2) | static check before any INT4 MTP launch |
 | vLLM #52182 | `VLLM_TEST_FORCE_FP8_MARLIN` removed | yes | arm dropped |
 
@@ -158,6 +170,12 @@ Kernel sum is 116 ms per step:
 | 10-26 | VMS pre-read INT4 + DFlash2 instead of the FP8 checkpoint it loads | agent 3 |
 | 10-26 | EMS: missing probe evidence counted as a pass; dirty-server flags lost; a dead server still "ok"; TP2 judged on replica 0 only | agent 1 |
 | 10-26 | my first `vms_degenerate` used a distinct-character ratio that flags every long normal text | local harness |
+| 10-26 | rev 2b report lines and the try/except around the EMS body never applied (a silent `str.replace` miss) | rev 2d build; now asserted replacements |
+| 10-26 | rev 2e dropped every window whose prefill did not settle in 120 s: the no-prefix arm (16 x 40k prefill) would lose valid data | self-audit (rev 2e-b): 300 s budget, kept as `mixed_load` |
+| 10-26 | the rev 2e tail / degenerate rules flagged a normal ARC grid ("0 0 0 ...") as degenerate, which would FAIL correct arms | self-audit (rev 2e-c): grid-aware shared rule |
+| 10-26 | the reports said BOUNDARY is "never auto-certified" while `adoptable` accepts it; the VMS no-prefix note said tok/s includes the prefix recompute (it is decode after settle) | self-audit (rev 2e-d): text fixed, `certified_exact` column |
+| 10-26 | VMS `vms_window` waited up to 900 s for the level after its streams had died or finished; the EMS reference never got `probe_complete_vs_target`, so it could never be adoptable | rev 2e-d harness run (rev 2e-e fix) |
+| 10-26 | a first rev 2e-d try put the prefix-hit count in `src/e14_measure.py`, but the notebooks load the E14 modules from the Kaggle payload dataset shared with E15P | caught before any push; reverted, done inside the EMS cell |
 
 ## 5. Levers rejected or closed
 
@@ -171,6 +189,8 @@ Kernel sum is 116 ms per step:
 
 ## 6. Open (to be answered by the EMS / VMS GPU runs)
 
+Status of the matrices: rev 2g (2026-10-26), three notebooks (rev 2f, user 2026-10-26: a crash in one must not damage the others): `Q27-XHIGH-EMS_SAFE_ENGINE_MATRIX_SGLANG.ipynb` `9ed2b035`, `Q27-XHIGH-EMS_RISKY_ENGINE_MATRIX_SGLANG.ipynb` `5b8b91f2`, `Q27-XHIGH-VMS_ENGINE_MATRIX_VLLM.ipynb` `6c2a39c5`. Both independent audits of rev 2c were checked item by item and applied; see `Bug ang fix/EMS_VMS_rev2e_independent_audits_disposition_2026-10-26.md` and section 7.
+
 1. **DFlash vs target-only greedy identity on our stack**, at 12 concurrent with thinking on.
 2. **MTP (EAGLE 3/1/4, 2/1/3) vs DFlash W6** in tok/s and accept, at 16 and 20 streams. Also the KV gain from #45151.
 3. DFlash W6 at 20 / 24 streams.
@@ -178,4 +198,13 @@ Kernel sum is 116 ms per step:
 5. ReplaySSM fp16 / fp32.
 6. **vLLM:** FP8 MTP 2/3/4, 20/24 seqs, SSM fp16, prefix on/off, **Triton W8A8 vs Marlin W8A16**, INT4 + MTP, and DP2 x TP2.
 7. Width 6 at the 40k band (never measured in R2).
-8. **Not in the 200-min matrices** (next round): target-only at 12/20/24, chunked prefill 2048 vs 4096, radix strategy (lazy / extra / none), `SGLANG_ENABLE_PCIE_IPC_ALLREDUCE`, vLLM `--language-model-only`, `--kv-cache-dtype auto`.
+8. **Not in the matrices** (next round): target-only at 12/20/24, chunked prefill 2048 vs 4096, radix strategy (lazy / extra / none), vLLM `--language-model-only`, `--kv-cache-dtype auto`. PCIe-IPC all-reduce has been in the matrices since rev 2d (`dflash_w6_pcie`, `mtp_3_1_4_pcie`, `fp8_mtp3_pcie`).
+9. Speed at production context: the XL band (~85k block, positions to ~93k) per arm (rev 2d).
+10. The real KV gain of the PR #45151 patch (KV tokens of `mtp_3_1_4_pr45151` vs `mtp_3_1_4`).
+
+## 7. Before any production switch (cannot be closed on CPU)
+
+1. The EMS and VMS GPU runs (user go; ~260 min each, ~9 h quota at 2x). The EMS PCIe arms and all of VMS need the dataset `foysalemonshanto/vllm-0-32-0-cu13-wheelhouse` attached.
+2. Long generation (60k+ output tokens, with churn and rejected drafts) on the winner. The matrix covers only 256-token greedy gates, a 1,024-token probe and 75-s windows (the XL windows decode up to 8k tokens).
+3. A real ARC task run (Poetiq / Duck) at production sampling (temperature 1, top_p 0.95, top_k 20) on the winner.
+4. A BOUNDARY winner (near-tie divergences only: adoptable, but not bit-exact) must also be confirmed on ARC task accuracy. `certified_exact` marks the PASS_EXACT arms.

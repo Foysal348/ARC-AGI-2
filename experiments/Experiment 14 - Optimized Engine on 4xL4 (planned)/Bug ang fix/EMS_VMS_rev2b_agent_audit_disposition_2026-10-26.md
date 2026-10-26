@@ -29,7 +29,7 @@ Builds after the fixes:
 | A1-F9 / F10 | gate and probe can use different oracles; the target A/A is accepted with missing margins | yes | one flag `EMSR["oracle"]`: target-only only when its gate A/A AND probe A/A are complete; otherwise both stay on DFlash |
 | A1-F11 | a failed launch shows gate "reference" | yes | "no data" when there are no rows |
 | A1-F12 | empty prompts → ZeroDivisionError per window | yes | EMS stops before the first launch with a reason |
-| A1-F13 | no top-level guard; a TP2 start failure leaks a server | yes | the whole EMS body is in try / except (the report cell always runs); the TP2 start loop is guarded |
+| A1-F13 | no top-level guard; a TP2 start failure leaks a server | yes | the TP2 start loop is guarded (rev 2b). **Correction (rev 2d-b, 2026-10-26):** the try / except around the whole EMS body and the rev 2b report lines (oracle flag, notes, gate vs the DFlash reference) did NOT apply in rev 2b: the patch replaced a search text that did not match, and `str.replace` is silent. Found while adding the rev 2d report columns; applied in rev 2d-b with asserted replacements, plus a harness check on the report lines and the try block |
 | A1-F14 | skip message says 15 min (real floor ~16.7 min) | yes | text fixed |
 | A1-F15 / A2 | FlashInfer workspace shared by the TP2 replicas | **no issue** | SGLang `third_party_cache_defaults()` sets `FLASHINFER_WORKSPACE_BASE` and `TORCHINDUCTOR_CACHE_DIR` under SGLANG_CACHE_DIR with setdefault (environ.py:1963-1975), so they follow each replica's own dir |
 | A1-F16 | capacity: ~7-9 of 12 PLAN launches fit in 200 min | estimate | kept; order = priority; reported to the user |

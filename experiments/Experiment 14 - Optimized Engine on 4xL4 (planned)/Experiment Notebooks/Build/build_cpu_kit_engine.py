@@ -27,9 +27,12 @@ KIT_SLUG = "foysalemonshanto/q27-engine-cpu-kit"
 KERNEL_SLUG = "foysalemonshanto/q27-engine-cpu-harness"
 IMAGE = "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461"
 OUT_DIR = HERE / "cpu_kit_engine"
-NB_EMS = "Q27-XHIGH-EMS_ENGINE_MATRIX_SGLANG.ipynb"
+NB_SAFE = "Q27-XHIGH-EMS_SAFE_ENGINE_MATRIX_SGLANG.ipynb"      # rev 2f: EMS split in two (+ VMS = 3 parts)
+NB_RISKY = "Q27-XHIGH-EMS_RISKY_ENGINE_MATRIX_SGLANG.ipynb"
 NB_VMS = "Q27-XHIGH-VMS_ENGINE_MATRIX_VLLM.ipynb"
-RUNS = [("ems", "e14src/harness/harness_ems_nb.py", NB_EMS, {}),
+RUNS = [("ems_all", "e14src/harness/harness_ems_nb.py", NB_SAFE, {"HARNESS_EMS_PART": "ALL"}),
+        ("ems_safe", "e14src/harness/harness_ems_nb.py", NB_SAFE, {"HARNESS_EMS_PART": "SAFE"}),
+        ("ems_risky", "e14src/harness/harness_ems_nb.py", NB_RISKY, {"HARNESS_EMS_PART": "RISKY"}),
         ("vms", "e14src/harness/harness_vms_nb.py", NB_VMS, {}),
         ("vms_bad_int4", "e14src/harness/harness_vms_nb.py", NB_VMS, {"VMS_BAD_INT4": "1"})]
 SGL_FILES = ["_version.py", "srt/dllm/mixin/scheduler.py", "srt/managers/scheduler.py", "srt/managers/schedule_batch.py",
@@ -60,7 +63,7 @@ for p in sorted(FIX.rglob("*")):
 for rel in SGL_FILES:
     files["sgl_ref/" + rel] = (SGL / rel).read_bytes()
 files["redhat_index.json"] = REDHAT_INDEX.read_bytes()
-for nb in (NB_EMS, NB_VMS):
+for nb in (NB_SAFE, NB_RISKY, NB_VMS):
     files["nb/" + nb] = (HERE.parent / nb).read_bytes()
 for p in sorted(E15PAY.glob("q27x_e14_modules_*.bin")):
     files["payload/" + p.name] = p.read_bytes()
@@ -163,5 +166,5 @@ KD.mkdir(exist_ok=True)
     "competition_sources": [], "model_sources": [], "docker_image": IMAGE, "machine_shape": "None"}, indent=2),
     encoding="utf-8")
 print("kit", OUT_DIR / KIT_NAME, round(len(kit) / 1e6, 1), "MB,", len(manifest), "files")
-for nb in (NB_EMS, NB_VMS):
+for nb in (NB_SAFE, NB_RISKY, NB_VMS):
     print("notebook", nb, hashlib.sha256((HERE.parent / nb).read_bytes()).hexdigest()[:16])

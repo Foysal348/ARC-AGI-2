@@ -33,6 +33,8 @@ time.sleep(0.5)
 _lb = arg("--linear-backend", "auto")
 # vLLM 0.32.0 on SM 8.9: auto (and marlin) -> MarlinFP8ScaledMMLinearKernel; triton -> TritonFp8BlockScaledMMKernel
 print(f"INFO [__init__.py] Selected {'TritonFp8BlockScaledMMKernel' if _lb == 'triton' else 'MarlinFP8ScaledMMLinearKernel'} for Fp8LinearMethod", flush=True)
+if os.environ.get("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC") == "1":   # vLLM 0.32.0 flashinfer_pcie_ipc_all_reduce.py log line
+    print("INFO Initialized FlashInfer PCIe IPC all-reduce for TP4, hidden_dim=5120, dtype=torch.bfloat16, max_tokens=64.", flush=True)
 print(f"INFO GPU KV cache size: {KV:,} tokens", flush=True)
 print(f"INFO Maximum concurrency for {arg('--max-model-len', '106496')} tokens per request: {KV / int(arg('--max-model-len', 106496)):.2f}x", flush=True)
 LOCK = threading.Lock()
@@ -74,7 +76,11 @@ class H(BaseHTTPRequestHandler):
                          f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {CNT["acc"]}',
                          f'vllm:spec_decode_num_drafts_total{{engine="0"}} {CNT["drf"]}',
                          f'vllm:kv_cache_usage_perc{{engine="0"}} {min(0.99, ctx / KV):.4f}',
-                         'vllm:num_preemptions_total{engine="0"} 0']
+                         'vllm:num_preemptions_total{engine="0"} 0',
+                         f'vllm:prompt_tokens_total{{engine="0"}} {CNT.get("prompt", 0.0)}',
+                         f'vllm:prefix_cache_queries_total{{engine="0"}} {CNT.get("pq", 0.0)}',
+                         f'vllm:prefix_cache_hits_total{{engine="0"}} {CNT.get("ph", 0.0)}',
+                         f'vllm:prompt_tokens_cached_total{{engine="0"}} {CNT.get("ph", 0.0)}']
             return self._send("\n".join(lines) + "\n", ctype="text/plain")
         return self._send("{}", 404)
 
@@ -111,7 +117,10 @@ class H(BaseHTTPRequestHandler):
             while sent < max_t:
                 chunk = toks[sent:sent + 8]
                 sent += len(chunk)
-                d = {"choices": [{"text": "".join(chunk), "index": 0}]}
+                d = {"choices": [{"text": "".join(chunk), "index": 0,
+                                  "finish_reason": "length" if sent >= max_t else None}]}
+                if req.get("return_token_ids"):      # vLLM 0.32.0: token_ids = the delta ids of this chunk (ints)
+                    d["choices"][0]["token_ids"] = [ord(c) for c in chunk]
                 if nlp:     # vLLM completions logprobs shape: tokens / token_logprobs / top_logprobs (dict per token)
                     d["choices"][0]["logprobs"] = {"tokens": list(chunk), "token_logprobs": [-0.05] * len(chunk),
                                                    "top_logprobs": [{c: -0.05, "␀": -2.5} for c in chunk]}
@@ -120,6 +129,10 @@ class H(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 with LOCK:
                     CNT["gen"] += len(chunk)
+                    if sent == len(chunk):           # first chunk: the prompt counted once (prefill done)
+                        CNT["prompt"] = CNT.get("prompt", 0.0) + len(prompt)
+                        CNT["pq"] = CNT.get("pq", 0.0) + len(prompt)
+                        CNT["ph"] = CNT.get("ph", 0.0) + (len(prompt) * 0.9 if "--no-enable-prefix-caching" not in argv else 0)
                     if k:
                         CNT["drf"] += len(chunk) / step
                         CNT["acc"] += len(chunk) - len(chunk) / step
@@ -136,6 +149,7 @@ class H(BaseHTTPRequestHandler):
                 CTX.pop(rid, None)
 
 
+ThreadingHTTPServer.request_queue_size = 256      # rev 2e-e: default 5 drops simultaneous connects (Windows)
 srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
 srv.daemon_threads = True
 print(f"INFO Started server process; Uvicorn running on http://127.0.0.1:{PORT}", flush=True)

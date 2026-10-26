@@ -528,6 +528,7 @@ class H(BaseHTTPRequestHandler):
         return self._send(json.dumps({"text": "", "output_ids": o, "meta_info": meta}))
 
 
+ThreadingHTTPServer.request_queue_size = 256      # rev 2e-e: default 5 drops simultaneous connects (Windows)
 srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
 srv.daemon_threads = True
 out(f"] The server is fired up and ready to roll! port {PORT}")

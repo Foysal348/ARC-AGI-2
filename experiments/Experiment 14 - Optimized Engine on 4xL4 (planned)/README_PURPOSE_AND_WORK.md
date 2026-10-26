@@ -82,7 +82,40 @@ Findings: `README_FINDINGS.md`. Full history and the 2026-10-23 plan: `README.md
   - #43029 is not applicable.
   - Topology, P2P matrix and NCCL INIT logging were added.
   - See `Bug ang fix/Deep_reread_rev2c_2026-10-26.md`.
-- **GPT audit packs:** `Experiment Review/ENGINE_MATRIX_EMS_VMS_REV2B_AUDIT_FOR_GPT_2026-10-26.zip`, then `..._REV2C_...zip` (current).
+- **GPT audit packs:** `Experiment Review/ENGINE_MATRIX_EMS_VMS_REV2B_AUDIT_FOR_GPT_2026-10-26.zip`, then `..._REV2C_...zip`, then `..._REV2E_...zip` (current).
+- **rev 2d (user: "take 1 and 2"):** see `Bug ang fix/Rev2d_long_context_and_pcie_ipc_2026-10-26.md`.
+  - An XL band: a shared ~85k-token block, streams = KV // 100k, a third 75-s window on every TP4 arm.
+  - FlashInfer PCIe-IPC all-reduce arms:
+    - EMS `dflash_w6_pcie` and `mtp_3_1_4_pcie`, through a FlashInfer 0.7.0.post1 overlay from the vLLM wheelhouse;
+    - VMS `fp8_mtp3_pcie`, through the native `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`.
+  - Budget 200 → 260 min.
+  - rev 2d-b: the rev 2b report / try-except edits had silently not applied. They are now applied with asserts.
+- **rev 2e: the two independent audits of rev 2c**, `Bug ang fix/README_EMS_VMS_REV2C_INDEPENDENT_AUDIT_2026-10-26.md` and `Bug ang fix/ENGINE_MATRIX_REV2C_INDEPENDENT_AUDIT_README_BN.md`.
+  - Every item was checked in the code and the sources before the change. Disposition, item by item: `Bug ang fix/EMS_VMS_rev2e_independent_audits_disposition_2026-10-26.md`.
+  - Fail closed: nothing is adoptable without the target-only oracle (EMS `_gated`, VMS `oracle_ready`).
+  - VMS compares integer token ids (`return_token_ids`). Every greedy row needs `[DONE]` + `finish_reason`, else it is `INCOMPLETE_SSE`.
+  - `gate_class` = INCOMPLETE / FAIL / BOUNDARY / PASS_EXACT, plus a post-divergence tail check.
+  - Only healthy windows count: no stream error, empty or degenerate output, and an EMS running share ≥ 0.80 (our proposed bar).
+  - VMS joins the streams, then requires an idle server between windows (otherwise `DIRTY_SERVER_AFTER_WINDOW`).
+  - VMS records both decode tok/s and end-to-end tok/s. EMS tok/s is labelled decode only.
+  - Prefix-cache counters: VMS reads the vLLM metrics. EMS (rev 2e-d) reads the SGLang prefill log lines.
+  - Also added: a cross-request sentinel canary, an XL parity gate, and separate `measurement_ok` / `capacity_ok` / `correctness_ok` / `adoptable` fields.
+  - The #45151 patch:
+    - is written atomically, with both snippets verified;
+    - is backed up and its sha recorded;
+    - its arm is skipped unless the patch applied.
+  - `ntn_fp8` moved after the 20/24-stream arms.
+- **Self-audit (user: "research before changing, remove nothing without evidence"):**
+  - **rev 2e-b:** an unsettled VMS window is kept as `mixed_load` (settle budget 300 s), not dropped. The next band is skipped only after a dirty or dead server.
+  - **rev 2e-c:** a grid-aware degenerate / tail rule. The old rules flagged normal ARC grids.
+  - **rev 2e-d:**
+    - The report text now matches the code: BOUNDARY is adoptable under the documented near-tie rule, but it is not bit-exact. A `certified_exact` column was added.
+    - The stale VMS no-prefix note was fixed.
+    - EMS prefix-cache hits are measured inside the EMS cell, because the shared `e14_measure` comes from the Kaggle payload dataset.
+  - **rev 2e-e** (found by the rev 2e-d harness run; `_scratch/vms/patch_rev2e_e.py`):
+    - VMS `vms_window` waited up to 900 s for `level` running requests even after the streams had died or finished. It now stops once fewer than `level` streams are alive, with the same error plus the stream errors. On the GPU this saves an arm's time cap.
+    - The EMS reference record never got `probe_complete_vs_target`, so `_gated` could never mark the production reference adoptable. Fixed.
+    - Harness only: both fake servers listen with a backlog of 256 (Windows dropped some of 16-24 simultaneous connects), and the negative tests use longer strings (Qwen BPE merges a run of '!' into few ids).
 
 ## The two matrices (current arms)
 
@@ -102,6 +135,7 @@ Findings: `README_FINDINGS.md`. Full history and the 2026-10-23 plan: `README.md
 | 10 | ReplaySSM fp16 / fp32 |
 | 11 | DFlash W4, W8 |
 | 12 | Last: 2 x TP2 (DFlash W6, then the best MTP) |
+| + | rev 2d: `dflash_w6_pcie` and `mtp_3_1_4_pcie` (PCIe-IPC all-reduce); an XL band on every TP4 arm. rev 2e: `ntn_fp8` runs after the 20/24-stream arms |
 
 **VMS (vLLM 0.32.0):**
 
@@ -116,8 +150,9 @@ Findings: `README_FINDINGS.md`. Full history and the 2026-10-23 plan: `README.md
 | 7 | prefix caching off |
 | 8 | `--linear-backend triton` (W8A8) |
 | 9 | Last: DP2 x TP2, FP8 and INT4 |
+| + | rev 2d: `fp8_mtp3_pcie` first after the oracle; an XL band. The order since rev 2e: pcie, noprefix, mtp2, mtp4, s20, s24, lb_triton, ssm_fp16, int4_s16, int4_s20 |
 
-Time: about 10-15 min per arm. In 200 min the reference, the oracle, ~7-9 arms and the reserved TP2 slot fit. Later arms are skipped and recorded, never squeezed.
+Time: about 10-15 min per arm, plus the XL band. The budget is 260 min (rev 2d). Arms that do not fit are recorded as `NOT_TESTED_BUDGET: <reason>`; they are never squeezed and never reported as tested.
 
 ## How to run (the gate order)
 
@@ -131,9 +166,21 @@ Time: about 10-15 min per arm. In 200 min the reference, the oracle, ~7-9 arms a
    The `PUSHED` sets protect notebooks that were already run.
 2. **Local harness:** `src/harness/make_harness_{ems,vms}.py`, then `harness_{ems,vms}_nb.py <notebook>`. VMS also runs with `VMS_BAD_INT4=1`. Use Python 3.12 if possible: `_scratch/py312venv`.
 3. **Kaggle CPU kit:** `python "Experiment Notebooks/Build/build_cpu_kit_engine.py"`, then `kaggle datasets version -p cpu_kit_engine` and `kaggle kernels push -p cpu_kernel_engine`. Require `all_ok`.
-4. **GPU:** only on the user's go. The account needs ≥ 2 x 210 min of quota. Push with QUICK_SAVE and commit from the editor.
+4. **GPU:** only on the user's go. The account needs ≥ 2 x 270 min of quota (~9 h quota each at 2x). Attach the vLLM wheelhouse dataset to both notebooks. Push with QUICK_SAVE and commit from the editor.
 
 ## Status (2026-10-26)
+
+- **Current: rev 2g** (rev 2f split + the rev 2f audit fixes, `Bug ang fix/EMS_VMS_rev2g_disposition_rev2f_audits_2026-10-26.md`), three notebooks (rev 2f, user 2026-10-26: a crash in one must not damage the others): `Q27-XHIGH-EMS_SAFE_ENGINE_MATRIX_SGLANG.ipynb` `9ed2b035`, `Q27-XHIGH-EMS_RISKY_ENGINE_MATRIX_SGLANG.ipynb` `5b8b91f2`, `Q27-XHIGH-VMS_ENGINE_MATRIX_VLLM.ipynb` `6c2a39c5`.
+  - EMS SAFE: oracle + reference + MTP 3/1/4, DFlash 20 / 24 (+ the best MTP at 20), MTP 2/1/3, mem 0.86, DFlash width 4 / 8. No site-packages patch, no FlashInfer overlay, no 2 x TP2.
+  - EMS RISKY: oracle + reference + MTP 3/1/4 (the direct A/B partner), #45151, PCIe-IPC (DFlash / MTP), NTN INT4 / FP8, ReplaySSM fp16 / fp32, then 2 x TP2.
+  - VMS: unchanged layout (its risky INT4 / TP2 arms are already last).
+  - Every arm call is in its own try/except in all three, so one arm's crash never ends the remaining arms.
+  - Each part reruns install + oracle + reference (~25-35 min overhead). Total GPU about 9.2 h (about 18.5 h quota).
+  - Local Python 3.12 harnesses: see `_scratch/ems/run13_py312.log` and `_scratch/vms/run13_py312.log`.
+  - The Kaggle CPU kit v4 on these shas is pending.
+  - GPT pack: `Experiment Review/ENGINE_MATRIX_EMS_VMS_REV2E_AUDIT_FOR_GPT_2026-10-26.zip`.
+  - Open before production: `README_FINDINGS.md` section 7.
+- Earlier (superseded):
 
 - **EMS rev 2c** (`c062255e`) and **VMS rev 2c** (`675db353`) are built:
   - local harnesses pass (EMS 26/26, VMS 19/19);
