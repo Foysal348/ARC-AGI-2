@@ -55,7 +55,7 @@ def _delay_threshold():
     if v is not None:
         t = min(int(v), CAP)
         return t if t > 1 else None
-    if SPEC and CAP >= 8:
+    if SPEC and str(arg("--speculative-algorithm", "")).upper() == "DFLASH" and CAP >= 8:   # 0.5.21: DFlash only
         return min(4, max(2, (CAP + 5) // 6))
     return None
 if "--cuda-graph-bs-decode" in argv:
@@ -501,10 +501,16 @@ class H(BaseHTTPRequestHandler):
 
 # ------------------------------------------------------------------ E15P: Poetiq streaming (E11-05 behaviours)
 import hashlib as _hl  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
-PTOK = AutoTokenizer.from_pretrained(os.environ["E11_INT4"])
-PFILL = PTOK.encode(" thinking", add_special_tokens=False)
-PCLOSE = PTOK.encode("</think>", add_special_tokens=False)[0]
+_PT = []          # the tokenizer is loaded only for streamed (Poetiq / smoke) requests: EMS's servers never need it,
+                  # and two servers loading it at once ran out of memory on a 16 GB machine (EMS harness run 1)
+
+
+def _ptok():
+    if not _PT:
+        from transformers import AutoTokenizer
+        _t = AutoTokenizer.from_pretrained(os.environ["E11_INT4"])
+        _PT.extend([_t, _t.encode(" thinking", add_special_tokens=False), _t.encode("</think>", add_special_tokens=False)[0]])
+    return _PT
 PEOS = 248046
 PBEH = json.loads(os.environ.get("FAKE_POETIQ_BEH", "{}"))
 KV_OVERRIDE = os.environ.get("FAKE_KV_USAGE")
@@ -547,6 +553,7 @@ def p_code(b, it):
 
 def p_plan(rid, max_new):
     """(tokens, finish 'stop' | 'length', tokens per second)"""
+    PTOK, PFILL, PCLOSE = _ptok()
     if rid == "e11-smoke-a":
         return (PFILL * 20)[:min(16, max_new)], "length", 0
     if rid == "e11-smoke-b":

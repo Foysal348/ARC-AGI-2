@@ -1,0 +1,98 @@
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index a91fca469102..faa10623d376 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -220,6 +220,21 @@ def __init__(
+ 
+         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+ 
++        # The draft model builds its own embed_tokens/lm_head while loading and
++        # only hands them over to the target's tensors in init_lm_head(). Do it
++        # here, before the scheduler profiles free memory for the target KV
++        # pool: otherwise the duplicate draft tensors are still resident when
++        # the pool is sized and the KV cache is permanently undersized.
++        self._embed_and_head_shared = False
++        self._share_embed_and_head()
++
++    def _share_embed_and_head(self):
++        if self._embed_and_head_shared:
++            return
++        self.init_token_map()
++        self.init_lm_head()
++        self._embed_and_head_shared = True
++
+     def alloc_memory_pool(
+         self,
+         memory_pool_config=None,
+@@ -234,8 +249,7 @@ def alloc_memory_pool(
+             req_to_token_pool=req_to_token_pool,
+             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+         )
+-        self.init_token_map()
+-        self.init_lm_head()
++        self._share_embed_and_head()
+ 
+         if get_spec().speculative_use_rejection_sampling:
+             target_vocab_size = self.target_worker.model_config.vocab_size
+diff --git a/test/registered/unit/spec/test_eagle_share_embed_and_head.py b/test/registered/unit/spec/test_eagle_share_embed_and_head.py
+new file mode 100644
+index 000000000000..e527ada49d09
+--- /dev/null
++++ b/test/registered/unit/spec/test_eagle_share_embed_and_head.py
+@@ -0,0 +1,56 @@
++"""The EAGLE/MTP draft must share target embed/head before KV sizing.
++
++The draft model allocates its own embed_tokens/lm_head while it loads. If those
++duplicates are still resident when the scheduler profiles free memory for the
++target KV pool, the pool is permanently undersized. The worker therefore binds
++them to the target in __init__ and only re-uses the bound state later.
++"""
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from sglang.srt.speculative import eagle_worker_v2
++from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=1, suite="base-a-test-cpu")
++
++
++class TestShareEmbedAndHead(CustomTestCase):
++    def _worker(self):
++        worker = object.__new__(EagleDraftWorker)
++        worker._embed_and_head_shared = False
++        worker.init_token_map = MagicMock()
++        worker.init_lm_head = MagicMock()
++        return worker
++
++    def test_share_runs_only_once(self):
++        worker = self._worker()
++        order = []
++        worker.init_token_map.side_effect = lambda: order.append("token_map")
++        worker.init_lm_head.side_effect = lambda: order.append("lm_head")
++
++        worker._share_embed_and_head()
++        worker._share_embed_and_head()
++
++        worker.init_token_map.assert_called_once_with()
++        worker.init_lm_head.assert_called_once_with()
++        self.assertEqual(order, ["token_map", "lm_head"])
++
++    def test_alloc_memory_pool_reuses_shared_state(self):
++        worker = self._worker()
++        worker.draft_worker = MagicMock()
++        worker._share_embed_and_head()
++
++        spec = SimpleNamespace(speculative_use_rejection_sampling=False)
++        with patch.object(eagle_worker_v2, "get_spec", return_value=spec):
++            worker.alloc_memory_pool()
++
++        worker.init_token_map.assert_called_once_with()
++        worker.init_lm_head.assert_called_once_with()
++
++
++if __name__ == "__main__":
++    unittest.main()

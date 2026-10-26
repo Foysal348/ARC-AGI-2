@@ -1,5 +1,7 @@
 # Experiment 14 — Optimized engine on 4xL4 (planned, opened 2026-10-23)
 
+> **2026-10-26:** findings consolidated in `README_FINDINGS.md`; purpose and the full work log (incl. the EMS / VMS engine matrices) in `README_PURPOSE_AND_WORK.md`.
+
 **Goal:** raise Qwen3.8-27B throughput on Kaggle 4xL4 toward the 600–800 tok/s that top teams say is needed. Throughput must not cost correctness.
 - **Decode today:** SGLang W1 (INT4 + DFlash2) does ~330–380 tok/s over whole runs. A decode step at 12 running takes ~115 ms below 10k context and ~133–140 ms at 50–80k.
 - **Effective today:** the rate inside the Duck agent is only ~167–280 tok/s.
