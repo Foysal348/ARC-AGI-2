@@ -82,7 +82,7 @@ Findings: `README_FINDINGS.md`. Full history and the 2026-10-23 plan: `README.md
   - #43029 is not applicable.
   - Topology, P2P matrix and NCCL INIT logging were added.
   - See `Bug ang fix/Deep_reread_rev2c_2026-10-26.md`.
-- **GPT audit pack:** `Experiment Review/ENGINE_MATRIX_EMS_VMS_REV2B_AUDIT_FOR_GPT_2026-10-26.zip`.
+- **GPT audit packs:** `Experiment Review/ENGINE_MATRIX_EMS_VMS_REV2B_AUDIT_FOR_GPT_2026-10-26.zip`, then `..._REV2C_...zip` (current).
 
 ## The two matrices (current arms)
 
@@ -135,9 +135,9 @@ Time: about 10-15 min per arm. In 200 min the reference, the oracle, ~7-9 arms a
 
 ## Status (2026-10-26)
 
-- **EMS rev 2c** and **VMS rev 2c** are built:
-  - local harnesses pass;
-  - Kaggle CPU kit run 2 passed rev 2b / `e2733e17`;
-  - kit run 3 (rev 2c) is next.
-- Not yet run on the GPU.
+- **EMS rev 2c** (`c062255e`) and **VMS rev 2c** (`675db353`) are built:
+  - local harnesses pass (EMS 26/26, VMS 19/19);
+  - **Kaggle CPU kit run 3 ALL OK** on these shas (EMS 26/26, VMS 19/19 normal + 19/19 bad-INT4, Python 3.12.13);
+  - GPT audit pack: `Experiment Review/ENGINE_MATRIX_EMS_VMS_REV2C_AUDIT_FOR_GPT_2026-10-26.zip`.
+- Not yet run on the GPU (needs the user's go and an account with ≥ 2 x 210 min quota).
 - E15P (Poetiq on the SGLang engine) was submitted on 2026-10-26 as ref 57644341 and is PENDING.
