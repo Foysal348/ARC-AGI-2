@@ -52,7 +52,7 @@ E15 = NBDIR.parents[1] / "Experiment 15 - Duck 2x35k independent attempts (plann
 SRC = E15 / "Q27-XHIGH-E15P_EVAL120_S60_S15_POETIQ_SGLANG.ipynb"
 SRC_SHA = "56a22f7f"
 OUT = NBDIR / "Q27-XHIGH-VMS_ENGINE_MATRIX_VLLM.ipynb"
-PUSHED: set = set()
+PUSHED: set = {"6c2a39c568848dc23baf24f3955ce41779b11348c2fe20607a00eeb1dc5df216"}   # VMS, hosen42 v1 (2026-10-26)
 WHEELHOUSE_SLUG = "foysalemonshanto/vllm-0-32-0-cu13-wheelhouse"
 
 

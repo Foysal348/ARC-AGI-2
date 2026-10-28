@@ -75,16 +75,17 @@ if HPART != "ALL":
     _ran = {k for k, v in A.items() if not v.get("skipped")}
     # rev 2g: both parts run their own best MTP at 20 after the plan; RISKY also runs 2 x TP2
     _dyn = {k for k in _ran if (k.startswith(("mtp", "ntn")) and k.endswith("_s20"))} |         ({k for k in _ran if k.startswith("tp2x2_")} if HPART == "RISKY" else set())
+    _ndyn = {"SAFE": 1, "RISKY": 3, "MTPX": 0}[HPART]       # rev 2h: MTPX runs no best-MTP-at-20 and no TP2
     check(f"rev 2f part {HPART}: EMS_PART baked in", G["EMS_PART"] == HPART and EM.get("part") == HPART, (G.get("EMS_PART"), EM.get("part")))
     check(f"rev 2f part {HPART}: exactly its arms ran, plus the oracle and reference and "
           + ("the best MTP at 20" if HPART == "SAFE" else "the best MTP at 20 and 2 x TP2 (DFlash + the best MTP)"),
-          _ran - _dyn == _pa and len(_dyn) == (1 if HPART == "SAFE" else 3), (sorted(_ran), sorted(_dyn)))
+          _ran - _dyn == _pa and len(_dyn) == _ndyn, (sorted(_ran), sorted(_dyn)))
     check(f"rev 2f part {HPART}: every arm that ran is ok; every other arm recorded OTHER_PART",
           all(A[k].get("ok") for k in _ran) and all(str(A[k].get("skipped", "")).startswith("OTHER_PART") for k in A if k not in _ran)
           and any(k not in _ran for k in A), {k: (A[k].get("ok"), A[k].get("skipped")) for k in A})
-    check(f"rev 2f part {HPART}: no EMS cell error; patch / overlay / TP2 reserve only in RISKY",
-          not EM.get("error") and (("SAFE part" in str(EM["pr45151_patch"].get("why")) and "SAFE part" in str(EM["fi07_overlay"].get("why")))
-                                   if HPART == "SAFE" else "SAFE part" not in str(EM.get("pr45151_patch"))),
+    check(f"rev 2f part {HPART}: no EMS cell error; the #45151 patch only in RISKY",
+          not EM.get("error") and (("part: not needed" in str(EM["pr45151_patch"].get("why")))      # rev 2g-d: the overlay runs in SAFE too (PCIe arms)
+                                   if HPART in ("SAFE", "MTPX") else "part: not needed" not in str(EM.get("pr45151_patch"))),
           (EM.get("error"), EM.get("pr45151_patch"), EM.get("fi07_overlay")))
     check(f"rev 2f part {HPART}: the reference is adoptable (probe_complete_vs_target set), the oracle canary clean",
           A["ref_dflash_w6_s16"].get("adoptable") and (EM.get("canary_oracle") or {}).get("foreign_leaks") == 0,

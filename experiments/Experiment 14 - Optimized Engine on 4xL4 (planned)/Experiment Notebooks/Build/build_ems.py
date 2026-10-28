@@ -54,7 +54,8 @@ E15 = NBDIR.parents[1] / "Experiment 15 - Duck 2x35k independent attempts (plann
 SRC = E15 / "Q27-XHIGH-E15P_EVAL120_S60_S15_POETIQ_SGLANG.ipynb"
 SRC_SHA = "56a22f7f"
 OUT = NBDIR / "Q27-XHIGH-EMS_ENGINE_MATRIX_SGLANG.ipynb"
-PUSHED: set = set()
+PUSHED: set = {"5b8b91f23ffe59312c4c37e26d6b4776babe0d39ac141f3db7167e081253ae4d",   # RISKY, foysalemonshanto v1
+                "8f01847c25877e9b1b78f7a9fb0099d4aa466ba67322047ecfe147c4410f2da0"}   # SAFE rev 2g-d, hosen42 v1 (2026-10-26)   # RISKY, foysalemonshanto v1 (2026-10-26)
 
 
 def sha(p):
@@ -293,10 +294,15 @@ EMSR = {"arms": {}, "launches": {}, "order": []}
 E14_RESULTS["ems"] = EMSR
 # rev 2f: which part of the matrix this notebook runs (baked in at build time; EMS_PART=ALL = every arm, CPU harness)
 EMS_PART = os.environ.get("EMS_PART") or "__EMS_PART__"
-EMS_PART_ARMS = {"SAFE": ("mtp_3_1_4", "dflash_w6_s20", "dflash_w6_s24", "mtp_2_1_3", "mtp_3_1_4_mem86", "dflash_w4", "dflash_w8"),
-                 "RISKY": ("dflash_w6_pcie", "mtp_3_1_4", "mtp_3_1_4_pr45151", "mtp_3_1_4_pcie", "ntn_int4", "ntn_fp8",
-                           "mtp_replay_fp16", "mtp_replay_fp32")}
-assert EMS_PART in ("ALL", "SAFE", "RISKY"), EMS_PART      # rev 2g: a typo must not silently skip every arm
+# rev 2g-d: the two PCIe-IPC arms moved to SAFE (in RISKY v1 the overlay failed: no pip in the SGLang venv)
+EMS_PART_ARMS = {"SAFE": ("mtp_3_1_4", "dflash_w6_pcie", "mtp_3_1_4_pcie", "dflash_w6_s20", "dflash_w6_s24", "mtp_2_1_3",
+                          "mtp_3_1_4_mem86", "dflash_w4", "dflash_w8"),
+                 "RISKY": ("mtp_3_1_4", "mtp_3_1_4_pr45151", "ntn_int4", "ntn_fp8", "mtp_replay_fp16", "mtp_replay_fp32"),
+                 # rev 2h: larger MTP and temperature-0.6 windows (MTPX-only arms; ALL skips them)
+                 "MTPX": ("mtp_4_1_5", "mtp_5_1_6", "dflash_w6_t06", "mtp_3_1_4_t06", "mtp_5_1_6_t06")}
+EMS_MTPX_ONLY = set(EMS_PART_ARMS["MTPX"])
+EMS_WIN_TEMP = None          # rev 2h: sampling temperature of the speed-window streams (None = the Gen default, 1.0)
+assert EMS_PART in ("ALL", "SAFE", "RISKY", "MTPX"), EMS_PART      # rev 2g: a typo must not silently skip every arm
 EMS_TP2_ON = EMS_PART in ("ALL", "RISKY")
 EMSR["part"] = EMS_PART
 
@@ -308,6 +314,8 @@ class _E14GenWindow(E14M.Gen):
         super().__init__(*a, **k)
         if self.max_new >= 16384:
             self.sp["ignore_eos"] = True
+            if globals().get("EMS_WIN_TEMP") is not None:          # rev 2h: temperature-0.6 window arms
+                self.sp["temperature"] = float(globals()["EMS_WIN_TEMP"])
 
 
 if not getattr(E14M.Gen, "_ems_window", False):
@@ -396,7 +404,7 @@ try:
             EMSR["pip_freeze"] = repr(_e)[:200]
         EMSR["prompt_sha"] = {k_: [__import__("hashlib").sha256(json.dumps(list(x_)).encode()).hexdigest()[:16] for x_ in v_]
                               for k_, v_ in (globals().get("EMS_PROMPTS") or {}).items() if k_ in ("short", "long", "xl")}
-        EMSR["pr45151_patch"] = ems_patch_pr45151() if EMS_PART in ("ALL", "RISKY") else {"applied": False, "why": "SAFE part: not needed"}
+        EMSR["pr45151_patch"] = ems_patch_pr45151() if EMS_PART in ("ALL", "RISKY") else {"applied": False, "why": EMS_PART + " part: not needed"}
 
         EMS_FI07 = "/tmp/ems-fi07"
 
@@ -432,11 +440,24 @@ try:
                     name = f.name.replace("0.7.0.post1cu130", "0.7.0.post1+cu130")
                     shutil.copy(f, tmp / name)
                     wheels.append(str(tmp / name))
-                r_ = subprocess.run([E14_VENV["launch"][0], "-m", "pip", "install", "--no-deps", "--no-index", "--target", EMS_FI07,
+                # rev 2g-d (GPU evidence): the SGLang venv has no pip; the base Kaggle Python's pip only unpacks the wheels
+                # into the overlay dir (--target), the venv's python then imports them through PYTHONPATH
+                r_ = subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--target", EMS_FI07,
                                      "--upgrade"] + wheels, capture_output=True, text=True, timeout=1200)
                 out["pip_rc"], out["pip_tail"] = r_.returncode, (r_.stdout + r_.stderr)[-600:]
-                if r_.returncode != 0:
-                    return out
+                if r_.returncode != 0:      # last resort: a wheel is a zip; unpack it, *.data/purelib|platlib to the top
+                    import zipfile as _zf
+                    Path(EMS_FI07).mkdir(parents=True, exist_ok=True)
+                    for w_ in wheels:
+                        with _zf.ZipFile(w_) as z_:
+                            z_.extractall(EMS_FI07)
+                    for d_ in Path(EMS_FI07).glob("*.data"):
+                        for sub_ in ("purelib", "platlib"):
+                            for x_ in (d_ / sub_).glob("*") if (d_ / sub_).is_dir() else []:
+                                tgt_ = Path(EMS_FI07) / x_.name
+                                if not tgt_.exists():
+                                    shutil.move(str(x_), str(tgt_))
+                    out["unzip_fallback"] = True
                 chk = subprocess.run([E14_VENV["launch"][0], "-c", "import flashinfer, sys; from flashinfer.comm import "
                                       "PcieIpcAllReduceWorkspace; print(flashinfer.__version__, flashinfer.__file__)"],
                                      capture_output=True, text=True, timeout=600, env=dict(E14_VENV["env"], PYTHONPATH=EMS_FI07))
@@ -445,7 +466,7 @@ try:
             except Exception as e:
                 out["why"] = f"{type(e).__name__}: {e}"[:300]
             return out
-        EMSR["fi07_overlay"] = ems_fi07_overlay() if EMS_PART in ("ALL", "RISKY") else {"ok": False, "why": "SAFE part: not needed"}
+        EMSR["fi07_overlay"] = ems_fi07_overlay()       # rev 2g-d: the PCIe arms run in SAFE (RISKY v1 is already pushed)
         print("EMS FlashInfer 0.7 overlay:", json.dumps(EMSR["fi07_overlay"])[:500], flush=True)
         # the env of a PCIe-IPC arm: the overlay first on the path, the SGLang 0.5.21 switch on (pcie_ipc_ar.py; it sits after
         # custom all-reduce, which is off on 4 PCIe GPUs, and before NCCL; bf16 decode reductions only)
@@ -930,6 +951,12 @@ try:
                                      drop=_SPEC + ("--min-free-slots-delay",))),
             ("dflash_w4", dict(set_={"--speculative-num-draft-tokens": 4})),
             ("dflash_w8", dict(set_={"--speculative-num-draft-tokens": 8})),
+            # rev 2h (MTPX): larger MTP, and the temperature-0.6 windows (production Duck temperature)
+            ("mtp_4_1_5", dict(set_=_mtp(steps=4, draft=5), drop=_SPEC + ("--min-free-slots-delay",))),
+            ("mtp_5_1_6", dict(set_=_mtp(steps=5, draft=6), drop=_SPEC + ("--min-free-slots-delay",))),
+            ("dflash_w6_t06", dict(win_temp=0.6)),
+            ("mtp_3_1_4_t06", dict(set_=_mtp(), drop=_SPEC + ("--min-free-slots-delay",), win_temp=0.6)),
+            ("mtp_5_1_6_t06", dict(set_=_mtp(steps=5, draft=6), drop=_SPEC + ("--min-free-slots-delay",), win_temp=0.6)),
         ]
         # EMS rev 2 (GPT pre-GPU audit S8, checked in the SGLang 0.5.21 source): no other linear-attention kernel exists for
         # a speculative run on the L4 (SM 8.9), so both backend arms are dropped instead of spending two launches.
@@ -976,19 +1003,28 @@ try:
                 _why = "FlashInfer 0.7 overlay: " + str(EMSR["fi07_overlay"].get("why") or EMSR["fi07_overlay"])[:300]
             if _name in ("dflash_w6_s20", "dflash_w6_s24") and E14_VENV["cfg"].get("streams12"):
                 _why = "the reference fell back to 12 streams: 20 / 24 cannot fit the same memory"
+            if EMS_PART == "ALL" and _name in EMS_MTPX_ONLY:
+                _why = "OTHER_PART: runs in the EMS MTPX notebook"
             if EMS_PART != "ALL" and _name not in EMS_PART_ARMS.get(EMS_PART, ()):
                 _why = "OTHER_PART: runs in the EMS " + ("SAFE" if EMS_PART == "RISKY" else "RISKY") + " notebook"
             if _why:
                 EMSR["arms"][_name] = {"ok": False, "skipped": _why}
                 EMSR["order"].append(_name)
                 continue
-            _safe(_name, _arm, _name, **_kw)      # rev 2f/2g: one arm's own crash never ends the remaining arms
+            _kw = dict(_kw)
+            globals()["EMS_WIN_TEMP"] = _kw.pop("win_temp", None)       # rev 2h: per-arm window temperature
+            try:
+                _safe(_name, _arm, _name, **_kw)      # rev 2f/2g: one arm's own crash never ends the remaining arms
+            finally:
+                globals()["EMS_WIN_TEMP"] = None
+            if globals().get("EMSR", {}).get("arms", {}).get(_name) is not None and _name.endswith("_t06"):
+                EMSR["arms"][_name]["window_temperature"] = 0.6
 
         # rev 2g (agents N3): the fastest gated MTP of THIS part at 20 streams, after the whole plan (in RISKY the #45151 /
         # PCIe / NTN arms are candidates: the KV #45151 frees is the reason to run it); rev 2b: by family
         _mt = {k: v for k, v in EMSR["arms"].items() if v.get("family") == "mtp" and not k.endswith("_s20") and _gated(v)
                and v.get("short_tok_s")}
-        if _mt and not E14_VENV["cfg"].get("streams12"):
+        if _mt and not E14_VENV["cfg"].get("streams12") and EMS_PART != "MTPX":      # rev 2h: not in MTPX
             _best = max(_mt, key=lambda k: _mt[k]["short_tok_s"])
             _safe(_best + "_s20", _arm, _best + "_s20", set_=EMSR["arms"][_best]["set"], drop=tuple(EMSR["arms"][_best]["drop"]),
                   streams=20, env=EMSR["arms"][_best].get("env"))
@@ -1309,14 +1345,19 @@ Each arm: correctness gate first, then 8k and 40k steady windows at the level th
 **Inputs:** competition data; RedHat INT4, DFlash2 bf16, FP8 repack (the NTN-FP8 arm and the tokenizer); the SGLang 0.5.21
 wheelhouse; the vLLM wheelhouse (the tokenizer pins); the payload dataset (E14 modules).
 """
-for PART in ("SAFE", "RISKY"):
+PART_MD = {
+    "SAFE": "oracle + reference + MTP 3/1/4, DFlash W6 and MTP with PCIe-IPC all-reduce (FlashInfer 0.7 overlay), DFlash 20 / "
+            "24 streams (+ the best MTP at 20), MTP 2/1/3, mem 0.86, DFlash width 4 / 8; no #45151 patch, no TP2.",
+    "RISKY": "oracle + reference + MTP 3/1/4 (A/B partner), #45151, NTN INT4 / FP8, ReplaySSM fp16 / fp32, the best MTP at 20, "
+             "then 2 x TP2.",
+    "MTPX": "oracle + reference + MTP 4/1/5 and 5/1/6, and temperature-0.6 windows for DFlash W6, MTP 3/1/4 and MTP 5/1/6 "
+            "(gates stay greedy); no patch, no TP2."}
+for PART in ("SAFE", "RISKY", "MTPX"):
     cells_p = [c.replace('"__EMS_PART__"', f'"{PART}"') for c in cells]
     assert sum(c.count(f'or "{PART}"') for c in cells_p) == 1
     md_p = md.replace("# EMS — SGLang engine-config matrix", f"# EMS {PART} — SGLang engine-config matrix", 1) + (
-        "\n**rev 2f part " + PART + ":** " + ("oracle + reference + MTP 3/1/4, DFlash 20 / 24 (+ the best MTP at 20), MTP 2/1/3, "
-        "mem 0.86, DFlash width 4 / 8; no patch, no overlay, no TP2." if PART == "SAFE" else
-        "oracle + reference + MTP 3/1/4 (A/B partner), #45151, PCIe-IPC (DFlash / MTP), NTN INT4 / FP8, ReplaySSM fp16 / "
-        "fp32, then 2 x TP2.") + " The other part is its own notebook (a crash in one cannot touch the other).\n")
+        "\n**Part " + PART + ":** " + PART_MD[PART] + " The other parts are their own notebooks (a crash in one cannot touch "
+        "the others).\n")
     nb = json.load(open(SRC, encoding="utf-8"))
     nb["cells"] = [{"cell_type": "markdown", "metadata": {}, "source": md_p.splitlines(keepends=True)}] + [
         {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": c.splitlines(keepends=True)}

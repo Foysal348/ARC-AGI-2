@@ -1,0 +1,138 @@
+"""E18 = S1-60K (LB 34.58; Experiment 10, sha ed530071) on vLLM 0.32.0 with 20 streams (user 2026-10-27: "S1-60K
+notebook, only the engine becomes vLLM 0.32 and 20 streams; Poetiq, prompt and 60k exactly as they are").
+
+Cells of S1-60K, by index of the notebook:
+  0 markdown          -> new (E18 note + the S1 note kept below it)
+  1 CELL 0            -> unchanged
+  2 CELL 1            -> three changes: MAX_NUM_SEQS default 16 -> 20; the commit profile E18SMOKE (20 eval tasks, 45 min,
+                         the default for a commit; the rerun stays RERUN_ALL); the vLLM 0.32 wheelhouse path
+  3 CELL 2 install    -> unchanged (it still installs vLLM 0.19: the fallback engine; the tokenizer stack stays 4.57.6)
+  4 task order        -> unchanged
+  5 Poetiq core       -> unchanged
+  6 CELL 5 engine     -> new (Build/e18_engine_cell.py: vLLM 0.32 server + the in-process shim); S1's own engine cell is
+                         embedded verbatim as the last fallback
+  7 solver            -> unchanged
+  8 report            -> unchanged
+  + CELL 8b           -> new: engine stats + stop the vLLM server
+usage: python build_e18.py   -> ../Q27-XHIGH-E18_S1_60K_VLLM032_S20.ipynb"""
+import hashlib
+import json
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+NBDIR = HERE.parent
+E10 = NBDIR.parents[1] / "Experiment 10 - Q27-XHIGH Poetiq Code-Verify attempt_2 (planned)" / "Experiment Notebooks"
+SRC = E10 / "Q27-XHIGH-v1_4_4_E10_S1_60K_POETIQ_FIX_ORDER2.ipynb"
+SRC_SHA = "ed530071"
+OUT = NBDIR / "Q27-XHIGH-E18_S1_60K_VLLM032_S20.ipynb"
+PUSHED: set = {"07af34e3b4e2aded240d0eecd385ff0b3340623b463bb8002e68a539adb55bf1"}   # foysalemonshanto v1 (2026-10-27, E18SMOKE)
+WHEELHOUSE_SLUG = "foysalemonshanto/vllm-0-32-0-cu13-wheelhouse"
+# E18SMOKE: the 4 S1COMMIT4 tasks + the first 16 other tasks of PROXY56 (20 tasks -> 20 concurrent units at 1 expert)
+SMOKE_TASKS = ["1818057f", "2ba387bc", "bf45cf4b", "58490d8a",
+               "0934a4d8", "20a9e565", "4c7dc4dd", "89565ca0", "136b0064", "291dc1e1", "16b78196", "271d71e2",
+               "28a6681f", "2b83f449", "2c181942", "31f7f899", "35ab12c3", "3dc255db", "409aa875", "4c416de3"]
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def src(c):
+    return "".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+
+
+def rep(text, a, b, n=1):
+    assert text.count(a) == n, (text.count(a), a[:100])
+    return text.replace(a, b)
+
+
+assert sha(SRC).startswith(SRC_SHA), sha(SRC)
+nb = json.load(open(SRC, encoding="utf-8"))
+cells = [src(c) for c in nb["cells"]]
+assert len(cells) == 9 and nb["cells"][0]["cell_type"] == "markdown"
+assert "CELL 1 — configuration" in cells[2] and "CELL 2 — offline install" in cells[3]
+assert "CELL 5 — engine" in cells[6] and "e10_run_solver" in cells[7] and "E10 RUN REPORT" in cells[8]
+assert len(set(SMOKE_TASKS)) == 20
+
+# ---------------------------------------------------------------- CELL 1
+c1 = cells[2]
+c1 = rep(c1, 'os.environ.get("Q27X_PROFILE", "S1COMMIT4")', 'os.environ.get("Q27X_PROFILE", "E18SMOKE")')
+c1 = rep(c1, '''    # R5 EVAL120: full evaluation run''', '''    # E18 (2026-10-27): the commit run of the vLLM 0.32 / 20-stream build: 20 eval tasks (20 concurrent units at 1 expert),
+    # 45 min; engine ready ~10-12 min, admission until 35 min, drain 36 min, hard stop 42 min
+    "E18SMOKE":  {"source": "eval", "task_list": ''' + json.dumps(SMOKE_TASKS) + ''',
+                  "time_budget_sec": 45 * 60, "admit_frac": 0.80, "drain_frac": 0.90, "hard_margin_sec": 3 * 60,
+                  "verify_margin_sec": 1 * 60, "drain_margin_sec": 6 * 60, "admit_margin_sec": 1 * 60},
+    # R5 EVAL120: full evaluation run''')
+c1 = rep(c1, 'MAX_NUM_SEQS = int(os.environ.get("Q27X_MAX_NUM_SEQS", 16))',
+         'MAX_NUM_SEQS = int(os.environ.get("Q27X_MAX_NUM_SEQS", 20))   # E18: 16 -> 20 (VMS fp8_mtp3_s20 PASS)')
+c1 = rep(c1, '''WHEELHOUSE = Path(os.environ.get("Q27X_WHEELHOUSE", "/kaggle/input/datasets/mirzamilanfarabi/arc3-vllm-h100-wheelhouse-v3"))
+''', '''WHEELHOUSE = Path(os.environ.get("Q27X_WHEELHOUSE", "/kaggle/input/datasets/mirzamilanfarabi/arc3-vllm-h100-wheelhouse-v3"))
+# E18: the vLLM 0.32.0 venv wheelhouse (the engine); WHEELHOUSE above keeps the tokenizer stack + the vLLM 0.19 fallback
+E18_VLLM_WHEELHOUSE = Path(os.environ.get("E18_VLLM_WHEELHOUSE", "/kaggle/input/datasets/''' + WHEELHOUSE_SLUG + '''"))
+''')
+c1 = rep(c1, '''CONFIG["profile_row"] = P
+''', '''CONFIG["profile_row"] = P
+CONFIG["e18"] = {"engine": "vLLM 0.32.0 server (venv) + in-process shim; S1's vLLM 0.19 engine as the last fallback",
+                 "vllm_wheelhouse": str(E18_VLLM_WHEELHOUSE), "max_num_seqs": MAX_NUM_SEQS, "base": "S1-60K ed530071"}
+''')
+
+# ---------------------------------------------------------------- CELL 5 engine
+ENGINE = (HERE / "e18_engine_cell.py").read_text(encoding="utf-8").replace("\r\n", "\n")
+eng = ENGINE.replace("import shutil as _shutil\n", "import shutil as _shutil\n# S1-60K's engine cell (ed530071, cell 6), verbatim: "
+                     "the last fallback below\nS1_ENGINE_SRC = " + json.dumps(cells[6]) + "\n", 1)
+assert "S1_ENGINE_SRC = " in eng
+
+# ---------------------------------------------------------------- CELL 8b
+C8B = '''# ==================================================================== CELL 8b — E18: engine stats, stop the vLLM server
+try:
+    _st = {"engine": ENGINE_INFO.get("engine"), "shim": getattr(engine, "stats", None), "concurrency": CONCURRENCY,
+           "kv_tokens": ENGINE_INFO.get("kv_tokens"), "scheduler_tok_per_sec": E10_SCHED.get("tok_per_sec"),
+           "scheduler_tokens": E10_SCHED.get("tokens"), "max_active": E10_SCHED.get("max_active"),
+           "kv_gate_blocks": E10_SCHED.get("kv_gate_blocks"), "metrics_end": metrics_snapshot() if ENGINE_READY else []}
+    write_json_atomic(OUT / "e18_engine_stats.json", _st)
+    print("E18 engine stats:", json.dumps({k: v for k, v in _st.items() if k != "metrics_end"}, default=str)[:2000], flush=True)
+except BaseException:
+    print("E18 stats error:", traceback.format_exc()[-1500:], flush=True)
+try:
+    if globals().get("E18_SERVER") is not None:
+        E18_SERVER.kill()
+        print("E18: vLLM 0.32 server stopped", flush=True)
+except BaseException as _e:
+    print("E18: server stop error", repr(_e)[:300], flush=True)
+'''
+
+MD = """# E18 — S1-60K on vLLM 0.32.0, 20 streams
+
+**User (2026-10-27):** S1-60K (LB 34.58, sha `ed530071`) unchanged except the engine: vLLM 0.32.0 instead of 0.19.0, and
+20 streams instead of 16. Poetiq, prompts, 60,000 + 8,192 tokens, sampling, queue, KV gate and deadlines are S1's.
+
+- The solver, report, Poetiq core, task order, install (CELL 2) and CELL 0 cells are **byte-identical** to S1-60K.
+- CELL 5 runs vLLM 0.32.0 as an OpenAI server from a venv (`foysalemonshanto/vllm-0-32-0-cu13-wheelhouse`, the
+  Experiment 14 VMS launch) with S1's engine flags, and gives the solver the same `engine.add_request / step /
+  abort_request`, `llm.get_metrics()` and `SamplingParams` names through a shim. Prompts are S1's token ids.
+- Ladder: S1 flags + language-model-only → the exact VMS `fp8_mtp3_s20` flags → VMS with Triton attention → S1's own
+  in-process vLLM 0.19 engine cell (verbatim).
+- Commit run: `E18SMOKE` = 20 eval tasks, 45 min (engine, 20 concurrent units, drain, verification, tok/s). The hidden
+  rerun is `RERUN_ALL` (12 h), unchanged.
+
+---
+
+"""
+nb["cells"][0]["source"] = (MD + cells[0]).splitlines(keepends=True)
+nb["cells"][2]["source"] = c1.splitlines(keepends=True)
+nb["cells"][6]["source"] = eng.splitlines(keepends=True)
+nb["cells"].append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+                    "source": C8B.splitlines(keepends=True)})
+for c in nb["cells"]:
+    if c["cell_type"] == "code":
+        c["outputs"] = []; c["execution_count"] = None
+        compile(src(c), "<cell>", "exec")
+new = [src(c) for c in nb["cells"]]
+unchanged = [i for i in range(len(cells)) if new[i] == cells[i]]
+assert unchanged == [1, 3, 4, 5, 7, 8], unchanged
+out = OUT
+if out.exists() and sha(out) in PUSHED:
+    out = out.with_name(out.stem + "_REBUILD.ipynb")
+data = (json.dumps(nb, indent=1, ensure_ascii=False) + "\n").encode("utf-8")
+out.write_bytes(data)
+print(out.name, hashlib.sha256(data).hexdigest()[:8], f"{len(data) / 1024:.0f} kB", "| unchanged cells", unchanged, "of", len(new))
