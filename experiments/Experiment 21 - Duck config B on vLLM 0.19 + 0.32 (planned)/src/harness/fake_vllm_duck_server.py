@@ -40,6 +40,7 @@ Fault injection (env, all optional; FORM = 0.19 | 0.32 limits a fault to one arg
   FAKE_NUM_BLOCKS=<FORM>:<n>[,...]   log n KV blocks for that form (fewer streams fit: the gate A/B test)
   FAKE_DROP_BLOCK_LINE=<FORM>        omit the "Setting attention block size" line (the notebook must refuse)
   FAKE_REJECT=<FORM>:<substr>[,...]  exit 1 if an argv element contains <substr> in that form ("*" = any form)
+  FAKE_REJECT_UNLESS=<FORM>:<substr> exit 1 if NO argv element contains <substr> in that form (rev 2i)
   FAKE_NEVER_READY=1 | <FORM>        print the loading lines, then never bind the port (no /health, no KV line)
   FAKE_DIE_AFTER_SEC=<s>             exit (os._exit 1) s seconds after the first tool request (mid-solve)
   FAKE_DIE_FORM=<FORM>               limit the death to one form; FAKE_DIE_TIMES=<n> (default 1): the first n
@@ -219,6 +220,11 @@ def _reject(why):
 if os.environ.get("FAKE_REJECT_FLAG") and os.environ["FAKE_REJECT_FLAG"] in argv:
     time.sleep(0.3)
     _reject(f"FAKE_REJECT_FLAG {os.environ['FAKE_REJECT_FLAG']}")
+for _r in [x for x in os.environ.get("FAKE_REJECT_UNLESS", "").split(",") if ":" in x]:
+    _f, _sub = _r.split(":", 1)
+    if form_match(_f) and not any(_sub in str(a) for a in argv):
+        time.sleep(0.3)
+        _reject(f"FAKE_REJECT_UNLESS {_r}")
 for _r in [x for x in os.environ.get("FAKE_REJECT", "").split(",") if ":" in x]:
     _f, _sub = _r.split(":", 1)
     if form_match(_f) and any(_sub in str(a) for a in argv):
@@ -588,6 +594,12 @@ def chat(body):
             text = last.split("Reply with exactly this code: ", 1)[1].strip()
             with LOCK:
                 ST["cache_probe"] += 1
+        elif "7 * 6 =" in last:                    # rev 2i content probes
+            text = "42"
+        elif "Complete the sequence with the next number only: " in last:
+            text = "10"
+        elif "Repeat exactly, nothing else: " in last:
+            text = last.split("Repeat exactly, nothing else: ", 1)[1].strip()
         elif "what is 2 + 2" in last:
             text = "2 + 2 = 4."
             with LOCK:

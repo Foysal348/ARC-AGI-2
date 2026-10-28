@@ -5,8 +5,9 @@ usage: python harness_e21_nb.py <notebook> [scale]
 env E21_MODE:
   commit       both halves on a few eval tasks (profile E21H_PROFILE, default EVAL6) with short per-half windows
   rerun        KAGGLE_IS_COMPETITION_RERUN=1: half A only, every fixture test task, a complete submission.json
-  fallbackA    half A's primary launch is rejected by the fake (NB1: the INT4 path, NB2: --mamba-ssm-cache-dtype; 0.19
-               form only) -> its fallback launches; half B runs its primary
+  fallbackA    half A's primary launch is rejected by the fake (--mamba-ssm-cache-dtype in a 0.19 launch: both
+               variants' half A primary, rev 2j) -> its fallback launches; half B: NB2 repeats half A's
+               fallback (E21_B_FOLLOWS_A), NB1 (rev 2i) runs its own INT4 primary
   halfAfail    the 0.19 server never becomes ready (FAKE_NEVER_READY=0.19) -> half A has no engine, half B still runs and
                the notebook finishes with a valid submission
   death        the half-A server dies mid-solve (FAKE_DIE_AFTER_SEC, 0.19 form, once) -> the watchdog relaunches it once
@@ -164,7 +165,7 @@ else:
         os.environ.update(Q27X_PROFILE=os.environ.get("E21H_PROFILE", "E15B" if MODE in ("gateAB", "kvoutage") else "EVAL6"),
                           Q27X_TIME_BUDGET="10800")
 if MODE == "fallbackA":
-    os.environ["FAKE_REJECT"] = "0.19:w4a16" if VAR == "NB1" else "0.19:--mamba-ssm-cache-dtype"
+    os.environ["FAKE_REJECT"] = "0.19:--mamba-ssm-cache-dtype"     # rev 2j: both variants' half A primary has SSM fp16
 if MODE == "halfAfail":
     os.environ["FAKE_NEVER_READY"] = "0.19"
 if MODE == "death":
@@ -181,7 +182,7 @@ GATE_A_STREAMS = 10
 if MODE == "gateAB":
     # 0.19 logs fewer blocks: FP8 / INT4 (B 1,600, 51 blocks per 57k request) 510 -> 10 streams; NB2's SSM-16 primary
     # (B 832, 84 blocks per 57k request) 850 -> 10 streams (510 would give 6 < 8: refused -> fallback)
-    os.environ.update(FAKE_NUM_BLOCKS="0.19:" + ("510" if VAR == "NB1" else "850"), FAKE_SPEED="100",
+    os.environ.update(FAKE_NUM_BLOCKS="0.19:850", FAKE_SPEED="100",       # rev 2j: both half A primaries SSM fp16
                       FAKE_ACCEPT_LEN="0.19:1.2")      # rev 2b: half A's MTP acceptance 1.2 < 1.5 -> mtp_acceptance_warning
 
 
@@ -372,7 +373,8 @@ for p in STATE.glob("stats_*.json"):
 port_of = lambda L: int(L["argv"][L["argv"].index("--port") + 1]) if "--port" in L["argv"] else None
 la = [L for L in launches if port_of(L) == 1234]
 lb = [L for L in launches if port_of(L) == 8011]
-exp_seqs = 20 if VAR == "NB1" else 16
+exp_seqs = 20 if VAR == "NB1" else 16       # half B's primary (rev 2i: NB1 half A = FP8, 16)
+EXP_A_SEQS = 18 if VAR == "NB1" else 16      # rev 2j
 sub = jload(WORK / "submission.json")
 test = jload(ARC / "arc-agi_test_challenges.json")
 
@@ -414,18 +416,23 @@ fa, fb = first_ready(la), first_ready(lb)
 model_of = lambda L: (L["argv"][1] if L["form"] == "0.19" else L["argv"][0]) if L else ""
 if MODE not in ("fallbackA", "halfAfail"):
     if VAR == "NB1":
-        check("NB1 half A primary: INT4 weights (w4a16 path), --max-num-seqs 20, no SSM flag",
-              fa and "w4a16" in model_of(fa) and flag(fa, "--max-num-seqs") == "20" and "--mamba-ssm-cache-dtype" not in fa["argv"],
-              fa and fa["argv"])
+        check("NB1 half A primary (rev 2j): FP8 weights, --max-num-seqs 18, --mamba-ssm-cache-dtype float16; no 0.19 INT4 launch",
+              fa and "w4a16" not in model_of(fa) and flag(fa, "--max-num-seqs") == "18"
+              and flag(fa, "--mamba-ssm-cache-dtype") == "float16"
+              and not any("w4a16" in model_of(L) for L in la), fa and fa["argv"])
     else:
         check("NB2 half A primary: FP8 weights, --max-num-seqs 16, --mamba-ssm-cache-dtype float16",
               fa and "w4a16" not in model_of(fa) and flag(fa, "--max-num-seqs") == "16"
               and flag(fa, "--mamba-ssm-cache-dtype") == "float16", fa and fa["argv"])
 if "B" in want_halves and MODE not in ("fallbackA", "gpuheldB"):
-    check(f"{VAR} half B primary: the same weights / seqs {exp_seqs} / SSM setting as half A's spec",
+    check(f"{VAR} half B primary: {'INT4' if VAR == 'NB1' else 'FP8'} weights / seqs {exp_seqs} / SSM {'default' if VAR == 'NB1' else 'fp16'}",
           fb and flag(fb, "--max-num-seqs") == str(exp_seqs) and (("w4a16" in model_of(fb)) == (VAR == "NB1"))
           and ((flag(fb, "--mamba-ssm-cache-dtype") == "float16") == (VAR == "NB2")), fb and fb["argv"])
-if MODE == "fallbackA":      # rev 2 E21_B_FOLLOWS_A: a half-A fallback is repeated in half B (only the version differs)
+if MODE == "fallbackA" and VAR == "NB1":     # rev 2i: NB1 never follows A; half B runs its own INT4 primary
+    check("fallbackA NB1: half B launched its own primary (INT4, seqs 20), first try; no spec_note",
+          fb and lb and lb[0] is fb and "w4a16" in model_of(fb) and flag(fb, "--max-num-seqs") == "20"
+          and not (((st.get("halves") or {}).get("B") or {}).get("engine") or {}).get("spec_note"), fb and fb["argv"])
+elif MODE == "fallbackA":      # rev 2 E21_B_FOLLOWS_A: a half-A fallback is repeated in half B (only the version differs)
     check(f"fallbackA {VAR}: half B launched half A's FALLBACK config (FP8, seqs 16, no SSM flag), first try",
           fb and lb and lb[0] is fb and "w4a16" not in model_of(fb) and flag(fb, "--max-num-seqs") == "16"
           and "--mamba-ssm-cache-dtype" not in fb["argv"], fb and fb["argv"])
@@ -461,6 +468,7 @@ for H in want_halves:
     e = rep.get("e12_run") or {}
     if expect_engine[H]:
         want_used = "fallback" if (MODE == "fallbackA" and H == "A") else "primary"
+        _hseqs = EXP_A_SEQS if H == "A" else exp_seqs
         check(f"half {H}: engine ready on the {want_used} config ({eng.get('backend')})", eng.get("used") == want_used
               and str(eng.get("backend") or "").startswith("vllm-" + ("0.19.0" if H == "A" else "0.32.0")),
               {k: eng.get(k) for k in ("used", "backend", "fatal")} | {"attempts": [(a.get("tag"), a.get("why"), str(a.get("error"))[:200]) for a in eng.get("attempts") or []]})
@@ -471,17 +479,23 @@ for H in want_halves:
                   and any(L["outcome"] == "rejected" for L in la), (a0.get("why"), a0.get("error")))
             fl = first_ready(la)
             if VAR == "NB1":
-                check("fallbackA NB1: half A fallback = FP8 weights, --max-num-seqs 16",
-                      fl and "w4a16" not in model_of(fl) and flag(fl, "--max-num-seqs") == "16", fl and fl["argv"])
+                check("fallbackA NB1: half A fallback = FP8 weights, --max-num-seqs 16, no SSM flag (rev 2j: the S1 engine)",
+                      fl and "w4a16" not in model_of(fl) and flag(fl, "--max-num-seqs") == "16"
+                      and "--mamba-ssm-cache-dtype" not in fl["argv"], fl and fl["argv"])
             else:
                 check("fallbackA NB2: half A fallback = FP8 without --mamba-ssm-cache-dtype, seqs 16",
                       fl and "--mamba-ssm-cache-dtype" not in fl["argv"] and flag(fl, "--max-num-seqs") == "16",
                       fl and fl["argv"])
         cap = eng.get("capacity") or {}
-        want_streams = (16 if MODE == "fallbackA" else GATE_A_STREAMS if (MODE == "gateAB" and H == "A") else exp_seqs)
+        want_streams = (GATE_A_STREAMS if (MODE == "gateAB" and H == "A")
+                        else 16 if (MODE == "fallbackA" and (VAR == "NB2" or H == "A")) else _hseqs)
         check(f"half {H}: capacity check from the vLLM lines -> {want_streams} streams; Duck streams / workers = that",
               cap.get("streams") == want_streams and e.get("streams") == want_streams and e.get("rev6_workers") == want_streams,
               (cap, e.get("streams"), e.get("rev6_workers")))
+        check(f"half {H}: rev 2i content probes (7 * 6, copy, sequence) passed on the ready launch",
+              any(len(a.get("content_probes") or []) == 3 and all(x.get("ok") and x.get("clean") for x in a["content_probes"])
+                  for a in eng.get("attempts") or [] if (a.get("smoke") or {}).get("ok")),
+              [a.get("content_probes") for a in eng.get("attempts") or []])
         check(f"half {H}: smoke OK, /v1/models = the served name", any((a.get("smoke") or {}).get("ok") for a in eng.get("attempts") or [])
               and any(a.get("models") for a in eng.get("attempts") or []), [(a.get("smoke"), a.get("models")) for a in eng.get("attempts") or []])
         check(f"half {H}: Duck ran without solver error; branches started; isolation preflight PASS",
@@ -496,7 +510,9 @@ for H in want_halves:
               and sl.get("startup", {}).get("kv_tokens_logged"),
               {k: bs.get(k) for k in ("error", "server_gen_tokens", "server_running_mean", "gauge_samples")} | {"sl": sl})
         check(f"half {H}: no worker error, no stale SERVER_DOWN", not bs.get("worker_errors"), bs.get("worker_errors"))
-        _ssm16 = any(flag(L, "--mamba-ssm-cache-dtype") == "float16" for L in (la if H == "A" else lb) if L["outcome"] == "ready")
+        # rev 2i: the capacity record is the half's FIRST ready server (a switching relaunch keeps it, VAL2_engine F11)
+        _fr = first_ready(la if H == "A" else lb)
+        _ssm16 = bool(_fr) and flag(_fr, "--mamba-ssm-cache-dtype") == "float16"
         check(f"half {H}: capacity from the rev 2 vLLM lines (block size {832 if _ssm16 else 1600}, num_blocks, F = 15 with MTP-3)",
               cap.get("block_size") == (832 if _ssm16 else 1600) and cap.get("num_blocks")
               and cap.get("fixed_blocks_per_request") == 15, cap)
@@ -625,7 +641,8 @@ for H in want_halves:
         check(f"half {H}: lmo_in_log True (the fake prints 'language_model_only': True in its non-default args line)",
               _r.get("lmo_in_log") is True, _r.get("lmo_in_log"))
 _he_a = (((st.get("halves") or {}).get("A") or {}).get("engine") or {})
-_want_cs = ("NOT_RUN" if MODE in ("halfAfail", "gpuheldB") else "FALLBACK_BOTH" if MODE == "fallbackA" else
+_want_cs = ("NOT_RUN" if MODE in ("halfAfail", "gpuheldB") else
+            ("CONFOUNDED_FALLBACK" if VAR == "NB1" else "FALLBACK_BOTH") if MODE == "fallbackA" else
             "SWITCHED_MIDHALF" if (MODE == "death" and _he_a.get("relaunch_cfg_switched")) else "PRIMARY_BOTH")
 check(f"rev 2c/2e: config_status = {_want_cs}" + (" (half A switched to its fallback in a relaunch)" if MODE == "death" else "")
       + "; configs_ran recorded per half",
@@ -634,7 +651,8 @@ check(f"rev 2c/2e: config_status = {_want_cs}" + (" (half A switched to its fall
                                                "relaunch_cfg_switched": _he_a.get("relaunch_cfg_switched"),
                                                "configs_ran": R21.get("configs_ran")})
 # gateAB: the halves ran 10 vs full streams; since rev 2e (kit run 2) unequal streams make the comparison invalid
-_want_cv = (MODE in TWO_RUN_MODES and _want_cs in ("PRIMARY_BOTH", "FALLBACK_BOTH") and MODE != "gateAB")
+_want_cv = (MODE in TWO_RUN_MODES and _want_cs in ("PRIMARY_BOTH", "FALLBACK_BOTH") and MODE != "gateAB"
+            and VAR != "NB1")       # rev 2i: NB1's halves differ by design (FP8 16 vs INT4 20): never a valid A/B
 check(f"rev 2c/2e: comparison_valid = {_want_cv}" + (" (gateAB: 10 vs full streams -> invalid, rev 2e rule)" if MODE == "gateAB" else ""),
       R21.get("comparison_valid") is _want_cv,
       {"comparison_valid": R21.get("comparison_valid"), "windows_sec": R21.get("windows_sec"),

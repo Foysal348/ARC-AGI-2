@@ -95,6 +95,58 @@ def e21_duck_serving_flags(served, port):
             "--disable-uvicorn-access-log"]
 
 
+def e21_reject_broken_int4(cfg):
+    """rev 2i (GPT INT4 audits 1+2): RedHat INT4 on vLLM 0.19.0 generates garbage from the first token (GPU smoke run 1,
+    2026-10-29; the same checkpoint is coherent on 0.32). Never launch that pair."""
+    if cfg.get("vllm") == "0.19.0" and cfg.get("weights") == "int4":
+        raise RuntimeError("E21_BLOCKER_INT4_V019: RedHat INT4 generates garbage on vLLM 0.19.0 (GPU smoke run 1)")
+
+
+E21_CONTENT_PROBES = [("Reply with exactly one number: 7 * 6 =", "42", "number"),          # audit 1
+                      ("Repeat exactly, nothing else: ARC-GRID-17", "ARC-GRID-17", "copy"),   # audit 2
+                      ("Complete the sequence with the next number only: 2, 4, 6, 8,", "10", "number")]   # audit 2
+E21_NUMBER_WORDS = {"4": "four", "10": "ten", "42": "forty-two"}
+
+
+def e21_garbage(gen, limit=80):
+    """rev 2i: empty, too long for the question, or < 90 % ASCII (the 0.19 INT4 multilingual token soup)."""
+    g = (gen or "").strip()
+    return not g or len(g) > limit or sum(ch.isascii() for ch in g) < 0.9 * len(g)
+
+
+def e21_content_ok(gen, want, kind, limit=80):
+    """rev 2i (GPT INT4 audits 1+2): a clean reply that holds the answer (number: the last number in it, or its word)."""
+    g = (gen or "").strip()
+    if e21_garbage(g, limit):
+        return False
+    if kind == "number":
+        return re.findall(r"-?\d+", g)[-1:] == [want] or E21_NUMBER_WORDS.get(want, "\0") in g.lower()
+    return want in g
+
+
+def e21_content_probes(served):
+    """rev 2i: three more greedy, thinking-off probes after the 2 + 2 smoke. A garbage reply (or one cut at the limit) is
+    fatal in every mode; a clean but wrong answer is fatal in commit / smoke and a recorded warning in the hidden rerun,
+    so a formatting surprise can never leave the rerun without an engine."""
+    res = []
+    for prompt, want, kind in E21_CONTENT_PROBES:
+        r = _e12v_request_json(SGL_URL + "/v1/chat/completions", payload={
+            "model": served, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": 32,
+            "chat_template_kwargs": {"enable_thinking": False}}, timeout=300)
+        c = r["choices"][0]
+        gen = (c["message"].get("content") or "").strip()
+        res.append({"want": want, "generated": gen[:120], "finish": c.get("finish_reason"),
+                    "clean": not e21_garbage(gen) and c.get("finish_reason") != "length",
+                    "ok": e21_content_ok(gen, want, kind) and c.get("finish_reason") != "length"})
+    if not all(x["clean"] for x in res):
+        raise RuntimeError(f"content probes: garbage reply {json.dumps(res, ensure_ascii=True)[:600]}")
+    if not all(x["ok"] for x in res):
+        if not RERUN:
+            raise RuntimeError(f"content probes: wrong answer {json.dumps(res, ensure_ascii=True)[:600]}")
+        print("E21 WARNING (rerun, not fatal): content probes wrong answer", json.dumps(res, ensure_ascii=True)[:300], flush=True)
+    return res
+
+
 def e21_model_path(weights):
     return E21_STAGED.get(weights) or (SGL_MODEL_PATH if weights == "int4" else MODEL_PATH)
 
@@ -102,7 +154,7 @@ def e21_model_path(weights):
 def e21_flags_v019(cfg, port, backend):
     """vLLM 0.19 = the E12-V CELL 5 command: Duck's flags + the S1-60K engine (TP4, fp8_e4m3 KV, MTP-3, FlashInfer,
     4096 batched tokens, 0.90 GPU memory, language-model-only, custom all-reduce off, seed). E21 changes: the model path
-    (INT4 for NB1), --max-num-seqs per half, --mamba-ssm-cache-dtype for NB2 (vLLM 0.19 CacheConfig.mamba_ssm_cache_dtype)."""
+    (FP8 in both variants since rev 2i), --max-num-seqs per half, --mamba-ssm-cache-dtype for NB2 (vLLM 0.19 CacheConfig.mamba_ssm_cache_dtype)."""
     f = ["--model", str(e21_model_path(cfg["weights"]))] + e21_duck_serving_flags(E21_SERVED[cfg["weights"]], port)
     f += ["--tensor-parallel-size", "4", "--kv-cache-dtype", KV_CACHE_DTYPE, "--speculative-config", json.dumps(SPECULATIVE_CONFIG),
           "--attention-backend", backend, "--max-num-batched-tokens", str(MAX_NUM_BATCHED_TOKENS),
@@ -295,6 +347,10 @@ def e21_launch(H, cfg, tag, timeout=None):
     E18_URL = f"http://127.0.0.1:{port}"
     backend = "FLASHINFER" if CUDA_LINK.get("probe") == "PASS" else "TRITON_ATTN"
     info = {"tag": tag, "cfg": dict(cfg), "attention_backend": backend, "port": port}
+    try:
+        e21_reject_broken_int4(cfg)                  # rev 2i
+    except RuntimeError as _e:
+        raise RuntimeError(str(_e), info)
     if cfg["vllm"] == "0.19.0":
         if not E11_HARNESS:
             assert pkg_version("vllm") == "0.19.0", pkg_version("vllm")
@@ -345,13 +401,16 @@ def e21_launch(H, cfg, tag, timeout=None):
             "temperature": 0.0, "max_tokens": 96, "chat_template_kwargs": {"enable_thinking": False}}, timeout=300)
         gen = (r["choices"][0]["message"].get("content") or "").strip()
         usage = r.get("usage") or {}
-        info["smoke"] = {"generated": gen[:200], "usage": usage,
+        info["smoke"] = {"generated": gen[:200], "usage": usage, "finish": r["choices"][0].get("finish_reason"),
                          "cache_details_present": isinstance(usage.get("prompt_tokens_details"), dict),
-                         "ok": ("4" in gen or "four" in gen.lower()) and not (len(gen) >= 8 and len(set(gen.replace(" ", ""))) <= 2)   # rev 2g (VAL2_engine F10)
+                         # rev 2i (GPT INT4 audit 1, section 6): the answer, not "a 4 anywhere"; clean, mostly ASCII
+                         "ok": e21_content_ok(gen, "4", "number", limit=160)
+                         and not (len(gen) >= 8 and len(set(gen.replace(" ", ""))) <= 2)   # rev 2g (VAL2_engine F10)
                          and isinstance(usage.get("prompt_tokens"), int) and usage["prompt_tokens"] > 0
                          and isinstance(usage.get("completion_tokens"), int) and usage["completion_tokens"] > 0}
         if not info["smoke"]["ok"]:
             raise RuntimeError(f"half {H} {tag}: smoke failed {json.dumps(info['smoke'])[:400]}")
+        info["content_probes"] = e21_content_probes(E21_SERVED[cfg["weights"]])   # rev 2i
         info["contract"] = e21_contract_probe(E21_SERVED[cfg["weights"]])
         print(f"E21 half {H} {tag}: {why} | capacity", json.dumps(info["capacity"]), "| smoke", json.dumps(info["smoke"]),
               "| contract", json.dumps(info["contract"]), flush=True)
@@ -386,24 +445,29 @@ def e21_relaunch():
         ENGINE_INFO.setdefault("relaunches", []).append({"skipped": f"only {round(t)} s for a relaunch"})
         return False, "too little time for a relaunch"
     e21_snapshot_counters()
+    E21_STATE["relaunch_inflight"] = H           # rev 2k: e21_end_half cancels / aborts only while this is set
     try:
-        if E11_SERVER is not None:
-            E11_SERVER.kill()
-    except Exception:
-        pass
-    _e18_kill_gpu_pids()
-    _wait_gpu_release()
-    if E21_HALF != H or E21_STATE.get("ending") == H:      # rev 2h (GPT v3 audit 2): the half ended meanwhile
-        ENGINE_INFO.setdefault("relaunches", []).append({"skipped": "the half ended during the relaunch"})
-        return False, "the half ended during the relaunch"
-    try:
-        srv, info = e21_launch(H, cfg, f"relaunch{len(ENGINE_INFO.setdefault('relaunches', []))}", timeout=t)
-        ENGINE_INFO["relaunches"].append({k: info.get(k) for k in ("tag", "ready", "why", "ready_sec", "capacity", "cfg")})
-        ENGINE_INFO["cfg"] = cfg
-        return True, info.get("why")
-    except Exception as e:
-        ENGINE_INFO.setdefault("relaunches", []).append({"error": repr(e)[:600]})
-        return False, repr(e)[:300]
+        try:
+            if E11_SERVER is not None:
+                E11_SERVER.kill()
+        except Exception:
+            pass
+        _e18_kill_gpu_pids()
+        _wait_gpu_release()
+        if E21_HALF != H or E21_STATE.get("ending") == H:      # rev 2h (GPT v3 audit 2): the half ended meanwhile
+            ENGINE_INFO.setdefault("relaunches", []).append({"skipped": "the half ended during the relaunch"})
+            return False, "the half ended during the relaunch"
+        try:
+            srv, info = e21_launch(H, cfg, f"relaunch{len(ENGINE_INFO.setdefault('relaunches', []))}", timeout=t)
+            ENGINE_INFO["relaunches"].append({k: info.get(k) for k in ("tag", "ready", "why", "ready_sec", "capacity", "cfg")})
+            ENGINE_INFO["cfg"] = cfg
+            return True, info.get("why")
+        except Exception as e:
+            ENGINE_INFO.setdefault("relaunches", []).append({"error": repr(e)[:600]})
+            return False, repr(e)[:300]
+    finally:
+        if E21_STATE.get("relaunch_inflight") == H:
+            E21_STATE["relaunch_inflight"] = None
 
 
 def e21_cfgs(spec):
@@ -530,7 +594,12 @@ def e21_end_half(H):
         for th in threading.enumerate():
             if th.name in ("e15b_watchdog", "e12_heartbeat") and th is not threading.current_thread():
                 th.join(timeout=30)
-                if th.is_alive() and th.name == "e15b_watchdog":
+                # rev 2k (CPU kit wdhold): a watchdog only blocked in a probe is harmless (it cannot act in half B:
+                # the rev 2c half check, the rev 2h relaunch re-check); cancel / abort only a relaunch in flight
+                _inflight = th.is_alive() and th.name == "e15b_watchdog" and E21_STATE.get("relaunch_inflight") == H
+                if th.is_alive() and th.name == "e15b_watchdog" and not _inflight:
+                    st["watchdog_blocked_not_relaunching"] = True
+                if _inflight:
                     # rev 2h (GPT v3 audit 2): a relaunch is in flight; kill its server (half B has not begun, so
                     # every server / GPU process is this half's), then join again, bounded
                     st["watchdog_relaunch_cancelled"] = True
@@ -542,8 +611,8 @@ def e21_end_half(H):
                     _e18_kill_gpu_pids()
                     th.join(timeout=180)
                 st[th.name + "_alive_after_join"] = th.is_alive()
-                if th.is_alive() and th.name == "e15b_watchdog" and not last:
-                    E21_STATE["abort_next_half"] = f"half {H} watchdog still active after the handoff joins"
+                if _inflight and th.is_alive() and not last and E21_STATE.get("relaunch_inflight") == H:
+                    E21_STATE["abort_next_half"] = f"half {H} watchdog relaunch still in flight after the handoff joins"
         _recs, _run = globals().get("E12_RECORDS") or {}, globals().get("E12_RUN") or {}
         if st.get("cell6_ran"):
             with (globals().get("_E12_LOCK") or threading.Lock()):

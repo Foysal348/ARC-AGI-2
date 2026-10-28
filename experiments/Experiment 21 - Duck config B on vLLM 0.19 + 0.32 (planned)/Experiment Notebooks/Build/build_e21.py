@@ -2,7 +2,9 @@
 9e4b89285136, before3, weak commit) on vLLM OpenAI servers instead of SGLang, two halves in one notebook:
 half A = vLLM 0.19.0 (the S1-60K engine as the E12-V Duck server), half B = vLLM 0.32.0 (the VMS arm), the same 120
 evaluation tasks each, ~5.5 h per half; the hidden rerun runs half A only (all 240 tasks, 12 h).
-  NB1: RedHat INT4 (W4A16) + MTP-3, 20 streams in both halves (fallback FP8 MTP-3, 16 streams)
+  NB1 (rev 2j): half A = FP8 + MTP-3 + SSM fp16, 18 streams (fallback: SSM default, 16 streams); half B = RedHat INT4
+       (W4A16) + MTP-3, 20 streams
+       (fallback FP8 MTP-3, 16 streams). RedHat INT4 on vLLM 0.19 generates garbage (GPU smoke run 1, 2026-10-29).
   NB2: FP8 + MTP-3 + --mamba-ssm-cache-dtype float16, 16 streams in both halves (fallback: SSM dtype default)
 Donor map: Experiment 21 README. Every reused cell or function is taken from its donor notebook text here and asserted.
 usage: python build_e21.py            -> ../Q27-XHIGH-E21_DUCKB_VLLM_NB1_INT4_S20.ipynb, ..._NB2_FP8_SSM16_S16.ipynb"""
@@ -167,8 +169,10 @@ def cell1(variant, profile="E21X2EVAL120"):
                  "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60, "solve_window_sec": 20 * 60},
     "E14SEVAL120G4B": {''')
     nb1 = variant == "NB1"
-    spec = ('{"A": {"vllm": "0.19.0", "weights": "int4", "seqs": 20, "ssm": None,\n'
-            '              "fallback": {"weights": "fp8", "seqs": 16, "ssm": None}},\n'
+    # rev 2i: NB1 half A = FP8 (INT4 on 0.19 = garbage, GPU smoke run 1); rev 2j (user): SSM fp16 at 18 streams (19 fit at
+    # the 57k peak in smoke run 1), fallback = the S1-60K engine (SSM default, 16 streams)
+    spec = ('{"A": {"vllm": "0.19.0", "weights": "fp8", "seqs": 18, "ssm": "float16",\n'
+            '              "fallback": {"seqs": 16, "ssm": None}},\n'
             '        "B": {"vllm": "0.32.0", "weights": "int4", "seqs": 20, "ssm": None,\n'
             '              "fallback": {"weights": "fp8", "seqs": 16, "ssm": None}}}') if nb1 else (
            '{"A": {"vllm": "0.19.0", "weights": "fp8", "seqs": 16, "ssm": "float16",\n'
@@ -185,7 +189,7 @@ E21_VARIANT = "{variant}"
 E21_HALF_SPECS = {{"{variant}": {spec}}}
 E21_HALVES = ["A"] if RERUN else ["A", "B"]
 ENGINE_BACKEND = "vllm"                       # CELL 1b stages the variant's weights; CELL 2 installs vllm==0.19.0 here
-E21_STAGE_PATHS = [{"SGL_MODEL_PATH, MODEL_PATH" if nb1 else "MODEL_PATH"}]   # rev 2: NB1 stages its FP8 fallback too (VAL_engine_A2 H2)
+E21_STAGE_PATHS = {"[MODEL_PATH] if RERUN else [MODEL_PATH, SGL_MODEL_PATH]" if nb1 else "[MODEL_PATH]"}   # rev 2i: FP8 first; INT4 = NB1 half B only
 E12_SOLVE_WINDOW_SEC = (float(os.environ.get("E21_HALF_SOLVE_SEC", P["solve_window_sec"]))
                         if P.get("solve_window_sec") else None)          # per half, from its own solve start
 E21_HALF_SOLVE_SEC = E12_SOLVE_WINDOW_SEC or 0.0
@@ -197,7 +201,7 @@ E21_LAUNCH_TIMEOUT_V032_SEC = 20 * 60      # rev 2b (C1 M3): 0.32 from staged we
 # and merges and encodes identically (README Finding 4, Kaggle CPU kit on the real files).
 if not Path(os.environ.get("E12_TOKENIZER_JSON", "")).is_file() and (MODEL_PATH / "tokenizer.json").is_file():
     os.environ["E12_TOKENIZER_JSON"] = str(MODEL_PATH / "tokenizer.json")
-E21_B_FOLLOWS_A = True                       # user option (ka): a half-A fallback config is repeated in half B
+E21_B_FOLLOWS_A = {"False" if nb1 else "True"}                       # user option (ka): a half-A fallback config is repeated in half B (rev 2i: not NB1, whose halves differ by design)
 assert PROFILE in ("E21X2EVAL120", "E21SMOKE", "RERUN_ALL") or os.environ.get("E21_ANY_PROFILE") == "1", PROFILE   # rev 2 (E1 LOW-5)
 assert RERUN or len(E21_HALVES) == 1 or (E12_SOLVE_WINDOW_SEC or 0) > 0, "two halves need a solve window"   # C1 L3
 E21_VLLM_MAX_MODEL_LEN = 135168               # E12-V: Duck's 128 Ki context window + margin
@@ -215,7 +219,7 @@ CONFIG["e21"] = {{"variant": E21_VARIANT, "halves": E21_HALVES, "specs": E21_HAL
                  "half_solve_sec": E12_SOLVE_WINDOW_SEC, "b_setup_reserve_sec": E21_B_SETUP_RESERVE_SEC,
                  "max_model_len": E21_VLLM_MAX_MODEL_LEN, "served": E21_SERVED, "ports": E21_PORTS,
                  "stage": [str(p) for p in E21_STAGE_PATHS], "vllm032_wheelhouse": str(E18_VLLM_WHEELHOUSE),
-                 "reasoning_history_key": "reasoning"}}
+                 "reasoning_history_key": "reasoning", "b_follows_a": E21_B_FOLLOWS_A}}   # rev 2i (GPT INT4 audit 1)
 # rev 2 (VAL_fidelity_E2 LOW-1, E1 LOW-1): CONFIG was snapshot above before this block; record what really runs
 CONFIG["e11"]["ENGINE_BACKEND"] = ENGINE_BACKEND
 CONFIG["e12"]["E12_SOLVE_WINDOW_SEC"] = E12_SOLVE_WINDOW_SEC
@@ -625,10 +629,10 @@ try:
         E21_REPORT["config_status"] = "NOT_RUN"
     elif any(v["switched"] for v in _ran.values()):
         E21_REPORT["config_status"] = "SWITCHED_MIDHALF"
+    elif all(v["cfg"] == _prim[H] for H, v in _ran.items()):      # rev 2i: before CONFOUNDED (NB1 primaries differ)
+        E21_REPORT["config_status"] = "PRIMARY_BOTH"
     elif len({json.dumps(v["cfg"], sort_keys=True) for v in _ran.values()}) > 1:
         E21_REPORT["config_status"] = "CONFOUNDED_FALLBACK"
-    elif all(v["cfg"] == _prim[H] for H, v in _ran.items()):
-        E21_REPORT["config_status"] = "PRIMARY_BOTH"
     else:
         E21_REPORT["config_status"] = "FALLBACK_BOTH"
     E21_REPORT["comparison_valid"] = (len(_ws) == 2 and max(_ws) - min(_ws) <= 0.01 * max(_ws)
@@ -670,7 +674,9 @@ except BaseException:
 
 
 def md(variant):
-    v = {"NB1": "RedHat INT4 (W4A16) + MTP-3, **20 streams** (fallback: FP8 MTP-3, 16 streams)",
+    v = {"NB1": "half A: FP8 + MTP-3 + SSM fp16, **18 streams** (fallback: SSM default, 16 streams); half B: RedHat INT4 "
+                "(W4A16) + MTP-3, **20 streams** "
+                "(fallback: FP8 MTP-3, 16 streams). RedHat INT4 on vLLM 0.19 generates garbage (GPU smoke run 1, 2026-10-29)",
          "NB2": "FP8 + MTP-3 + `--mamba-ssm-cache-dtype float16`, **16 streams** (fallback: SSM dtype default = S1's engine)"}[variant]
     return (f"# E21 {variant} · Duck config B (= R3K2) on vLLM 0.19 + vLLM 0.32, two halves in one notebook\n\n"
             f"- **Weights / streams:** {v}\n"

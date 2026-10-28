@@ -192,3 +192,96 @@ Notebooks: NB1 `4cade9fa`, NB2 `d84efecc`, NB1_SMOKE `0fb2d386`, NB2_SMOKE `7cd3
 | Audit 1 HIGH-2: `comparison_valid` ignores solver / step errors and incomplete scoring | yes | FIXED: per half `solver_error`, `scoring_complete` (`eval_query_total` == all test queries of `TASK_IDS`), `watchdog_stalls`; `comparison_valid` requires no errors, no solver error, complete scoring and no stall in both halves |
 | Audit 1 HIGH-3: the late callback calls the global `e12_write_submission` (half B's writer) | checked: NOT A DEFECT | in commit `e12_write_submission` writes the identity submission only (records are read only `if RERUN`), and the hidden rerun has half A only; nothing of half A can reach a submission. Not changed |
 | Audit 2 HIGH: a half-A relaunch in flight when half A ends can kill / launch during half B (= VAL2_engine F7) | yes (code-level) | FIXED: `e21_end_half` marks the half as ending first; `e21_relaunch` re-checks it right before launching; a watchdog still alive after the 30-s join gets its in-flight server and GPU processes killed (half B has not begun), then a second join (≤ 180 s); still alive -> `abort_next_half` (fail closed, GPT's guard): half B is not started and gets a `handoff` error. Unit test `_scratch/e21/test_rev2h_race.py`: 5/5 (no launch while ending; in-flight relaunch cancelled + joined + half B allowed; stuck watchdog -> abort; the last half never aborts; the runner skips half B) |
+
+## rev 2i: GPU smoke run 1 + GPT INT4 audits 1 and 2 (2026-10-29)
+
+GPU smoke run 1 (rev 2h, foysal v1): RedHat INT4 on vLLM 0.19.0 + MTP-3 generated garbage from the first token. The content smoke caught it, and the FP8 fallback ran. The same checkpoint is coherent on vLLM 0.32.0 (Exp 14 VMS). Debug zip: `E21_GPT_INT4_V019_DEBUG_2026-10-29.zip`.
+
+Both GPT audits gave the same verdict:
+- NO-GO for 0.19 INT4.
+- Root cause unproven (the leading suspect is the 0.19 compressed-tensors / fused-GDN path). The 0.19 source already has the `in_proj_qkvz` / `in_proj_ba` mapping.
+- No safe config overlay or monkeypatch.
+- Half A = 0.19 FP8.
+
+| Item | rev 2i |
+|---|---|
+| NB1 spec | **Half A:** 0.19 FP8 MTP-3, 16 streams, SSM default; fallback the same with SSM fp16 (the NB2 primary, which ran on GPU in smoke run 1). Same weights, so a death relaunch may switch to it. **Half B:** 0.32 INT4 MTP-3, 20 streams; fallback 0.32 FP8, 16 streams |
+| Guard `e21_reject_broken_int4` | Refuses any 0.19 + INT4 launch (both audits) |
+| Content probes `e21_content_probes` | Run after the 2 + 2 smoke: "7 * 6 =" → 42 (the last number in the reply), and an exact copy of "ARC-GRID-17". The reply must be at most 80 characters, at least 90 % ASCII, and not cut at the limit. Fatal in commit / smoke (a failure takes the fallback); a warning in the hidden rerun (`e21_soft`), so a formatting surprise never leaves the rerun without an engine. The original smoke stays fatal everywhere |
+| `E21_B_FOLLOWS_A` | False for NB1 (its halves differ by design), True for NB2 |
+| Staging | FP8 first. NB1 stages INT4 only when not RERUN: the hidden rerun copies FP8 only |
+| `config_status` | PRIMARY_BOTH is checked before CONFOUNDED_FALLBACK (NB1's primaries differ). NB1's `comparison_valid` is always False (16 vs 20 streams, FP8 vs INT4); NB1 half B is a diagnostic |
+| Not done | The 0.19 INT4 isolation matrix (target-only / BF16 KV / eager) is a separate diagnostic, not in E21 |
+
+Tests:
+- `_scratch/e21/test_rev2i.py`: 41/41.
+  - The guard.
+  - `e21_content_ok` on the real smoke-run-1 garbage (FAIL, also with " 42" appended) and on normal replies ("42.", "**42**", "7 * 6 = 42" PASS).
+  - Specs, follow flag, staging, and guard + probes in all four built notebooks.
+- Harness regression: `_scratch/e21/rev2i_local/`.
+
+### rev 2i-b: second full read of both INT4 audits (user request)
+
+| Audit item | Status |
+|---|---|
+| A1 §6 (mandatory): the 2 + 2 smoke accepts any reply containing "4" | FIXED: `e21_content_ok(gen, "4", "number", limit=160)`. The last number in the reply is 4 (or the word "four"), the reply is at most 160 characters and at least 90 % ASCII. The smoke-run-1 garbage with a 4 appended fails. `finish_reason` is recorded |
+| A1 §6: three content checks must be a READY condition | FIXED: there are three probes after the smoke (7 * 6 → 42; copy ARC-GRID-17; sequence 2, 4, 6, 8 → 10, from A2). **A garbage reply or one cut at the limit is fatal in every mode**; a clean but wrong answer is fatal in commit / smoke and a warning in the rerun |
+| A1 §5: record the B-follows-A behavior | FIXED: `CONFIG["e21"]["b_follows_a"]` (in `e21_report.json`); `spec_note` as before |
+| A1 §5 / A2 Patch A: NB1 spec | DONE. Deviation from A2: half A's fallback is 0.19 FP8 + SSM fp16 (A1's option), not 0.32 FP8. A 0.32 fallback in half A would put an untested path into the hidden rerun (venv install + the 0.32 launch on port 1234). A fallback inherits `vllm` from its primary (A2's warning): A → 0.19, B → 0.32, as intended |
+| A2 Patch B: guard | DONE (`e21_reject_broken_int4`, first statement of `e21_launch`, so relaunches too) |
+| A2 Patch C: regression tests | DONE: `_scratch/e21/test_rev2i.py`, 51/51. The rerun half list is checked by the harness `rerun` mode |
+| A1/A2: no config overlay, no monkeypatch, no forced quantization | respected |
+| A2 §3 / A1 §3 + decision tree: 0.19 INT4 isolation matrix (target-only, BF16 KV, eager, FP8 KV, compile) with diagnostic flags | NOT DONE: a separate diagnostic GPU run, not part of the E21 pair |
+| A2 §3: save output token IDs; 0.19 vs 0.32 greedy token comparison; 16-32 prompts; 40k-60k concurrent smoke | NOT DONE (the diagnostic / INT4 certification). Half B's INT4 is a diagnostic; the hidden half A is FP8 |
+| A2 §5: 0.32 INT4 never ran at max-model-len 135,168 (VMS: 106,496) | OPEN: covered only by a GPU smoke of NB1 (half B = 0.32 INT4 at 135,168, real Duck prompts) |
+| A1 final / A2 final: before pushing NB1 + NB2 together: new shas, CPU harness, short GPU content smoke | local harness + unit tests (this rev); Kaggle CPU kit and a GPU smoke: pending, need the user's go |
+
+## rev 2j (user 2026-10-29): NB1 half A at 18 streams
+
+- **NB1 half A:** vLLM 0.19 FP8 + MTP-3 + `--mamba-ssm-cache-dtype float16`, **18 streams**. In GPU smoke run 1 (block 832), 19 streams fit at the 57k p50 peak, 17 at 65k, 14 at 79k. Fallback: FP8 SSM default, 16 streams (the S1-60K engine); it has the same weights, so a death relaunch may switch to it.
+- **Half B:** unchanged (0.32 INT4 20, fallback 0.32 FP8 16).
+- **NB2:** unchanged; shas still `3eab28b3` / `34879de4`.
+- **New NB1 shas:** `4dc53a51`, SMOKE `e98e82dc`.
+- **Harness:** fallbackA rejects the SSM flag for both variants; gateAB uses 850 blocks for both; NB1 half A expects 18 streams.
+
+## Kaggle CPU kit rev 2i-b (2026-10-29, kit f2ddaf6b574c) + rev 2k
+
+**Kit results:**
+- h1: ALL OK.
+- h3: ALL OK.
+- flags: ALL OK. Both vLLM parsers accepted 8/8 commands each.
+- h2 and h4: every mode PASS except **wdhold: NB1 47/74, NB2 46/74**.
+  - Half B was not started: "half A watchdog still active after the handoff joins".
+  - The rev 2h handoff guard aborted half B whenever the half-A watchdog thread outlived the 30-s join, including when it was only blocked in a /health probe. That case is harmless: the rev 2c half check and the rev 2h relaunch re-check stop such a thread from acting in half B.
+  - rev 2h had been tested only locally, and not in wdhold mode. This is a rev 2h regression, not a rev 2i one.
+
+**rev 2k fix:**
+- `e21_relaunch` sets `E21_STATE["relaunch_inflight"] = H` for its whole body (cleared in `finally`).
+- `e21_end_half` kills and aborts only while a relaunch is in flight. A watchdog that is merely blocked is recorded as `watchdog_blocked_not_relaunching` and half B runs.
+
+**Tests:**
+- `test_rev2h_race.py`: 7/7. New tests: T3b, a blocked watchdog with no relaunch → no cancel, no abort; T3c, the flag is cleared on every return path.
+- `test_rev2i.py`: 51/51.
+
+**Shas:**
+
+| Notebook | Sha |
+|---|---|
+| NB1 | `1e16c875` |
+| NB2 | `cbbfd01b` |
+| NB1_SMOKE | `5d6a3b80` |
+| NB2_SMOKE | `8d45270b` |
+
+**GPU smoke run 2** (foysal v2, pushed 2026-10-29) runs rev 2j, before the 2k change. The 2k change touches only the handoff guard path, so smoke run 2 still validates the engines, the content probes, 0.32 INT4 at 135,168 and NB1 half A at 18 streams.
+
+### Kaggle CPU kit rev 2k (kit 026ab4ac9277, 2026-10-29): ALL OK
+
+| Kernel | Runs |
+|---|---|
+| h1 | NB1 commit 72/72, death 77/77, fallbackA 73/73, halfAfail 51/51, reasoningkey 72/72, rerun 43/43 |
+| h2 | NB1 gateAB 75/75, gpuheldB 51/51, kvoutage 75/75, overrun 74/74, **wdhold 74/74**; NB1_SMOKE commit 73/73 |
+| h3 | NB2 commit 72/72, death 77/77, fallbackA 74/74, halfAfail 51/51, reasoningkey 72/72, rerun 43/43 |
+| h4 | NB2 gateAB 75/75, gpuheldB 51/51, kvoutage 75/75, overrun 74/74, **wdhold 74/74**; NB2_SMOKE commit 73/73 |
+| flags | ALL OK (real vLLM 0.19 + 0.32 parsers) |
+
+Full-run push folders: NB1 `1e16c875`, NB2 `cbbfd01b`.
