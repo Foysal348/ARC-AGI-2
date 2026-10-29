@@ -1,0 +1,254 @@
+diff --git a/tests/v1/attention/test_attention_backends.py b/tests/v1/attention/test_attention_backends.py
+index bb8e154b2f37..0f911594931b 100644
+--- a/tests/v1/attention/test_attention_backends.py
++++ b/tests/v1/attention/test_attention_backends.py
+@@ -500,8 +500,8 @@ def _test_backend_correctness(
+     if max_num_batched_tokens is not None:
+         vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+     if num_speculative_tokens > 0:
+-        vllm_config.speculative_config = SimpleNamespace(
+-            num_speculative_tokens=num_speculative_tokens
++        vllm_config.speculative_config = SpeculativeConfig(
++            method="ngram", num_speculative_tokens=num_speculative_tokens
+         )
+     vllm_config.cache_config.cache_dtype = kv_cache_dtype
+     device = torch.device(f"{DEVICE_TYPE}:0")
+@@ -1205,6 +1205,7 @@ def test_flashinfer_varlen_cudagraph_capability(
+         use_v2_model_runner=True,
+     )
+     monkeypatch.setattr(fi, "can_use_trtllm_attention", lambda *_, **__: True)
++    monkeypatch.setattr(fi.current_platform, "has_device_capability", lambda _: True)
+     monkeypatch.setattr(
+         fi.FlashInferMetadataBuilder,
+         "_get_flashinfer_trtllm_api_decode_kernel",
+@@ -1715,16 +1716,17 @@ def causal_mask_mod(
+ 
+ @pytest.mark.skipif(
+     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
+-    or not current_platform.is_device_capability_family(120),
+-    reason="NVFP4 XQA decode requires SM12x.",
++    or not any(current_platform.is_device_capability_family(f) for f in (80, 120)),
++    reason="FlashInfer decodes an NVFP4 cache with XQA on SM12x and fa2 on SM8x.",
+ )
+ @pytest.mark.parametrize("use_cuda_graph", [False, True])
+ @pytest.mark.parametrize("q_len", [1, 4])
+-def test_flashinfer_xqa_nvfp4_decode_correctness(
++def test_flashinfer_nvfp4_decode_correctness(
+     default_vllm_config, q_len, use_cuda_graph
+ ):
+     """Single-token and spec-decode queries over an NVFP4 cache decode with
+-    XQA, eager and replayed, and match the fa2 prefill that wrote the cache."""
++    XQA on SM12x and fa2 on SM8x, eager and replayed, and match the fa2
++    prefill that wrote the cache."""
+     import unittest.mock
+ 
+     from vllm.v1.attention.backends import flashinfer as fi
+@@ -1801,15 +1803,46 @@ def run(query_lens, use_cuda_graph=False):
+     # The full prefill writes every token through the NVFP4 writer; its fa2
+     # output for the last q_len tokens of each request is the reference.
+     _, reference = run(seq_lens)
+-    xqa_fn = fi.flashinfer_xqa_batch_decode_with_kv_cache
+-    with unittest.mock.patch.object(
+-        fi, "flashinfer_xqa_batch_decode_with_kv_cache", wraps=xqa_fn
+-    ) as xqa:
++    xqa = current_platform.is_device_capability_family(120)
++    name = "flashinfer_xqa_batch_decode_with_kv_cache" if xqa else "fast_plan_decode"
++    with unittest.mock.patch.object(fi, name, wraps=getattr(fi, name)) as decode:
+         rows, output = run([q_len] * len(seq_lens), use_cuda_graph)
+-    assert xqa.called
++    assert decode.called
++    assert xqa or decode.call_args.kwargs["q_len_per_req"] == q_len
+     torch.testing.assert_close(output, reference[rows], atol=2e-2, rtol=2e-2)
+ 
+ 
++@pytest.mark.skipif(
++    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
++    or current_platform.has_device_capability(90),
++    reason="FlashInfer fa2 spec decode runs before SM90.",
++)
++@pytest.mark.parametrize("use_cuda_graph", [False, True])
++def test_flashinfer_fa2_spec_decode_correctness(default_vllm_config, use_cuda_graph):
++    """Uniform spec-decode queries take fa2 decode and match SDPA."""
++    import unittest.mock
++
++    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
++
++    def causal_mask_mod(b, h, q_idx, kv_idx, *, context_len):
++        return (q_idx + context_len) >= kv_idx
++
++    with unittest.mock.patch.object(
++        flashinfer_backend,
++        "fast_plan_decode",
++        wraps=flashinfer_backend.fast_plan_decode,
++    ) as plan:
++        _test_backend_correctness(
++            BatchSpec(seq_lens=[32, 40, 1024], query_lens=[4, 4, 4]),
++            "meta-llama/Meta-Llama-3-8B",
++            [AttentionBackendEnum.FLASHINFER],
++            causal_mask_mod,
++            use_cuda_graph=use_cuda_graph,
++            num_speculative_tokens=3,
++        )
++    assert plan.call_args.kwargs["q_len_per_req"] == 4
++
++
+ if current_platform.is_rocm():
+     # FLASH_ATTN is not supported on ROCm
+     SLIDING_WINDOW_BACKENDS_TO_TEST = [
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index bb9e1b0e4577..1183259d884e 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -111,6 +111,11 @@ def _nvfp4_kv_on_fa2() -> bool:
+     return any(current_platform.is_device_capability_family(f) for f in (80, 90, 120))
+ 
+ 
++def _use_fa2_native_decode() -> bool:
++    # Below SM90, native decode runs fa2, which takes uniform multi-token queries.
++    return not current_platform.has_device_capability(90)
++
++
+ _KVPair = tuple[torch.Tensor, torch.Tensor]
+ 
+ 
+@@ -885,9 +890,9 @@ def __init__(
+         )
+         if self.enable_cuda_graph:
+             # For full cudagraph capture, one `decode_wrapper` for each batch
+-            # size is needed for FlashInfer.
++            # size and query length is needed for FlashInfer.
+             self._decode_wrappers_cudagraph: dict[
+-                int, BatchDecodeWithPagedKVCacheWrapper
++                tuple[int, int], BatchDecodeWithPagedKVCacheWrapper
+             ] = {}
+             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
+             if self.compilation_config.max_cudagraph_capture_size is not None:
+@@ -1021,10 +1026,12 @@ def __init__(
+             == FlashInferDecodeKernel.TRTLLM_GEN
+             and not self.use_dcp
+         )
++        self.use_fa2_native_decode = _use_fa2_native_decode()
+         self._init_reorder_batch_threshold(
+             1,
+             supports_spec_as_decode=(
+                 self.flashinfer_trtllm_api_decode_kernel is not None
++                or self.use_fa2_native_decode
+             ),
+             # trtllm-gen decode receives no cp_rank/global-seq-len information,
+             # so its end-aligned causal mask is wrong for q_len > 1 over the
+@@ -1153,6 +1160,12 @@ def get_cudagraph_support(
+             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+ 
+         kv_specs = iter_layer_specs(kv_cache_spec)
++        if _use_fa2_native_decode():
++            # fa2 decodes uniform causal spec queries.
++            if kv_specs and not vllm_config.attention_config.use_non_causal:
++                return AttentionCGSupport.UNIFORM_BATCH
++            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
++
+         num_qo_heads = vllm_config.model_config.get_num_attention_heads(
+             vllm_config.parallel_config
+         )
+@@ -1197,8 +1210,10 @@ def get_varlen_cudagraph_max_query_len(
+     ) -> int | None:
+         # The uniform gate already covers DCP, head geometry, the XQA head-dim
+         # limit and causality, and yields None for subclasses that force NEVER.
++        # The native fa2 decode wrapper takes only uniform query lengths.
+         if (
+-            cls.get_cudagraph_support(vllm_config, kv_cache_spec)
++            _use_fa2_native_decode()
++            or cls.get_cudagraph_support(vllm_config, kv_cache_spec)
+             != AttentionCGSupport.UNIFORM_BATCH
+         ):
+             return None
+@@ -1417,9 +1432,13 @@ def _get_prefill_wrapper(
+         assert self._prefill_wrapper is not None
+         return self._prefill_wrapper
+ 
+-    def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
++    def _get_decode_wrapper(
++        self, batch_size: int, use_cudagraph: bool = False, q_len_per_req: int = 1
++    ):
+         if use_cudagraph:
+-            decode_wrapper = self._decode_wrappers_cudagraph.get(batch_size, None)
++            decode_wrapper = self._decode_wrappers_cudagraph.get(
++                (batch_size, q_len_per_req), None
++            )
+         else:
+             decode_wrapper = self._decode_wrapper
+ 
+@@ -1434,7 +1453,13 @@ def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
+                 paged_kv_last_page_len = None
+             # NVFP4 KV cache requires the trtllm-gen backend inside
+             # the wrapper on SM100; SM8x, SM90 and SM12x read it with fa2.
+-            backend = "trtllm-gen" if self.nvfp4_trtllm else "auto"
++            backend = (
++                "trtllm-gen"
++                if self.nvfp4_trtllm
++                else "fa2"
++                if self.use_fa2_native_decode
++                else "auto"
++            )
+             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                 self._get_workspace_buffer(),
+                 get_flashinfer_layout_string(self.kv_cache_layout),
+@@ -1451,7 +1476,9 @@ def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
+ 
+             # save the decode wrapper
+             if use_cudagraph:
+-                self._decode_wrappers_cudagraph[batch_size] = decode_wrapper
++                self._decode_wrappers_cudagraph[batch_size, q_len_per_req] = (
++                    decode_wrapper
++                )
+             else:
+                 self._decode_wrapper = decode_wrapper
+ 
+@@ -1890,10 +1917,14 @@ def build(
+                     and pure_decode
+                     and num_decode_tokens <= self._decode_cudagraph_max_bs
+                 )
+-                num_input_tokens = num_decode_tokens
++                num_input_tokens, q_len_per_req = num_decode_tokens, 1
++                if self.use_fa2_native_decode:
++                    # fa2 plans uniform spec decodes per request.
++                    num_input_tokens = num_decodes
++                    q_len_per_req = num_decode_tokens // num_decodes
+ 
+                 decode_wrapper = self._get_decode_wrapper(
+-                    num_input_tokens, use_cudagraph
++                    num_input_tokens, use_cudagraph, q_len_per_req
+                 )
+                 # Use the persistent buffer with padding length,
+                 # instead of the same address but chunked version
+@@ -1942,6 +1973,7 @@ def build(
+                     o_data_type=o_dtype,
+                     fixed_split_size=self.decode_fixed_split_size,
+                     disable_split_kv=self.disable_split_kv,
++                    q_len_per_req=q_len_per_req,
+                 )
+                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
+         return attn_metadata
+@@ -2807,6 +2839,7 @@ def fast_plan_decode(
+     non_blocking: bool = True,
+     fixed_split_size: int = -1,
+     disable_split_kv: bool = False,
++    q_len_per_req: int = 1,
+ ) -> None:
+     """A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for
+     cudagraph capture/replay, while the no cudagraph version turns back
+@@ -2851,6 +2884,7 @@ def fast_plan_decode(
+             seq_lens=seq_lens_cpu,
+             fixed_split_size=fixed_split_size,
+             disable_split_kv=disable_split_kv,
++            q_len_per_req=q_len_per_req,
+         )
+         self.vllm_first_call = False
+         return
+@@ -2878,6 +2912,7 @@ def fast_plan_decode(
+         non_blocking=non_blocking,
+         fixed_split_size=fixed_split_size,
+         disable_split_kv=disable_split_kv,
++        q_len_per_req=q_len_per_req,
+     )
+ 
+ 
