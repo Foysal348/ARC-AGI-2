@@ -32,31 +32,76 @@ i0 = s.index("    PLAN = [\n        # rev 2d: FlashInfer PCIe-IPC")
 i1 = s.index("    VMS[\"dropped\"] = {")
 NEW_PLAN = r'''    _FULL = {"--compilation-config": json.dumps({"cudagraph_mode": "FULL_AND_PIECEWISE"})}
     _FDEC = {"--compilation-config": json.dumps({"cudagraph_mode": "FULL_DECODE_ONLY"})}
+    _LARG = {"--speculative-config": json.dumps({"method": "mtp", "num_speculative_tokens": 3,
+                                                 "use_local_argmax_reduction": True})}      # rev 2: dossier V32-ARGMAX
+    _PMU = {"--prefix-match-unit": 64}                                                       # rev 2: dossier V32-HYBRID-REUSE
+    _PMUS = {"--prefix-match-unit": 64, "--enable-mamba-shared-prefix-checkpoint": None}
+    _N2 = {"NCCL_MIN_CTAS": "2", "NCCL_MAX_CTAS": "2"}
     _N4 = {"NCCL_MIN_CTAS": "4", "NCCL_MAX_CTAS": "4", "NCCL_NTHREADS": "512"}
     _N8 = {"NCCL_MIN_CTAS": "8", "NCCL_MAX_CTAS": "8", "NCCL_NTHREADS": "512"}
+    _RING = {"NCCL_ALGO": "Ring"}
+
+    def _spec_swap(flags, new_json):
+        """the arm's --speculative-config replaced (vms_flags adds the default MTP 3 JSON; a second flag would be ambiguous)"""
+        f = list(flags)
+        i = f.index("--speculative-config")
+        f[i + 1] = new_json
+        return f
+
+    # FP8 arms, gated against the FP8 target-only oracle
     PLAN = [
-        # E22 (speed research 2026-10-29): one lever per arm, the FP8 graph-mode arm gated against the oracle first
+        # E22 (speed research 2026-10-29 + Resources dossiers v5): one lever per arm
         ("fp8_s16_triton_full", vms_flags(MODEL_PATH, backend="TRITON_ATTN", extra=_FULL), {}),
-        ("int4_s20", vms_flags(VMS_INT4, seqs=20), dict(level=20, gate=False)),
-        ("int4_s20_triton_full", vms_flags(VMS_INT4, seqs=20, backend="TRITON_ATTN", extra=_FULL), dict(level=20, gate=False)),
-        ("int4_s20_triton_fdec", vms_flags(VMS_INT4, seqs=20, backend="TRITON_ATTN", extra=_FDEC), dict(level=20, gate=False)),
-        ("int4_s20_nccl4", vms_flags(VMS_INT4, seqs=20), dict(level=20, gate=False, env_extra=_N4)),
-        ("int4_s20_nccl8", vms_flags(VMS_INT4, seqs=20), dict(level=20, gate=False, env_extra=_N8)),
-        ("int4_s24", vms_flags(VMS_INT4, seqs=24), dict(level=24, gate=False)),
-        ("int4_s20_b8192", vms_flags(VMS_INT4, seqs=20, batched=8192), dict(level=20, gate=False)),
+        ("fp8_s16_ssm_bf16", vms_flags(MODEL_PATH, extra={"--mamba-ssm-cache-dtype": "bfloat16"}), {}),
+        ("fp8_s16_local_argmax", _spec_swap(vms_flags(MODEL_PATH), _LARG["--speculative-config"]), {}),
+    ]
+    # INT4 arms, gated against the INT4 target-only oracle (rev 2: dossier P0-05 V32-INT4-ORACLE; run after the FP8 block)
+    PLAN_INT4 = [
+        ("int4_s20", vms_flags(VMS_INT4, seqs=20), dict(level=20)),
+        ("int4_s20_local_argmax", _spec_swap(vms_flags(VMS_INT4, seqs=20), _LARG["--speculative-config"]), dict(level=20)),
+        ("int4_s20_triton_full", vms_flags(VMS_INT4, seqs=20, backend="TRITON_ATTN", extra=_FULL), dict(level=20)),
+        ("int4_s20_triton_fdec", vms_flags(VMS_INT4, seqs=20, backend="TRITON_ATTN", extra=_FDEC), dict(level=20)),
+        ("int4_s20_nccl2", vms_flags(VMS_INT4, seqs=20), dict(level=20, env_extra=_N2)),
+        ("int4_s20_nccl4", vms_flags(VMS_INT4, seqs=20), dict(level=20, env_extra=_N4)),
+        ("int4_s20_nccl8", vms_flags(VMS_INT4, seqs=20), dict(level=20, env_extra=_N8)),
+        ("int4_s20_ring", vms_flags(VMS_INT4, seqs=20), dict(level=20, env_extra=_RING)),
+        ("int4_s20_pmu64", vms_flags(VMS_INT4, seqs=20, extra=_PMU), dict(level=20)),
+        ("int4_s20_pmu64_sharedckpt", vms_flags(VMS_INT4, seqs=20, extra=_PMUS), dict(level=20)),
+        ("int4_s24", vms_flags(VMS_INT4, seqs=24), dict(level=24)),
+        ("int4_s20_b8192", vms_flags(VMS_INT4, seqs=20, batched=8192), dict(level=20)),
         ("int4_s24_triton_full_nccl8", vms_flags(VMS_INT4, seqs=24, backend="TRITON_ATTN", extra=_FULL),
-         dict(level=24, gate=False, env_extra=_N8)),
+         dict(level=24, env_extra=_N8)),
     ]
 '''
 s = s[:i0] + NEW_PLAN + s[i1:]
+# rev 2: after the FP8 plan, the INT4 oracle (same INT4 checkpoint, no speculation, prefix caching off) becomes the gate
+# reference of every INT4 arm (gate="ref" fills VMS_REF from its own A/A rows; cleared first so no FP8 row is mixed in)
+s = rep(s, '''        vms_arm(_name, _fl, **_kw)
+    # LAST: 2 x TP2 inside one vLLM server''', '''        vms_arm(_name, _fl, **_kw)
+    if _INT4_OK:
+        VMS_REF.clear()
+        vms_arm("int4_target_only_noprefix", vms_flags(VMS_INT4, seqs=20, spec=0, prefix=False), gate="ref", level=20)
+        VMS["int4_gate_reference"] = "int4_target_only_noprefix (RedHat INT4, no speculation, prefix caching off)"
+    for _name, _fl, _kw in PLAN_INT4:
+        if not _INT4_OK:
+            VMS["arms"][_name] = {"ok": False, "skipped": "INT4 MTP static check failed: " + VMS["int4_mtp_static"].get("why", "")}
+            VMS["order"].append(_name)
+            continue
+        vms_arm(_name, _fl, **_kw)
+    # LAST: 2 x TP2 inside one vLLM server''')
 # drop the 2 x TP2 arms (KV does not fit; measured 0.57x)
 j0 = s.index("    # LAST: 2 x TP2 inside one vLLM server")
 j1 = s.index('    for _a in VMS["arms"].values():       # rev 2e: the final classification')
 s = s[:j0] + "    VMS_RESERVE = 0.0\n" + s[j1:]
+# rev 2: 20 launches (reference, 2 oracles, 17 arms) at ~12-14 min each
+s = rep(s, '"time_budget_sec": 260 * 60,', '"time_budget_sec": 420 * 60,')
 s = rep(s, 'md = """# VMS — vLLM 0.32.0 engine-config matrix (Qwen3.8-27B on 4x L4), engine only',
-        'md = """# E22 Speed Lab — vLLM 0.32.0 (Qwen3.8-27B on 4x L4), target 1000+ tok/s\n\n'
-        'Arms (after the FP8 reference and the FP8 target-only oracle): fp8_s16_triton_full (FULL CUDA graphs with MTP, '
-        'gated), int4_s20 (baseline), int4_s20_triton_full, int4_s20_triton_fdec, int4_s20_nccl4, int4_s20_nccl8, int4_s24, '
-        'int4_s20_b8192, int4_s24_triton_full_nccl8 (combination).\n\n'
+        'md = """# E22 Speed Lab rev 2 — vLLM 0.32.0 (Qwen3.8-27B on 4x L4), target 1500+ tok/s\n\n'
+        'FP8 block (gated vs the FP8 target-only oracle): fp8_s16_triton_full (FULL CUDA graphs with MTP), fp8_s16_ssm_bf16 '
+        '(fused CUDA GDN verify kernel), fp8_s16_local_argmax (use_local_argmax_reduction). INT4 block (gated vs the INT4 '
+        'target-only oracle int4_target_only_noprefix): int4_s20 (baseline), int4_s20_local_argmax, int4_s20_triton_full, '
+        'int4_s20_triton_fdec, int4_s20_nccl2 / nccl4 / nccl8, int4_s20_ring (NCCL_ALGO=Ring), int4_s20_pmu64 '
+        '(--prefix-match-unit 64), int4_s20_pmu64_sharedckpt (+ --enable-mamba-shared-prefix-checkpoint), int4_s24, '
+        'int4_s20_b8192, int4_s24_triton_full_nccl8 (combination). Budget 420 min.\n\n'
         '## Base: the Exp 14 VMS matrix')
 exec(compile(s, str(E14B / "build_vms.py"), "exec"), {"__file__": str(E14B / "build_vms.py"), "__name__": "__main__"})
