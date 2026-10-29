@@ -24,6 +24,7 @@ T0 = time.time()
 FILES = json.loads(''' + repr(json.dumps(FILES)) + r''')
 TAG, COMMIT = "merlin-v3.0.0", "ad42e37feb7611c4ffd24017bf20a7e2dc94c6e5"
 WHEEL_NAME = "vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl"
+WHEEL_SAFE = WHEEL_NAME.replace("+", "_PLUS_")
 WHEEL_SHA = "5c33b3dce51b8255b0c1a95a930edb24c1a481a023327d8d2d8f76e8be45c82d"
 WHEEL_URL = f"https://github.com/halt95/merlin-engine/releases/download/{TAG}/{WHEEL_NAME}"
 W = Path("/kaggle/working"); PAY = W / "merlin_offline"; T = Path("/tmp/e23p2"); LOGS = T / "logs"
@@ -88,6 +89,10 @@ try:
     R["wheel"] = {"sha256": got, "ok": got == WHEEL_SHA}
     if got != WHEEL_SHA:
         fail(f"wheel sha256 {got} != {WHEEL_SHA}")
+    # v5: Kaggle Models refuse '+' in file names (v4 Model creation failed); the payload keeps the wheel as WHEEL_SAFE and
+    # install_merlin_offline.sh copies it back to WHEEL_NAME before Merlin's installer checks the name
+    if (PAY / WHEEL_NAME).is_file():
+        os.replace(PAY / WHEEL_NAME, PAY / WHEEL_SAFE)
 
     # 3. GCC 13 (conda-forge) at the fixed prefix /tmp/merlin_gcc13: install-env.sh requires CC/CXX >= 13
     shutil.rmtree("/tmp/merlin_gcc13", ignore_errors=True)
@@ -140,7 +145,7 @@ try:
     D = T / "diag"
     shutil.rmtree(D, ignore_errors=True)
     D.mkdir()
-    sh("diag_unzip", f"cd {D} && python3 -c \"import zipfile; z=zipfile.ZipFile('{PAY}/{WHEEL_NAME}'); "
+    sh("diag_unzip", f"cd {D} && python3 -c \"import zipfile; z=zipfile.ZipFile('{PAY}/{WHEEL_SAFE}'); "
                      f"[z.extract(n) for n in z.namelist() if n.endswith('.so') or '.so.' in n.split('/')[-1]]\" && find . -name '*.so*' | head -40")
     sos = sorted(str(p) for p in D.rglob("*.so*") if p.is_file())
     rc, txt = sh("diag_scan", f"python3 -I {PAY}/glibc235_fix.py --dry-run " + " ".join(sos), ok_rc=(0, 2))
@@ -209,9 +214,40 @@ finally:
     if not R["output_ok"]:
         fail(f"payload {R['payload_bytes'] / 1e9:.2f} GB too big")
     R["all_ok"] = not R["errors"]
+    # v4 (Kaggle Model upload takes at most 50 files; the payload has 231): on ALL OK the payload becomes ONE stored zip
+    # (wheels are already compressed), CRC-checked after writing, then the folder is removed; output = 3 files.
+    # Kaggle unzips it on upload, giving merlin_offline/... inside the Model.
+    import zipfile
+    if R["all_ok"]:
+        try:
+            files = sorted(p for p in PAY.rglob("*") if p.is_file())
+            odd = [str(p.relative_to(PAY)) for p in files if re.search(r"[^A-Za-z0-9._/-]", str(p.relative_to(PAY)))]
+            R["odd_names"] = odd
+            if odd:
+                raise RuntimeError(f"file names Kaggle Models may refuse: {odd}")
+            zpath = W / "merlin_offline.zip"
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+                for p in files:
+                    z.write(p, "merlin_offline/" + str(p.relative_to(PAY)))
+            with zipfile.ZipFile(zpath) as z:
+                bad_member = z.testzip()
+                n_members = len(z.namelist())
+            R["zip"] = {"file": zpath.name, "bytes": zpath.stat().st_size, "sha256": sha256(zpath), "members": n_members,
+                        "files": len(files), "crc_bad_member": bad_member}
+            if bad_member is not None or n_members != len(files):
+                fail(f"zip check failed: bad member {bad_member}, {n_members} members vs {len(files)} files")
+            else:
+                shutil.rmtree(PAY)
+        except Exception as e:
+            fail(f"zip: {e!r}")
+        R["all_ok"] = not R["errors"]
     R["sec"] = round(time.time() - T0)
     (W / "p2_report.json").write_text(json.dumps(R, indent=1))
-    shutil.copytree(LOGS, W / "p2_logs", dirs_exist_ok=True)
+    with zipfile.ZipFile(W / "p2_logs.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(LOGS.glob("*")):
+            z.write(p, "p2_logs/" + p.name)
+    R["output_files"] = sorted(p.name for p in W.iterdir())
+    print("output files:", R["output_files"], json.dumps(R.get("zip")), flush=True)
     print(json.dumps({k: R.get(k) for k in ("merlin_commit", "wheel", "gcc13", "wheelhouse", "offline_install", "ldd_shim_clean",
                                              "import_shim_ok", "payload_bytes", "errors")}, default=str)[:6000], flush=True)
     print("ALL OK" if R["all_ok"] else "NOT OK", "|", R["sec"], "s", flush=True)

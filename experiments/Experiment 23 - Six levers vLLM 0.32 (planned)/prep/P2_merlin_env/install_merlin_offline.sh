@@ -15,7 +15,16 @@ DEST="${2:?usage: install_merlin_offline.sh <payload-dir> <dest-dir>}"
 mkdir -p "$DEST"
 DEST="$(cd "$DEST" && pwd -P)"
 die() { echo "install_merlin_offline: FAIL: $*" >&2; exit 1; }
-WHEEL="$(ls "$PAY"/vllm-0.32.0+merlin.*-cp313-cp313-linux_x86_64.whl 2>/dev/null | head -1)"
+# Kaggle Models refuse '+' in file names, so the payload stores the wheel as ..._PLUS_merlin...; Merlin's installer
+# verifies the wheel's basename against release/merlin-wheel.sha256, so it is copied back to its real name here.
+WHEEL_SAFE="$(ls "$PAY"/vllm-0.32.0_PLUS_merlin.*-cp313-cp313-linux_x86_64.whl 2>/dev/null | head -1)"
+if [ -f "$WHEEL_SAFE" ]; then
+  mkdir -p "$DEST/wheel"
+  WHEEL="$DEST/wheel/$(basename "$WHEEL_SAFE" | sed 's/_PLUS_/+/')"
+  cp -f "$WHEEL_SAFE" "$WHEEL"
+else
+  WHEEL="$(ls "$PAY"/vllm-0.32.0+merlin.*-cp313-cp313-linux_x86_64.whl 2>/dev/null | head -1)"
+fi
 [ -f "$WHEEL" ] || die "no Merlin wheel in $PAY"
 for f in merlin-engine.tar merlin_uvpy.tar.gz merlin_gcc13.tar.gz glibc235_fix.py rehash_products.py libglibc238_shim.so; do
   [ -e "$PAY/$f" ] || die "payload is missing $f"
