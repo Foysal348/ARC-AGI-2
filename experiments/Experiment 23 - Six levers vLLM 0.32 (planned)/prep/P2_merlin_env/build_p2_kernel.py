@@ -225,28 +225,45 @@ finally:
             R["odd_names"] = odd
             if odd:
                 raise RuntimeError(f"file names Kaggle Models may refuse: {odd}")
-            zpath = W / "merlin_offline.zip"
-            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+            # v6: the v5 zip was unzipped by Kaggle into folders and the Model creation failed again ("File name contains
+            # invalid characters"); our working Models (FP8, INT4) are flat. A .tar is not unpacked by Kaggle: the
+            # Model holds ONE file, and the GPU notebook extracts it to /tmp.
+            import tarfile
+            # v7: Kaggle unpacks .zip / .tar / .tar.gz on Model creation and checks every inner name (forum: "@PaxHeader",
+            # "&", "=" refused); the GCC 13 tree has c++ names. A .bin is never unpacked (our CPU kits always used .bin).
+            zpath = W / "merlin_offline_tar.bin"
+            with tarfile.open(zpath, "w", format=tarfile.PAX_FORMAT) as t:
                 for p in files:
-                    z.write(p, "merlin_offline/" + str(p.relative_to(PAY)))
-            with zipfile.ZipFile(zpath) as z:
-                bad_member = z.testzip()
-                n_members = len(z.namelist())
-            R["zip"] = {"file": zpath.name, "bytes": zpath.stat().st_size, "sha256": sha256(zpath), "members": n_members,
-                        "files": len(files), "crc_bad_member": bad_member}
-            if bad_member is not None or n_members != len(files):
-                fail(f"zip check failed: bad member {bad_member}, {n_members} members vs {len(files)} files")
+                    t.add(p, "merlin_offline/" + str(p.relative_to(PAY)), recursive=False)
+            want = {"merlin_offline/" + str(p.relative_to(PAY)): p.stat().st_size for p in files}
+            with tarfile.open(zpath) as t:
+                got = {m.name: m.size for m in t.getmembers() if m.isfile()}
+            bad_member = sorted(n for n in set(want) | set(got) if want.get(n) != got.get(n))
+            R["zip"] = {"file": zpath.name, "bytes": zpath.stat().st_size, "sha256": sha256(zpath), "members": len(got),
+                        "files": len(files), "mismatch": bad_member[:20]}
+            if bad_member:
+                fail(f"tar check failed: {len(bad_member)} members differ in name/size: {bad_member[:10]}")
             else:
                 shutil.rmtree(PAY)
         except Exception as e:
             fail(f"zip: {e!r}")
         R["all_ok"] = not R["errors"]
-    R["sec"] = round(time.time() - T0)
-    (W / "p2_report.json").write_text(json.dumps(R, indent=1))
-    with zipfile.ZipFile(W / "p2_logs.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    import tarfile
+    with tarfile.open(W / "p2_logs_tar.bin", "w") as t:
         for p in sorted(LOGS.glob("*")):
-            z.write(p, "p2_logs/" + p.name)
+            t.add(p, "p2_logs/" + p.name, recursive=False)
+    # v7: on ALL OK the output must be flat files Kaggle will not unpack (no folders, no archive extensions, safe names)
+    if R["all_ok"]:
+        bad_out = sorted(str(p.relative_to(W)) for p in W.rglob("*") if (p.is_dir() and p.name != "__pycache__") or (
+            p.is_file() and (len(p.relative_to(W).parts) > 1 or re.search(r"\.(zip|tar|gz|tgz|bz2|xz|7z)$", p.name, re.I)
+                             or re.search(r"[^A-Za-z0-9._-]", p.name))))
+        R["bad_output_names"] = bad_out
+        if bad_out:
+            fail(f"output not flat / safe for a Kaggle Model: {bad_out[:20]}")
+        R["all_ok"] = not R["errors"]
+    R["sec"] = round(time.time() - T0)
     R["output_files"] = sorted(p.name for p in W.iterdir())
+    (W / "p2_report.json").write_text(json.dumps(R, indent=1))
     print("output files:", R["output_files"], json.dumps(R.get("zip")), flush=True)
     print(json.dumps({k: R.get(k) for k in ("merlin_commit", "wheel", "gcc13", "wheelhouse", "offline_install", "ldd_shim_clean",
                                              "import_shim_ok", "payload_bytes", "errors")}, default=str)[:6000], flush=True)

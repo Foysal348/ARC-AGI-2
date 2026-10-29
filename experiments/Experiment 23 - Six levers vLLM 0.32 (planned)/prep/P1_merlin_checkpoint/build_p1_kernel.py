@@ -81,10 +81,13 @@ EXPECTED = json.loads(r"""__EXPECTED__""")          # name -> [size, sha256]
 MERLIN_CKPT_SHA256 = """__MERLIN_CKPT_SHA256__"""
 TOTAL_BYTES = __TOTAL_BYTES__
 MERLIN_TAG, MERLIN_COMMIT, MERLIN_TGZ_SHA256_SEEN = "__MERLIN_TAG__", "__MERLIN_COMMIT__", "__MERLIN_TGZ_SHA__"
-MODEL_SUBDIR = "Qwen3.8-27B-W4A16-Merlin"
-SKIP = {".gitattributes"}   # v2: not downloaded (Kaggle Models refuse dot-files); still checked in the remote tree
-MD = OUT / MODEL_SUBDIR
-TGZ = OUT / f"merlin-engine-{MERLIN_TAG}.tar.gz"
+MODEL_SUBDIR = "."   # v3: flat output (the v2 Model creation from a subfolder failed; our working Models are flat)
+SKIP = {".gitattributes"}   # v2: not downloaded (the v1 Model creation failed); still checked in the remote tree
+MD = OUT
+# v4: the source tarball stays in /tmp (checked, not in the output): Kaggle unpacks .tar.gz files on Model creation and
+# refuses the GitHub tarball's PaxHeader / pax_global_header entries (the v1-v3 "File name contains invalid character"
+# failures); P2 ships the engine source
+TGZ = TMP / f"merlin-engine-{MERLIN_TAG}.tar.gz"
 MANIFEST = OUT / "q27_e23_p1_manifest.json"
 REPORT_PATH = OUT / "p1_report.json"
 UA = "q27-e23-p1/1.0"
@@ -393,12 +396,18 @@ finally:
     R["checkpoint_bytes_expected"] = want_bytes
     if not MAX_FILE and R["checkpoint_bytes"] != want_bytes:
         R["errors"].append(f"checkpoint bytes {R['checkpoint_bytes']} != {want_bytes} ({TOTAL_BYTES} minus {sorted(SKIP)})")
-    extra = sorted(str(p.relative_to(OUT)) for p in MD.rglob("*") if p.is_file() and (p.name not in EXPECTED or p.name in SKIP))
+    known_out = {TGZ.name, MANIFEST.name, REPORT_PATH.name}
+    extra = sorted(str(p.relative_to(OUT)) for p in MD.rglob("*") if p.is_file() and p.name not in known_out
+                   and (p.name not in EXPECTED or p.name in SKIP))
     if extra:
         R["warnings"].append(f"unexpected files in model dir: {extra[:20]}")
     # v2: every output path must be a name Kaggle Models accept (no dot-files, only [A-Za-z0-9._-] per path part)
-    odd = sorted(str(p.relative_to(OUT)) for p in OUT.rglob("*") if p.is_file() and any(
-        part.startswith(".") or re.search(r"[^A-Za-z0-9._-]", part) for part in p.relative_to(OUT).parts))
+    # v3: and no subfolders at all (flat, like our working FP8 / INT4 Models)
+    odd = sorted(str(p.relative_to(OUT)) for p in OUT.rglob("*") if p.is_file() and (len(p.relative_to(OUT).parts) > 1 or any(
+        part.startswith(".") or re.search(r"[^A-Za-z0-9._-]", part) for part in p.relative_to(OUT).parts)))
+    # v4: and no archive Kaggle would unpack (it checks every name inside; see TGZ above)
+    odd += sorted(str(p.relative_to(OUT)) for p in OUT.rglob("*") if p.is_file()
+                  and re.search(r"\.(zip|tar|gz|tgz|bz2|xz|7z)$", p.name, re.I))
     R["odd_names"] = odd
     if odd:
         R["errors"].append(f"output names Kaggle Models refuse: {odd[:20]}")
