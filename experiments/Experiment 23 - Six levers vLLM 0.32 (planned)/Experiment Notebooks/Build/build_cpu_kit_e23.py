@@ -109,10 +109,10 @@ FENV = {"E23_FAKE_SERVER": str(T / "fake_vllm_server.py"), "FAKE_SPEED": "300"}
 procs = {}
 for v in ("SMOKE_A", "SMOKE_B"):
     (T / f"nb_{v}.py").write_text(NB[v])
+    os.makedirs(f"/tmp/e23kit/tmp_{v}", exist_ok=True)
     lf = open(T / f"nb_{v}.log", "w")
     procs[v] = (subprocess.Popen([sys.executable, str(T / f"nb_{v}.py")], stdout=lf, stderr=subprocess.STDOUT, cwd=str(T),
                                  env={**os.environ, **FENV, "E23_OUT": f"/tmp/e23kit/out_{v}", "E23_TMP": f"/tmp/e23kit/tmp_{v}"}), lf)
-    os.makedirs(f"/tmp/e23kit/tmp_{v}", exist_ok=True)
 for v, (p, lf) in procs.items():
     try:
         rc = p.wait(timeout=3600)
@@ -142,6 +142,7 @@ if sub.is_file():
 REP["checks"]["rerun"] = {"rc": rc, "tracebacks": txt.count("Traceback"), "submission_format_ok": ok_sub}
 
 # 4. FULL with a 30-minute budget: order and budget guard on Linux (the 90-minute run is the local harness)
+os.makedirs("/tmp/e23kit/tmp_FULL", exist_ok=True)
 rc, txt = run("nb_FULL", NB["FULL"], {**FENV, "E23_OUT": "/tmp/e23kit/out_FULL", "E23_TMP": "/tmp/e23kit/tmp_FULL",
                                       "E23_BUDGET_SEC": "1800"}, 3000)
 rj = Path("/tmp/e23kit/out_FULL/e23_results.json")
@@ -180,7 +181,7 @@ KD.mkdir(exist_ok=True)
     "model_sources": ["foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/PyTorch/hf-fp8/1",
                       "foysalemonshanto/qwen3-8-27b-int4-redhat/PyTorch/w4a16-g128/1",
                       "foysalemonshanto/qwen3-8-27b-w4a16-merlin/Transformers/default/1",
-                      "foysalemonshanto/e23-merlin-env/Other/default/1",
+                      "foysalemonshanto/e23-merlin-env/Other/v1/1",
                       "foysalemonshanto/e23-eagle4-env/Other/default/1",
                       "foysalemonshanto/qwen3-8-27b-eagle4/Transformers/default/1"],
     "docker_image": IMAGE, "machine_shape": "None"}, indent=2), encoding="utf-8", newline="\n")

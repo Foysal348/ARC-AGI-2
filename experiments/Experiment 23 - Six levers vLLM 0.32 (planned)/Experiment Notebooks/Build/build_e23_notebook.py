@@ -22,7 +22,7 @@ E23 = HERE.parents[1]
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 P60532 = (E23 / "patches" / "pr60532.diff").read_text(encoding="utf-8").replace("\r\n", "\n")
 
-MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3 · __VARIANT__
+MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3b · __VARIANT__
 
 The user's six experiments, each with only its own test sequence (DESIGN.md), at the production context
 (thinking up to 120k: `--max-model-len 131072`, bands 2k / 8k / 40k / 90k / 120k):
@@ -56,7 +56,7 @@ LOGS = OUT / "logs"
 LOGS.mkdir(exist_ok=True)
 TMP = Path(os.environ.get("E23_TMP", "/tmp"))
 INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
-R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3",
+R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3b",
      "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "setup": {}, "sections": {}, "errors": [], "order": []}
 _SAVE_LOCK = threading.Lock()
 
@@ -367,7 +367,9 @@ def prompt(band, variant):
     return _HEAD + body[:need] + _TAIL
 
 
-BANDS = {"2k": 2048, "8k": 8192, "40k": 40000, "90k": 90000, "120k": 120000}
+# The 120k band starts at 116k: the earliest-admitted streams keep decoding while the last 120k prompts prefill, and
+# 120k + 512 would leave only 10.5k new tokens (the window context is ~116k + decoded tokens ~= 120k; rev 3b).
+BANDS = {"2k": 2048, "8k": 8192, "40k": 40000, "90k": 90000, "120k": 116000}
 NSTREAM = 24
 PROMPTS = {b: [prompt(n, v) for v in range(NSTREAM)] for b, n in BANDS.items()}
 MAX_NEW = {b: MAX_LEN - n - 512 for b, n in BANDS.items()}       # a stream never ends inside a window
