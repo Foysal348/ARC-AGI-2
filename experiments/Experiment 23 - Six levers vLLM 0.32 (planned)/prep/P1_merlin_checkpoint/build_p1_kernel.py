@@ -63,7 +63,7 @@ assert all(len(v[1]) == 64 for v in EXPECTED.values())
 
 CODE = r'''# E23 P1: Merlin Qwen3.8-27B W4A16 checkpoint + merlin-engine source (tag) into /kaggle/working, every file verified
 # (size + sha256, embedded at build time). CPU kernel, internet ON, public HF repo (no token, no secrets).
-import hashlib, importlib.metadata, json, os, shutil, struct, subprocess, sys, tarfile, time, traceback
+import hashlib, importlib.metadata, json, os, re, shutil, struct, subprocess, sys, tarfile, time, traceback
 import urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -82,6 +82,7 @@ MERLIN_CKPT_SHA256 = """__MERLIN_CKPT_SHA256__"""
 TOTAL_BYTES = __TOTAL_BYTES__
 MERLIN_TAG, MERLIN_COMMIT, MERLIN_TGZ_SHA256_SEEN = "__MERLIN_TAG__", "__MERLIN_COMMIT__", "__MERLIN_TGZ_SHA__"
 MODEL_SUBDIR = "Qwen3.8-27B-W4A16-Merlin"
+SKIP = {".gitattributes"}   # v2: not downloaded (Kaggle Models refuse dot-files); still checked in the remote tree
 MD = OUT / MODEL_SUBDIR
 TGZ = OUT / f"merlin-engine-{MERLIN_TAG}.tar.gz"
 MANIFEST = OUT / "q27_e23_p1_manifest.json"
@@ -291,7 +292,10 @@ try:
     log("env", json.dumps(R["env"]))
 
     # 0. capacity: the whole checkpoint lands in OUT (no second copy anywhere)
-    want = {n: v for n, v in EXPECTED.items() if not MAX_FILE or v[0] <= MAX_FILE}
+    # v2: Kaggle Models refuse dot-files (the v1 Model creation failed on .gitattributes, a HF git setting the engine never
+    # reads), and the upload page cannot deselect one file: it stays in the remote-tree check but is not downloaded
+    want = {n: v for n, v in EXPECTED.items() if (not MAX_FILE or v[0] <= MAX_FILE) and n not in SKIP}
+    R["skipped_files"] = sorted(SKIP)
     need = sum(v[0] for v in want.values()) + 100_000_000
     free = shutil.disk_usage(OUT).free
     R["capacity"] = {"need_bytes": need, "free_bytes": free, "ok": free >= need}
@@ -383,14 +387,21 @@ finally:
     for p in MD.glob("*.p1part"):
         p.unlink(missing_ok=True)
     files_ok = bool(R["files"]) and all(r["ok"] for r in R["files"].values()) and len(R["files"]) == (
-        sum(1 for v in EXPECTED.values() if not MAX_FILE or v[0] <= MAX_FILE))
+        sum(1 for n, v in EXPECTED.items() if (not MAX_FILE or v[0] <= MAX_FILE) and n not in SKIP))
     R["checkpoint_bytes"] = sum(r.get("size", 0) for r in R["files"].values() if r["ok"])
-    R["checkpoint_bytes_expected"] = TOTAL_BYTES
-    if not MAX_FILE and R["checkpoint_bytes"] != TOTAL_BYTES:
-        R["errors"].append(f"checkpoint bytes {R['checkpoint_bytes']} != {TOTAL_BYTES}")
-    extra = sorted(str(p.relative_to(OUT)) for p in MD.rglob("*") if p.is_file() and p.name not in EXPECTED)
+    want_bytes = TOTAL_BYTES - sum(EXPECTED[n][0] for n in SKIP)
+    R["checkpoint_bytes_expected"] = want_bytes
+    if not MAX_FILE and R["checkpoint_bytes"] != want_bytes:
+        R["errors"].append(f"checkpoint bytes {R['checkpoint_bytes']} != {want_bytes} ({TOTAL_BYTES} minus {sorted(SKIP)})")
+    extra = sorted(str(p.relative_to(OUT)) for p in MD.rglob("*") if p.is_file() and (p.name not in EXPECTED or p.name in SKIP))
     if extra:
         R["warnings"].append(f"unexpected files in model dir: {extra[:20]}")
+    # v2: every output path must be a name Kaggle Models accept (no dot-files, only [A-Za-z0-9._-] per path part)
+    odd = sorted(str(p.relative_to(OUT)) for p in OUT.rglob("*") if p.is_file() and any(
+        part.startswith(".") or re.search(r"[^A-Za-z0-9._-]", part) for part in p.relative_to(OUT).parts))
+    R["odd_names"] = odd
+    if odd:
+        R["errors"].append(f"output names Kaggle Models refuse: {odd[:20]}")
     R["all_ok"] = files_ok and not R["errors"] and bool((R.get("merlin_src") or {}).get("ok"))
     if R["all_ok"]:
         MANIFEST.write_text(json.dumps({
