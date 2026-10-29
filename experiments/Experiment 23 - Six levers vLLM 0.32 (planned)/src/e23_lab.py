@@ -427,8 +427,8 @@ def degenerate(text):
         return "REPEATED_CHAR"
     if t.count("!") > 0.5 * max(1, len(t)):
         return "BANG_GARBAGE"
-    words = re.findall(r"\w+", t)
-    if len(words) > 40 and len(set(words)) < 0.08 * len(words):
+    words = re.findall(r"[A-Za-z]{3,}", t)            # rev 3c: words only; ARC grid dumps (digits) are not garbage
+    if len(words) > 60 and len(set(words)) < 0.08 * len(words):
         return "LOW_VARIETY"
     return None
 
@@ -452,8 +452,8 @@ def compare(ref, cand):
                 mm = a.get("margins") or []
                 m = mm[d] if d < len(mm) else None
                 st = "INCONCLUSIVE" if m is None else ("FAIL_HIGH_MARGIN" if m >= FAIL_MARGIN else "NEAR_TIE")
-        g = degenerate(b.get("text"))
-        if g and degenerate(a.get("text")) is None:           # rev 3: only when the oracle itself is clean
+        g = degenerate(b.get("text")) if (b.get("tokens") and not b.get("error")) else None
+        if g and degenerate(a.get("text")) is None:           # rev 3c: a request error is not corruption
             st = "FAIL_HIGH_MARGIN"
         per.append({"first_diff": d, "oracle_margin": m, "status": st, "garbage": g})
         worst = st if rank[st] > rank[worst] else worst
@@ -499,7 +499,7 @@ def teacher_forced(port, ids, last=256, model="q27", timeout=1800):
         if not isinstance(d, dict):
             out.append(None)
             continue
-        e = d.get(str(ids[pos])) or d.get(f"token_id:{ids[pos]}") or next(iter(d.values()), None)
+        e = d.get(str(ids[pos])) or d.get(f"token_id:{ids[pos]}")     # rev 3c: no fallback to another token
         out.append([e.get("logprob"), e.get("rank")] if isinstance(e, dict) else None)
     return {"positions": out, "n": len(out)}
 
@@ -555,6 +555,8 @@ def steady(port, prompts, level, secs=60.0, admit=None, max_new=8192, temperatur
             time.sleep(sample)
             if all(not g.is_alive() for g in ss):          # rev 3: checked before the metrics read (a dead server)
                 r.update(status="INCONCLUSIVE_STREAMS_ENDED_IN_ADMISSION", errors=[g.err for g in ss if g.err][:3])
+                if barrier:
+                    barrier.abort()                       # rev 3c: the other replicas must not wait for this one
                 return r
             try:
                 m = prom(port)
@@ -595,18 +597,26 @@ def steady(port, prompts, level, secs=60.0, admit=None, max_new=8192, temperatur
                 return r
         m0, t0 = prom(port), time.perf_counter()
         runs, waits, kvs, mids, gmem, stalls = [], [], [], [], [], [0] * len(ss)
-        last_tok = [len(g.tokens) for g in ss]
+        last_tok, track, misses = [len(g.tokens) for g in ss], None, 0
         while time.perf_counter() - t0 < secs:
             time.sleep(min(sample, max(0.1, secs - (time.perf_counter() - t0))))
-            m = prom(port)
+            try:
+                m = prom(port)
+            except Exception:                              # rev 3c: one failed metrics read is not a crash
+                misses += 1
+                if misses >= 5:
+                    break
+                continue
             mids.append(m)
             runs.append(m.get(RUN, 0))
             waits.append(m.get(WAIT, 0))
             if KVU in m:
                 kvs.append(m[KVU])
             now_tok = [len(g.tokens) for g in ss]
+            if track is None:                              # rev 3c: only streams decoding at window start can stall
+                track = {i for i in range(len(ss)) if now_tok[i] > last_tok[i]}
             for i, g in enumerate(ss):
-                if g.t_first is not None and g.is_alive():
+                if i in track and g.is_alive():
                     stalls[i] = stalls[i] + 1 if now_tok[i] <= last_tok[i] else 0
             last_tok = now_tok
             if any(x >= 3 for x in stalls):
@@ -634,7 +644,9 @@ def steady(port, prompts, level, secs=60.0, admit=None, max_new=8192, temperatur
                  kv_usage_mean=round(statistics.mean(kvs), 3) if kvs else None, kv_usage_max=max(kvs) if kvs else None,
                  gpu_mem_peak_mib=[max(row[i][1] for row in gmem if len(row) > i) for i in range(max(map(len, gmem)))] if gmem else None,
                  preemptions=m1.get(PREEMPT, 0) - m0.get(PREEMPT, 0), t0=t0, t1=t1)
-        if any(x >= 3 for x in stalls):
+        if misses >= 5:
+            r["status"] = "INCONCLUSIVE_METRICS_LOST"
+        elif any(x >= 3 for x in stalls):
             r["status"] = "INCONCLUSIVE_STALLED_STREAM"
         elif sum(g.is_alive() for g in ss) < min(level, best):
             r["status"] = "INCONCLUSIVE_STREAMS_ENDED_IN_WINDOW"
@@ -740,8 +752,9 @@ def trace_summary(pdir):
     is_graph = lambda e: "GraphLaunch" in str(e.get("name", ""))
     is_kl = lambda e: re.search(r"LaunchKernel|cuLaunchKernel", str(e.get("name", ""))) is not None
     # per-forward counts inside gpu_model_runner forward annotations (needs VLLM_CUSTOM_SCOPES_FOR_PROFILING=1)
-    fw = [e for e in ev if e.get("ph") == "X" and "forward" in str(e.get("name", "")).lower()
-          and "gpu_model_runner" in str(e.get("name", "")).lower()]
+    fw = sorted([e for e in ev if e.get("ph") == "X" and str(e.get("cat", "")) == "user_annotation"
+                 and "forward" in str(e.get("name", "")).lower() and "gpu_model_runner" in str(e.get("name", "")).lower()],
+                key=lambda e: e.get("ts", 0))           # rev 3c: not the gpu_user_annotation copies (0 launches)
     per_fw = []
     for a in fw[:400]:
         lo, hi, tid = a.get("ts", 0), a.get("ts", 0) + a.get("dur", 0), a.get("tid")

@@ -22,7 +22,7 @@ E23 = HERE.parents[1]
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 P60532 = (E23 / "patches" / "pr60532.diff").read_text(encoding="utf-8").replace("\r\n", "\n")
 
-MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3b · __VARIANT__
+MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3c · __VARIANT__
 
 The user's six experiments, each with only its own test sequence (DESIGN.md), at the production context
 (thinking up to 120k: `--max-model-len 131072`, bands 2k / 8k / 40k / 90k / 120k):
@@ -30,7 +30,7 @@ The user's six experiments, each with only its own test sequence (DESIGN.md), at
 2. Four-rank host-staged all-reduce (P5 bench)
 3. FULL-graph speculative verification (G0 FlashInfer PIECEWISE, G1/G2 TRITON FULL, G3 FlashInfer + #60532) with a graph verdict
 4. SM89 FP8 GEMM (#61224 CUTLASS vs Marlin, P4 bench) + an INT4 TP4 control row
-5. NVFP4 KV: correctness (greedy + teacher-forced 40k / 90k), 90k / 120k residency, + MTP3
+5. NVFP4 KV: correctness (greedy + teacher-forced 40k / 90k on separate short launches), 90k / 120k residency, + MTP3
 6. MTP OFF / K1 / K3 at 8/12/16/20 active streams (step time from the iteration histogram)
 plus EAGLE-4 feasibility (SMOKE B; FULL only with E23_EAGLE_FULL=1).
 
@@ -47,7 +47,7 @@ PART = os.environ.get("Q27X_E23_PART", "__PART__").upper()        # SMOKE: A (Me
 assert MODE in ("SMOKE", "FULL") and PART in ("A", "B", "ALL"), (MODE, PART)
 RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true", "yes"}
 FAKE = os.environ.get("E23_FAKE_SERVER")                          # local CPU harness only
-BUDGET = int(os.environ.get("E23_BUDGET_SEC") or {"SMOKE": {"A": 120, "B": 150, "ALL": 250}[PART] * 60, "FULL": 690 * 60}[MODE])
+BUDGET = int(os.environ.get("E23_BUDGET_SEC") or {"SMOKE": {"A": 120, "B": 175, "ALL": 290}[PART] * 60, "FULL": 690 * 60}[MODE])
 HARD_STOP = T_START + BUDGET
 MAX_LEN = 131072                                                  # user 2026-10-29: thinking up to 120k
 OUT = Path(os.environ.get("E23_OUT", "/kaggle/working/e23"))
@@ -56,7 +56,7 @@ LOGS = OUT / "logs"
 LOGS.mkdir(exist_ok=True)
 TMP = Path(os.environ.get("E23_TMP", "/tmp"))
 INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
-R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3b",
+R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3c",
      "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "setup": {}, "sections": {}, "errors": [], "order": []}
 _SAVE_LOCK = threading.Lock()
 
@@ -115,11 +115,20 @@ else:
         MERLIN_OK = all((MERLIN / n).is_file() and (MERLIN / n).stat().st_size == s
                         for n, (s, _) in mt["files"].items() if n != ".gitattributes")
     R["inputs"]["merlin_files_ok"] = MERLIN_OK
+    if MODE == "SMOKE" and PART in ("A", "ALL") and (not MERLIN_OK or MERLIN_PAY is None):
+        save()                   # rev 3c: SMOKE A exists for Merlin; never a silent rc 0 with only P4 / P5 data
+        raise RuntimeError("SMOKE A needs the Merlin checkpoint (qwen3-8-27b-w4a16-merlin/Transformers/default/1) and env "
+                           "(e23-merlin-env/Other/v1/1): " + json.dumps({"MERLIN": str(MERLIN), "MERLIN_PAY": str(MERLIN_PAY),
+                                                                         "merlin_files_ok": MERLIN_OK}))
     km = json.loads((KITS / "q27_e23_kernels_manifest.json").read_text())       # rev 3: the kit files are what we built
     R["inputs"]["kits_sha_ok"] = {n: (KITS / n).is_file() and hashlib.sha256((KITS / n).read_bytes()).hexdigest() == v.get("sha256")
                                   for n, v in km.items() if isinstance(v, dict) and n.endswith((".so", ".py"))}
     R["identity"] = {k: L.identity(v) for k, v in dict(fp8=FP8, int4=INT4, merlin=MERLIN, eagle_draft=EAGLE_DRAFT).items() if v}
     ABORT = {"why": None}
+    NVSMI_OK = bool(L.gpu_mem()) and not FAKE                       # rev 3c: a later nvidia-smi failure is not "released"
+    R["setup"]["gpus_at_start"] = L.gpu_mem()
+    if not FAKE and len(R["setup"]["gpus_at_start"] or []) != 4:
+        R["errors"].append(f"expected 4 GPUs, nvidia-smi shows {R['setup']['gpus_at_start']}")
     L.start_watchdog(HARD_STOP, lambda: ABORT.update(why="HARD_STOP reached: watchdog killed live servers"))
     log("MODE", MODE, "PART", PART, "| budget", BUDGET // 60, "min |", json.dumps(R["inputs"])[:900])
     save()
@@ -158,7 +167,8 @@ else:
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CUDA_PATH", "LD_PRELOAD")}
     env.update(CUDA_HOME=kv["CUDA_HOME"], PATH=f"{TMP}/vllm-venv/bin:{kv['CUDA_HOME']}/bin:{env.get('PATH', '')}",
                LIBRARY_PATH=f"{SHIM}:{env.get('LIBRARY_PATH', '')}", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
-               VLLM_NO_USAGE_STATS="1", VLLM_CACHE_ROOT=f"{TMP}/vllm-cache", VLLM_ALLOW_LONG_MAX_MODEL_LEN="1")
+               VLLM_NO_USAGE_STATS="1", VLLM_CACHE_ROOT=f"{TMP}/vllm-cache", VLLM_ALLOW_LONG_MAX_MODEL_LEN="1",
+               CUDA_DEVICE_ORDER="PCI_BUS_ID")
     STOCK = {"vllm": [f"{TMP}/vllm-venv/bin/vllm", "serve"], "env": env, "py": kv["VENV_PYTHON"], "cuda_home": kv["CUDA_HOME"],
              "name": "stock"}
     R["setup"]["stock_version"] = subprocess.run([kv["VENV_PYTHON"], "-c", "import vllm; print(vllm.__version__)"],
@@ -219,9 +229,13 @@ def merlin_install():
         raise
 
 
+MERLIN_CC = {"mode": "gcc13"}       # rev 3c: Merlin README:229 / install-env.sh: FlashInfer JIT at first start needs GCC >= 13
+
+
 def merlin_server(name, profile, gpus, port, kv_bytes, seqs=None, capture=None):
     """Merlin's own launch.build() (pure: the profile's flags + env, no host refusal), our max len / port last, and
-    seqs / capture sizes only when given (None = the profile's own, the TP1 memory fallback)."""
+    seqs / capture sizes only when given (None = the profile's own, the TP1 memory fallback). Compiler: the payload's
+    GCC 13 (+ its libstdc++ when present) unless a GCC 13 compile failed earlier (then the system GCC 11)."""
     eng = merlin_install()
     extra = ["--served-model-name", "q27", "--max-model-len", str(MAX_LEN), "--port", str(port)]
     if seqs:
@@ -238,14 +252,19 @@ def merlin_server(name, profile, gpus, port, kv_bytes, seqs=None, capture=None):
     base.update(GPUS=gpus, PORT=str(port), KV_BYTES=str(kv_bytes), P2P="off", VENV=kvv["MERLIN_VENV"])
     plan = eng["ML"].build("27b", profile, str(MERLIN), base, extra=extra, checkpoint="27b", status="untested")
     env = dict(plan.env)
-    # rev 3: -lcuda shim (FlashInfer JIT), system GCC at serve time (GCC 13 was only the install rule), per-port caches
+    # -lcuda shim (FlashInfer JIT), per-port caches; compiler set below (rev 3c: GCC 13 first, see MERLIN_CC)
     env.update(LD_PRELOAD=kvv["MERLIN_SHIM"], CUDA_HOME=eng["cuda_home"], VLLM_USE_RUST_FRONTEND="0", HF_HUB_OFFLINE="1",
                TRANSFORMERS_OFFLINE="1", LIBRARY_PATH=f"{SHIM}:{os.environ.get('LIBRARY_PATH', '')}",
                PATH=f"{kvv['MERLIN_VENV']}/bin:{eng['cuda_home']}/bin:{os.environ.get('PATH', '')}",
                VLLM_CACHE_ROOT=f"{TMP}/merlin-cache", TRITON_CACHE_DIR=f"{TMP}/merlin-triton-{port}",
-               FLASHINFER_WORKSPACE_BASE=f"{TMP}/merlin-fi")
+               FLASHINFER_WORKSPACE_BASE=f"{TMP}/merlin-fi", CUDA_DEVICE_ORDER="PCI_BUS_ID")
     for k in ("CC", "CXX", "CUDAHOSTCXX"):
         env.pop(k, None)
+    if MERLIN_CC["mode"] == "gcc13" and kvv.get("MERLIN_CC") and kvv.get("MERLIN_CXX"):
+        env.update(CC=kvv["MERLIN_CC"], CXX=kvv["MERLIN_CXX"], CUDAHOSTCXX=kvv["MERLIN_CXX"])
+        lib13 = Path(kvv["MERLIN_CC"]).parents[1] / "lib"
+        if (lib13 / "libstdc++.so.6").exists():
+            env["LD_LIBRARY_PATH"] = f"{lib13}:{env.get('LD_LIBRARY_PATH', '')}"
     dp = getattr(eng["ML"], "distributed_ports", None)                   # Merlin's own --instances port scheme
     if dp:
         try:
@@ -383,10 +402,16 @@ save()
 '''
 
 CELL4 = r'''# ==================================================================== CELL 4 — the step runner (budget, GPU gate, fail-closed)
-WIN = {"SMOKE": 30.0, "FULL": 120.0}[MODE]                         # 120 s FULL windows (noise)
+WIN = float(os.environ.get("E23_WIN_SEC") or {"SMOKE": 30.0, "FULL": 120.0}[MODE])   # 120 s FULL windows (noise)
+EST_SCALE = float(os.environ.get("E23_EST_SCALE") or 1.0) if FAKE else 1.0   # local harness only: walk the whole order
+SM_TF = MODE == "SMOKE"                                            # SMOKE teacher-forced: the 40k row only
 ROWS = {}            # oracle greedy rows by key (same weights)
 TF = {}              # teacher-forced rows by key
 NTOK = 128 if MODE == "FULL" else 64
+LIVE = {"rec": None}                 # rev 3c: windows land in the step record before every save (a hard kill keeps them)
+COMPILE_ERR = re.compile(r"ninja: build stopped|Error building extension|error: command '.*(nvcc|g\+\+|gcc|c\+\+)' failed|"
+                         r"GLIBCXX_[0-9.]+' not found|unsupported GNU version|fatal error: ")
+OOM_ERR = re.compile(r"OutOfMemoryError|CUDA out of memory|out of memory")
 
 
 def step(sec, name, est_min, fn):
@@ -395,12 +420,15 @@ def step(sec, name, est_min, fn):
     R["order"].append(f"{sec}/{name}")
     if ABORT["why"]:
         rec.update(status="SKIPPED_ABORT", why=ABORT["why"])
+        log("---", sec, name, "SKIPPED_ABORT")
         save()
         return rec
-    if left() < est_min * 60 + 300:
+    if left() < est_min * EST_SCALE * 60 + 300:
         rec.update(status="SKIPPED_BUDGET", left_min=round(left() / 60, 1), est_min=est_min)
+        log("---", sec, name, "SKIPPED_BUDGET", f"(est {est_min} min, left {left() / 60:.0f} min)")
         save()
         return rec
+    LIVE["rec"] = rec
     t = time.time()
     log(">>>", sec, name, f"(est {est_min} min, left {left() / 60:.0f} min)")
     try:
@@ -411,7 +439,8 @@ def step(sec, name, est_min, fn):
     except Exception as e:
         rec.update(status="ERROR", error=f"{type(e).__name__}: {e}"[:800], tb=traceback.format_exc()[-2500:])
     rec["sec"] = round(time.time() - t, 1)
-    if ABORT["why"] and rec["status"] == "DONE":
+    LIVE["rec"] = None
+    if ABORT["why"] and rec["status"] in ("DONE", "SERVER_DIED", "LAUNCH_FAILED", "BODY_ERROR"):
         rec["status"] = "PARTIAL_HARD_STOP"
     log("<<<", sec, name, rec.get("status"), f"{rec['sec']:.0f}s")
     save()
@@ -453,6 +482,12 @@ def with_servers(servers, timeout, body):
             s.kill()
         gpus = ",".join(sorted({g for s in servers for g in s.gpus.split(",")}))
         rel = L.wait_gpu_release(180, fake=bool(FAKE), gpus=gpus)
+        if rel is False:                 # rev 3c: one more kill + 300 s before the lab aborts
+            for s in servers:
+                s.kill()
+            rel = L.wait_gpu_release(300, fake=bool(FAKE), gpus=gpus)
+        if rel is None and NVSMI_OK:     # nvidia-smi worked at start: a failure now is not "released"
+            rel = False
         out["gpu_released"] = rel
         if rel is False:
             ABORT["why"] = f"GPUs {gpus} still held after {[s.name for s in servers]}"
@@ -472,8 +507,9 @@ def oracle(port, key=None, refs=()):
 
 
 def tforced(port, key=None, ref=None):
-    """Teacher-forced 40k / 90k prompt logprobs (last 256 positions); saved under `key` or compared with TF[ref]."""
-    rows = {b: L.teacher_forced(port, ids) for b, ids in TF_P.items()}
+    """Teacher-forced 40k / 90k prompt logprobs (last 256 positions); saved under `key` or compared with TF[ref].
+    rev 3c: on stock vLLM only on its own short launch (prompt logprobs = chunk x 248k-vocab logits: OOM at 0.90)."""
+    rows = {b: L.teacher_forced(port, ids) for b, ids in TF_P.items() if not (SM_TF and b != "40k")}
     if key:
         TF[key] = rows
     if ref:
@@ -481,16 +517,30 @@ def tforced(port, key=None, ref=None):
     return {b: {"n": (rows[b] or {}).get("n"), "error": (rows[b] or {}).get("error")} for b in rows}
 
 
-def levels(port, band, lv, **kw):
-    out = {}
+def levels(port, band, lv, server=None, **kw):
+    """rev 3c: the guard includes admission (prefill) time; a band stops once KV-bound (the fit is recorded); a dead
+    server stops the band; every window is written into the live step record before save()."""
+    out, fit = {}, None
     for n in lv:
-        if ABORT["why"] or left() < WIN + 300:
-            out[f"{band}@{n}"] = {"status": "SKIPPED_BUDGET"}
-            continue
-        try:                             # rev 3: one failing level never loses the others
-            out[f"{band}@{n}"] = L.steady(port, PROMPTS[band], n, secs=WIN, max_new=MAX_NEW[band], **kw)
-        except Exception as e:
-            out[f"{band}@{n}"] = {"status": "ERROR", "error": f"{type(e).__name__}: {e}"[:300]}
+        k = f"{band}@{n}"
+        need = WIN + 90 + min(3600, n * BANDS[band] / 1500)
+        if ABORT["why"] or left() < need + 120:
+            out[k] = {"status": "SKIPPED_BUDGET", "need_sec": round(need)}
+        elif fit is not None:
+            out[k] = {"status": "SKIPPED_KV_BOUND", "streams_fit": fit}
+        elif server is not None and not server.alive():
+            out[k] = {"status": "SKIPPED_SERVER_DEAD"}
+        else:
+            try:                         # rev 3: one failing level never loses the others
+                out[k] = L.steady(port, PROMPTS[band], n, secs=WIN, max_new=MAX_NEW[band], **kw)
+            except Exception as e:
+                out[k] = {"status": "ERROR", "error": f"{type(e).__name__}: {e}"[:300]}
+            rm = out[k].get("running_max")
+            if out[k].get("status") == "CAPACITY_LIMITED" or (rm is not None and 0 < rm < n and
+                                                              str(out[k].get("status")).startswith("INCONCLUSIVE")):
+                fit = rm
+        if LIVE["rec"] is not None:
+            LIVE["rec"].setdefault("live_windows", {})[k] = out[k]
         save()
     return out
 save()
@@ -498,6 +548,7 @@ save()
 
 CELL5 = r'''# ==================================================================== CELL 5 — the plan (dependency order; report = user numbering)
 import concurrent.futures as CF
+import signal
 SM = MODE == "SMOKE"
 DO_A = (not SM) or PART in ("A", "ALL")          # Merlin, P5, P4
 DO_B = (not SM) or PART in ("B", "ALL")          # stock vLLM + EAGLE + PP4
@@ -505,11 +556,20 @@ CAP_TP1 = [1, 2, 5, 10, 15, 20]                                  # seqs 4 x (1 +
 CAP_TP4 = [1, 2, 4, 5, 8, 10, 15, 20, 25, 30, 35, 40, 60, 80, 100, 120]   # seqs 24 x 5 = 120
 KV_TP1, KV_TP4 = 8055029760, 16301686784                         # Merlin preflight's L4 (22.5 GiB) pins
 P4_FUT = None
+P4_PROC = {"p": None}
 TP1_CFG = {"seqs": 4, "capture": CAP_TP1}
+TP1_KW = {"prefill_tok_s": 250.0}                                # rev 3c: one L4 prefills ~250-400 tok/s (not TP4's 700)
 
 
 def kit(name):
     return str(KITS / name)
+
+
+def _killpg(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except Exception:
+        pass
 
 
 # ---- #2 host-staged all-reduce: all four GPUs free, before any server
@@ -518,34 +578,45 @@ def s2():
     Path(out).unlink(missing_ok=True)
     cmd = [STOCK["py"], kit("bench_host_ar.py"), "--so", kit("p5_host_ar.so"), "--out", out,
            "--timeout-s", "900" if SM else "3000"] + (["--quick"] if SM else [])
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=STOCK["env"],
+                         start_new_session=True)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1000 if SM else 3300, env=STOCK["env"])
-        rc, tail = p.returncode, (p.stdout + p.stderr)[-2000:]
-    except subprocess.TimeoutExpired as e:
-        rc, tail = -9, str(e)[-500:]
+        so, _ = p.communicate(timeout=1000 if SM else 3300)
+        rc, tail = p.returncode, (so or "")[-2000:]
+    except subprocess.TimeoutExpired:
+        _killpg(p)                                    # rev 3c: the bench's children die with it
+        so, _ = p.communicate()
+        rc, tail = -9, (so or "")[-1000:]
     res = json.loads(Path(out).read_text()) if Path(out).is_file() else {}
-    return {"rc": rc, "summary": res.get("summary"), "tail": tail,
+    rel = L.wait_gpu_release(180, fake=bool(FAKE))
+    return {"rc": rc, "summary": res.get("summary"), "tail": tail, "gpu_released": rel,
             "status": "DONE" if rc == 0 else ("CHECK_FAILED" if rc == 1 else "BENCH_ERROR")}
 
 
 def s4_thread():
     out = str(OUT / "p4_bench.json")
     Path(out).unlink(missing_ok=True)
+    per_shape = 420 if SM else 600
     cmd = [STOCK["py"], kit("bench_fp8_gemm.py"), "--so", kit("p4_sm89_fp8.so"), "--out", out, "--gpu", "3",
-           "--weights", "auto", "--model-dir", str(FP8)] + (["--m", "1,16,80", "--shapes", "gate_up_proj,down_proj"] if SM else [])
+           "--weights", "auto", "--model-dir", str(FP8), "--timeout-per-shape", str(per_shape)] + \
+          (["--m", "1,16,80", "--shapes", "gate_up_proj,down_proj"] if SM else [])
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=STOCK["env"],
+                         start_new_session=True)
+    P4_PROC["p"] = p
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1500 if SM else 3600, env=STOCK["env"],
-                           start_new_session=True)
-        rc, tail = p.returncode, (p.stdout + p.stderr)[-2000:]
-    except subprocess.TimeoutExpired as e:
-        rc, tail = -9, str(e)[-500:]
+        so, _ = p.communicate(timeout=2 * per_shape + 300 if SM else 5 * per_shape + 300)
+        rc, tail = p.returncode, (so or "")[-2000:]
+    except subprocess.TimeoutExpired:
+        _killpg(p)                                    # rev 3c: per-shape children hold GPU 3 otherwise
+        so, _ = p.communicate()
+        rc, tail = -9, (so or "")[-1000:]
     res = json.loads(Path(out).read_text()) if Path(out).is_file() else {}
     return {"rc": rc, "summary_per_m": res.get("summary_per_m"), "gates": res.get("gates") or res.get("gate"),
-            "tail": tail, "status": "DONE" if rc == 0 else "BENCH_ERROR"}
+            "tail": tail, "status": "DONE" if rc == 0 else ("CHECK_FAILED" if rc == 1 else "BENCH_ERROR")}
 
 
 def join_p4():
-    """P4 holds GPU 3; join it (bounded) before any step that needs GPU 3."""
+    """P4 holds GPU 3; join it (bounded) before any step that needs GPU 3; a GPU 3 that stays held aborts the lab."""
     global P4_FUT
     if P4_FUT is None:
         return
@@ -553,100 +624,175 @@ def join_p4():
         res = P4_FUT.result(timeout=max(60, min(3600, left() - 600)))
     except Exception as e:
         res = {"status": "ERROR", "error": repr(e)[:300]}
+        if P4_PROC["p"] is not None:
+            _killpg(P4_PROC["p"])
+    rel = L.wait_gpu_release(300, fake=bool(FAKE), gpus="3")
+    if rel is None and NVSMI_OK:
+        rel = False
+    res["gpu3_released"] = rel
     R["sections"].setdefault("4_sm89_fp8_gemm", {})["p4_bench_gpu3"] = res
     P4_FUT = None
-    L.wait_gpu_release(180, fake=bool(FAKE), gpus="3")
+    if rel is False:
+        ABORT["why"] = "GPU 3 still held after the P4 bench"
     save()
 
 
-# ---- #1 Merlin TP1 (GPU 0) with #4 P4 on GPU 3 meanwhile; memory fallback; replicas; Merlin TP4
+# ---- Merlin launch with the two recoveries the audits asked for: a GCC 13 compile failure -> the system GCC once;
+# an OOM (launch or mid-body) on TP1 -> Merlin's own TP1 profile values. Never after the hard stop.
+def _logs_of(o):
+    return " ".join((v or {}).get("log_tail", "") for v in (o.get("servers") or {}).values())
+
+
+def merlin_run(make, timeout, body, tp1=False):
+    o = with_servers(make(), timeout, body)
+    tries = []
+    for _ in range(2):
+        if ABORT["why"] or o.get("status") not in ("LAUNCH_FAILED", "SERVER_DIED"):
+            break
+        logs = _logs_of(o)
+        if COMPILE_ERR.search(logs) and MERLIN_CC["mode"] == "gcc13":
+            MERLIN_CC["mode"] = "system"
+            why = "gcc13_compile_error -> system GCC"
+        elif tp1 and (OOM_ERR.search(logs) or o.get("status") == "LAUNCH_FAILED") and TP1_CFG["seqs"] is not None:
+            TP1_CFG.update(seqs=None, capture=None)
+            why = "TP1 OOM / launch failure -> profile defaults (seqs 2, capture [1,2,5,10])"
+        else:
+            break
+        tries.append({"why": why, "status": o.get("status"), "servers": o.get("servers")})
+        o = with_servers(make(), timeout, body)
+    if tries:
+        o["earlier_attempts"] = tries
+    o["merlin_compiler"] = MERLIN_CC["mode"]
+    return o
+
+
+# ---- #1 Merlin TP1 (GPU 0) with #4 P4 on GPU 3 meanwhile; replicas; Merlin TP4
 def _tp1_body(ss):
-    port = ss[0].port
+    s = ss[0]
+    port = s.port
     o = {"probes": L.chat_probes(port), "oracle": oracle(port, key="merlin")}
-    o["steady"] = levels(port, "40k", [2, 4] if SM else [2, 3, 4])
-    o["steady"].update(levels(port, "90k", [1, 2]))
-    o["steady"].update(levels(port, "120k", [1] if SM else [1, 2]))
+    g90 = L.greedy(port, [PROMPTS["90k"][4]], n_tok=NTOK, timeout=max(300, min(1800, left() / 6)))
+    ROWS["merlin_90k"] = g90
+    o["greedy_90k"] = {"garbage": [L.degenerate(r["text"]) for r in g90], "errors": [r["error"] for r in g90]}
+    o["steady"] = levels(port, "40k", [2, 4] if SM else [2, 3, 4], server=s, **TP1_KW)
+    o["steady"].update(levels(port, "90k", [1, 2] if SM else [1, 2, 3, 4], server=s, **TP1_KW))
+    o["steady"].update(levels(port, "120k", [1] if SM else [1, 2, 3], server=s, **TP1_KW))
+    if s.alive():                    # Merlin's fork budgets prompt-logprob memory; still last (nothing measured after it)
+        o["teacher_forced"] = tforced(port, key="merlin")
     return o
 
 
 def s1_tp1():
-    o = with_servers([merlin_server("merlin_tp1", "27b-tp1-sm89-24g", "0", 8100, KV_TP1, **TP1_CFG)], 2400, _tp1_body)
-    if o.get("status") == "LAUNCH_FAILED":           # rev 3: memory edge -> Merlin's own TP1 profile values (seqs 2)
-        TP1_CFG.update(seqs=None, capture=None)
-        o2 = with_servers([merlin_server("merlin_tp1_fallback", "27b-tp1-sm89-24g", "0", 8100, KV_TP1)], 2400, _tp1_body)
-        o2["first_attempt"] = {k: o[k] for k in ("status", "servers") if k in o}
-        o2["config"] = "profile defaults (seqs 2, capture [1,2,5,10])"
-        return o2
-    o["config"] = "seqs 4, capture " + str(CAP_TP1)
+    o = merlin_run(lambda: [merlin_server("merlin_tp1", "27b-tp1-sm89-24g", "0", 8100, KV_TP1, **TP1_CFG)], 2400,
+                   _tp1_body, tp1=True)
+    o["config"] = ("profile defaults (seqs 2, capture [1,2,5,10])" if TP1_CFG["seqs"] is None
+                   else "seqs 4, capture " + str(CAP_TP1))
     return o
 
 
 def _tp1_level(band, default):
     rec = R["sections"]["1_tp1x4_pp4"].get("a_merlin_tp1_gpu0") or {}
     st = rec.get("steady") or {}
-    ok = [int(k.split("@")[1]) for k, v in st.items() if k.startswith(band + "@") and v.get("status") in ("STEADY", "CAPACITY_LIMITED")]
+    ok = []
+    for k, v in st.items():
+        if k.startswith(band + "@") and v.get("status") in ("STEADY", "CAPACITY_LIMITED"):
+            ok.append(int(k.split("@")[1]) if v["status"] == "STEADY" else int(v.get("running_max") or 0))
+    ok = [x for x in ok if x > 0]
     return max(ok) if ok else default
 
 
-def s1_rep(n):
+def s1_rep(n, bands=None):
     def f():
         lv40, lv90 = _tp1_level("40k", 2), _tp1_level("90k", 1)
-        ss = [merlin_server(f"merlin_tp1_rep{i}", "27b-tp1-sm89-24g", str(i), 8100 + i, KV_TP1, **TP1_CFG) for i in range(n)]
+
+        def make():
+            return [merlin_server(f"merlin_tp1_rep{i}", "27b-tp1-sm89-24g", str(i), 8100 + i, KV_TP1, **TP1_CFG)
+                    for i in range(n)]
 
         def body(ss):
             o = {"per_replica_level": {"40k": lv40, "90k": lv90},
                  "replica_greedy": {s.name: L.compare(ROWS.get("merlin")[:1], L.greedy(s.port, ORACLE_P[:1], n_tok=NTOK))
                                     if ROWS.get("merlin") else {"status": "INCONCLUSIVE_NO_ORACLE"} for s in ss}}
             o["40k"] = L.steady_multi([(s.port, PROMPTS["40k"][i * 6:], lv40) for i, s in enumerate(ss)], secs=WIN,
-                                      max_new=MAX_NEW["40k"])
-            if not SM:
+                                      max_new=MAX_NEW["40k"], **TP1_KW)
+            if "90k" in (bands or ("40k", "90k")):
                 o["90k"] = L.steady_multi([(s.port, PROMPTS["90k"][i * 6:], lv90) for i, s in enumerate(ss)], secs=WIN,
-                                          max_new=MAX_NEW["90k"])
+                                          max_new=MAX_NEW["90k"], **TP1_KW)
             return o
-        return with_servers(ss, 2400, body)
+        return merlin_run(make, 2400, body)
     return f
 
 
 def s1_tp4():
     def body(ss):
-        port = ss[0].port
+        s = ss[0]
+        port = s.port
         o = {"probes": L.chat_probes(port), "oracle": oracle(port, refs=("merlin",))}
-        o["steady"] = levels(port, "40k", [8, 16] if SM else [8, 16, 24])
-        o["steady"].update(levels(port, "90k", [8] if SM else [8, 12, 16]))
-        o["steady"].update(levels(port, "120k", [8] if SM else [8, 12]))
+        g90 = L.greedy(port, [PROMPTS["90k"][4]], n_tok=NTOK, timeout=max(300, min(1800, left() / 6)))
+        o["greedy_90k_vs_tp1"] = L.compare(ROWS.get("merlin_90k"), g90) if ROWS.get("merlin_90k") else \
+            {"status": "INCONCLUSIVE_NO_ORACLE"}
+        o["steady"] = levels(port, "40k", [8, 16] if SM else [8, 16, 24], server=s)
+        o["steady"].update(levels(port, "90k", [8] if SM else [8, 12, 16], server=s))
+        o["steady"].update(levels(port, "120k", [8] if SM else [8, 12], server=s))
+        if s.alive():
+            o["teacher_forced_vs_tp1"] = tforced(port, ref="merlin")
         return o
-    o = with_servers([merlin_server("merlin_tp4", "27b-tp4-sm89-24g", "0,1,2,3", 8100, KV_TP4, seqs=24, capture=CAP_TP4)], 2400, body)
-    if o.get("status") == "LAUNCH_FAILED":           # the profile's own capture list (up to 40)
-        o2 = with_servers([merlin_server("merlin_tp4_fallback", "27b-tp4-sm89-24g", "0,1,2,3", 8100, KV_TP4, seqs=24)], 2400, body)
+    o = merlin_run(lambda: [merlin_server("merlin_tp4", "27b-tp4-sm89-24g", "0,1,2,3", 8100, KV_TP4, seqs=24,
+                                          capture=CAP_TP4)], 2400, body)
+    if o.get("status") == "LAUNCH_FAILED" and not ABORT["why"]:      # the profile's own capture list (validated to 40)
+        o2 = merlin_run(lambda: [merlin_server("merlin_tp4_fallback", "27b-tp4-sm89-24g", "0,1,2,3", 8100, KV_TP4,
+                                               seqs=8)], 2400, body)
         o2["first_attempt"] = {k: o[k] for k in ("status", "servers") if k in o}
+        o2["config"] = "fallback seqs 8 with the profile's capture list (graphs cover every batch)"
         return o2
     return o
 
 
-# ---- #6 MTP OFF / K1 / K3 (FP8, stock vLLM 0.32, seqs 20); K3 = G0 of #3 (FlashInfer, PIECEWISE pinned), profiled
+# ---- #6 MTP OFF / K1 / K3 (FP8, stock vLLM 0.32, seqs 20); K3 = G0 of #3 (FlashInfer, PIECEWISE pinned), profiled.
+# rev 3c: every K3 launch (main + A/A reps) has the same command (profiler config included); only the main one profiles.
 def s6(depth, profile=False, tag=None):
     def f():
-        pdir = TMP / f"e23_profile_mtp{depth}_{tag or 'main'}" if profile else None
+        pdir = TMP / f"e23_profile_mtp{depth}_{tag or 'main'}" if depth == 3 else None
         extra = ["--compilation-config", json.dumps({"cudagraph_mode": "PIECEWISE"})] if depth == 3 else []
         srv = stock_server(tag or f"fp8_mtp{depth}", stock_flags(FP8, 8200, spec=depth, extra=extra, profile_dir=pdir), 8200)
 
         def body(ss):
-            port = ss[0].port
+            s = ss[0]
+            port = s.port
             o = {"probes": L.chat_probes(port),
                  "oracle": oracle(port, key=("fp8_mtp0" if depth == 0 else ("fp8_g0" if depth == 3 else None)) if not tag else None,
                                   refs=() if depth == 0 and not tag else ("fp8_mtp0",))}
-            if depth == 0 and not tag:
-                o["teacher_forced"] = tforced(port, key="fp8_mtp0")
-            o["steady"] = levels(port, "40k", [16] if SM else [8, 12, 16, 20])
-            if not SM and depth in (0, 3):
-                o["steady"].update(levels(port, "90k", [8, 12, 20]))
-                o["steady"].update(levels(port, "120k", [8, 12]))
-            if profile:
+            if depth == 0:
+                o["steady"] = {} if SM else levels(port, "40k", [8, 12, 16, 20], server=s)
+                if not SM:
+                    o["steady"].update(levels(port, "90k", [12, 20], server=s))
+            elif depth == 1:
+                o["steady"] = levels(port, "40k", [8, 12, 16, 20], server=s)
+            else:
+                o["steady"] = levels(port, "40k", [16] if SM else [8, 12, 16, 20], server=s)
+                if not SM:
+                    o["steady"].update(levels(port, "90k", [8, 12, 20], server=s))
+                    o["steady"].update(levels(port, "120k", [8, 12], server=s))
+            if profile and s.alive():
                 o["profile"] = L.profiled_load(port, PROMPTS["40k"], 16, pdir, max_new=MAX_NEW["40k"])
+                _keep_trace(pdir, tag or f"mtp{depth}")
+            if pdir:
                 shutil.rmtree(pdir, ignore_errors=True)
             return o
         return with_servers([srv], 1800, body)
     return f
+
+
+def _keep_trace(pdir, tag):
+    """rev 3c: the rank-0 trace is kept in OUT (the verdict code has never seen a real 0.32 trace)."""
+    try:
+        fs = sorted(Path(pdir).rglob("*.pt.trace.json*"), key=lambda p: p.stat().st_size)
+        f0 = next((p for p in fs if re.search(r"rank0\.|rank[-_]?0[._]|tp0_", p.name)), fs[0] if fs else None)
+        if f0 is not None and f0.stat().st_size < 400e6:
+            (OUT / "traces").mkdir(exist_ok=True)
+            shutil.copy2(f0, OUT / "traces" / f"{tag}_{f0.name}")
+    except Exception as e:
+        R["errors"].append(f"keep_trace {tag}: {e!r}"[:200])
 
 
 def _site():
@@ -654,18 +800,22 @@ def _site():
                           capture_output=True, text=True).stdout.strip()
 
 
+PATCH_ORIG = {}
+
+
 def _patch(reverse=False):
-    """rev 3: forward = back up flashinfer.py, dry-run, apply (restore the backup on a failed apply); reverse = restore
-    the backup by copy and verify its sha (not patch -R)."""
+    """forward = back up flashinfer.py, dry-run, apply (restore the backup on a failed apply); reverse = restore the
+    backup by copy and verify it against the sha recorded BEFORE patching (rev 3c: not against the backup itself)."""
     target = Path(_site()) / "vllm/v1/attention/backends/flashinfer.py"
     bak = TMP / "flashinfer.py.e23_orig"
     if reverse:
         if not bak.is_file():
             return {"applied": False, "error": "no backup"}
         shutil.copy2(bak, target)
-        ok = hashlib.sha256(target.read_bytes()).hexdigest() == hashlib.sha256(bak.read_bytes()).hexdigest()
-        return {"applied": ok, "restored_sha": hashlib.sha256(target.read_bytes()).hexdigest()[:16]}
+        now = hashlib.sha256(target.read_bytes()).hexdigest()
+        return {"applied": now == PATCH_ORIG.get("sha"), "restored_sha": now[:16]}
     shutil.copy2(target, bak)
+    PATCH_ORIG["sha"] = hashlib.sha256(target.read_bytes()).hexdigest()
     diff = P60532.split("diff --git a/vllm/v1/attention/backends/flashinfer.py")[1]
     Path(TMP / "pr60532_vllm_only.diff").write_text("diff --git a/vllm/v1/attention/backends/flashinfer.py" + diff.split("\ndiff --git")[0] + "\n")
     base = ["patch", "-p1", "-d", _site(), "--batch", "--forward", "--no-backup-if-mismatch", "-i", str(TMP / "pr60532_vllm_only.diff")]
@@ -676,31 +826,33 @@ def _patch(reverse=False):
     if p.returncode:
         shutil.copy2(bak, target)
     return {"rc": p.returncode, "out": (p.stdout + p.stderr)[-600:], "applied": p.returncode == 0,
-            "orig_sha": hashlib.sha256(bak.read_bytes()).hexdigest()[:16]}
+            "orig_sha": PATCH_ORIG["sha"][:16]}
 
 
 def s3(tag, backend, graph, patch=False):
     def f():
-        pre = _patch() if patch and not FAKE else None
-        if pre and not pre["applied"]:
-            return {"status": "PATCH_FAILED", "patch": pre}
-        try:
+        pre = None
+        try:                          # rev 3c: the patch is inside the try, so any exception still restores the file
+            pre = _patch() if patch and not FAKE else None
+            if pre and not pre["applied"]:
+                return {"status": "PATCH_FAILED", "patch": pre}
             pdir = TMP / f"e23_profile_{tag}"
             extra = ["--compilation-config", json.dumps({"cudagraph_mode": graph})] if graph else []
             srv = stock_server(f"fp8_{tag}", stock_flags(FP8, 8200, backend=backend, extra=extra, profile_dir=pdir), 8200)
 
             def body(ss):
-                port = ss[0].port
+                s = ss[0]
+                port = s.port
                 o = {"probes": L.chat_probes(port), "oracle": oracle(port, refs=("fp8_mtp0", "fp8_g0")), "patch": pre}
-                o["steady"] = levels(port, "40k", [16] if SM else [16, 20])
-                if not SM:
-                    o["steady"].update(levels(port, "90k", [12]))
-                o["profile"] = L.profiled_load(port, PROMPTS["40k"], 16, pdir, max_new=MAX_NEW["40k"])
+                o["steady"] = levels(port, "40k", [16] if SM else [16, 20], server=s)
+                if s.alive():
+                    o["profile"] = L.profiled_load(port, PROMPTS["40k"], 16, pdir, max_new=MAX_NEW["40k"])
+                    _keep_trace(pdir, tag)
                 shutil.rmtree(pdir, ignore_errors=True)
                 return o
             return with_servers([srv], 1800, body)
         finally:
-            if pre and pre.get("applied"):
+            if patch and not FAKE and (TMP / "flashinfer.py.e23_orig").is_file() and PATCH_ORIG.get("sha"):
                 rv = _patch(reverse=True)
                 R["sections"].setdefault("3_full_graph", {})[f"{tag}_patch_revert"] = rv
                 if not rv.get("applied"):
@@ -708,62 +860,93 @@ def s3(tag, backend, graph, patch=False):
     return f
 
 
-# ---- #5 NVFP4 KV: greedy + teacher-forced correctness vs FP8-KV target-only, 90k / 120k census, + MTP3 (not on NO_GO)
-def s5(spec, tag=None):
+# ---- #5 NVFP4 KV. Teacher-forced on its own short launch per KV dtype (same settings both sides, prompt-logprob
+# memory fits); target-only = correctness + one census level; NVFP4 + MTP3 = the residency census + streams increase.
+def s5_tf(kv, key=None, ref=None):
     def f():
-        prior = (R["sections"].get("5_nvfp4_kv") or {}).get("nvfp4_target_only") or {}
-        if spec and prior.get("status") in ("NO_GO_CORRUPT", "LAUNCH_FAILED", "ERROR", "FAIL_GPU_RELEASE", "SKIPPED_BUDGET"):
-            return {"status": "SKIPPED_TARGET_ONLY_NO_GO", "target_only_status": prior.get("status")}
-        srv = stock_server(tag or f"nvfp4_mtp{spec}", stock_flags(FP8, 8200, spec=spec, kv="nvfp4", seqs=24), 8200)
+        srv = stock_server(f"tf_{kv}", stock_flags(FP8, 8200, spec=0, kv=kv, seqs=2, batched=512, mem=0.80), 8200)
 
         def body(ss):
-            port = ss[0].port
-            o = {"probes": L.chat_probes(port), "oracle": oracle(port, refs=("fp8_mtp0",) if spec == 0 else ("fp8_g0", "fp8_mtp0"))}
-            if spec == 0:
-                o["teacher_forced_vs_fp8kv"] = tforced(port, ref="fp8_mtp0")
-                if (o["oracle"].get("vs_fp8_mtp0") or {}).get("status") == "FAIL_HIGH_MARGIN":
-                    o["status"] = "NO_GO_CORRUPT"
-                    return o
-            o["steady"] = levels(port, "90k", [12] if SM else [12, 16, 20, 24])
-            o["steady"].update(levels(port, "120k", [12] if SM else [12, 16, 20]))
-            if not SM:
-                o["steady"].update(levels(port, "40k", [16, 20]))
+            o = {"teacher_forced": tforced(ss[0].port, key=key, ref=ref)}
+            if ref:
+                st = [v.get("status") for v in o["teacher_forced"].values()]
+                o["status"] = "DONE" if st and all(x == "MEASURED" for x in st) else "INCONCLUSIVE_TF"
             return o
         return with_servers([srv], 1800, body)
     return f
 
 
-# ---- #4 INT4 control (stock vLLM, RedHat W4A16, MTP3, s20): the INT4 path against Merlin's low-M INT4 engine
+def s5(spec, tag=None):
+    def f():
+        prior = (R["sections"].get("5_nvfp4_kv") or {}).get("nvfp4_target_only") or {}
+        if spec and prior.get("status") in ("NO_GO_CORRUPT", "LAUNCH_FAILED", "ERROR", "FAIL_GPU_RELEASE", "SKIPPED_BUDGET",
+                                            "SERVER_DIED"):
+            return {"status": "SKIPPED_TARGET_ONLY_NO_GO", "target_only_status": prior.get("status")}
+        srv = stock_server(tag or f"nvfp4_mtp{spec}", stock_flags(FP8, 8200, spec=spec, kv="nvfp4", seqs=24), 8200)
+
+        def body(ss):
+            s = ss[0]
+            port = s.port
+            o = {"probes": L.chat_probes(port), "oracle": oracle(port, refs=("fp8_mtp0",) if spec == 0 else ("fp8_g0", "fp8_mtp0"))}
+            if spec == 0:
+                if (o["oracle"].get("vs_fp8_mtp0") or {}).get("status") == "FAIL_HIGH_MARGIN":
+                    o["status"] = "NO_GO_CORRUPT"
+                    return o
+                o["steady"] = levels(port, "120k", [8], server=s) if SM else levels(port, "90k", [12], server=s)
+            else:
+                o["steady"] = levels(port, "90k", [12, 16, 20, 24], server=s)
+                o["steady"].update(levels(port, "120k", [12, 16, 20], server=s))
+                o["steady"].update(levels(port, "40k", [16, 20], server=s))
+            return o
+        return with_servers([srv], 1800, body)
+    return f
+
+
+# ---- #4 INT4 control (stock vLLM, RedHat W4A16, MTP3, s20): the INT4 path against Merlin's low-M INT4 engine;
+# also the PP4 oracle (same weights)
 def s4_int4():
+    if INT4 is None:
+        return {"status": "SKIPPED_REQUIRED_ARTIFACT", "why": "RedHat INT4 checkpoint not attached"}
     srv = stock_server("int4_mtp3_s20", stock_flags(INT4, 8200, spec=3, seqs=20), 8200)
 
     def body(ss):
-        port = ss[0].port
+        s = ss[0]
+        port = s.port
         o = {"probes": L.chat_probes(port), "oracle": oracle(port, key="int4_mtp3")}
-        o["steady"] = levels(port, "40k", [8, 16, 20])
-        o["steady"].update(levels(port, "90k", [12]))
+        o["steady"] = levels(port, "40k", [8, 16, 20], server=s)
+        o["steady"].update(levels(port, "90k", [12], server=s))
         return o
     return with_servers([srv], 1800, body)
 
 
-# ---- #1e PP4 branch (stock vLLM, INT4 RedHat): eager first (#63505's only reported pass), then compiled; stop on garbage
+# ---- #1e PP4 branch (stock vLLM, INT4 RedHat): compiled first, eager (#63505's reported pass) only when compiled fails
 def s1_pp4(eager):
     def f():
+        if INT4 is None:
+            return {"status": "SKIPPED_REQUIRED_ARTIFACT", "why": "RedHat INT4 checkpoint not attached"}
         extra = ["--enforce-eager"] if eager else []
         srv = stock_server("int4_pp4_eager" if eager else "int4_pp4_compiled",
                            stock_flags(INT4, 8200, tp=1, pp=4, spec=0, seqs=16, extra=extra), 8200)
 
         def body(ss):
-            port = ss[0].port
+            s = ss[0]
+            port = s.port
             o = {"probes": L.chat_probes(port), "oracle": oracle(port, refs=("int4_mtp3",)),
-                 "note": "PP4 uses stock vLLM + RedHat INT4 (Merlin's fork has no PP profile); #63505 open on 0.32"}
+                 "note": "PP4 uses stock vLLM + RedHat INT4 (Merlin's fork has no PP profile); #63505 open on 0.32; "
+                         "the V1 runner forces async scheduling off under PP, so these rows understate PP"}
             if not o["probes"]["ok"] or any(o["oracle"]["garbage"]) or any(o["oracle"]["errors"]):
                 o["status"] = "NO_GO_GARBAGE_OR_ERROR"
                 return o
-            o["steady"] = levels(port, "40k", [8] if SM else [8, 16])
+            o["steady"] = levels(port, "40k", [8] if SM else [8, 16], server=s)
             return o
         return with_servers([srv], 1800, body)
     return f
+
+
+def pp4():
+    rec = step("1_tp1x4_pp4", "f_pp4_int4_compiled", 15 if SM else 25, s1_pp4(False))
+    if rec.get("status") not in ("DONE", "SKIPPED_BUDGET", "SKIPPED_ABORT", "SKIPPED_REQUIRED_ARTIFACT"):
+        step("1_tp1x4_pp4", "e_pp4_int4_eager", 15 if SM else 25, s1_pp4(True))
 
 
 # ---- EAGLE-4 feasibility: a BF16-KV FP8-weight target-only oracle first (same KV dtype as tree verify), then EAGLE
@@ -778,61 +961,93 @@ def s7_eagle():
         return {"status": "SKIPPED_REQUIRED_ARTIFACT", "why": "EAGLE env / drafter not attached (or fake mode)"}
     spec = json.dumps({"method": "eagle_harness", "model": str(EAGLE_DRAFT),
                        "method_config": {"mode": "static", "node_top_k": 4, "tree_depth": 14, "max_verify_width": 16}})
-    fl = stock_flags(FP8, 8300, seqs=16, kv="auto", backend="CUSTOM", prefix=False, spec_json=spec)
-    srv = stock_server("eagle4_fp8", fl, 8300, engine=eng)
 
     def body(ss):
-        port = ss[0].port
+        s = ss[0]
+        port = s.port
         o = {"probes": L.chat_probes(port), "oracle": oracle(port, refs=("fp8_kvauto_mtp0", "fp8_mtp0"))}
-        o["steady"] = levels(port, "8k", [8, 16])
-        o["steady"].update(levels(port, "40k", [8]))
+        o["steady"] = levels(port, "8k", [8, 16], server=s)
+        o["steady"].update(levels(port, "40k", [8], server=s))
         return o
-    return with_servers([srv], 2400, body)
+    # rev 3c: prefix caching ON first (the oracles are prefix ON; prefix OFF forces mamba_cache_mode none, E19's flips)
+    o = with_servers([stock_server("eagle4_fp8", stock_flags(FP8, 8300, seqs=16, kv="auto", backend="CUSTOM",
+                                                             spec_json=spec), 8300, engine=eng)], 2400, body)
+    o["prefix_caching"] = True
+    if o.get("status") == "LAUNCH_FAILED" and not ABORT["why"]:
+        o2 = with_servers([stock_server("eagle4_fp8_noprefix", stock_flags(FP8, 8300, seqs=16, kv="auto", backend="CUSTOM",
+                                                                           prefix=False, spec_json=spec), 8300, engine=eng)],
+                          2400, body)
+        o2.update(prefix_caching=False, confounded="prefix caching OFF (E19: spec decode + prefix off flips tokens)",
+                  first_attempt={k: o[k] for k in ("status", "servers") if k in o})
+        return o2
+    return o
 
 
+def start_prefetch():
+    pref = []
+    if DO_A and MERLIN:
+        pref.append(prefetch_bg([MERLIN], "merlin"))
+    if DO_B:
+        pref.append(prefetch_bg([FP8], "fp8"))
+    return pref
+
+
+# ---- run order (audit5 rev 3b: realistic estimates, trimmed levels the plan does not need, PP4 before the A/A fill).
+# SMOKE A: P5, Merlin TP1 (+P4), Merlin TP4, Merlin TP1 x4 (40k). SMOKE B: mtp0 (oracle) -> mtp3/G0 -> G3 -> TF FP8 ref
+# -> NVFP4 target-only -> TF NVFP4 -> [kvauto oracle + EAGLE] -> PP4. FULL: P5, Merlin a-d, mtp0, INT4 control, mtp1,
+# mtp3/G0, G1, G2, G3, TF FP8 ref, NVFP4 target-only, TF NVFP4, NVFP4 + MTP3, PP4, then A/A repeats fill the time.
 PREF = []
-if DO_A and MERLIN:
-    PREF.append(prefetch_bg([MERLIN], "merlin"))
-if DO_B:
-    PREF.append(prefetch_bg([FP8] + ([INT4] if INT4 and not SM else []), "fp8_int4"))
-
-# ---- run order. SMOKE A: P5, Merlin TP1 (+P4), Merlin TP4. SMOKE B: FP8 mtp0 -> mtp3/G0 -> G3 -> NVFP4 -> EAGLE -> PP4.
-# FULL: P5, Merlin block, section 6, section 3, section 5, INT4 control, A/A repeats (time left), PP4 last (#63505).
 if DO_A:
-    step("2_host_allreduce", "p5_bench", 12 if SM else 30, s2)
-    P4_FUT = CF.ThreadPoolExecutor(1).submit(s4_thread)
-    step("1_tp1x4_pp4", "a_merlin_tp1_gpu0", 45 if SM else 75, s1_tp1)
+    step("2_host_allreduce", "p5_bench", 12 if SM else 30, s2)      # before the prefetch (host memory + PCIe quiet)
+PREF = start_prefetch()
+if DO_A:
+    if left() > (40 if SM else 55) * 60 + 300:
+        P4_FUT = CF.ThreadPoolExecutor(1).submit(s4_thread)
+    step("1_tp1x4_pp4", "a_merlin_tp1_gpu0", 40 if SM else 55, s1_tp1)
     join_p4()
     if not SM:
-        step("1_tp1x4_pp4", "b_merlin_tp1_x2", 30, s1_rep(2))
-        step("1_tp1x4_pp4", "c_merlin_tp1_x4", 35, s1_rep(4))
-    step("1_tp1x4_pp4", "d_merlin_tp4", 40 if SM else 60, s1_tp4)
+        step("1_tp1x4_pp4", "b_merlin_tp1_x2", 25, s1_rep(2))
+        step("1_tp1x4_pp4", "c_merlin_tp1_x4", 25, s1_rep(4))
+    step("1_tp1x4_pp4", "d_merlin_tp4", 40 if SM else 70, s1_tp4)
+    if SM:
+        step("1_tp1x4_pp4", "c_merlin_tp1_x4", 20, s1_rep(4, bands=("40k",)))
 if DO_B:
-    step("6_mtp_depth", "mtp0_target_only", 20 if SM else 50, s6(0))
+    if not SM and INT4:
+        PREF.append(prefetch_bg([INT4], "int4"))
+    step("6_mtp_depth", "mtp0_target_only", 12 if SM else 45, s6(0))
     if not SM:
-        step("6_mtp_depth", "mtp1", 35, s6(1))
-    step("6_mtp_depth", "mtp3_eq_G0_piecewise", 25 if SM else 60, s6(3, profile=True))
+        step("4_sm89_fp8_gemm", "int4_mtp3_s20_control", 40, s4_int4)
+        step("6_mtp_depth", "mtp1", 30, s6(1))
+    step("6_mtp_depth", "mtp3_eq_G0_piecewise", 20 if SM else 70, s6(3, profile=True))
     if not SM:
-        step("3_full_graph", "G1_triton_full_and_piecewise", 35, s3("G1", "TRITON_ATTN", "FULL_AND_PIECEWISE"))
-        step("3_full_graph", "G2_triton_full_decode_only", 35, s3("G2", "TRITON_ATTN", "FULL_DECODE_ONLY"))
-    step("3_full_graph", "G3_flashinfer_pr60532", 20 if SM else 40, s3("G3", "FLASHINFER", "FULL_AND_PIECEWISE", patch=True))
-    step("5_nvfp4_kv", "nvfp4_target_only", 25 if SM else 55, s5(0))
+        step("3_full_graph", "G1_triton_full_and_piecewise", 30, s3("G1", "TRITON_ATTN", "FULL_AND_PIECEWISE"))
+        step("3_full_graph", "G2_triton_full_decode_only", 30, s3("G2", "TRITON_ATTN", "FULL_DECODE_ONLY"))
+    step("3_full_graph", "G3_flashinfer_pr60532", 20 if SM else 30, s3("G3", "FLASHINFER", "FULL_AND_PIECEWISE", patch=True))
+    step("5_nvfp4_kv", "tf_fp8kv_reference", 11 if SM else 15, s5_tf("fp8_e4m3", key="fp8kv_tf"))
+    step("5_nvfp4_kv", "nvfp4_target_only", 25 if SM else 30, s5(0))
+    step("5_nvfp4_kv", "tf_nvfp4_vs_fp8kv", 11 if SM else 15, s5_tf("nvfp4", ref="fp8kv_tf"))
     if not SM:
-        step("5_nvfp4_kv", "nvfp4_mtp3", 45, s5(3))
-        step("4_sm89_fp8_gemm", "int4_mtp3_s20_control", 35, s4_int4)
-    if SM or os.environ.get("E23_EAGLE_FULL") == "1":
-        step("7_eagle4", "fp8_kvauto_target_only_oracle", 15, s7_kvauto_oracle)
-        step("7_eagle4", "eagle4_fp8_tp4", 30, s7_eagle)
-if not SM:      # A/A repeats of the decisive comparisons while 70 min stay reserved for PP4
-    for i in range(1, 4):
-        if left() < (70 + 50) * 60:
+        step("5_nvfp4_kv", "nvfp4_mtp3", 85, s5(3))
+    if (SM or os.environ.get("E23_EAGLE_FULL") == "1") and left() >= (11 + 26 + 10) * 60:
+        step("7_eagle4", "fp8_kvauto_target_only_oracle", 11, s7_kvauto_oracle)
+        step("7_eagle4", "eagle4_fp8_tp4", 26, s7_eagle)
+    pp4()
+if not SM:      # A/A repeats of the decisive comparisons fill whatever time is left (greedy; nothing reserved after)
+    def _done(path):
+        sec, name = path.split("/")
+        return ((R["sections"].get(sec) or {}).get(name) or {}).get("status") == "DONE"
+
+    def AA(i):       # only configurations whose main run completed (a failed config is not relaunched)
+        c = [(f"mtp3_control_rep{i}", 60, s6(3, tag=f"fp8_mtp3_rep{i}"), "6_mtp_depth/mtp3_eq_G0_piecewise"),
+             (f"merlin_tp1_x4_rep{i}", 30, s1_rep(4), "1_tp1x4_pp4/c_merlin_tp1_x4"),
+             (f"nvfp4_mtp3_rep{i}", 85, s5(3, tag=f"nvfp4_mtp3_rep{i}"), "5_nvfp4_kv/nvfp4_mtp3")]
+        return [(n, e, fn) for n, e, fn, main in c if _done(main)]
+    for i in range(1, 7):
+        todo = [(n, e, fn) for n, e, fn in AA(i) if left() >= e * EST_SCALE * 60 + 300]
+        if not todo or ABORT["why"]:
             break
-        step("8_aa_repeats", f"mtp3_control_rep{i}", 50, s6(3, tag=f"fp8_mtp3_rep{i}"))
-        step("8_aa_repeats", f"merlin_tp1_x4_rep{i}", 35, s1_rep(4))
-        step("8_aa_repeats", f"nvfp4_mtp3_rep{i}", 45, s5(3, tag=f"nvfp4_mtp3_rep{i}"))
-if DO_B:
-    step("1_tp1x4_pp4", "e_pp4_int4_eager", 20 if SM else 30, s1_pp4(True))
-    step("1_tp1x4_pp4", "f_pp4_int4_compiled", 20 if SM else 30, s1_pp4(False))
+        for n, e, fn in todo:
+            step("8_aa_repeats", n, e, fn)
 '''
 
 CELL6 = r'''# ==================================================================== CELL 6 — report
@@ -899,6 +1114,23 @@ for variant, (mode, part) in VARIANTS.items():
     out = HERE.parent / f"Q27-XHIGH-E23_SIX_LEVERS_{variant}.ipynb"
     out.write_text(data, encoding="utf-8", newline="\n")
     print(out.name, hashlib.sha256(data.encode()).hexdigest()[:8], f"{len(data) / 1024:.0f} kB")
+    kd = HERE / "gpu_kernels" / f"q27-xhigh-e23-six-levers-{variant.lower().replace('_', '-')}"
+    kd.mkdir(parents=True, exist_ok=True)
+    (kd / f"{kd.name}.ipynb").write_text(data, encoding="utf-8", newline="\n")
+    (kd / "kernel-metadata.json").write_text(json.dumps({
+        "id": f"foysalemonshanto/{kd.name}", "title": kd.name.replace("-", " ").title(), "code_file": f"{kd.name}.ipynb",
+        "language": "python", "kernel_type": "notebook", "is_private": True, "enable_gpu": True, "enable_tpu": False,
+        "enable_internet": False, "keywords": [],
+        "dataset_sources": ["foysalemonshanto/q27-e23-sm89-kernels", "foysalemonshanto/vllm-0-32-0-cu13-wheelhouse"],
+        "kernel_sources": [], "competition_sources": ["arc-prize-2026-arc-agi-2"],
+        "model_sources": ["foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/PyTorch/hf-fp8/1",
+                          "foysalemonshanto/qwen3-8-27b-int4-redhat/PyTorch/w4a16-g128/1",
+                          "foysalemonshanto/qwen3-8-27b-w4a16-merlin/Transformers/default/1",
+                          "foysalemonshanto/e23-merlin-env/Other/v1/1",
+                          "foysalemonshanto/e23-eagle4-env/Other/default/1",
+                          "foysalemonshanto/qwen3-8-27b-eagle4/Transformers/default/1"],
+        "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
+        "machine_shape": "NvidiaL4"}, indent=2), encoding="utf-8", newline="\n")
 old = HERE.parent / "Q27-XHIGH-E23_SIX_LEVERS.ipynb"
 if old.exists():
     old.unlink()          # rev 3: the three variants replace the single rev 1 / 2 file (never run on Kaggle)
