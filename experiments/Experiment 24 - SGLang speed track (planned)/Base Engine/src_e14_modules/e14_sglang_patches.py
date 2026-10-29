@@ -1,0 +1,515 @@
+"""E14 guarded, revertible text patches for an INSTALLED SGLang 0.5.21 package (2026-10-23).
+
+Backports (ported whitespace-exact onto the 0.5.21 text, see Notes/14 for the hunk-by-hunk derivation):
+- "41872"  SGLang PR #41872 (in v0.5.22): an empty running batch never keeps admission closed.
+           scheduler.py: clear batch_is_full when the running batch is empty, before the early return;
+           NO_TOKEN only latches batch_is_full when something can still be served.
+- "44401"  SGLang PR #44401 (merged 2026-10-15): count a request's held req_to_token row once at admission.
+           get_num_allocatable_reqs(..., num_held_rows=0) gives the rows of already-row-holding requests in
+           adder.can_run_list (a continuing chunk, a session borrow) back to `available`; the admission gate
+           in _get_new_batch_prefill_raw and in the dLLM mixin pass that count; the PREFILL-disagg check
+           subtracts it.
+- "43567"  SGLang PR #43567 (merged 2026-10-11, in v0.5.22): with extra_buffer_lazy, when the optional pending
+           ping-pong slot cannot be allocated the forward writes the keep slot in place; invalidate the keep slot's
+           old checkpoint (mamba_last_track_seqlen = None) so delayed prefill processing never donates it to the
+           radix cache under the old prefix length (upstream KL 0.649 -> 0, a silent wrong-state cache hit).
+           schedule_batch.py: mamba_lazy_prealloc_at_boundary and mamba_lazy_spec_prepare.
+
+API (stdlib only; the notebook embeds this file as text and runs it with its own python):
+- PATCHES                  name -> list of hunks {"file", "old", "new", "old_sha256"}
+- check(pkg_dir, names)    per-hunk state, no writes
+- apply(pkg_dir, names)    all-or-nothing per patch name, .e14bak backups, compile check, rollback, pyc cleanup
+- revert(pkg_dir)          restore every .e14bak byte-identical, then remove it
+Every function returns a plain JSON-serializable dict and never raises on a source problem.
+CLI: python e14_sglang_patches.py {check|apply|revert} <pkg_dir> [name ...]
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+
+BACKUP_SUFFIX = ".e14bak"
+DEFAULT_NAMES = ("44401", "41872")  # independent hunks: either order gives the same bytes
+
+# sha256 of the whole, unpatched 0.5.21 files (from the sglang-0.5.21 wheel). Informational only: the hunks are the
+# guard, so a different build whose hunk regions are byte-identical still patches.
+REFERENCE_FILE_SHA256 = {
+    "srt/managers/scheduler.py": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
+    "srt/dllm/mixin/scheduler.py": "29628477323d55eb15c6bada659588ae690080418dd70ea74b260ef00e9c5817",
+    "srt/managers/schedule_batch.py": "b2f78c781de88c36ce27cc5d44b343420338b4da299e885c575665d6fab843ca",
+}
+
+# sha256 of the same files with BOTH patches applied (either order gives these bytes). Informational only.
+REFERENCE_PATCHED_SHA256 = {
+    "srt/managers/scheduler.py": "4ae05197445f5be254027a4d2bd2b14f98b9140c8ca3732bae2c199315547fc8",
+    "srt/dllm/mixin/scheduler.py": "d86972c5ef3256779047fe946e0c327b3ccde3389ef6c528ca814e3ce675d636",
+}
+
+_SCHED = "srt/managers/scheduler.py"
+_DLLM = "srt/dllm/mixin/scheduler.py"
+_SBATCH = "srt/managers/schedule_batch.py"
+
+# ------------------------------------------------------------------------------------------------- PR #43567
+# 0.5.21 srt/managers/schedule_batch.py L3489-3493 and L3524-3527 (the exact upstream diff, whitespace-identical)
+_43567_PREALLOC_OLD = '            if new_slot is not None:\n                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])\n                req.kv.mamba_next_track_idx = other_idx\n\n    def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):\n'
+_43567_PREALLOC_NEW = "            if new_slot is not None:\n                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])\n                req.kv.mamba_next_track_idx = other_idx\n            else:\n                # The in-flight write invalidates the keep slot's old checkpoint.\n                req.kv.mamba_last_track_seqlen = None\n\n    def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):\n"
+_43567_SPEC_OLD = '                if new_slot is not None:\n                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])\n                    has_pending = True\n            # On failure the verify scatters in place into the keep slot.\n'
+_43567_SPEC_NEW = '                if new_slot is not None:\n                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])\n                    has_pending = True\n                else:\n                    req.kv.mamba_last_track_seqlen = None\n            # On failure the verify scatters in place into the keep slot.\n'
+
+# ------------------------------------------------------------------------------------------------- PR #41872
+# 0.5.21 srt/managers/scheduler.py L3842-3848 (start of _get_new_batch_prefill_raw).
+_41872_EMPTY_OLD = """        if self.enable_priority_preemption or self.is_hybrid_swa:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            running_batch.batch_is_full = False
+
+        if (
+            running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+"""
+_41872_EMPTY_NEW = """        if self.enable_priority_preemption or self.is_hybrid_swa:
+            # Reset batch_is_full to try preemption with a prefill adder.
+            running_batch.batch_is_full = False
+        if running_batch.is_empty():
+            # An empty batch never reaches update_running_batch, the only
+            # other place that clears the flag, so admission would stay shut.
+            running_batch.batch_is_full = False
+
+        if (
+            running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
+"""
+
+# 0.5.21 srt/managers/scheduler.py L4028-4040 (NO_TOKEN branch of the waiting-queue loop).
+_41872_NOTOKEN_OLD = """            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_lmcache
+                        or self.enable_unified_cache_external_linker
+                    ):
+                        # Set batch_is_full after making sure there are requests that can be served
+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                            not running_batch.is_empty()
+                        )
+                    else:
+                        running_batch.batch_is_full = True
+"""
+_41872_NOTOKEN_NEW = """            if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.NO_TOKEN:
+                    # Set batch_is_full after making sure there are requests that can be served
+                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                        not running_batch.is_empty()
+                    )
+"""
+
+# ------------------------------------------------------------------------------------------------- PR #44401
+# 0.5.21 srt/managers/scheduler.py L3788-3791 (get_num_allocatable_reqs signature and `available`).
+_44401_ALLOC_OLD = """        running_batch: Optional[ScheduleBatch] = None,
+    ) -> int:
+        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
+        available = self.req_to_token_pool.available_size()
+"""
+_44401_ALLOC_NEW = """        running_batch: Optional[ScheduleBatch] = None,
+        num_held_rows: int = 0,
+    ) -> int:
+        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
+        # Requests the caller counts that already hold a row (a continuing
+        # chunk, a session borrow) need no free one; give their rows back.
+        available = self.req_to_token_pool.available_size() + num_held_rows
+"""
+
+# 0.5.21 srt/managers/scheduler.py L3865-3867 (comment only; the old one was wrong for 0.5.21 too).
+_44401_COMMENT_OLD = """        # Ignore the check if self.chunked_req is not None.
+        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # as the space for the chunked requests has just been released.
+"""
+_44401_COMMENT_NEW = """        # Ignore the check if self.chunked_req is not None.
+        # In the non-PP case, a chunked request keeps its req_to_token row across chunks,
+        # so continuing it needs no free row.
+"""
+
+# 0.5.21 srt/managers/scheduler.py L3967-3981 (admission gate in the waiting-queue loop).
+_44401_GATE_OLD = """            running_bs = len(running_batch.reqs)
+            candidate_beam_width = (
+                req.beam_group.beam_width if req.beam_group is not None else None
+            )
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs,
+                candidate_beam_width,
+                running_batch=running_batch,
+            ):
+                running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # In prefill mode, prealloc queue and transfer queue can also take memory,
+                # so we need to check if the available size for the actual available size.
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    running_batch.batch_is_full = True
+"""
+_44401_GATE_NEW = """            running_bs = len(running_batch.reqs)
+            candidate_beam_width = (
+                req.beam_group.beam_width if req.beam_group is not None else None
+            )
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs,
+                candidate_beam_width,
+                running_batch=running_batch,
+                num_held_rows=num_held_rows,
+            ):
+                running_batch.batch_is_full = True
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # In prefill mode, prealloc queue and transfer queue can also take memory,
+                # so we need to check if the available size for the actual available size.
+                if (
+                    len(adder.can_run_list) - num_held_rows
+                    >= self.req_to_token_pool.available_size()
+                ):
+                    running_batch.batch_is_full = True
+"""
+
+# 0.5.21 srt/dllm/mixin/scheduler.py L377-380 (process_dllm_incoming_reqs gate; unused by our AR model).
+_44401_DLLM_OLD = """            # Check if batch is full
+            running_bs = len(running_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                running_batch.batch_is_full = True
+"""
+_44401_DLLM_NEW = """            # Check if batch is full
+            running_bs = len(running_batch.reqs)
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, num_held_rows=num_held_rows
+            ):
+                running_batch.batch_is_full = True
+"""
+
+
+def _h(file, old, new, old_sha256):
+    return {"file": file, "old": old, "new": new, "old_sha256": old_sha256}
+
+
+PATCHES = {
+    "41872": [
+        _h(_SCHED, _41872_EMPTY_OLD, _41872_EMPTY_NEW, "7bc08f1e0e763b0c6b738686783aa70cbb700aa79f5612a04b16eca22d6f5b1e"),
+        _h(_SCHED, _41872_NOTOKEN_OLD, _41872_NOTOKEN_NEW, "17f586b7c5a6baef1ebbf8b662c2f2beea082b5f513dd03ae0e0d99b511a343b"),
+    ],
+    "43567": [
+        _h(_SBATCH, _43567_PREALLOC_OLD, _43567_PREALLOC_NEW, "bce78b2ab8f978033d1a8f1cfb73bac8cec8c1c775a46900c01916d006cb3b97"),
+        _h(_SBATCH, _43567_SPEC_OLD, _43567_SPEC_NEW, "26e249bfb527571f9e4c6933e8ffd5041d3d1aa79215d8c1b1d3b615e5ef6a16"),
+    ],
+    "44401": [
+        _h(_SCHED, _44401_ALLOC_OLD, _44401_ALLOC_NEW, "1c2a815a61a49f3a239698680c49f081fbfecfe0270f756647f579122d52a228"),
+        _h(_SCHED, _44401_COMMENT_OLD, _44401_COMMENT_NEW, "a8cf5910f52f02404c677e5eca089c74a4d4de7b4c6a18964ca84dc39c826835"),
+        _h(_SCHED, _44401_GATE_OLD, _44401_GATE_NEW, "bda3d8015142de899644bad5b41710d0e8a40420763b9b88ac1913aeafaf64c5"),
+        _h(_DLLM, _44401_DLLM_OLD, _44401_DLLM_NEW, "c3099b40a270bcf0601ddc6c08d167875fe83da267ea960bd241e7315aacbaeb"),
+    ],
+}
+
+
+# ------------------------------------------------------------------------------------------------- helpers
+def _sha(b):
+    if isinstance(b, str):
+        b = b.encode("utf-8")
+    return hashlib.sha256(b).hexdigest()
+
+
+def _path(pkg_dir, rel):
+    return os.path.join(str(pkg_dir), *rel.split("/"))
+
+
+def _read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _write_atomic(path, data):
+    tmp = path + ".e14tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def _compile_check(text, path):
+    """None if `text` compiles as a module, else the error string."""
+    try:
+        compile(text, path, "exec", dont_inherit=True)
+        return None
+    except Exception as e:  # SyntaxError, ValueError (null bytes), ...
+        return "%s: %s" % (type(e).__name__, e)
+
+
+def _drop_pyc(path):
+    """Delete __pycache__/<stem>.*.pyc next to `path` so no stale bytecode is used."""
+    removed = []
+    d, base = os.path.split(path)
+    stem = os.path.splitext(base)[0]
+    cache = os.path.join(d, "__pycache__")
+    try:
+        names = os.listdir(cache)
+    except OSError:
+        return removed
+    for n in names:
+        if n.startswith(stem + ".") and n.endswith(".pyc"):
+            try:
+                os.remove(os.path.join(cache, n))
+                removed.append(n)
+            except OSError:
+                pass
+    return removed
+
+
+def _version(pkg_dir):
+    try:
+        txt = _read(_path(pkg_dir, "_version.py")).decode("utf-8", "replace")
+        m = re.search(r"__version__\s*=\s*version\s*=\s*['\"]([^'\"]+)['\"]", txt) or re.search(
+            r"__version__\s*=\s*['\"]([^'\"]+)['\"]", txt)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def _resolve(names):
+    if names is None:
+        return list(DEFAULT_NAMES)
+    if isinstance(names, str):
+        return [names]
+    return [str(n) for n in names]
+
+
+def _hunk_state(text, hunk):
+    """State of one hunk against `text` (None = file missing)."""
+    info = {"file": hunk["file"], "old_sha_ok": _sha(hunk["old"]) == hunk["old_sha256"]}
+    if not info["old_sha_ok"]:
+        info.update(status="mismatch", reason="hunk text corrupted (old_sha256 differs)")
+        return info
+    if text is None:
+        info.update(status="mismatch", reason="file missing")
+        return info
+    n_old, n_new = text.count(hunk["old"]), text.count(hunk["new"])
+    info.update(old_count=n_old, new_count=n_new)
+    if n_old == 1 and n_new == 0:
+        info["status"] = "applicable"
+    elif n_old == 0 and n_new == 1:
+        info["status"] = "applied"
+    else:
+        info["status"] = "mismatch"
+        info["reason"] = "old occurs %d times, new occurs %d times (need exactly one of them once)" % (n_old, n_new)
+    return info
+
+
+def _load_texts(pkg_dir, files):
+    """rel -> (raw bytes, decoded text) or None if unreadable."""
+    out = {}
+    for rel in files:
+        try:
+            raw = _read(_path(pkg_dir, rel))
+            out[rel] = (raw, raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            out[rel] = None
+    return out
+
+
+def _patch_state(name, texts):
+    hunks = PATCHES[name]
+    states = []
+    for i, h in enumerate(hunks):
+        t = texts.get(h["file"])
+        s = _hunk_state(t[1] if t else None, h)
+        s["index"] = i
+        states.append(s)
+    kinds = {s["status"] for s in states}
+    if kinds == {"applicable"}:
+        state = "not_applied"
+    elif kinds == {"applied"}:
+        state = "applied"
+    elif "mismatch" in kinds:
+        state = "mismatch"
+    else:
+        state = "partial"
+    return state, states
+
+
+# ------------------------------------------------------------------------------------------------- API
+def check(pkg_dir, names=None):
+    names = _resolve(names)
+    rep = {"pkg_dir": str(pkg_dir), "sglang_version": _version(pkg_dir), "files": {}, "patches": {}}
+    files = sorted({h["file"] for n in names if n in PATCHES for h in PATCHES[n]})
+    texts = _load_texts(pkg_dir, files)
+    for rel in files:
+        t = texts[rel]
+        sha = _sha(t[0]) if t else None
+        rep["files"][rel] = {
+            "exists": t is not None,
+            "sha256": sha,
+            "matches_unpatched_0_5_21": sha == REFERENCE_FILE_SHA256.get(rel),
+            "matches_both_patched_0_5_21": sha == REFERENCE_PATCHED_SHA256.get(rel),
+            "backup_exists": os.path.exists(_path(pkg_dir, rel) + BACKUP_SUFFIX),
+        }
+    for n in names:
+        if n not in PATCHES:
+            rep["patches"][n] = {"state": "unknown patch", "hunks": []}
+            continue
+        state, states = _patch_state(n, texts)
+        rep["patches"][n] = {"state": state, "hunks": states}
+    return rep
+
+
+def apply(pkg_dir, names=DEFAULT_NAMES):
+    """Apply each named patch all-or-nothing. Never raises for source problems; see the returned dict."""
+    names = _resolve(names)
+    rep = {"pkg_dir": str(pkg_dir), "sglang_version": _version(pkg_dir), "results": {}, "ok": True}
+    for n in names:
+        res = _apply_one(pkg_dir, n)
+        rep["results"][n] = res
+        if res["status"] not in ("applied", "already applied"):
+            rep["ok"] = False
+    return rep
+
+
+def _apply_one(pkg_dir, name):
+    if name not in PATCHES:
+        return {"status": "refused: unknown patch", "hunks": []}
+    hunks = PATCHES[name]
+    files = sorted({h["file"] for h in hunks})
+    texts = _load_texts(pkg_dir, files)
+    state, states = _patch_state(name, texts)
+    res = {"status": None, "state_before": state, "hunks": states, "files": {}}
+    if state == "applied":
+        res["status"] = "already applied"
+        return res
+    if state != "not_applied":
+        res["status"] = "refused: source mismatch"
+        res["reason"] = "%s: every hunk must match exactly once (no partial edit was made)" % state
+        return res
+
+    # Build every edited text in memory first.
+    new_texts = {rel: texts[rel][1] for rel in files}
+    for h in hunks:
+        t = new_texts[h["file"]]
+        if t.count(h["old"]) != 1:  # defensive: an earlier hunk of this patch must not disturb a later one
+            res["status"] = "refused: source mismatch"
+            res["reason"] = "hunk %d no longer unique after earlier hunks" % hunks.index(h)
+            return res
+        new_texts[h["file"]] = t.replace(h["old"], h["new"], 1)
+    for rel in files:
+        err = _compile_check(new_texts[rel], _path(pkg_dir, rel))
+        if err:
+            res["status"] = "refused: compile failed"
+            res["reason"] = "%s: %s (nothing written)" % (rel, err)
+            return res
+
+    # Backups of the pristine original (kept if one already exists from an earlier patch).
+    try:
+        for rel in files:
+            bak = _path(pkg_dir, rel) + BACKUP_SUFFIX
+            if not os.path.exists(bak):
+                _write_atomic_new(bak, texts[rel][0])
+                res["files"].setdefault(rel, {})["backup_created"] = True
+    except OSError as e:
+        res["status"] = "refused: backup failed"
+        res["reason"] = str(e)
+        return res
+
+    # Write, re-read, verify; on any failure restore every file of this patch to its pre-patch bytes.
+    written = []
+    try:
+        for rel in files:
+            p = _path(pkg_dir, rel)
+            data = new_texts[rel].encode("utf-8")
+            _write_atomic(p, data)
+            written.append(rel)
+            back = _read(p)
+            if back != data:
+                raise RuntimeError("%s: re-read bytes differ from written bytes" % rel)
+            err = _compile_check(back.decode("utf-8"), p)
+            if err:
+                raise RuntimeError("%s: compile after write failed: %s" % (rel, err))
+    except Exception as e:
+        rolled = []
+        for rel in written:
+            try:
+                _write_atomic(_path(pkg_dir, rel), texts[rel][0])
+                rolled.append(rel)
+            except OSError:
+                pass
+        for rel in files:
+            _drop_pyc(_path(pkg_dir, rel))
+        res["status"] = "refused: write failed (rolled back)"
+        res["reason"] = "%s: %s" % (type(e).__name__, e)
+        res["rolled_back"] = rolled
+        return res
+
+    for rel in files:
+        p = _path(pkg_dir, rel)
+        f = res["files"].setdefault(rel, {})
+        f["sha256_before"] = _sha(texts[rel][0])
+        f["sha256_after"] = _sha(_read(p))
+        f["pyc_removed"] = _drop_pyc(p)
+    res["status"] = "applied"
+    return res
+
+
+def _write_atomic_new(path, data):
+    """Write `data` to a path that must not exist yet (the backup)."""
+    tmp = path + ".e14tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(path):
+        os.remove(tmp)
+        raise OSError("backup appeared concurrently: %s" % path)
+    os.replace(tmp, path)
+    if _read(path) != data:
+        raise OSError("backup verify failed: %s" % path)
+
+
+def revert(pkg_dir):
+    """Restore every <file>.e14bak under pkg_dir byte-identical, remove the backup and stale pyc."""
+    rep = {"pkg_dir": str(pkg_dir), "restored": [], "errors": [], "ok": True}
+    baks = []
+    for root, _dirs, fnames in os.walk(str(pkg_dir)):
+        for fn in fnames:
+            if fn.endswith(BACKUP_SUFFIX):
+                baks.append(os.path.join(root, fn))
+    for bak in sorted(baks):
+        target = bak[: -len(BACKUP_SUFFIX)]
+        rel = os.path.relpath(target, str(pkg_dir)).replace(os.sep, "/")
+        try:
+            data = _read(bak)
+            _write_atomic(target, data)
+            if _read(target) != data:
+                raise OSError("restored bytes differ from backup")
+            os.remove(bak)
+            rep["restored"].append({"file": rel, "sha256": _sha(data), "pyc_removed": _drop_pyc(target)})
+        except OSError as e:
+            rep["errors"].append({"file": rel, "error": str(e)})
+            rep["ok"] = False
+    return rep
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) < 2 or argv[0] not in ("check", "apply", "revert"):
+        print("usage: e14_sglang_patches.py {check|apply|revert} <pkg_dir> [name ...]")
+        return 2
+    cmd, pkg = argv[0], argv[1]
+    names = argv[2:] or None
+    if cmd == "check":
+        rep = check(pkg, names)
+    elif cmd == "apply":
+        rep = apply(pkg, names or DEFAULT_NAMES)
+    else:
+        rep = revert(pkg)
+    print(json.dumps(rep, indent=1))
+    return 0 if rep.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
