@@ -35,9 +35,10 @@ class M(nn.Module):
         super().__init__()
         s.a = nn.Linear(2, 2); s.a.quant_method = UnquantizedLinearMethod()
         s.e = nn.Linear(2, 2); s.e.quant_method = AutoGPTQMoEMethod()
+        s.e2 = nn.Linear(2, 2); s.e2.quant_method = s.e.quant_method      # one quant method shared by two layers
 m = M()
 process_weights_after_loading(m, None, "cpu")
-print("OK", m.e.repacked, m.a.lin)
+print("OK", m.e.repacked, m.e2.repacked, m.a.lin, "instance_patched", "process_weights_after_loading" in vars(m.e.quant_method))
 ''')
 tdir = W / "trace"
 for f in tdir.glob("*") if tdir.exists() else []:
@@ -46,8 +47,10 @@ env = {**os.environ, "E13_VLLM_TRACE_DIR": str(tdir), "PYTHONPATH": os.pathsep.j
 p = subprocess.run([sys.executable, str(W / "run.py")], capture_output=True, text=True, env=env, timeout=120)
 recs = [json.loads(l) for f in tdir.glob("*.jsonl") for l in open(f, encoding="utf-8")]
 ev = [r["ev"] for r in recs]
-ok = (p.returncode == 0 and "OK True True" in p.stdout and ev.count("vpatched") == 1 and "vgc" in ev
-      and [r for r in recs if r["ev"] == "vpwal_end"][0]["moe_modules"] == 1
-      and [r for r in recs if r["ev"] == "vgc"][0]["module"] == "e")
+vg = [r for r in recs if r["ev"] == "vgc"]
+ok = (p.returncode == 0 and "OK True True True instance_patched False" in p.stdout and ev.count("vpatched") == 1
+      and [r for r in recs if r["ev"] == "vpwal_end"][0]["moe_modules"] == 2
+      and [r["module"] for r in vg] == ["e", "e2"]
+      and [r for r in recs if r["ev"] == "vpwal_start"][0]["wrapped_classes"] == ["AutoGPTQMoEMethod"])
 print("UNIT_VLLM_GC", json.dumps({"ok": ok, "events": ev, "stdout": p.stdout[-200:], "stderr": p.stderr[-400:]}))
 sys.exit(0 if ok else 1)

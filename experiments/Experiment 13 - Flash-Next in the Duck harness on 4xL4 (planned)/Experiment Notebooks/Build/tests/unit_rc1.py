@@ -96,6 +96,12 @@ class FusedMoE(nn.Module):
         s.w13_scales = nn.Parameter(torch.rand(4, 2, 16).to(torch.bfloat16), requires_grad=False)
         s.w13_qweight = nn.Parameter(torch.randint(-2**31, 2**31 - 1, (4, 1, 16), dtype=torch.int32), requires_grad=False)
         s.register_buffer("expert_map_cpu", torch.tensor([0, 1, 2, 3] + [-1] * 12, dtype=torch.int32))
+        import types as _t
+        s.dispatcher = _t.SimpleNamespace(local_expert_mapping=torch.tensor([-1] * 8 + [0, 1, 2, 3] + [-1] * 4, dtype=torch.int32))
+        s.reduce_results = False
+        w2 = torch.rand(4, 16, 3)
+        w2[2, 5, 1] = float("nan")
+        s.w2_scales = nn.Parameter(w2.transpose(1, 2), requires_grad=False)      # non-contiguous 3D [4, 3, 16]
         if SCEN == "badscale" and i == 2:
             with torch.no_grad():
                 s.w13_scales[3, 1, 5] = float("nan")
@@ -103,6 +109,10 @@ class FusedMoE(nn.Module):
         y = hidden_states * topk_output.topk_weights.sum(-1, keepdim=True)
         if s.i == 2 and SCEN in ("badscale", "clean_nan"):
             y = y * float("nan")
+        if SCEN == "inplace" and s.i in (1, 2):              # SGLang inplace=True: the output overwrites the input
+            with torch.no_grad():
+                hidden_states.copy_(y * (float("nan") if s.i == 2 else 3.0))
+            return hidden_states
         if s.i == 2 and SCEN == "mutate":
             with torch.no_grad():
                 s.w13_qweight.add_(1)
@@ -229,6 +239,32 @@ check("L2 non-Marlin switch: layer 2 -> apply_gptq_quant_layer(backend=gptq), la
       res.get("ar_l2") == ["wna16", "model.layers.2.mlp.experts", "gptq"] and res.get("ar_l3") == ["marlin", "model.layers.3.mlp.experts"], res)
 check("events: rc1_ple_patched + rc1_ar_patched + rc1_l2_no_marlin + ple_mode", {"rc1_ple_patched", "rc1_ar_patched", "rc1_l2_no_marlin",
                                                                                 "ple_mode"} <= set(ev), sorted(set(ev)))
+
+t2b = ((sc.get("after_postprocess") or {}).get("2") or {}).get("tensors") or {}
+w2 = t2b.get("w2_scales") or {}
+check("non-contiguous 3D scale scanned row by row: 1 NaN in expert row 2, contig False",
+      w2.get("nonfinite") == 1 and w2.get("bad_rows") == [2] and w2.get("contig") is False and w2.get("shape") == [4, 3, 16], w2)
+dm = t2b.get("dispatcher.local_expert_mapping") or {}
+check("scan includes the dispatcher's EP map", dm.get("min") == -1 and dm.get("max") == 3 and dm.get("shape") == [16], dm)
+if fx:
+    import torch
+    d0 = torch.load(tdir / [n for n in fx if "L2_fw0" in n][0], weights_only=False)
+    check("fixture expert map = the dispatcher map (rank 2 block 8..11), reduce_results recorded, hidden from pre hook",
+          d0["expert_map"].tolist() == [-1] * 8 + [0, 1, 2, 3] + [-1] * 4 and d0["meta"].get("reduce_results") is False
+          and d0.get("hidden_from") == "pre_hook", (d0.get("expert_map"), d0.get("meta"), d0.get("hidden_from")))
+
+p, r, res, tdir = run("inplace", {"E13_SYNC_RE": r"layers\.2\.mlp\.experts$"})
+nf = [x for x in r if x["ev"] == "nan_forward"]
+f0 = (nf[0]["first_nonfinite"] or [{}])[0] if nf else {}
+check("in-place MoE: input finiteness checked before the overwrite (inputs_bad False, origin layer 2)",
+      p.returncode == 0 and f0.get("module") == "model.layers.2.mlp.experts" and f0.get("inputs_bad") is False, f0)
+import torch
+fxs = {f.name: torch.load(f, weights_only=False) for f in tdir.glob("fixture_L1_fw0_*.pt")}
+d1 = next(iter(fxs.values()), None)
+check("in-place MoE: the fixture keeps the true input (output = 3 x input x sum(w), not equal to the stored hidden)",
+      d1 is not None and d1["hidden_from"] == "pre_hook" and not torch.allclose(d1["hidden"].float(), d1["out"].float()), d1 and d1["hidden_from"])
+check("E13_SYNC_RE on CPU: the failed sync is logged, never a hook error",
+      any(x["ev"] == "sync_error" for x in r) and not [x for x in r if x["ev"] == "hook_error"], [x["ev"] for x in r if "error" in x["ev"]][:5])
 
 p, r, res, tdir = run("mutate", {"E13_L2_NO_MARLIN": "0"})
 sc = {x["when"]: x["layers"] for x in r if x["ev"] == "rc1_scan"}

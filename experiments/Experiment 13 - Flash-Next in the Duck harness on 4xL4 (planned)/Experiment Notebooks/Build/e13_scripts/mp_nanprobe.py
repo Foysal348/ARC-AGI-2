@@ -90,6 +90,14 @@ def _install_nan_hooks(model):
     nfw = int(os.environ.get("E13_NAN_FORWARDS", "120"))
     big = float(os.environ.get("E13_NAN_ABSMAX", "1e4"))
     FL = (torch.float16, torch.bfloat16, torch.float32)
+    _sr = os.environ.get("E13_SYNC_RE")                # RC1 audit extra B: e.g. layers\.2\.mlp\.experts$
+    sync_re = _re.compile(_sr) if _sr else None
+
+    def _sync():
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:                        # never let the diagnostic break the hook
+            _log({"ev": "sync_error", "error": repr(e)[:200]})
     names = {id(m): n for n, m in model.named_modules()}
     layer_re = _re.compile(r"(^|\.)layers\.\d+$")
     st = {"fw": 0, "handles": [], "inp": {}, "errors": 0, "on": True}
@@ -126,10 +134,20 @@ def _install_nan_hooks(model):
             nm = names.get(id(mod), "?")
             if nm.endswith("mlp.experts") and len(cur.get("moe_in", {})) < 8:   # RC1: every MoE input, ints included
                 cur.setdefault("moe_in", {})[nm] = [_tdesc(t) for t in allt[:8]]
+            if nm.endswith("mlp.experts"):            # RC1 audit: input finiteness BEFORE an in-place MoE overwrites it
+                st.setdefault("inp_bad_pre", {})[id(mod)] = any(stats(x)[2] for x in st["inp"][id(mod)])
+                fxp = globals().get("_rc1_fixture_pre")
+                if fxp:
+                    fxp(nm, mod, args, kwargs, st["fw"])
+            if sync_re is not None and sync_re.search(nm):   # RC1 audit extra B: device-wide sync around the module
+                _sync()
 
     @guard
     def post(mod, args, kwargs, out):
+        if sync_re is not None and st["fw"] < nfw and sync_re.search(names.get(id(mod), "")):
+            _sync()
         inp = st["inp"].pop(id(mod), [])
+        ib_pre = st.get("inp_bad_pre", {}).pop(id(mod), None)
         if st["fw"] >= nfw:
             return
         name = names.get(id(mod), "?")
@@ -147,7 +165,7 @@ def _install_nan_hooks(model):
                     if len(cur["nonfinite"]) < 8:
                         ib = None
                         if not cur["nonfinite"]:                 # the first one: origin or propagated?
-                            ib = any(stats(x)[2] for x in inp)
+                            ib = ib_pre if ib_pre is not None else any(stats(x)[2] for x in inp)
                         cur["nonfinite"].append({"module": name, "type": type(mod).__name__, "tensor_idx": i,
                                                  "shape": list(t.shape), "dtype": str(t.dtype).replace("torch.", ""),
                                                  "inputs_bad": ib, "prev_clean_module": cur["last_ok"]})
