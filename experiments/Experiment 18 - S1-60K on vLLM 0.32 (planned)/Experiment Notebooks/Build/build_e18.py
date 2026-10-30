@@ -25,7 +25,8 @@ E10 = NBDIR.parents[1] / "Experiment 10 - Q27-XHIGH Poetiq Code-Verify attempt_2
 SRC = E10 / "Q27-XHIGH-v1_4_4_E10_S1_60K_POETIQ_FIX_ORDER2.ipynb"
 SRC_SHA = "ed530071"
 OUT = NBDIR / "Q27-XHIGH-E18_S1_60K_VLLM032_S20_R2.ipynb"   # rev 2 (audits A + B + smoke v1); v1 = ..._S20.ipynb (07af34e3)
-PUSHED: set = {"07af34e3b4e2aded240d0eecd385ff0b3340623b463bb8002e68a539adb55bf1"}   # foysalemonshanto v1 (2026-10-27, E18SMOKE)
+PUSHED: set = {"07af34e3b4e2aded240d0eecd385ff0b3340623b463bb8002e68a539adb55bf1",   # foysalemonshanto v1 (2026-10-27, E18SMOKE)
+              "59b53de94683ddedd57d68865aa76a01288650bb14e4d0ff5548fc3f632cd7eb"}  # foysalemonshanto v3 (2026-10-31, R2 SMOKE30)
 WHEELHOUSE_SLUG = "foysalemonshanto/vllm-0-32-0-cu13-wheelhouse"
 # E18SMOKE: the 4 S1COMMIT4 tasks + the first 16 other tasks of PROXY56 (20 tasks -> 20 concurrent units at 1 expert)
 SMOKE_TASKS = ["1818057f", "2ba387bc", "bf45cf4b", "58490d8a",
