@@ -22,7 +22,7 @@ E23 = HERE.parents[1]
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 P60532 = (E23 / "patches" / "pr60532.diff").read_text(encoding="utf-8").replace("\r\n", "\n")
 
-MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3f · __VARIANT__
+MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3g · __VARIANT__
 
 The user's six experiments, each with only its own test sequence (DESIGN.md), at the production context
 (thinking up to 120k: `--max-model-len 131072`, bands 2k / 8k / 40k / 90k / 120k):
@@ -47,7 +47,7 @@ PART = os.environ.get("Q27X_E23_PART", "__PART__").upper()        # SMOKE: A (Me
 assert MODE in ("SMOKE", "FULL") and PART in ("A", "B", "ALL"), (MODE, PART)
 RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true", "yes"}
 FAKE = os.environ.get("E23_FAKE_SERVER")                          # local CPU harness only
-BUDGET = int(os.environ.get("E23_BUDGET_SEC") or {"SMOKE": {"A": 135, "B": 215, "ALL": 345}[PART] * 60, "FULL": 690 * 60}[MODE])
+BUDGET = int(os.environ.get("E23_BUDGET_SEC") or {"SMOKE": {"A": 105, "B": 135, "ALL": 240}[PART] * 60, "FULL": 690 * 60}[MODE])
 HARD_STOP = T_START + BUDGET
 MAX_LEN = 131072                                                  # user 2026-10-29: thinking up to 120k
 OUT = Path(os.environ.get("E23_OUT", "/kaggle/working/e23"))
@@ -56,7 +56,7 @@ LOGS = OUT / "logs"
 LOGS.mkdir(exist_ok=True)
 TMP = Path(os.environ.get("E23_TMP", "/tmp"))
 INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
-R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3f",
+R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3g",
      "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "setup": {}, "sections": {}, "errors": [], "order": []}
 _SAVE_LOCK = threading.Lock()
 
@@ -838,8 +838,8 @@ def _tp1_body(ss):
     if all(not r.get("error") and r.get("tokens") and not L.degenerate(r.get("text")) for r in g90):
         ROWS["merlin_90k"] = g90                                     # rev 3e: clean references only
     o["greedy_90k"] = {"garbage": [L.degenerate(r["text"]) for r in g90], "errors": [r["error"] for r in g90]}
-    o["steady"] = levels(port, "40k", [2, 4] if SM else [2, 3, 4], server=s, **TP1_KW)
-    o["steady"].update(levels(port, "90k", [1, 2] if SM else [1, 2, 3, 4], server=s, **TP1_KW))
+    o["steady"] = levels(port, "40k", [2] if SM else [2, 3, 4], server=s, **TP1_KW)
+    o["steady"].update(levels(port, "90k", [] if SM else [1, 2, 3, 4], server=s, **TP1_KW))   # SMOKE: 90k = the greedy row
     o["steady"].update(levels(port, "120k", [1] if SM else [1, 2], server=s, **TP1_KW))
     if s.alive():                    # Merlin's fork budgets prompt-logprob memory; still last (nothing measured after it)
         o["teacher_forced"] = tforced(port, key="merlin")
@@ -907,8 +907,8 @@ def s1_tp4():
         g90 = L.greedy(port, [PROMPTS["90k"][4]], n_tok=NTOK, timeout=max(300, min(1800, left() / 6)))
         o["greedy_90k_vs_tp1"] = L.compare(ROWS.get("merlin_90k"), g90) if ROWS.get("merlin_90k") else \
             {"status": "INCONCLUSIVE_NO_ORACLE"}
-        o["steady"] = levels(port, "40k", [8, 16] if SM else [8, 16, 24], server=s)
-        o["steady"].update(levels(port, "90k", [8] if SM else [8, 16], server=s))
+        o["steady"] = levels(port, "40k", [8] if SM else [8, 16, 24], server=s)
+        o["steady"].update(levels(port, "90k", [] if SM else [8, 16], server=s))
         o["steady"].update(levels(port, "120k", [8] if SM else [8, 12], server=s))
         if s.alive():
             o["teacher_forced_vs_tp1"] = tforced(port, ref="merlin")
@@ -1230,7 +1230,7 @@ def s1_pp4(eager):
 
 def pp4():
     rec = step("1_tp1x4_pp4", "e_pp4_int4_eager", 15 if SM else 25, s1_pp4(True))
-    if rec.get("status") == "DONE":
+    if rec.get("status") == "DONE" and not SM:                  # rev 3g: compiled PP4 only in FULL
         step("1_tp1x4_pp4", "f_pp4_int4_compiled", 15 if SM else 25, s1_pp4(False))
     else:
         R["sections"].setdefault("1_tp1x4_pp4", {})["f_pp4_int4_compiled"] = {"status": "SKIPPED_EAGER_NOT_PROVEN",
@@ -1356,12 +1356,12 @@ PREF = start_prefetch() if not ABORT["why"] else []
 if DO_A:
     if not ABORT["why"] and left() > (40 if SM else 50) * 60 + 300:     # rev 3e: never after the P5 release abort
         P4_FUT = CF.ThreadPoolExecutor(1).submit(s4_thread)
-    step("1_tp1x4_pp4", "a_merlin_tp1_gpu0", 40 if SM else 50, s1_tp1)
+    step("1_tp1x4_pp4", "a_merlin_tp1_gpu0", 30 if SM else 50, s1_tp1)
     join_p4()
     if not SM:
         step("1_tp1x4_pp4", "b_merlin_tp1_x2", 25, s1_rep(2))
         step("1_tp1x4_pp4", "c_merlin_tp1_x4", 25, s1_rep(4))
-    step("1_tp1x4_pp4", "d_merlin_tp4", 40 if SM else 62, s1_tp4)
+    step("1_tp1x4_pp4", "d_merlin_tp4", 30 if SM else 62, s1_tp4)
     if SM:
         step("1_tp1x4_pp4", "c_merlin_tp1_x4", 20, s1_rep(4, bands=("40k",)))
 if DO_B:
@@ -1372,19 +1372,20 @@ if DO_B:
     if not SM:
         step("4_sm89_fp8_gemm", "int4_mtp3_s20_control", 35, s4_int4)
         step("6_mtp_depth", "mtp1", 30, s6(1))
-    step("6_mtp_depth", "mtp3_eq_G0_piecewise", 20 if SM else 62, s6(3, profile=True))
+    step("6_mtp_depth", "mtp3_eq_G0_piecewise", 18 if SM else 62, s6(3, profile=True))
     if not SM:
         step("3_full_graph", "G1_triton_full_and_piecewise", 25, s3("G1", "TRITON_ATTN", "FULL_AND_PIECEWISE"))
         step("3_full_graph", "G2_triton_full_decode_only", 25, s3("G2", "TRITON_ATTN", "FULL_DECODE_ONLY"))
-    step("3_full_graph", "G3_flashinfer_pr60532", 20 if SM else 25, s3("G3", "FLASHINFER", "FULL_AND_PIECEWISE", patch=True))
+    step("3_full_graph", "G3_flashinfer_pr60532", 18 if SM else 25, s3("G3", "FLASHINFER", "FULL_AND_PIECEWISE", patch=True))
     # rev 3e: BF16 KV = the teacher-forced reference; FP8 KV (production) and NVFP4 KV are measured against it
     step("5_nvfp4_kv", "tf_bf16kv_reference", 11 if SM else 15, s5_tf("auto", key="bf16kv_tf"))
-    step("5_nvfp4_kv", "tf_fp8kv_vs_bf16", 11 if SM else 15, s5_tf("fp8_e4m3", ref="bf16kv_tf"))
-    step("5_nvfp4_kv", "nvfp4_target_only", 25 if SM else 30, s5(0))
+    if not SM:                     # rev 3g: the FP8 calibration only feeds the FULL NVFP4 gate
+        step("5_nvfp4_kv", "tf_fp8kv_vs_bf16", 15, s5_tf("fp8_e4m3", ref="bf16kv_tf"))
+    step("5_nvfp4_kv", "nvfp4_target_only", 22 if SM else 30, s5(0))
     step("5_nvfp4_kv", "tf_nvfp4_vs_bf16", 11 if SM else 15, s5_tf("nvfp4", ref="bf16kv_tf"))
     if not SM:
         step("5_nvfp4_kv", "nvfp4_mtp3", 75, s5(3))
-    if (SM or os.environ.get("E23_EAGLE_FULL") == "1") and left() >= (11 + 40 + 30) * 60:      # rev 3e: EAGLE window 40 min, PP4 eager 30 min after it
+    if os.environ.get("E23_EAGLE_FULL") == "1" and left() >= (11 + 40 + 30) * 60:   # rev 3g: not in the 8 h SMOKE      # rev 3e: EAGLE window 40 min, PP4 eager 30 min after it
         step("7_eagle4", "fp8_kvauto_target_only_oracle", 11, s7_kvauto_oracle)
         step("7_eagle4", "eagle4_fp8_tp4", 40, s7_eagle)
     pp4()
@@ -1500,12 +1501,10 @@ for variant, (mode, part) in VARIANTS.items():
         "enable_internet": False, "keywords": [],
         "dataset_sources": ["foysalemonshanto/q27-e23-sm89-kernels", "foysalemonshanto/vllm-0-32-0-cu13-wheelhouse"],
         "kernel_sources": [], "competition_sources": ["arc-prize-2026-arc-agi-2"],
-        "model_sources": ["foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/PyTorch/hf-fp8/1",
-                          "foysalemonshanto/qwen3-8-27b-int4-redhat/PyTorch/w4a16-g128/1",
-                          "foysalemonshanto/qwen3-8-27b-w4a16-merlin/Transformers/default/1",
-                          "foysalemonshanto/e23-merlin-env/Other/v1/1",
-                          "foysalemonshanto/e23-eagle4-env/Other/default/1",
-                          "foysalemonshanto/qwen3-8-27b-eagle4/Transformers/default/1"],
+        "model_sources": ["foysalemonshanto/qwen3-8-27b-fp8-repacked-v1/PyTorch/hf-fp8/1"]
+                         + (["foysalemonshanto/qwen3-8-27b-int4-redhat/PyTorch/w4a16-g128/1"] if part in ("B", "ALL") else [])
+                         + (["foysalemonshanto/qwen3-8-27b-w4a16-merlin/Transformers/default/1",
+                             "foysalemonshanto/e23-merlin-env/Other/v1/1"] if part in ("A", "ALL") else []),
         "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
         "machine_shape": "NvidiaL4"}, indent=2), encoding="utf-8", newline="\n")
 old = HERE.parent / "Q27-XHIGH-E23_SIX_LEVERS.ipynb"
