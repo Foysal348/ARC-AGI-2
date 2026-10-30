@@ -26,6 +26,15 @@ Each claim below was checked against the code, the raw traces and the bench sour
 | 8 | The FULL oracle checks 128 generated tokens. Before any production-accuracy claim, a separate long-context gate is needed: 90k-120k context, long MTP decode, forced rejection and multi-turn state. This is not a blocker for the exploratory FULL. |
 | 9 | Health probe: Kaggle's nvidia-smi has no `reset_status.reset_required`. Treat the CUDA probe as the source and record the field as unsupported, not null. |
 
+## Additions from the third GPT audit (verified)
+
+| # | Sev | Where | Problem (verified) | Fix |
+|---|---|---|---|---|
+| 10 | HIGH | build s1_tp4, lines 910-912 | The Merlin TP4 FULL levels are 40k [8, 16, 24], 90k [8, 16] and 120k [8, 12]. This does not cover the planned 16/20/24 sweep at long context. | 40k [8, 16, 20, 24]; 90k [8, 12, 16, 20]; 120k [8, 12, 16]. Keep the existing KV-bound stop (the fit is recorded). |
+| 11 | MED | build line 1391 | `pp4()` runs before the A/A fill. A PP4 fault taints only its own arm, but later rows still run after a crash in the same session. | Move PP4 to the very end of FULL, after the A/A fill, or drop it (decision 6). |
+| 12 | note | audit 3, item 3 | Audit 3 calls `froggeric-qwen-v22.5.jinja` the production template. It is Merlin's template. Production renders with the model tokenizer's own chat template (Experiment 1 make_q27x.py:343). | Fix #4 stands as written: use the production tokenizer template, not froggeric. |
+| 13 | decision | audit 3 verdict | Audit 3 asks for a targeted GPU validation of the fixes (Merlin sweep, corrected NVFP4 gate, graph proof) before committing the 690 min FULL. | User decision: one targeted run first, or the FULL directly after the CPU kit. |
+
 ## Order after the fixes (both audits agree)
 1. Apply fixes 1-5 and 9; add gate tests; then one parallel Kaggle CPU kit (regression + preflight).
 2. FULL exploratory run on hosen42 (user go needed), in this order:
