@@ -29,14 +29,15 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 E12DIR = Path(r"D:/ARC AGI 2/experiments/Experiment 12 - Duck REPL agent for ARC-AGI-2 (planned)/Experiment Notebooks")
 EVAL30 = "--eval30" in sys.argv
-LOADPROBE = "--loadprobe" in sys.argv
+NANPROBE = "--nanprobe" in sys.argv          # 2026-10-30: LOADPROBE + gc fix + NaN locator + KV lever + vLLM registry check
+LOADPROBE = "--loadprobe" in sys.argv or NANPROBE
 assert not (EVAL30 and LOADPROBE)
 BASE = E12DIR / ("Q27-XHIGH-E12_DUCK_REPL_SGLANG_EVAL30.ipynb" if EVAL30 else "Q27-XHIGH-E12_DUCK_REPL_SGLANG_SMOKE1.ipynb")
 BASE_SHA = ("b65fb9dcc80b3652dc18b37d43355743311e2b55db8308ebc766d9d0b23de456" if EVAL30
             else "0fea4d0cb50fe85ec76a4ac27d6de32997aa580b0f5a2d7b36400c0be645c186")
 OUT_NB = HERE.parent / f"Q27-XHIGH-E13_DUCK_FLASHNEXT_{'EVAL30' if EVAL30 else 'SMOKE1'}.ipynb"
 if LOADPROBE:
-    OUT_NB = HERE.parent / "Q27-XHIGH-E13_FLASHNEXT_LOADPROBE.ipynb"
+    OUT_NB = HERE.parent / ("Q27-XHIGH-E13_FLASHNEXT_NANPROBE.ipynb" if NANPROBE else "Q27-XHIGH-E13_FLASHNEXT_LOADPROBE.ipynb")
 # never overwrite a notebook that ran on Kaggle (memory: never-rebuild-run-notebooks); a rebuild goes to *_REBUILD.ipynb
 PUSHED = {"74411bc070e9de40df066516b4096f5549ee62251d51432ca5f04a8f4feb3b6d",   # foysalemonshanto v1 (2026-10-26, SMOKE1 rev 6b)
           "107aa18227ffbc58cc725bb4dc13020a47848dcc8e5ef9f718094d2156ebf5e0"}   # foysalemonshanto v1 (2026-10-27, LOADPROBE)
@@ -44,6 +45,8 @@ if OUT_NB.exists() and hashlib.sha256(OUT_NB.read_bytes()).hexdigest() in PUSHED
     OUT_NB = OUT_NB.with_name(OUT_NB.stem + "_REBUILD.ipynb")
 TOPK_SCRIPT = (HERE / "e13_scripts" / "mp_topk.py").read_text(encoding="utf-8")
 MEMTRACE_SCRIPT = (HERE / "e13_scripts" / "mp_memtrace.py").read_text(encoding="utf-8").replace("\r\n", "\n")
+if NANPROBE:          # the gc fix + NaN locator extend the same sitecustomize (appended; rebinds _QMProxy and _patch)
+    MEMTRACE_SCRIPT += (HERE / "e13_scripts" / "mp_nanprobe.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 PROBE_SRC = r'''
 # ==================================================================== E13 LOADPROBE (user 2026-10-27)
 # rev 6b OOMed in the Marlin MoE repack (>= 20.86 GiB/rank) where E3 (0.5.19, FP8 PLE) used 19.06 GB. Two launches, the same
@@ -126,6 +129,18 @@ def e13_memtrace_summary(d):
                                   "alloc_before_gib": g((pe.get("before") or {}).get("alloc"))}
         big = sorted((r for r in recs if r.get("ev") == "pwal"), key=lambda r: -abs(r.get("delta") or 0))[:5]
         s["largest_repack_deltas"] = [{"module": r.get("module"), "delta_mib": round((r.get("delta") or 0) / 2 ** 20, 1)} for r in big]
+        gcs = [r for r in recs if r.get("ev") == "gc_collect"]          # NANPROBE: the gc fix at work
+        s["gc"] = {"collections": len(gcs), "freed_gib": g(sum(max(0, (r.get("alloc_before") or 0) - (r.get("alloc_after") or 0))
+                                                                  for r in gcs))}
+        nf = [r for r in recs if r.get("ev") == "nan_forward"]           # NANPROBE: per-forward first bad modules
+        if nf or "nan_hooks_installed" in ev:
+            fb = next((r for r in nf if r.get("first_bad")), None)
+            s["nan"] = {"hooks": ev.get("nan_hooks_installed"), "forwards_logged": len(nf),
+                        "forwards_with_bad": sum(1 for r in nf if r.get("first_bad")),
+                        "first_bad_forward": ({"fw": fb.get("fw"), "input_shapes": fb.get("input_shapes"),
+                                               "first_bad": (fb.get("first_bad") or [])[:6]} if fb else None),
+                        "first_forward_layer_absmax": (nf[0].get("layer_absmax") if nf else None),
+                        "hooks_error": (ev.get("nan_hooks_error") or {}).get("error")}
         out[f.stem] = s
     return out
 
@@ -142,7 +157,14 @@ def e13_probe_arm(tag, model_dir, vpy, hookdir, budget):
     rec["gpu_free_before"] = _e11_gpu_free(180)
     tdir = OUT / "e13_memtrace" / tag
     env = dict(_E13_ENV); env["PYTHONPATH"] = str(hookdir); env["E13_MEMTRACE_DIR"] = str(tdir)
-    rec["flags"] = e13_flags()
+    cfg = (globals().get("E13_ARM_CFG") or {}).get(tag) or {}          # NANPROBE: per-arm env / flag changes
+    env.update(cfg.get("env") or {})
+    fl = e13_flags()
+    for k, v in (cfg.get("set") or {}).items():
+        i = fl.index(k)
+        fl[i + 1] = v
+    rec["flags"] = fl + list(cfg.get("add") or [])
+    rec["arm_cfg"] = cfg
     launch = [str(vpy), "-m", "sglang.launch_server"] if not E11_HARNESS else [sys.executable, os.environ["E11_FAKE_SERVER"]]
     E11_SERVER = E11Server(launch + rec["flags"], env, f"e13_{tag}")
     E11_SERVER.start()
@@ -182,6 +204,34 @@ def e13_probe_arm(tag, model_dir, vpy, hookdir, budget):
     return rec
 
 
+def e13_vllm_registry():
+    """NANPROBE: does stock vLLM 0.32 (our wheelhouse venv, the E23 install) list Flash-Next's architecture? An import
+    check in that venv (no server, no GPU work): the supported-architecture list and the model config's architectures."""
+    arch = (json.loads((Path(E13_INTEL_DIR) / "config.json").read_text()).get("architectures") or [None])[0]
+    _whd = Path("/kaggle/input/datasets/foysalemonshanto/vllm-0-32-0-cu13-wheelhouse")   # the dataset only (model mounts are slow)
+    wh = sorted(_whd.rglob("install_wheelhouse.py")) if _whd.is_dir() else []
+    if not wh or E11_HARNESS:
+        return {"skipped": "vllm 0.32 wheelhouse not attached" if not wh else "harness", "arch": arch}
+    t = time.perf_counter()
+    r = subprocess.run([sys.executable, str(wh[0]), "/tmp/vllm-venv"], capture_output=True, text=True, timeout=2400)
+    kv = dict(l.split("=", 1) for l in (r.stdout or "").splitlines() if l.startswith(("VENV_PYTHON=", "CUDA_HOME=")))
+    out = {"arch": arch, "install_rc": r.returncode, "install_sec": round(time.perf_counter() - t)}
+    if r.returncode or "VENV_PYTHON" not in kv:
+        out["install_tail"] = ((r.stdout or "") + (r.stderr or ""))[-1500:]
+        return out
+    code = ("import json, vllm\nfrom vllm.model_executor.models.registry import ModelRegistry\n"
+            "s = sorted(ModelRegistry.get_supported_archs())\n"
+            f"a = {arch!r}\n"
+            "print('E13VLLM ' + json.dumps({'vllm': vllm.__version__, 'supported': a in s, "
+            "'qwen_archs': [x for x in s if 'Qwen' in x]}))\n")
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "LD_PRELOAD")}
+    env.update(CUDA_HOME=kv.get("CUDA_HOME", ""), VLLM_NO_USAGE_STATS="1")
+    c = subprocess.run([kv["VENV_PYTHON"], "-c", code], capture_output=True, text=True, timeout=900, env=env)
+    m = re.search(r"^E13VLLM (.*)$", c.stdout or "", re.M)
+    out.update(json.loads(m.group(1)) if m else {"check_rc": c.returncode, "check_tail": ((c.stdout or "") + (c.stderr or ""))[-1500:]})
+    return out
+
+
 _E13_ENV = None
 _t_engine = time.perf_counter()
 E13_PROBE = {"arms": [], "budget_hard_stop_in_sec": round(HARD_STOP - time.perf_counter())}
@@ -201,13 +251,18 @@ else:
         print("E13 top-k test:", json.dumps(_info["topk"], default=str)[:1500], flush=True)
         _hook = Path(os.environ.get("E13_HOOK_DIR", "/tmp/e13_memtrace_hook")); _hook.mkdir(parents=True, exist_ok=True)
         (_hook / "sitecustomize.py").write_text(E13_MEMTRACE_SRC, encoding="utf-8")
+        if globals().get("E13_VLLM_CHECK"):
+            _info["stage"] = "vllm_registry"
+            E13_PROBE["vllm_registry"] = e13_vllm_registry()
+            print("E13 vLLM 0.32 registry:", json.dumps(E13_PROBE["vllm_registry"], default=str)[:1500], flush=True)
+            (OUT / "e13_loadprobe.json").write_text(json.dumps(E13_PROBE, indent=1, default=str), encoding="utf-8")
         for _tag in E13_PROBE_ARMS:
             _room = HARD_STOP - time.perf_counter() - 5 * 60
             if _room < 8 * 60:
                 E13_PROBE["arms"].append({"tag": _tag, "outcome": f"skipped: {round(_room)} s left"}); continue
             _info["stage"] = f"probe {_tag}"
             try:
-                if _tag == "bf16ple":
+                if _tag == "bf16ple" or ((globals().get("E13_ARM_CFG") or {}).get(_tag) or {}).get("model") == "intel":
                     _md = E13_INTEL_DIR
                 else:
                     _md, E13_PROBE["fp8ple_merge"] = e13_fp8ple_dir()
@@ -307,6 +362,22 @@ _e13_ov += sorted(_e13_ovroot.glob("*/*/*")) if _e13_ovroot.is_dir() else []
 E13_OVERLAY_DIR = next((d for d in _e13_ov if (d / "config.json").is_file()), _e13_ov[0])
 E13_OVERLAY_SHARDS = {"model-00001-of-00017.safetensors": 2899311784, "model-00003-of-00017.safetensors": 5370548192, "model-00004-of-00017.safetensors": 5370910416, "model-00005-of-00017.safetensors": 5370140704, "model-00006-of-00017.safetensors": 5370205184, "model-00007-of-00017.safetensors": 5370927288, "model-00008-of-00017.safetensors": 5344445352, "model-00009-of-00017.safetensors": 5370355648, "model-00010-of-00017.safetensors": 5370927288, "model-00011-of-00017.safetensors": 5324173744, "model-00012-of-00017.safetensors": 5370438520, "model-00013-of-00017.safetensors": 5370927288, "model-00014-of-00017.safetensors": 5342689856, "model-00015-of-00017.safetensors": 5050474736, "model-00017-of-00017.safetensors": 1284526608, "model-plefp8-00000.safetensors": 5200027199, "model-plefp8-00001.safetensors": 5200027202, "model-plefp8-00002.safetensors": 5200027198, "model-plefp8-00003.safetensors": 5200027189, "model-plefp8-00004.safetensors": 5200027190, "model-plefp8-00005.safetensors": 5200027190, "model-plefp8-00006.safetensors": 5200027190, "model-plefp8-00007.safetensors": 5200027190, "model-plefp8-00008.safetensors": 5200027190, "model-plefp8-00009.safetensors": 4400023163}                  # E3 v4.2.1 pinned sizes: 15 Intel main shards + 10 FP8 PLE shards
 CONFIG["e13"]["loadprobe"] = {"arms": list(E13_PROBE_ARMS), "intel": str(E13_INTEL_DIR), "overlay": str(E13_OVERLAY_DIR)}
+'''
+if NANPROBE:
+    c1 += r'''
+# ---- E13 NANPROBE (user 2026-10-30): the two Flash-Next blockers on 4xL4 in one session.
+# Arm 1 nan_eager: BF16 PLE, gc fix, eager (no CUDA graphs) + forward hooks = the first module with NaN / Inf per rank.
+# Arm 2 kv_lean: BF16 PLE, gc fix, graphs on, mamba cache 4 x 2 slots (was 4 x 5) and mem fraction 0.95 = the KV lever.
+# FP8 PLE is not an arm: LOADPROBE showed it changes host memory only (GPU tensors byte-identical, KV unchanged).
+# Plus a vLLM 0.32 registry check (our wheelhouse venv): is Flash-Next's architecture supported there?
+E13_PROBE_ARMS = ("nan_eager", "kv_lean")
+E13_ARM_CFG = {
+    "nan_eager": {"model": "intel", "env": {"E13_NANPROBE": "1", "E13_NAN_FORWARDS": "120", "E13_GC_MIB": "256"},
+                  "add": ["--disable-cuda-graph"]},
+    "kv_lean": {"model": "intel", "env": {"E13_GC_MIB": "256"},
+                "set": {"--max-mamba-cache-size": str(SGL_SERVER_MAX_RUNNING * 2), "--mem-fraction-static": "0.95"}}}
+E13_VLLM_CHECK = True
+CONFIG["e13"]["nanprobe"] = {"arms": list(E13_PROBE_ARMS), "cfg": E13_ARM_CFG, "vllm_check": E13_VLLM_CHECK}
 '''
 
 # ---------------------------------------------------------------- CELL 5: Flash-Next engine (Duck-only)
@@ -716,9 +787,14 @@ if LOADPROBE:   # the probe replaces the bring-up block (from `_E13_ENV = None` 
     _cut = C5.index("\n_E13_ENV = None\n_t_engine = time.perf_counter()")
     C5 = C5[:_cut] + "\n" + PROBE_SRC.replace("MEMTRACE_B64", __import__("base64").b64encode(MEMTRACE_SCRIPT.encode()).decode())
 
-nb["cells"][0]["source"] = ("# E13 LOADPROBE — Qwen3.8-Flash-Next load-only memory probe on SGLang 0.5.21 (4xL4)\n"
-                            "Two launches with the rev 6b flags and a GPU memory trace: BF16 PLE (Franzen's package, rev 6b exactly) "
-                            "and FP8 PLE (the E3 v4.2.1 merge). No speed stage, no Duck; the submission is CELL 0's fallback.\n\n"
+nb["cells"][0]["source"] = ((("# E13 NANPROBE — Qwen3.8-Flash-Next on SGLang 0.5.21 (4xL4): output correctness + KV capacity\n"
+                              "This version: the LOADPROBE notebook plus the gc fix (repack OOM), an eager launch with forward "
+                              "hooks that name the first module producing NaN / Inf ('!!!!' output), a KV-lever launch (mamba "
+                              "cache 4x2 slots, mem 0.95) and a vLLM 0.32 registry check for Flash-Next's architecture. "
+                              "No Duck; the submission is CELL 0's fallback.\n\n") if NANPROBE else
+                             ("# E13 LOADPROBE — Qwen3.8-Flash-Next load-only memory probe on SGLang 0.5.21 (4xL4)\n"
+                              "Two launches with the rev 6b flags and a GPU memory trace: BF16 PLE (Franzen's package, rev 6b exactly) "
+                              "and FP8 PLE (the E3 v4.2.1 merge). No speed stage, no Duck; the submission is CELL 0's fallback.\n\n"))
                             if LOADPROBE else "") + ("# E13 — Duck REPL agent for ARC-AGI-2 on SGLang 0.5.21 + Qwen3.8-Flash-Next (Intel W4A16, BF16 PLE) "
                             f"({'EVAL30' if EVAL30 else 'SMOKE1'})\n"
                             "The E12 Duck notebook unchanged except the engine (CELL 5) and its inputs/limits in CELL 1. "
