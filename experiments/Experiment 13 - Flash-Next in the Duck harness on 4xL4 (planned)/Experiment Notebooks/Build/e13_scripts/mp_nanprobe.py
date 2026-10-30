@@ -49,16 +49,39 @@ class _QMProxyGC(_QMBase):
 _QMProxy = _QMProxyGC
 
 
+_STRUCT_FIELDS = ("hidden_states", "hidden_states_scale", "topk_output", "topk_weights", "topk_ids", "router_logits")
+
+
 def _tensors(o, depth=0):
     import torch
     if isinstance(o, torch.Tensor):
         yield o
-    elif depth < 3 and isinstance(o, (list, tuple)):
+    elif depth < 4 and isinstance(o, (list, tuple)):
         for x in o:
             yield from _tensors(x, depth + 1)
-    elif depth < 3 and isinstance(o, dict):
+    elif depth < 4 and isinstance(o, dict):
         for x in o.values():
             yield from _tensors(x, depth + 1)
+    elif depth < 4 and o is not None and not isinstance(o, (int, float, str, bool)):
+        for f in _STRUCT_FIELDS:                  # RC1 (GPT audit 1, fix A): structured MoE dispatch objects
+            x = getattr(o, f, None)
+            if x is not None:
+                yield from _tensors(x, depth + 1)
+
+
+def _tdesc(t):
+    """RC1: a tensor's dtype / shape / stride / contiguity and [min, max] (+ non-finite flag for floats, -1 count for ints)."""
+    import torch
+    d = {"dtype": str(t.dtype).replace("torch.", ""), "shape": list(t.shape), "stride": list(t.stride()),
+         "contig": t.is_contiguous()}
+    if t.numel() and t.dtype in (torch.float16, torch.bfloat16, torch.float32):
+        mn, mx = torch.aminmax(t.detach())
+        mn, mx = torch.stack([mn.float(), mx.float()]).tolist()
+        d.update(min=mn, max=mx, nonfinite=not (_math.isfinite(mn) and _math.isfinite(mx)))
+    elif t.numel() and not t.is_floating_point() and not t.is_complex() and t.dtype != torch.bool:
+        mn, mx = torch.aminmax(t.detach())
+        d.update(min=int(mn.item()), max=int(mx.item()), neg1=int((t == -1).sum().item()))
+    return d
 
 
 def _install_nan_hooks(model):
@@ -98,7 +121,11 @@ def _install_nan_hooks(model):
     @guard
     def pre(mod, args, kwargs):
         if st["fw"] < nfw:
-            st["inp"][id(mod)] = [t for t in list(_tensors(args)) + list(_tensors(kwargs)) if t.dtype in FL][:6]
+            allt = list(_tensors(args)) + list(_tensors(kwargs))
+            st["inp"][id(mod)] = [t for t in allt if t.dtype in FL][:6]
+            nm = names.get(id(mod), "?")
+            if nm.endswith("mlp.experts") and len(cur.get("moe_in", {})) < 8:   # RC1: every MoE input, ints included
+                cur.setdefault("moe_in", {})[nm] = [_tdesc(t) for t in allt[:8]]
 
     @guard
     def post(mod, args, kwargs, out):
@@ -135,6 +162,9 @@ def _install_nan_hooks(model):
                                        "shape": list(t.shape)})
         if not bad_here:
             cur["last_ok"] = name
+        fx = globals().get("_rc1_fixture")             # RC1: MoE input / routing / output fixture (Marlin vs reference)
+        if fx and name.endswith("mlp.experts"):
+            fx(name, mod, args, kwargs, out, st["fw"])
 
     def batch_info(args, kwargs):
         info = {"input_shapes": [list(t.shape) for t in list(_tensors(args))[:2]]}
@@ -173,8 +203,19 @@ def _install_nan_hooks(model):
         rec = {"ev": "nan_forward", "fw": st["fw"], **bi, "wall_s": round(__import__("time").time() - cur["t0"], 3),
                "logits": logits_stats(out), "first_nonfinite": cur["nonfinite"], "first_big": cur["big"],
                "const": cur["const"], "indexer": cur["indexer"], "layers": cur["layers"]}
+        if cur.get("moe_in"):
+            rec["moe_in"] = cur["moe_in"]
+        pm = globals().get("_ple_mode")                # RC1: the PLE mode this forward ran under (flag file)
+        if pm:
+            rec["ple_mode"] = pm()
         _log(rec)
         st["fw"] += 1
+        hk = globals().get("_rc1_after_forward")       # RC1: expert weight re-scan after forward 0
+        if hk:
+            try:
+                hk(model, st["fw"])
+            except Exception as e:
+                _log({"ev": "hook_error", "error": "rc1_after_forward " + repr(e)[:280]})
         if st["fw"] >= nfw:
             for h in st["handles"]:
                 h.remove()
@@ -186,8 +227,10 @@ def _install_nan_hooks(model):
             _log({"ev": "nan_hooks_removed", "forwards_checked": st["fw"], "hook_errors": st["errors"]})
         return out
 
+    only = os.environ.get("E13_NAN_ONLY")            # RC1: hooks only on modules whose name matches (e.g. layers 0-3)
+    only_re = _re.compile(only) if only else None
     for m in model.modules():
-        if m is not model:
+        if m is not model and (only_re is None or only_re.search(names.get(id(m), ""))):
             st["handles"].append(m.register_forward_pre_hook(pre, with_kwargs=True))
             st["handles"].append(m.register_forward_hook(post, with_kwargs=True))
     model.forward = forward

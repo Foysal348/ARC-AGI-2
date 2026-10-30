@@ -29,7 +29,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 E12DIR = Path(r"D:/ARC AGI 2/experiments/Experiment 12 - Duck REPL agent for ARC-AGI-2 (planned)/Experiment Notebooks")
 EVAL30 = "--eval30" in sys.argv
-NANPROBE = "--nanprobe" in sys.argv          # 2026-10-30: LOADPROBE + gc fix + NaN locator + KV lever + vLLM registry check
+RC1 = "--rc1" in sys.argv                    # 2026-10-30: root cause of the layer-2 MoE NaN (2 GPT audits) + vLLM 0.32 FN smoke
+NANPROBE = "--nanprobe" in sys.argv or RC1   # 2026-10-30: LOADPROBE + gc fix + NaN locator + KV lever + vLLM registry check
 LOADPROBE = "--loadprobe" in sys.argv or NANPROBE
 assert not (EVAL30 and LOADPROBE)
 BASE = E12DIR / ("Q27-XHIGH-E12_DUCK_REPL_SGLANG_EVAL30.ipynb" if EVAL30 else "Q27-XHIGH-E12_DUCK_REPL_SGLANG_SMOKE1.ipynb")
@@ -37,16 +38,21 @@ BASE_SHA = ("b65fb9dcc80b3652dc18b37d43355743311e2b55db8308ebc766d9d0b23de456" i
             else "0fea4d0cb50fe85ec76a4ac27d6de32997aa580b0f5a2d7b36400c0be645c186")
 OUT_NB = HERE.parent / f"Q27-XHIGH-E13_DUCK_FLASHNEXT_{'EVAL30' if EVAL30 else 'SMOKE1'}.ipynb"
 if LOADPROBE:
-    OUT_NB = HERE.parent / ("Q27-XHIGH-E13_FLASHNEXT_NANPROBE.ipynb" if NANPROBE else "Q27-XHIGH-E13_FLASHNEXT_LOADPROBE.ipynb")
+    OUT_NB = HERE.parent / ("Q27-XHIGH-E13_FLASHNEXT_RC1.ipynb" if RC1 else "Q27-XHIGH-E13_FLASHNEXT_NANPROBE.ipynb" if NANPROBE
+                            else "Q27-XHIGH-E13_FLASHNEXT_LOADPROBE.ipynb")
 # never overwrite a notebook that ran on Kaggle (memory: never-rebuild-run-notebooks); a rebuild goes to *_REBUILD.ipynb
 PUSHED = {"74411bc070e9de40df066516b4096f5549ee62251d51432ca5f04a8f4feb3b6d",   # foysalemonshanto v1 (2026-10-26, SMOKE1 rev 6b)
-          "107aa18227ffbc58cc725bb4dc13020a47848dcc8e5ef9f718094d2156ebf5e0"}   # foysalemonshanto v1 (2026-10-27, LOADPROBE)
+          "107aa18227ffbc58cc725bb4dc13020a47848dcc8e5ef9f718094d2156ebf5e0",   # foysalemonshanto v1 (2026-10-27, LOADPROBE)
+          "4c11a70b4c8e57942988a9c86ed38d3977b9a021220fa96b54b45d2e53f7bdd6"}   # hosen42 v1 (2026-10-30, NANPROBE rev 2)
 if OUT_NB.exists() and hashlib.sha256(OUT_NB.read_bytes()).hexdigest() in PUSHED:
     OUT_NB = OUT_NB.with_name(OUT_NB.stem + "_REBUILD.ipynb")
 TOPK_SCRIPT = (HERE / "e13_scripts" / "mp_topk.py").read_text(encoding="utf-8")
 MEMTRACE_SCRIPT = (HERE / "e13_scripts" / "mp_memtrace.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 if NANPROBE:          # the gc fix + NaN locator extend the same sitecustomize (appended; rebinds _QMProxy and _patch)
     MEMTRACE_SCRIPT += (HERE / "e13_scripts" / "mp_nanprobe.py").read_text(encoding="utf-8").replace("\r\n", "\n")
+VLLM_GC_SCRIPT = (HERE / "e13_scripts" / "mp_vllm_gc.py").read_text(encoding="utf-8").replace("\r\n", "\n")
+if RC1:               # weight scan, PLE mode switch, layer-2 non-Marlin switch (appended; rebinds _patch again)
+    MEMTRACE_SCRIPT += (HERE / "e13_scripts" / "mp_rc1.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 PROBE_SRC = r'''
 # ==================================================================== E13 LOADPROBE (user 2026-10-27)
 # rev 6b OOMed in the Marlin MoE repack (>= 20.86 GiB/rank) where E3 (0.5.19, FP8 PLE) used 19.06 GB. Two launches, the same
@@ -156,6 +162,8 @@ def e13_memtrace_summary(d):
                         "indexer_first": next((r.get("indexer") for r in nf if r.get("indexer")), None),
                         "logits_first_forwards": [{"fw": r.get("fw"), "mode": r.get("forward_mode"), **(r.get("logits") or {})}
                                                   for r in nf[:12]]}
+        if any(str(r.get("ev", "")).startswith("rc1_") for r in recs):    # RC1: weight scans, PLE modes, MoE inputs
+            s["rc1"] = e13_rc1_summary(recs)
         out[f.stem] = s
     return out
 
@@ -206,6 +214,378 @@ def e13_probe_smoke(deadline, cfg):
     out["ok"] = bool(out.get("count_ok")) and not out.get("garbage") and not out.get("error") and (
         out.get("chat_has_4", True) if "chat_skipped" not in out else True)
     return out
+
+
+E13_PLE_FLAG_PATH = Path(os.environ.get("E13_PLE_FLAG", "/tmp/e13_ple_mode"))
+_E13_PLE_PROMPTS = {"orig": ("1, 2, 3, 4, 5, 6, 7, 8,", "9, 10, 11"), "sync": ("11, 12, 13, 14, 15, 16, 17, 18,", "19, 20, 21"),
+                    "skip": ("21, 22, 23, 24, 25, 26, 27, 28,", "29, 30, 31")}
+
+
+def _e13_set_ple_mode(mode):
+    """RC1: the flag file every server process reads per forward (mp_rc1._ple_mode); 'orig' = no file."""
+    try:
+        if mode == "orig":
+            E13_PLE_FLAG_PATH.unlink(missing_ok=True)
+        else:
+            E13_PLE_FLAG_PATH.write_text(mode, encoding="utf-8")
+    except OSError as e:
+        print("E13 RC1: PLE flag write failed:", e, flush=True)
+
+
+def e13_ple_mode_runs(deadline, modes):
+    """RC1 (GPT audits: PLE A/B in one server): per mode, flush the radix cache (no reuse of NaN-poisoned mamba states),
+    set the flag file, then a count prompt of its own (no shared prefix). Records the text, the first output ids, the
+    expected continuation; the trace tags every forward with the mode it ran under."""
+    runs = []
+    for mode in modes:
+        prompt, want = _E13_PLE_PROMPTS[mode]
+        r = {"mode": mode, "prompt": prompt, "t_start": round(time.time(), 3)}
+        try:
+            try:
+                left = max(5.0, min(60.0, deadline - time.perf_counter()))
+                _urlreq.urlopen(_urlreq.Request(SGL_URL + "/flush_cache", data=b"", method="POST"), timeout=left).read()
+                r["flush"] = "ok"
+            except Exception as fe:
+                r["flush"] = f"{type(fe).__name__}: {fe}"[:160]
+            _e13_set_ple_mode(mode)
+            time.sleep(1)
+            g = _e13_post("/generate", {"text": prompt, "sampling_params": {"max_new_tokens": 32, "temperature": 0}}, deadline, 600)
+            text = g.get("text") or ""
+            r.update(count_text=text[:80], count_ok=text.strip().startswith(want), garbage=_e13_garbage(text),
+                     count_output_ids=(g.get("output_ids") or [])[:16])
+        except Exception as e:
+            r["error"] = f"{type(e).__name__}: {e}"[:400]
+        r["t_end"] = round(time.time(), 3)
+        r["ok"] = bool(r.get("count_ok")) and not r.get("garbage") and not r.get("error")
+        runs.append(r)
+        print(f"E13 RC1 PLE mode {mode}:", json.dumps({k: r.get(k) for k in ("ok", "count_text", "error", "flush")}), flush=True)
+    _e13_set_ple_mode("orig")
+    return runs
+
+
+def e13_rc1_summary(recs):
+    """RC1: the weight scans (after the repack / after forward 0) per layer and tensor, what changed between them, the
+    NaN result per PLE mode, the MoE inputs of the first forward, and the patch events."""
+    scans = {r.get("when"): r.get("layers") or {} for r in recs if r.get("ev") == "rc1_scan"}
+    keep = ("dtype", "shape", "stride", "contig", "nonfinite", "bad_rows_n", "bad_rows", "min", "max", "mean_abs", "sum", "wsum")
+    comp = {w: {L: {"type": v.get("type"), "quant_method": v.get("quant_method"), "scheme": v.get("scheme"),
+                    "runner": v.get("runner"),
+                    "meta": {k: v.get(k) for k in ("num_experts", "num_local_experts", "moe_ep_rank", "moe_ep_size", "top_k",
+                                                   "intermediate_size_per_partition") if k in v},
+                    "tensors": {n: {k: (t.get(k)[:8] if k == "bad_rows" and t.get(k) else t.get(k)) for k in keep if k in t}
+                                for n, t in (v.get("tensors") or {}).items()}}
+                for L, v in ls.items()} for w, ls in scans.items()}
+    changed = []
+    a, b = scans.get("after_postprocess") or {}, scans.get("after_forward_0") or {}
+    for L in a:
+        for n, t in ((a[L] or {}).get("tensors") or {}).items():
+            u = (((b.get(L) or {}).get("tensors")) or {}).get(n) or {}
+            for k in ("sum", "wsum", "nonfinite", "min", "max"):
+                if u and k in t and t.get(k) != u.get(k):
+                    changed.append({"layer": L, "tensor": n, "field": k, "before": t.get(k), "after": u.get(k)})
+    nf = [r for r in recs if r.get("ev") == "nan_forward"]
+    by_mode = {}
+    for r in nf:
+        m = r.get("ple_mode") or "orig"
+        d = by_mode.setdefault(m, {"forwards": 0, "with_nonfinite": 0, "first_module": None, "logits_nonfinite": 0})
+        d["forwards"] += 1
+        bad = bool(r.get("first_nonfinite")) or bool((r.get("logits") or {}).get("nonfinite"))
+        d["with_nonfinite"] += bad
+        d["logits_nonfinite"] += bool((r.get("logits") or {}).get("nonfinite"))
+        if bad and d["first_module"] is None:
+            d["first_module"] = ((r.get("first_nonfinite") or [{}])[0]).get("module") or "logits"
+    first_moe = next((r.get("moe_in") for r in nf if r.get("moe_in")), None)
+    src = next((v.get("src") for ls in scans.values() for v in ls.values() if isinstance(v, dict) and v.get("src")), None)
+    return {"runtime_src": src, "scans": comp, "changed_after_forward0": changed[:40], "by_ple_mode": by_mode, "first_moe_in": first_moe,
+            "events": [{k: r.get(k) for k in ("ev", "mode", "module", "prefix", "qm", "error") if r.get(k) is not None}
+                       for r in recs if str(r.get("ev", "")).startswith(("rc1_", "ple_mode"))][:30]}
+
+
+def _e13_gptq_dequant(qweight, qzeros, scales, group=128):
+    """GPTQ (auto_gptq v1 packing, AutoRound 'auto_round:auto_gptq'): qweight [K/8, N] int32 (8 nibbles along K),
+    qzeros [K/g, N/8] int32 (8 nibbles along N, stored zero - 1), scales [K/g, N] -> W [K, N] float32."""
+    import torch
+    sh = torch.arange(0, 32, 4, dtype=torch.int32)
+    q = ((qweight.unsqueeze(1) >> sh.view(1, 8, 1)) & 0xF).reshape(-1, qweight.shape[1])         # [K, N]
+    zs = ((qzeros.unsqueeze(2) >> sh.view(1, 1, 8)) & 0xF).reshape(qzeros.shape[0], -1)          # [K/g, N] stored
+    z = zs if bool((zs == 8).all()) else zs + 1     # v2 stores the zero (8 for sym int4); v1 stores zero - 1 (7)
+    g = torch.arange(q.shape[0]) // group
+    return (q.float() - z[g].float()) * scales.float()[g], int(torch.unique(zs).numel()), int(zs.flatten()[0])
+
+
+def e13_rc1_reference(tdir, model_dir):
+    """RC1 (GPT audit 3, test B): for every saved MoE fixture (layers 1 and 2, first forwards, per rank) recompute the
+    routed-expert output on the CPU from the checkpoint's GPTQ weights (independent dequant + PyTorch MLP) and compare with
+    the Marlin output of the same tokens; full sum and the rank-local sum (EP: the module may return its local part).
+    Also scans the checkpoint's scales of layers 1-2 for non-finite values (all 512 experts). Layer 1 validates the
+    reference itself (its Marlin output is finite)."""
+    import torch
+    from safetensors import safe_open
+    t0 = time.perf_counter()
+    out = {"fixtures": [], "ckpt_scales": {}}
+    try:
+        wm = json.loads((Path(model_dir) / "model.safetensors.index.json").read_text())["weight_map"]
+    except Exception as e:
+        return {"error": f"index: {type(e).__name__}: {e}"[:300]}
+    handles = {}
+
+    def get(name):
+        f = wm.get(name)
+        if f is None:
+            return None
+        if f not in handles:
+            handles[f] = safe_open(str(Path(model_dir) / f), framework="pt")
+        return handles[f].get_tensor(name)
+    pre = next((p for p in ("model.language_model.layers.", "model.layers.", "language_model.model.layers.")
+                if any(k.startswith(p) for k in wm)), "model.language_model.layers.")
+    for L in (1, 2):                                                 # checkpoint scales: every expert, every projection
+        bad, n, mx = [], 0, 0.0
+        for k, f in wm.items():
+            if k.startswith(f"{pre}{L}.mlp.experts.") and k.endswith(".scales") and time.perf_counter() - t0 < 600:
+                s = get(k).float(); n += 1
+                if not torch.isfinite(s).all():
+                    bad.append(k)
+                else:
+                    mx = max(mx, float(s.abs().max()))
+        out["ckpt_scales"][str(L)] = {"tensors": n, "nonfinite": bad[:10], "nonfinite_n": len(bad), "absmax": mx}
+    cache = {}
+
+    def expert(L, e):
+        if (L, e) not in cache:
+            W = {}
+            for p in ("gate_proj", "up_proj", "down_proj"):
+                b = f"{pre}{L}.mlp.experts.{e}.{p}."
+                qw, qz, sc = get(b + "qweight"), get(b + "qzeros"), get(b + "scales")
+                if qw is None:
+                    return None
+                W[p], W[p + "_zero_unique"], W[p + "_zero0"] = _e13_gptq_dequant(qw, qz, sc)
+            cache[(L, e)] = W
+        return cache[(L, e)]
+    for fp in sorted(Path(tdir).glob("fixture_L*_fw*_pid*.pt")):
+        if time.perf_counter() - t0 > 900:
+            out["truncated"] = "15 min"; break
+        r = {"file": fp.name}
+        try:
+            fx = torch.load(fp, map_location="cpu", weights_only=False)
+            L = int(re.search(r"layers\.(\d+)\.", fx["name"]).group(1))
+            meta = fx.get("meta") or {}
+            x = fx["hidden"].float()
+            T = x.shape[0]
+            ids = next((t for t in fx["ints"] if t is not None and t.dim() == 2 and t.shape[0] == T), None)
+            wts = next((t for t in fx["floats"] if t is not None and t.dim() == 2 and ids is not None and t.shape == ids.shape), None)
+            r.update(layer=L, fw=fx.get("fw"), rank=fx.get("rank"), meta=meta, tokens=T,
+                     ids=None if ids is None else ids.tolist(), weights=None if wts is None else [[round(float(v), 4) for v in row] for row in wts])
+            if ids is None or wts is None:
+                r["error"] = f"no top-k ids/weights among ints {fx.get('int_shapes')} floats {fx.get('float_shapes')}"
+                out["fixtures"].append(r); continue
+            ne, nl = int(meta.get("num_experts") or 512), int(meta.get("num_local_experts") or 128)
+            erank = meta.get("moe_ep_rank", fx.get("rank") or 0)
+            loc = int(ids.max()) < nl and int(ids.max()) >= 0 and ne > nl          # ids already local (EP mapped)?
+            r["ids_look_local"] = bool(loc)
+            ref_full = torch.zeros(T, x.shape[1]); ref_loc = torch.zeros(T, x.shape[1])
+            exp_bad = []
+            for t in range(T):
+                for k in range(ids.shape[1]):
+                    e = int(ids[t, k])
+                    if e < 0:
+                        continue
+                    ge = e + erank * nl if loc else e
+                    if ge >= ne:
+                        r.setdefault("skipped_ids", []).append(ge); continue
+                    W = expert(L, ge)
+                    if W is None:
+                        r.setdefault("missing_experts", []).append(ge); continue
+                    xt = x[t:t + 1]
+                    h = torch.nn.functional.silu(xt @ W["gate_proj"]) * (xt @ W["up_proj"])
+                    y = (h @ W["down_proj"])[0] * float(wts[t, k])
+                    if not torch.isfinite(y).all():
+                        exp_bad.append(ge)
+                    ref_full[t] += y
+                    if erank * nl <= ge < (erank + 1) * nl:
+                        ref_loc[t] += y
+            mo = fx["out"].float() if fx.get("out") is not None else None
+            rel = lambda a, b: float((a - b).norm() / max(float(b.norm()), 1e-9))
+            r.update(ref_finite=bool(torch.isfinite(ref_full).all()), ref_experts_nonfinite=sorted(set(exp_bad))[:10],
+                     ref_absmax=float(ref_full.abs().max()), marlin_finite=None if mo is None else bool(torch.isfinite(mo).all()),
+                     zero_convention={k: v for k, v in (cache[next(iter(cache))] if cache else {}).items() if "zero" in k})
+            if mo is not None and mo.shape == ref_full.shape and bool(torch.isfinite(mo).all()):
+                r.update(rel_err_full=round(rel(mo, ref_full), 5), rel_err_local=round(rel(mo, ref_loc), 5))
+            elif mo is not None:
+                r["marlin_nonfinite_tokens"] = int((~torch.isfinite(mo)).any(1).sum())
+        except Exception as e:
+            r["error"] = f"{type(e).__name__}: {e}"[:400]
+        out["fixtures"].append(r)
+    out["sec"] = round(time.perf_counter() - t0, 1)
+    return out
+
+
+# ---- RC1 arm 2: Flash-Next on vLLM 0.32.0 (native qwen4_exp). Install = the E18 VMS installer (Kaggle-proven).
+_E13_VLLM_INST = None
+E13_VLLM_HOOK_SRC = __import__("zlib").decompress(_b64.b64decode("VLLMGC_B64")).decode()   # gc after each MoE repack
+
+
+def e13_vllm_install():
+    global _E13_VLLM_INST
+    if _E13_VLLM_INST is not None:
+        return _E13_VLLM_INST
+    if os.environ.get("E13_VLLM_FAKE"):                                 # local harness: a fake OpenAI server
+        _E13_VLLM_INST = {"fake": True, "launch": [sys.executable, os.environ["E13_VLLM_FAKE"]], "env": dict(os.environ), "sec": 0}
+        return _E13_VLLM_INST
+    _whd = Path("/kaggle/input/datasets/foysalemonshanto/vllm-0-32-0-cu13-wheelhouse")
+    wh = sorted(_whd.rglob("install_wheelhouse.py")) if _whd.is_dir() else []
+    if not wh:
+        raise E11Fail("vLLM 0.32 wheelhouse not attached (foysalemonshanto/vllm-0-32-0-cu13-wheelhouse)")
+    t = time.perf_counter()
+    r = subprocess.run([sys.executable, str(wh[0]), "/tmp/vllm-venv"], capture_output=True, text=True,
+                       timeout=max(60, min(2400, HARD_STOP - time.perf_counter() - 150)))
+    if r.returncode:
+        raise E11Fail("vLLM 0.32 install failed: " + ((r.stdout or "") + (r.stderr or ""))[-2000:])
+    kv = dict(l.split("=", 1) for l in (r.stdout or "").splitlines() if l.startswith(("VENV_PYTHON=", "CUDA_HOME=")))
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CUDA_PATH", "LD_PRELOAD")}
+    env.update(CUDA_HOME=kv["CUDA_HOME"], PATH=f"/tmp/vllm-venv/bin:{kv['CUDA_HOME']}/bin:{env.get('PATH', '')}",
+               HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", VLLM_NO_USAGE_STATS="1", VLLM_LOGGING_LEVEL="INFO",
+               VLLM_CACHE_ROOT="/tmp/vllm-cache", PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True", OMP_NUM_THREADS="8")
+    _E13_VLLM_INST = {"launch": ["/tmp/vllm-venv/bin/vllm", "serve"], "env": env, "sec": round(time.perf_counter() - t),
+                      "venv_python": kv.get("VENV_PYTHON")}
+    return _E13_VLLM_INST
+
+
+def e13_vllm_flags():
+    """vLLM 0.32.0 serve flags for the first Flash-Next smoke (GPT audit 2: target only, eager, short context, low
+    concurrency): TP4 + expert parallel (= SGLang's EP4 layout, full experts per rank -> Marlin), PLE table in pinned host
+    memory, language model only (no vision profiling), bf16 KV (the default), no prefix caching (state-free smoke)."""
+    return [str(E13_INTEL_DIR), "--served-model-name", "flashnext", "--host", "127.0.0.1", "--port", str(E13_VLLM_PORT),
+            "--tensor-parallel-size", "4", "--enable-expert-parallel", "--enforce-eager",
+            "--max-model-len", "8192", "--max-num-seqs", "4", "--max-num-batched-tokens", "4096",
+            "--gpu-memory-utilization", "0.93", "--disable-custom-all-reduce", "--language-model-only",
+            "--engram-config", json.dumps({"cpu_offload": True}), "--distributed-executor-backend", "mp",
+            "--load-format", "safetensors", "--dtype", "bfloat16", "--no-enable-prefix-caching", "--seed", "0"]
+
+
+def _e13_vpost(path, body, deadline, cap):
+    left = min(cap, deadline - time.perf_counter())
+    if left < 20:
+        raise TimeoutError(f"arm deadline: {round(left)} s left")
+    req = _urlreq.Request(f"http://127.0.0.1:{E13_VLLM_PORT}" + path, data=json.dumps(body).encode(),
+                          headers={"Content-Type": "application/json"})
+    with _urlreq.urlopen(req, timeout=left) as r:
+        return json.loads(r.read())
+
+
+def e13_vllm_smoke(deadline):
+    out = {}
+    try:
+        t = time.perf_counter()
+        c = _e13_vpost("/v1/completions", {"model": "flashnext", "prompt": "1, 2, 3, 4, 5, 6, 7, 8,", "max_tokens": 32,
+                                           "temperature": 0, "logprobs": 1}, deadline, 600)
+        ch = (c.get("choices") or [{}])[0]
+        text = ch.get("text") or ""
+        lp = (ch.get("logprobs") or {}).get("token_logprobs") or []
+        out.update(count_text=text[:80], count_ok=text.strip().startswith("9, 10, 11"), garbage=_e13_garbage(text),
+                   count_logprobs=[None if v is None else round(float(v), 4) for v in lp[:8]],
+                   count_sec=round(time.perf_counter() - t, 1))
+        t = time.perf_counter()
+        m = _e13_vpost("/v1/chat/completions", {"model": "flashnext", "max_tokens": 1024, "temperature": 0, "messages": [
+            {"role": "user", "content": "What is 2 + 2? Answer with the number only."}]}, deadline, 900)
+        msg = (m.get("choices") or [{}])[0].get("message") or {}
+        txt = (msg.get("content") or "") + " " + (msg.get("reasoning_content") or msg.get("reasoning") or "")
+        out.update(chat_head=txt[:160], chat_tail=txt[-160:], chat_has_4="4" in txt, chat_usage=m.get("usage"),
+                   chat_finish=(m.get("choices") or [{}])[0].get("finish_reason"), chat_sec=round(time.perf_counter() - t, 1))
+        res = [None] * 4
+
+        def one(i):
+            try:
+                j = _e13_vpost("/v1/completions", {"model": "flashnext", "prompt": f"Write a long story about grid puzzle {i}.",
+                                                   "max_tokens": 256, "temperature": 0.7, "ignore_eos": True}, deadline, 900)
+                res[i] = (j.get("usage") or {}).get("completion_tokens")
+            except Exception as e:
+                res[i] = f"{type(e).__name__}: {e}"[:160]
+        t = time.perf_counter()
+        ths = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(4)]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join(max(1.0, deadline - time.perf_counter()))
+        sec = time.perf_counter() - t
+        toks = sum(x for x in res if isinstance(x, int))
+        out.update(streams4=res, streams4_sec=round(sec, 1), streams4_tok_s=round(toks / max(sec, 1e-6), 1))
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"[:400]
+    out["ok"] = bool(out.get("count_ok")) and not out.get("garbage") and bool(out.get("chat_has_4")) and not out.get("error")
+    return out
+
+
+_E13_VLLM_LOG_KEYS = ("PLE", "Engram", "engram", "ngram", "quantiz", "INC", "Marlin", "marlin", "MoE", "KV cache",
+                      "Maximum concurrency", "QSA", "FlashAttention", "fallback", "Traceback", "Error", "ERROR", "out of memory")
+
+
+def e13_vllm_arm(tag, cfg, budget):
+    """RC1 arm 2. Never raises for an engine outcome (that is the measurement)."""
+    global E11_SERVER
+    rec = {"tag": tag, "engine": "vllm 0.32.0", "model": str(E13_INTEL_DIR), "budget_sec": round(budget)}
+    rec["host_ram"] = e13_host_ram_guard()
+    rec["gpu_free_before"] = _e11_gpu_free(180)
+    if rec["gpu_free_before"].get("free") is False:
+        rec["outcome"] = "skipped: GPUs not free"; return rec
+    t_deadline = min(time.perf_counter() + budget, HARD_STOP - 5 * 60)
+    try:
+        inst = e13_vllm_install()
+    except Exception as e:
+        rec["outcome"] = f"install error: {type(e).__name__}: {e}"[:1500]; return rec
+    rec["install_sec"] = inst.get("sec")
+    rec["flags"] = e13_vllm_flags()
+    _vh = Path(os.environ.get("E13_VLLM_HOOK_DIR", "/tmp/e13_vllm_hook")); _vh.mkdir(parents=True, exist_ok=True)
+    (_vh / "sitecustomize.py").write_text(E13_VLLM_HOOK_SRC, encoding="utf-8")
+    vtd = OUT / "e13_memtrace" / tag
+    venv_env = dict(inst["env"], PYTHONPATH=str(_vh), E13_VLLM_TRACE_DIR=str(vtd))
+    E11_SERVER = E11Server(inst["launch"] + rec["flags"], venv_env, f"e13_{tag}")
+    E11_SERVER.log_path = OUT / f"vllm_server_e13_{tag}.log"
+    E11_SERVER.start()
+    print(f"E13 RC1 {tag}: vLLM launch", flush=True)
+    last, last_t = -1, time.perf_counter()
+    while True:
+        if not E11_SERVER.alive():
+            rec["outcome"] = f"exited rc={E11_SERVER.proc.returncode}"; break
+        try:
+            _urlreq.urlopen(f"http://127.0.0.1:{E13_VLLM_PORT}/health", timeout=10).read(); rec["outcome"] = "ready"; break
+        except Exception:
+            pass
+        sz = E11_SERVER.log_path.stat().st_size if E11_SERVER.log_path.exists() else 0
+        if sz != last:
+            last, last_t = sz, time.perf_counter()
+        if time.perf_counter() - last_t > 10 * 60:
+            rec["outcome"] = "stall (10 min log silence)"; break
+        if time.perf_counter() > t_deadline - 4 * 60:
+            rec["outcome"] = "timeout"; break
+        time.sleep(2 if E11_HARNESS else 5)
+    rec["sec"] = round(time.perf_counter() - E11_SERVER.t0, 1)
+    if rec["outcome"] == "ready":
+        rec["smoke"] = e13_vllm_smoke(t_deadline)
+    log = E11_SERVER.log_text()
+    lines = log.splitlines()
+    rec["log_lines"] = [l[:300] for l in lines if any(k in l for k in _E13_VLLM_LOG_KEYS)][:80]
+    rec["kv_tokens"] = [int(x.replace(",", "")) for x in re.findall(r"GPU KV cache size: ([\d,]+) tokens", log)][:4]
+    rec["max_concurrency"] = re.findall(r"Maximum concurrency for [^\n]{0,80}", log)[:2]
+    rec["oom_lines"] = [l[:300] for l in lines if "out of memory" in l.lower()][:6]
+    rec["log_tail"] = log[-3000:] if rec["outcome"] != "ready" or not (rec.get("smoke") or {}).get("ok") else ""
+    E11_SERVER.kill()
+    if not E11_HARNESS:
+        subprocess.run(["pkill", "-9", "-f", "vllm"], capture_output=True)
+    rec["gpu_free_after"] = _e11_gpu_free(180)
+    vrecs = []
+    for _vf in sorted(vtd.glob("vtrace_*.jsonl")):
+        for _l in _vf.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                vrecs.append(json.loads(_l))
+            except ValueError:
+                pass
+    rec["vllm_gc"] = {"patched": sum(r.get("ev") == "vpatched" for r in vrecs),
+                      "errors": [r for r in vrecs if "error" in str(r.get("ev"))][:4],
+                      "pwal_end": [{k: r.get(k) for k in ("pid", "alloc", "moe_modules", "freed_bytes")} for r in vrecs if r.get("ev") == "vpwal_end"][:4],
+                      "samples": [r for r in vrecs if r.get("ev") == "vgc"][:6]}
+    print(f"E13 RC1 {tag}:", json.dumps({k: rec.get(k) for k in ("outcome", "sec", "kv_tokens", "smoke", "oom_lines")},
+                                       default=str)[:2000], flush=True)
+    return rec
 
 
 def e13_long_test(deadline, spec):
@@ -266,6 +646,7 @@ def e13_probe_arm(tag, model_dir, vpy, hookdir, budget):
         rec["outcome"] = "skipped: GPUs not free"; return rec
     t_deadline = min(time.perf_counter() + budget, HARD_STOP - 5 * 60)  # F10: smoke + long test inside the arm too
     tdir = OUT / "e13_memtrace" / tag
+    _e13_set_ple_mode("orig")                                          # RC1: every arm starts on SGLang's own PLE path
     env = dict(_E13_ENV); env["PYTHONPATH"] = str(hookdir); env["E13_MEMTRACE_DIR"] = str(tdir)
     cfg = (globals().get("E13_ARM_CFG") or {}).get(tag) or {}          # NANPROBE: per-arm env / flag changes
     env.update(cfg.get("env") or {})
@@ -300,7 +681,10 @@ def e13_probe_arm(tag, model_dir, vpy, hookdir, budget):
     rec["caps"] = _e13_caps(log)
     rec["oom_lines"] = [l[:300] for l in log.splitlines() if "out of memory" in l.lower()][:6]
     rec["load_weight_end_lines"] = [l[:300] for l in log.splitlines() if "Load weight end" in l][:4]
-    if rec["outcome"] == "ready" and cfg:                              # NANPROBE arms (rev 2)
+    if rec["outcome"] == "ready" and cfg.get("ple_modes"):             # RC1: one count per PLE mode, same server
+        rec["ple_runs"] = e13_ple_mode_runs(t_deadline, cfg["ple_modes"])
+        rec["smoke"] = (rec["ple_runs"] or [{}])[0]
+    elif rec["outcome"] == "ready" and cfg:                            # NANPROBE arms (rev 2)
         rec["smoke"] = e13_probe_smoke(t_deadline, cfg)
         if cfg.get("rerun_count") and E11_SERVER.alive():              # F14: drain past the hook window, then count again
             rec["count_after_hooks"] = e13_probe_smoke(t_deadline, {**cfg, "chat_max_tokens": 0, "drain_tokens": 160})
@@ -317,6 +701,12 @@ def e13_probe_arm(tag, model_dir, vpy, hookdir, budget):
             rec["smoke"] = {"ok": False, "error": f"{type(e).__name__}: {e}"[:400]}
     E11_SERVER.kill()
     rec["gpu_free_after"] = _e11_gpu_free(180)
+    if (cfg.get("env") or {}).get("E13_RC1_FIXTURE") == "1":            # RC1 test B: CPU reference vs Marlin
+        try:
+            rec["rc1_reference"] = e13_rc1_reference(tdir, model_dir)
+        except Exception as e:
+            rec["rc1_reference"] = {"error": f"{type(e).__name__}: {e}"[:400]}
+        print(f"E13 RC1 {tag} reference:", json.dumps(rec["rc1_reference"], default=str)[:3000], flush=True)
     rec["memtrace"] = e13_memtrace_summary(tdir)
     print(f"E13 LOADPROBE {tag}:", json.dumps({k: rec.get(k) for k in ("outcome", "sec", "caps", "oom_lines", "smoke")},
                                              default=str)[:1500], flush=True)
@@ -392,7 +782,13 @@ else:
                 E13_PROBE["arms"].append({"tag": _tag, "outcome": f"skipped: {round(_room)} s left"}); continue
             _info["stage"] = f"probe {_tag}"
             _acfg = (globals().get("E13_ARM_CFG") or {}).get(_tag) or {}
+            if _room < float(_acfg.get("min_room_sec") or 0):                 # RC1: the optional third arm
+                E13_PROBE["arms"].append({"tag": _tag, "outcome": f"skipped: {round(_room)} s left (< {_acfg['min_room_sec']})"}); continue
             try:
+                if _acfg.get("engine") == "vllm":                                  # RC1 arm 2: Flash-Next on vLLM 0.32
+                    E13_PROBE["arms"].append(e13_vllm_arm(_tag, _acfg, min(float(_acfg.get("budget_sec") or 30 * 60), _room)))
+                    (OUT / "e13_loadprobe.json").write_text(json.dumps(E13_PROBE, indent=1, default=str), encoding="utf-8")
+                    continue
                 if _tag == "bf16ple" or _acfg.get("model") == "intel":
                     _md = E13_INTEL_DIR
                 else:
@@ -476,7 +872,7 @@ c1 = once(c1, "SGL_SERVER_MAX_RUNNING = 13 ", "SGL_SERVER_MAX_RUNNING = 4  ", "s
 if not EVAL30:   # E13: Flash-Next load (about 25 min incl. the top-k test) + 15 min solving does not fit 50 min
     c1 = once(c1, '"SMOKE1":    {"source": "eval", "task_list": ["2ba387bc"], "time_budget_sec": 50 * 60,',
               '"SMOKE1":    {"source": "eval", "task_list": ["2ba387bc"], "time_budget_sec": '
-              + ("90" if NANPROBE else "75" if LOADPROBE else "105") + ' * 60,', "smoke budget")   # rev 6: +15 min speed stage; LOADPROBE 75 min (ceiling; ~35-40 min expected)
+              + ("120" if RC1 else "90" if NANPROBE else "75" if LOADPROBE else "105") + ' * 60,', "smoke budget")   # rev 6: +15 min speed stage; LOADPROBE 75 min (ceiling; ~35-40 min expected)
 c1 += r'''
 # ---- E13 (Flash-Next on 4xL4, PLAN rev 4.1 simple path): engine constants. Everything else in this notebook = E12.
 E13_FA2_WHEEL = "flash_attn-2.8.3.post1+cu13torch2.13cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
@@ -536,6 +932,33 @@ E13_ARM_CFG = {
                 "budget_sec": 30 * 60}}
 E13_VLLM_CHECK = True
 CONFIG["e13"]["nanprobe"] = {"arms": list(E13_PROBE_ARMS), "cfg": E13_ARM_CFG, "vllm_check": E13_VLLM_CHECK}
+'''
+if RC1:
+    c1 += r'''
+# ---- E13 RC1 (user 2026-10-30): root cause of the layer-2 MoE NaN (NANPROBE rev 2 + two GPT audits) and Flash-Next on
+# vLLM 0.32. One notebook, three arms in order (each with its own deadline; a GPU-free gate between arms):
+# Arm 1 rc1 (SGLang, eager, NANPROBE flags): hooks on layers 0-3 only; expert weight scan of layers 0-3 after the repack and
+#   after forward 0 (non-finite scales + the local experts holding them, int checksums, expert maps, quant method); every
+#   MoE input incl. the integer top-k ids (dtype, shape, stride, min / max); then the count prompt under three PLE modes
+#   in the same server (flag file; cache flushed + a different prompt per mode): orig, sync (side stream synchronized),
+#   skip (no prefetch, main-stream gather).
+# Arm 2 vllm_fn (vLLM 0.32.0, native qwen4_exp): TP4 + EP, eager, 8k context, PLE in pinned host memory (--engram-config),
+#   language model only; count + 2+2 chat + 4 x 256-token streams (tok/s); PLE / quant method / KV lines from the log.
+# Arm 3 l2_wna16 (SGLang, only with >= 22 min left): arm 1 with layer 2's experts on the non-Marlin GPTQ path (MoeWNA16).
+E13_PROBE_ARMS = ("rc1", "vllm_fn", "l2_wna16")
+_e13_rc1_env = {"E13_NANPROBE": "1", "E13_NAN_FORWARDS": "240", "E13_NAN_ABSMAX": "1e4", "E13_GC_MIB": "256",
+                "E13_NAN_ONLY": r"(^|\.)layers\.[0-3](\.|$)", "E13_RC1_SCAN": "1", "E13_RC1_LAYERS": "0,1,2,3",
+                "E13_PLE_FLAG": os.environ.get("E13_PLE_FLAG", "/tmp/e13_ple_mode"), "E13_RC1_FIXTURE": "1", "E13_RC1_FIX_LAYERS": "1,2",
+                "E13_RC1_FIX_FORWARDS": "2", "E13_RC1_FIX_TOKENS": "6"}
+E13_ARM_CFG = {
+    "rc1": {"model": "intel", "env": _e13_rc1_env, "add": ["--disable-cuda-graph"], "nan": True, "chat_max_tokens": 0,
+            "ple_modes": ["orig", "sync", "skip"], "budget_sec": 32 * 60},
+    "vllm_fn": {"engine": "vllm", "budget_sec": 38 * 60},
+    "l2_wna16": {"model": "intel", "env": {**_e13_rc1_env, "E13_L2_NO_MARLIN": "1"}, "add": ["--disable-cuda-graph"], "nan": True,
+                 "chat_max_tokens": 0, "ple_modes": ["orig"], "min_room_sec": 22 * 60, "budget_sec": 25 * 60}}
+E13_VLLM_CHECK = False            # arm 2 runs vLLM for real
+E13_VLLM_PORT = int(os.environ.get("E13_VLLM_PORT", 8000))
+CONFIG["e13"]["rc1"] = {"arms": list(E13_PROBE_ARMS), "cfg": E13_ARM_CFG}
 '''
 
 # ---------------------------------------------------------------- CELL 5: Flash-Next engine (Duck-only)
@@ -944,12 +1367,34 @@ ENGINE_INFO["load_sec"] = round(time.perf_counter() - _t_engine, 1)
 ENGINE_INFO["concurrency"] = int(CONCURRENCY)
 print("engine:", json.dumps(ENGINE_INFO, default=str)[:3000], flush=True)
 '''
-C5 = C5.replace("TOPK_B64", __import__("base64").b64encode(TOPK_SCRIPT.encode()).decode())
+_enc = ((lambda b: __import__("base64").b64encode(__import__("zlib").compress(b, 9)).decode()) if RC1 else
+        (lambda b: __import__("base64").b64encode(b).decode()))     # RC1: zlib payloads (notebook < 400 kB, commit limit)
+if RC1:
+    C5 = once(C5, 'E13_TOPK_SRC = _b64.b64decode("TOPK_B64").decode()',
+              'E13_TOPK_SRC = __import__("zlib").decompress(_b64.b64decode("TOPK_B64")).decode()', "topk zlib")
+    PROBE_SRC = once(PROBE_SRC, 'E13_MEMTRACE_SRC = _b64.b64decode("MEMTRACE_B64").decode()',
+                     'E13_MEMTRACE_SRC = __import__("zlib").decompress(_b64.b64decode("MEMTRACE_B64")).decode()', "memtrace zlib")
+    # unused in RC1 (no FP8 PLE arm, no registry check, no long test): keep the notebook small
+    for _a, _b in (("def e13_fp8ple_dir():", "def e13_memtrace_summary(d):"), ("def e13_vllm_registry():", "_E13_ENV = None"),
+                   ("def e13_long_test(deadline, spec):", "def e13_probe_arm(")):
+        _i, _j = PROBE_SRC.index(_a), PROBE_SRC.index(_b)
+        PROBE_SRC = PROBE_SRC[:_i] + PROBE_SRC[_j:]
+C5 = C5.replace("TOPK_B64", _enc(TOPK_SCRIPT.encode()))
+PROBE_SRC = PROBE_SRC.replace("VLLMGC_B64", __import__("base64").b64encode(__import__("zlib").compress(VLLM_GC_SCRIPT.encode(), 9)).decode())
 if LOADPROBE:   # the probe replaces the bring-up block (from `_E13_ENV = None` to the end); every helper above stays
     _cut = C5.index("\n_E13_ENV = None\n_t_engine = time.perf_counter()")
-    C5 = C5[:_cut] + "\n" + PROBE_SRC.replace("MEMTRACE_B64", __import__("base64").b64encode(MEMTRACE_SCRIPT.encode()).decode())
+    C5 = C5[:_cut] + "\n" + PROBE_SRC.replace("MEMTRACE_B64", _enc(MEMTRACE_SCRIPT.encode()))
 
-nb["cells"][0]["source"] = ((("# E13 NANPROBE — Qwen3.8-Flash-Next on SGLang 0.5.21 (4xL4): output correctness + KV capacity\n"
+nb["cells"][0]["source"] = ((("# E13 RC1 — Qwen3.8-Flash-Next on 4xL4: root cause of the layer-2 MoE NaN (SGLang 0.5.21) + vLLM 0.32 smoke\n"
+                              "NANPROBE rev 2 put the first NaN in model.layers.2.mlp.experts (GPTQMarlinMoE, finite float inputs) "
+                              "on all ranks. This notebook (RC1 fix list, 3 GPT audits): arm 1 SGLang eager with hooks on layers 0-3, "
+                              "expert weight scans after the repack and after forward 0, every MoE input incl. top-k ids, MoE "
+                              "fixtures of layers 1-2 recomputed on the CPU from the checkpoint's GPTQ weights (Marlin vs reference), "
+                              "the runtime gptq_moe source sha, and the count prompt under three PLE modes (orig / sync / skip) in the "
+                              "same server; arm 2 Flash-Next on vLLM 0.32.0 (native qwen4_exp, TP4 + EP, eager, PLE in pinned host "
+                              "memory): count, 2+2 chat, 4 streams; arm 3 (time permitting) layer 2 on the non-Marlin GPTQ path. "
+                              "No Duck; the submission is CELL 0's fallback.\n\n") if RC1 else
+                             ("# E13 NANPROBE — Qwen3.8-Flash-Next on SGLang 0.5.21 (4xL4): output correctness + KV capacity\n"
                               "This version (rev 2, NANPROBE_FIX_LIST 2026-10-30: 2 GPT + 2 agent audits): the LOADPROBE "
                               "notebook plus the gc fix (repack OOM); an eager launch with a NaN / collapse locator (instance-forward "
                               "wrapper, per rank: first non-finite module with origin vs propagated, layer [min, max], logits "
