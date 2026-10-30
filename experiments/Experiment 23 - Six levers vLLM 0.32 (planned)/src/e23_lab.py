@@ -790,9 +790,10 @@ def trace_summary(pdir):
     eager_share = round(sum(v["eager"] for v in src.values()) / tot_k, 3) if tot_k else None
     fw_g = statistics.median([x[0] for x in per_fw]) if per_fw else None
     fw_k = statistics.median([x[1] for x in per_fw]) if per_fw else None
-    if per_fw:
-        verdict = "FULL" if fw_g == 1 and fw_k == 0 else ("PIECEWISE" if fw_g and fw_g > 1 else ("EAGER" if not fw_g else "MIXED"))
-        basis = "per_forward_annotation"
+    if per_fw:                   # rev 3f (GPT rev 3e audit: 2 FULL + 1 EAGER forwards read FULL by the median)
+        kinds = {"FULL" if g == 1 and k == 0 else "PIECEWISE" if g > 1 else "EAGER" if g == 0 else "MIXED" for g, k in per_fw}
+        verdict = kinds.pop() if len(kinds) == 1 else "MIXED"       # every forward must agree
+        basis = "per_forward_annotation (all forwards)"
     elif tot_k:                  # rev 3d (GPT-2 reproduced FULL with 0 forwards): CUPTI alone never proves FULL
         att = src["attention"]
         hint = ("FULL" if att["eager"] == 0 and (eager_share or 0) < 0.05 else
@@ -803,7 +804,7 @@ def trace_summary(pdir):
         verdict, basis = "UNKNOWN", "none"
     return {"file": f.name, "files": len(files), "kernels": len(kern), "kernel_us_sum": round(tot),
             "graph_launches": sum(1 for e in rt if is_graph(e)), "kernel_launches": sum(1 for e in rt if is_kl(e)),
-            "forwards": len(per_fw), "per_forward_median_graph_launches": fw_g, "per_forward_median_kernel_launches": fw_k,
+            "forwards": len(per_fw), "forward_kinds": {k_: sum(1 for g, k in per_fw if ("FULL" if g == 1 and k == 0 else "PIECEWISE" if g > 1 else "EAGER" if g == 0 else "MIXED") == k_) for k_ in ("FULL", "PIECEWISE", "EAGER", "MIXED")}, "per_forward_median_graph_launches": fw_g, "per_forward_median_kernel_launches": fw_k,
             "launch_source": src, "eager_kernel_share": eager_share, "graph_verdict": verdict, "verdict_basis": basis,
             "by_category_pct": {k: round(100 * v / tot, 1) for k, v in per.items()} if tot else {},
             "top_kernels_us": dict(sorted(((k, round(v)) for k, v in names.items()), key=lambda x: -x[1])[:25]),

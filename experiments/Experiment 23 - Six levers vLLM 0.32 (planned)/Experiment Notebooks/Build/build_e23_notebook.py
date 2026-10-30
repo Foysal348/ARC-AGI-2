@@ -22,7 +22,7 @@ E23 = HERE.parents[1]
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 P60532 = (E23 / "patches" / "pr60532.diff").read_text(encoding="utf-8").replace("\r\n", "\n")
 
-MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3e · __VARIANT__
+MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3f · __VARIANT__
 
 The user's six experiments, each with only its own test sequence (DESIGN.md), at the production context
 (thinking up to 120k: `--max-model-len 131072`, bands 2k / 8k / 40k / 90k / 120k):
@@ -56,7 +56,7 @@ LOGS = OUT / "logs"
 LOGS.mkdir(exist_ok=True)
 TMP = Path(os.environ.get("E23_TMP", "/tmp"))
 INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
-R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3e",
+R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3f",
      "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "setup": {}, "sections": {}, "errors": [], "order": []}
 _SAVE_LOCK = threading.Lock()
 
@@ -472,7 +472,8 @@ def with_servers(servers, timeout, body):
             if not ok:
                 out["status"] = "LAUNCH_FAILED"
                 out["servers"][s.name]["log_tail"] = s.log()[-4000:]
-                out["servers"][s.name]["xid"] = bool(XID.search(s.log() or ""))   # rev 3e: a fault during start-up / capture
+                _xl = [l for l in (s.log() or "").splitlines() if XID.search(l)][:8]   # rev 3e/3f: start-up / capture faults
+                out["servers"][s.name].update(xid=bool(_xl), xid_lines=_xl)
                 return out
         mem0 = L.gpu_mem()
         for s in servers:
@@ -484,7 +485,8 @@ def with_servers(servers, timeout, body):
         for s in servers:
             out["servers"][s.name].update(s.facts(), gpu_mem_end=L.gpu_mem(), host_rss_mb_end=s.rss_mb(),
                                           alive_after_body=s.alive(), rc=None if s.alive() else s.proc.returncode,
-                                          xid=bool(XID.search(s.log() or "")))
+                                          xid_lines=[l for l in (s.log() or "").splitlines() if XID.search(l)][:8])
+            out["servers"][s.name]["xid"] = bool(out["servers"][s.name]["xid_lines"])
             if not s.alive():
                 out["status"] = "SERVER_DIED"
                 out["servers"][s.name]["log_tail"] = s.log()[-4000:]
@@ -629,17 +631,76 @@ def gated(o, need=(), extra=()):
     return o
 
 
+# rev 3f (GPT rev 3e audit): Xid by recovery class (NVIDIA XID catalog). These need a GPU reset (driver / bus / GSP /
+# uncontained ECC / NVLink / channel faults): the campaign stops. Application-class faults (an illegal memory access,
+# Xid 13 / 31 / 43 ...) are recovered by the process restart every arm already does, and are continued only after the
+# GPU health probe passes (all 4 GPUs, no reset pending, a clean CUDA matmul on each).
+XID_RESET = {48, 61, 62, 63, 64, 68, 69, 74, 79, 92, 94, 95, 109, 110, 119, 120, 121, 136, 140, 143, 144, 145, 146, 147,
+             148, 149, 150, 151, 154, 155, 156, 157}
+HEALTH_CODE = ("import torch\nn = torch.cuda.device_count()\nok = n == 4\nfor i in range(n):\n"
+               "    a = torch.ones(1024, 1024, device=f'cuda:{i}')\n"
+               "    ok = ok and float((a @ a).sum().item()) == float(1024 ** 3)\n"
+               "torch.cuda.synchronize()\nprint('HEALTH_OK' if ok else 'HEALTH_BAD', n)\n")
+
+
+def gpu_health():
+    """rev 3f: nvidia-smi sees 4 GPUs with no reset pending, then a fresh process runs a checked matmul on each."""
+    if FAKE:
+        return {"ok": True, "fake": True}
+    out = {}
+    try:
+        q = subprocess.run(["nvidia-smi", "--query-gpu=index,reset_status.reset_required,memory.used", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=60)
+        rows = [l for l in q.stdout.strip().splitlines() if l.strip()]
+        out["nvidia_smi_rows"] = rows
+        out["reset_required"] = any("yes" in l.lower() for l in rows) if q.returncode == 0 else None
+        if q.returncode != 0:              # an old driver without reset_status: fall back to the plain query
+            out["reset_required"] = None
+            rows = [l for l in subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True,
+                                              text=True, timeout=60).stdout.strip().splitlines() if l.strip()]
+        out["gpus"] = len(rows)
+        h = subprocess.run([STOCK["py"], "-c", HEALTH_CODE], capture_output=True, text=True, timeout=300, env=STOCK["env"])
+        out["cuda_probe"] = (h.stdout + h.stderr)[-300:]
+        out["ok"] = out["gpus"] == 4 and out["reset_required"] is not True and h.returncode == 0 and "HEALTH_OK" in h.stdout
+    except Exception as e:
+        out.update(ok=False, error=f"{type(e).__name__}: {e}"[:200])
+    return out
+
+
+def fault_gate(texts, arm):
+    """rev 3f: classify GPU fault lines in `texts` (server logs, bench output). Returns None (no fault), 'CONTINUE'
+    (application fault + healthy GPUs: this arm is NO_GO, the run goes on) or 'ABORT' (a reset-class Xid, or the GPUs
+    are not healthy after the fault: the campaign stops)."""
+    lines = [l for t in texts for l in (t or "").splitlines() if XID.search(l)]
+    if not lines:
+        return None
+    # "NVRM: Xid (PCI:0000:00:04): 79, pid=..." (the PCI address comes first) or a bare "Xid 79"
+    nums = {int(x) for l in lines for x in re.findall(r"Xid \([^)]*\):\s*(\d+)|\bXid\s+(\d+)\b", l) for x in x if x}
+    rec = {"arm": arm, "lines": lines[:5], "xid": sorted(nums)}
+    if nums & XID_RESET:
+        rec["class"] = "RESET_REQUIRED"
+        ABORT["why"] = f"GPU fault needing a reset (Xid {sorted(nums & XID_RESET)}) in {arm}"
+    else:
+        rec["health"] = gpu_health()
+        rec["class"] = "APP_RESTART" if rec["health"].get("ok") else "UNHEALTHY_AFTER_FAULT"
+        if not rec["health"].get("ok"):
+            ABORT["why"] = f"GPUs unhealthy after a GPU fault in {arm}"
+    R["setup"].setdefault("gpu_faults", []).append(rec)
+    return "ABORT" if ABORT["why"] and rec["class"] != "APP_RESTART" else "CONTINUE"
+
+
 def taint_check(o):
-    """rev 3e (audits A/B/C/D): a GPU fault line in a server log (with_servers records `xid`, at launch too) marks THIS
-    arm NO_GO_GPU_FAULT; the session only gets a label (every later record carries `after_gpu_fault`), nothing is
-    skipped because of it (the arms expected to fault -- compiled PP4, FULL graphs, cutedsl -- must not stop the run)."""
-    hit = [n for n, v in (o.get("servers") or {}).items() if (v or {}).get("xid")]
+    """rev 3e/3f: a GPU fault line in a server log (with_servers records `xid_lines`, at launch too) marks THIS arm
+    NO_GO_GPU_FAULT; a reset-class Xid or unhealthy GPUs afterwards abort the campaign (fault_gate); an application-class
+    fault with healthy GPUs lets the run go on, every later record labelled `after_gpu_fault`."""
+    texts = {n: "\n".join((v or {}).get("xid_lines") or []) for n, v in (o.get("servers") or {}).items() if (v or {}).get("xid")}
     prior = list(R["setup"].get("gpu_fault_arms") or [])
     if prior:
         o["after_gpu_fault"] = prior
-    if hit:
-        R["setup"]["gpu_fault_arms"] = prior + hit
-        o["gpu_fault"] = hit
+    if texts:
+        R["setup"]["gpu_fault_arms"] = prior + list(texts)
+        o["gpu_fault"] = list(texts)
+        o["gpu_fault_class"] = fault_gate(list(texts.values()), ",".join(texts))
         o["correctness"] = "NO_GO_GPU_FAULT"
         if o.get("status") in (None, "DONE"):
             o["status"] = "NO_GO_GPU_FAULT"
@@ -669,6 +730,9 @@ def s2():
         so, _ = p.communicate()
         rc, tail = -9, (so or "")[-1000:]
     res = json.loads(Path(out).read_text()) if Path(out).is_file() else {}
+    fg = fault_gate([so or ""], "p5_bench")          # rev 3f: the standalone benches go through the same fault gate
+    if fg:
+        return {"rc": rc, "summary": res.get("summary"), "tail": tail, "status": "NO_GO_GPU_FAULT", "gpu_fault_class": fg}
     rel = L.wait_gpu_release(180, fake=bool(FAKE), gpus="0,1,2,3")
     if rel is None and NVSMI_OK:
         rel = False
@@ -698,6 +762,9 @@ def s4_thread():
         so, _ = p.communicate()
         rc, tail = -9, (so or "")[-1000:]
     res = json.loads(Path(out).read_text()) if Path(out).is_file() else {}
+    fg = fault_gate([so or ""], "p4_bench_gpu3")     # rev 3f: same fault gate as the servers
+    if fg:
+        return {"rc": rc, "tail": tail, "status": "NO_GO_GPU_FAULT", "gpu_fault_class": fg}
     kinds = {n: ((v or {}).get("weights_source") or {}).get("kind") for n, v in (res.get("shapes") or {}).items()}
     synth = [n for n, k in kinds.items() if k == "synthetic"]
     no_result = [n for n, k in kinds.items() if k is None]
@@ -996,8 +1063,10 @@ def s3(tag, backend, graph, patch=False):
             gs = g0.get("status")
             if gs in ("PROVEN_FULL", "MISMATCH_EXPECTED"):   # the PIECEWISE-pinned control read FULL: the verdict logic lies
                 o["graph_proof"] = {"status": "INCONCLUSIVE_GRAPH", "why": f"G0 control broken: {gs}", "own": o["graph_proof"]}
-            elif gs != "PROVEN_PIECEWISE":                   # rev 3e: no control result = the verdict stands, labelled
-                o["graph_proof"] = {**o["graph_proof"], "control": "UNCONTROLLED", "g0_status": gs}
+            elif gs != "PROVEN_PIECEWISE" and str(o["graph_proof"].get("status", "")).startswith("PROVEN_"):
+                # rev 3f (GPT rev 3e audit): without the PIECEWISE control a FULL verdict is not proven
+                o["graph_proof"] = {"status": "INCONCLUSIVE_GRAPH", "why": f"no G0 PIECEWISE control ({gs})",
+                                    "own": o["graph_proof"]}
             return o
         finally:
             if patch and not FAKE and (TMP / "flashinfer.py.e23_orig").is_file() and PATCH_ORIG.get("sha"):

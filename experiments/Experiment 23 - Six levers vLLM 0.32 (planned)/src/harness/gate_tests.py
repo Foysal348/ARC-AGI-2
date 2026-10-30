@@ -36,7 +36,15 @@ import re, subprocess, os, signal, hashlib, time   # noqa: E401  (names the extr
 G = {"CLEAN": ("EXACT", "NEAR_TIE"), "R": {"sections": {}, "setup": {}, "errors": [], "inputs": {}}, "L": L, "json": json,
      "re": re, "subprocess": subprocess, "os": os, "signal": signal, "Path": Path, "FAKE": None, "SM": False,
      "NVSMI_OK": True, "ABORT": {"why": None}, "time": time, "hashlib": hashlib}
-for n in ("_windows", "_num", "oracle_gate", "gated", "nvfp4_gate", "graph_proof", "_killpg", "s2", "s4_thread", "taint_check"):
+for node in ast.walk(tree):            # rev 3f: module-level constants the fault gate uses
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+            and node.targets[0].id in ("XID", "XID_RESET", "HEALTH_CODE") and node.targets[0].id not in G:
+        exec(ast.get_source_segment(src, node), G)
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name in ("gpu_health", "fault_gate") and node.name not in code:
+        code[node.name] = ast.get_source_segment(src, node)
+for n in ("_windows", "_num", "oracle_gate", "gated", "nvfp4_gate", "graph_proof", "_killpg", "gpu_health", "fault_gate",
+          "s2", "s4_thread", "taint_check"):
     if n in code:
         exec(code[n], G)
 
@@ -172,9 +180,49 @@ G["FAKE"] = "fake"
 check("gate_probe_fail_fake_ignored", og({"oracle": {"errors": [None], "garbage": [None]}, "probes": {"ok": False}}), None)
 G["FAKE"] = None
 
+# ---- rev 3f: per-forward graph verdict (GPT rev 3e audit: 2 FULL + 1 EAGER read FULL by the median)
+def fw_trace(kinds):
+    evs, ts = [], 0
+    for i, k in enumerate(kinds):
+        lo = ts
+        evs.append({"ph": "X", "cat": "user_annotation", "name": "gpu_model_runner: forward", "ts": lo, "dur": 50, "tid": 1})
+        if k == "FULL":
+            evs.append({"ph": "X", "cat": "cuda_runtime", "name": "cudaGraphLaunch", "ts": lo + 5, "dur": 1, "tid": 1, "args": {}})
+        elif k == "PIECEWISE":
+            for j in range(3):
+                evs.append({"ph": "X", "cat": "cuda_runtime", "name": "cudaGraphLaunch", "ts": lo + 5 + j, "dur": 1, "tid": 1, "args": {}})
+            evs.append({"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": lo + 20, "dur": 1, "tid": 1, "args": {}})
+        else:
+            for j in range(4):
+                evs.append({"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": lo + 5 + j, "dur": 1, "tid": 1, "args": {}})
+        ts += 100
+    (tdir / "x_rank0.1.pt.trace.json").write_text(json.dumps({"traceEvents": evs}))
+    return L.trace_summary(tdir)["graph_verdict"]
+
+
+check("trace_all_full", fw_trace(["FULL"] * 3), "FULL")
+check("trace_2full_1eager_mixed", fw_trace(["FULL", "FULL", "EAGER"]), "MIXED")
+check("trace_all_piecewise", fw_trace(["PIECEWISE"] * 3), "PIECEWISE")
+
+# ---- rev 3f: Xid recovery classes + GPU health probe
+G.update(FAKE=None, ABORT={"why": None}, STOCK={"py": sys.executable, "env": dict(os.environ)})
+G["R"]["setup"] = {}
+G["gpu_health"] = lambda: {"ok": True}
+check("xid_reset_class_aborts", (G["fault_gate"](["NVRM: Xid (PCI:0000:00:04): 79, GPU has fallen off the bus"], "armX"),
+                                 bool(G["ABORT"]["why"])), ("ABORT", True))
+G["ABORT"]["why"] = None
+check("app_fault_healthy_continues", (G["fault_gate"](["CUDA error: an illegal memory access was encountered"], "armY"),
+                                      G["ABORT"]["why"]), ("CONTINUE", None))
+G["gpu_health"] = lambda: {"ok": False}
+check("app_fault_unhealthy_aborts", (G["fault_gate"](["CUDA error: an illegal memory access was encountered"], "armZ"),
+                                     bool(G["ABORT"]["why"])), ("ABORT", True))
+G["ABORT"]["why"] = None
+check("no_fault_line_none", G["fault_gate"](["all good"], "armW"), None)
+G["gpu_health"] = lambda: {"ok": True}
+
 # ---- rev 3e: a GPU fault marks only its arm; later arms are labelled, not skipped; _done needs DONE + CLEAN
 G["R"]["setup"] = {}
-a1 = G["taint_check"]({"status": "DONE", "correctness": "CLEAN", "servers": {"pp4c": {"xid": True}}})
+a1 = G["taint_check"]({"status": "DONE", "correctness": "CLEAN", "servers": {"pp4c": {"xid": True, "xid_lines": ["CUDA error: an illegal memory access was encountered"]}}})
 a2 = G["taint_check"]({"status": "DONE", "correctness": "CLEAN", "servers": {"next": {"xid": False}}})
 check("taint_arm_no_go", (a1["status"], a1["correctness"]), ("NO_GO_GPU_FAULT", "NO_GO_GPU_FAULT"))
 check("taint_later_arm_labelled_not_blocked", (a2["status"], a2.get("after_gpu_fault")), ("DONE", ["pp4c"]))
