@@ -85,6 +85,27 @@ check("tf_complete_needs_top1", (L.tf_complete({"40k": full}), L.tf_complete({"4
 check("tok_id_parse", (L._tok_id("token_id:42"), L._tok_id("17"), L._tok_id("abc")), (42, 17, "str:abc"))
 
 
+# rev 3h: teacher_forced() on a vLLM 0.32-shaped /v1/completions response (the fake server has no prompt_logprobs)
+class _Resp:
+    def __init__(self, obj):
+        self.b = json.dumps(obj).encode()
+
+    def read(self):
+        return self.b
+
+
+_pl = [None, {"5": {"logprob": -0.1, "rank": 1, "decoded_token": "a"}},
+       {"6": {"logprob": -2.0, "rank": 2, "decoded_token": "b"}, "9": {"logprob": -0.2, "rank": 1, "decoded_token": "c"}},
+       {"7": {"logprob": -3.0, "rank": 4}}]
+_orig_urlopen = L.U.urlopen
+L.U.urlopen = lambda *a, **k: _Resp({"choices": [{"prompt_logprobs": _pl}]})
+try:
+    _tf = L.teacher_forced(1, [1, 5, 6, 7], last=3)
+finally:
+    L.U.urlopen = _orig_urlopen
+check("tf_parse_vllm_shape", _tf["positions"], [[-0.1, 1, 5], [-2.0, 2, 9], [-3.0, 4, None]])
+
+
 # ---- nvfp4_gate (rev 3e: BF16-KV reference; NVFP4 within 3x the FP8-KV drift, rank-1 within 0.02)
 def band(r1, mean, p99):
     return {"status": "MEASURED", "n": 256, "rank1_agreement": r1, "mean_abs_dlogprob": mean, "p99_abs_dlogprob": p99,
