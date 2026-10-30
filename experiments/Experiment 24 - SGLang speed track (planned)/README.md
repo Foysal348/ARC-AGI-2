@@ -7,7 +7,10 @@ This is the SGLang half of the two engine tracks the user chose on 2026-10-29: v
 - **Research basis:** `Resources/Qwen3_8_27B_SGLang_0_5_21_Research_BN_v5_FINAL.pdf` (v5.0, 48 pages). Its final priority queue is AA1 and its campaign is AA8.
 - **Sources:** all URLs and local evidence are in `Resources/sources/SOURCES.md`.
 
-Status: **planned**. No notebook has been built and no GPU has run. The notebook is built only after the user's go, and every GPU run needs a separate go.
+Status: **built and validated locally; not run on Kaggle** (2026-10-30).
+- The three notebooks, the Kaggle CPU kit and the local harness are built (see [Build](#build-2026-10-30)).
+- They went through two local validation rounds against fake SGLang 0.5.21 / vLLM 0.32 servers. The rounds included four independent reviews (one a DESIGN conformance audit), a null Monte Carlo of the verdict rules, fuzz tests and a mutation check. The evidence is in `Experiment Results/BUILD_VALIDATION_2026-10-30.md`.
+- No Kaggle CPU or GPU run has happened yet. Every Kaggle run needs a separate go.
 
 ## Base engine (the reference, not a frozen configuration)
 ### Speed reference: EMS arm `dflash_w6_s20`
@@ -171,6 +174,47 @@ Adoption is decided by correct ARC outputs per GPU-hour, not by raw tok/s.
 - `NCCL_SHM_USE_CUDA_MEMCPY=1`: slower, and it times out in graphs.
 - 2xTP2: the KV does not fit at 40k+.
 
+## Build (2026-10-30)
+The build follows `DESIGN.md` (rev 2), which turns the six-section plan above into arms, gates and budgets. The validation report lists the departures from DESIGN and the review fixes.
+
+**Notebooks** (`Experiment Notebooks/`). One builder writes all three with identical code; only the baked MODE / PART defaults differ.
+
+| Notebook | Content | Hard stop | Planned | Quota (2x on 4x L4) |
+|---|---|---|---|---|
+| `Q27-XHIGH-E24_SGLANG_SPEED_SMOKE.ipynb` | the README SMOKE list (subsets of sections 1-6) | 210 min | ~170 min | ~6 h |
+| `Q27-XHIGH-E24_SGLANG_SPEED_FULL_A.ipynb` | section 1 (accuracy gap), section 6 (backports), multi-boot A/A | 480 min | ~420 min | ~14 h |
+| `Q27-XHIGH-E24_SGLANG_SPEED_FULL_B.ipynb` | sections 2-5, up to 3 A/A rounds | 690 min | ~570 min + conditionals | ~21 h |
+
+E24 needs about 40 quota-h, which is more than one account's 30 h per week. Plan: SMOKE + FULL_A on one account, FULL_B on another. The private inputs must be shared with that second account. The kernel owner in the generated `kernel-metadata.json` files is a placeholder.
+
+**Code** (`src/`):
+- `e24_lab.py`: the measurement library (E23 lab + SGLang adapter).
+- `e24_hook.py`: the server-side sitecustomize: env records, counters, rank probe, NaN injection.
+- `e24_sglang_patches.py` with `patches/`: the five guarded 0.5.21 backports.
+- `e24_unit_41736_41737.py`: the overlay GPU unit tests.
+- `test_*.py`: the unit tests; `test_e24_decisions.py` covers the notebooks' verdict logic.
+- `harness/`: fake SGLang / vLLM servers, a mock `/kaggle/input`, and the local end-to-end runner.
+
+**Rebuild and check locally** (Python 3.12, stdlib only):
+```
+cd "Experiment Notebooks/Build" && python3.12 build_e24_notebook.py    # 3 notebooks + plan_argvs_e24.json
+cd src && python3.12 test_e24_decisions.py && python3.12 test_e24_lab.py
+E24_SGLANG_SRC=<sglang 0.5.21 src/sglang> python3.12 test_e24_hook.py   # also test_e24_patches.py
+cd src/harness && python3.12 test_fakes.py && python3.12 run_local_e24.py   # FAKE end to end: 3 variants + 10 faults, ~2.5 h
+cd "Experiment Notebooks/Build" && python3.12 build_cpu_kit_e24.py      # rebuild the CPU kit after every notebook rebuild
+```
+
+**Kaggle run order.** Each step needs its own go.
+1. **CPU kit.** Upload `Build/cpu_kernel_e24/kit_data/` as a version of the dataset `<owner>/q27-e24-cpu-kit-data`, then push `Build/cpu_kernel_e24/`. The kit checks:
+   - the offline installs;
+   - every planned argv through the real SGLang / vLLM parsers;
+   - the patches on the installed package and the hook targets;
+   - the three notebooks in FAKE mode on the real mounts.
+2. **SMOKE** (GPU). Its machinery summary decides whether FULL can start.
+3. **FULL_A and FULL_B** (GPU).
+
+The paired ARC sample (DESIGN §5.1) is a separate follow-up session after FULL_A.
+
 ## Folder layout
 - `Resources/`: the SGLang research PDF (v5.0 FINAL).
 - `Resources/sources/`:
@@ -184,4 +228,9 @@ Adoption is decided by correct ARC outputs per GPU-hour, not by raw tok/s.
   - `results/ems_report.md`;
   - `server_logs/` (7 EMS server logs);
   - `e22_speedlab_sglang/` (the planned, never-run E22 SGLang speedlab notebook, its builder, and the E22 engine findings).
-- `Experiment Notebooks/`, `Experiment Results/`: empty until the build.
+- `DESIGN.md`: the build design (rev 2): arms, gates, budgets and the departures from this README.
+- `src/`: the lab, hook, patcher, unit-test script, tests and the local harness.
+- `Experiment Notebooks/`:
+  - the three notebooks;
+  - `Build/`: `build_e24_notebook.py`, `build_cpu_kit_e24.py`, `cpu_kernel_e24/` (the CPU kit), `kernels/<variant>/kernel-metadata.json`, `plan_argvs_e24.json`.
+- `Experiment Results/BUILD_VALIDATION_2026-10-30.md`: the local build and validation report.
