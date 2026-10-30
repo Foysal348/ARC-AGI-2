@@ -143,7 +143,8 @@ class Server:
                                                                r"RuntimeError|AssertionError", l)][:12]
         pick = lambda pat, n=8: [l.strip()[:240] for l in t.splitlines() if re.search(pat, l, re.I)][:n]
         # rev 3 (measurement H5): the decisive startup evidence for the graph mode actually used with spec decode
-        downgrade = pick(r"not supported with spec-decode.*setting cudagraph_mode|setting cudagraph_mode\s*=", 4)
+        downgrade = pick(r"not supported with spec-decode.*setting cudagraph_mode|setting cudagraph_mode\s*=|"
+                         r"[Oo]verriding cudagraph_mode to", 4)       # rev 3e: + the 0.32 wording
         capture = sorted(set(re.findall(r"Capturing CUDA graphs \(([^)]+)\)", t)))
         configured = sorted(set(re.findall(r"CUDAGraphMode\.(\w+)", t)))
         return {"kv_tokens": min(kv) if kv else None, "kv_tokens_all": kv, "max_concurrency": float(mc[-1]) if mc else None,
@@ -505,16 +506,29 @@ def teacher_forced(port, ids, last=256, model="q27", timeout=1800):
 
 
 def compare_tf(ref, cand):
-    """Teacher-forced comparison: mean / max |delta logprob| of the actual tokens and rank-1 agreement."""
+    """Teacher-forced comparison: mean / max |delta logprob| of the actual tokens and rank-1 agreement. rev 3d (four
+    GPT audits): MEASURED only when EVERY expected position is valid on both sides (1 of 256 used to be MEASURED);
+    MEASURED is a measurement, not a PASS (the caller applies the A/A-derived tolerance)."""
     if not ref or not cand or ref.get("error") or cand.get("error"):
         return {"status": "INCONCLUSIVE"}
-    pairs = [(a, b) for a, b in zip(ref["positions"], cand["positions"]) if a and b and a[0] is not None and b[0] is not None]
-    if not pairs:
-        return {"status": "INCONCLUSIVE"}
-    d = [abs(a[0] - b[0]) for a, b in pairs]
+    a_, b_ = ref.get("positions") or [], cand.get("positions") or []
+    if not a_ or len(a_) != len(b_):
+        return {"status": "INCONCLUSIVE_INCOMPLETE_TF", "ref_n": len(a_), "cand_n": len(b_)}
+    if any(not a or not b or a[0] is None or b[0] is None for a, b in zip(a_, b_)):
+        return {"status": "INCONCLUSIVE_INCOMPLETE_TF", "valid": sum(1 for a, b in zip(a_, b_) if a and b and a[0] is not None
+                                                                     and b[0] is not None), "expected": len(a_)}
+    pairs = list(zip(a_, b_))
+    d = sorted(abs(a[0] - b[0]) for a, b in pairs)
     r1 = sum(1 for a, b in pairs if (a[1] == 1) == (b[1] == 1)) / len(pairs)
+    p99 = d[min(len(d) - 1, int(round(0.99 * (len(d) - 1))))]          # rev 3e: robust to one outlier position
     return {"status": "MEASURED", "n": len(pairs), "mean_abs_dlogprob": round(statistics.mean(d), 4),
-            "max_abs_dlogprob": round(max(d), 3), "rank1_agreement": round(r1, 4)}
+            "p99_abs_dlogprob": round(p99, 3), "max_abs_dlogprob": round(d[-1], 3), "rank1_agreement": round(r1, 4)}
+
+
+def tf_complete(rows):
+    """rev 3e: a teacher-forced row set counts as a reference only when every position of every band is valid."""
+    return bool(rows) and all(isinstance(r, dict) and not r.get("error") and r.get("positions") and
+                              all(p and p[0] is not None for p in r["positions"]) for r in rows.values())
 
 
 # ------------------------------------------------------------------ steady decode
@@ -779,12 +793,12 @@ def trace_summary(pdir):
     if per_fw:
         verdict = "FULL" if fw_g == 1 and fw_k == 0 else ("PIECEWISE" if fw_g and fw_g > 1 else ("EAGER" if not fw_g else "MIXED"))
         basis = "per_forward_annotation"
-    elif tot_k:
+    elif tot_k:                  # rev 3d (GPT-2 reproduced FULL with 0 forwards): CUPTI alone never proves FULL
         att = src["attention"]
-        verdict = ("FULL" if att["eager"] == 0 and (eager_share or 0) < 0.05 else
-                   "PIECEWISE" if att["eager"] > 0 and any(v["graph"] for v in src.values()) else
-                   "EAGER" if not any(v["graph"] for v in src.values()) else "MIXED")
-        basis = "cupti_correlation"
+        hint = ("FULL" if att["eager"] == 0 and (eager_share or 0) < 0.05 else
+                "PIECEWISE" if att["eager"] > 0 and any(v["graph"] for v in src.values()) else
+                "EAGER" if not any(v["graph"] for v in src.values()) else "MIXED")
+        verdict, basis = "UNPROVEN", f"no forward annotations (cupti hint: {hint})"
     else:
         verdict, basis = "UNKNOWN", "none"
     return {"file": f.name, "files": len(files), "kernels": len(kern), "kernel_us_sum": round(tot),
@@ -825,9 +839,11 @@ def profile(port, pdir, secs=6.0, delay_iters=20, max_iters=40):
     return rec
 
 
-def profiled_load(port, prompts, level, pdir, secs=6.0, max_new=8192, model="q27", prefill_tok_s=700.0):
+def profiled_load(port, prompts, level, pdir, secs=6.0, max_new=8192, model="q27", prefill_tok_s=700.0, spec=False):
     """`level` decoding streams (own window: the profiler slows decode), profile() only after prefill settled exactly
-    as in steady() (prompt counter + preemptions flat, every running request emitted and gaining tokens)."""
+    as in steady() (prompt counter + preemptions flat, every running request emitted and gaining tokens). rev 3d: no
+    profile when unsettled; the profile window must be decode-only (prompt counter flat) and, with `spec`, show
+    speculative drafts (else the trace cannot speak for multi-token verification)."""
     plen = len(prompts[0]) if prompts else 0
     settle = max(300.0, 120.0 + level * plen / prefill_tok_s)
     ss = [Stream(port, prompts[i % len(prompts)], max_new, 1.0, 4321 + i, model=model) for i in range(level)]
@@ -858,13 +874,27 @@ def profiled_load(port, prompts, level, pdir, secs=6.0, max_new=8192, model="q27
             if ok >= 3:
                 break
         rec["settled"] = ok >= 3
+        if not rec["settled"]:
+            rec["status"] = "INCONCLUSIVE_PREFILL_NOT_SETTLED"
+            return rec
         try:
-            rec["running_at_start"] = prom(port).get(RUN)
+            m0 = prom(port)
+            rec["running_at_start"] = m0.get(RUN)
         except Exception:
-            pass
+            m0 = {}
         rec.update(profile(port, pdir, secs))
-        if not rec["settled"] and isinstance(rec.get("trace"), dict):
-            rec["trace"]["note2"] = "prefill had not settled: the trace may mix prefill and decode"
+        try:
+            m1 = prom(port)
+        except Exception:
+            m1 = {}
+        rec["window_deltas"] = {"prompt_tokens": m1.get(PROMPT, 0) - m0.get(PROMPT, 0), "drafts": m1.get(DRF, 0) - m0.get(DRF, 0),
+                                "accepted": m1.get(ACC, 0) - m0.get(ACC, 0), "generated": m1.get(GEN, 0) - m0.get(GEN, 0)}
+        if not m0 or not m1:
+            rec["status"] = "INCONCLUSIVE_METRICS_UNAVAILABLE"
+        elif rec["window_deltas"]["prompt_tokens"]:
+            rec["status"] = "INCONCLUSIVE_PREFILL_IN_PROFILE"
+        elif spec and not (rec["window_deltas"]["drafts"] and rec["window_deltas"]["accepted"]):
+            rec["status"] = "INCONCLUSIVE_NO_SPEC_DECODE"            # rev 3e: drafts AND accepted tokens in the window
         return rec
     finally:
         for g in ss:

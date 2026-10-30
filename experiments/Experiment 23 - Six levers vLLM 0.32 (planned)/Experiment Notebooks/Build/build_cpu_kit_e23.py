@@ -22,6 +22,7 @@ for v in NB:                     # the kit carries FULL only; the other two are 
     assert bake(NB["FULL"], v) == NB[v], v
 FAKE = (E23 / "src" / "harness" / "fake_vllm_server.py").read_text(encoding="utf-8")       # E23 copy: varied words
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8")
+GATES = (E23 / "src" / "harness" / "gate_tests.py").read_text(encoding="utf-8")     # rev 3d: injected-fault gate tests
 IMAGE = "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461"
 
 CODE = r'''# E23 CPU kit: the three GPU notebooks against a fake vLLM server, real /kaggle/input mounts, Linux semantics
@@ -36,6 +37,7 @@ NB = {"FULL": NBF, "SMOKE_A": NBF.replace('os.environ.get("Q27X_E23_MODE", "FULL
 NB["SMOKE_B"] = NB["SMOKE_A"].replace('os.environ.get("Q27X_E23_PART", "A")', 'os.environ.get("Q27X_E23_PART", "B")', 1)
 (T / "fake_vllm_server.py").write_text(''' + repr(FAKE) + r''')
 (T / "e23_lab.py").write_text(''' + repr(LAB) + r''')
+(T / "gate_tests.py").write_text(''' + repr(GATES) + r''')
 REP = {"checks": {}, "runs": {}, "part": "__KP__"}
 KP = "__KP__"                      # p1 unit + SMOKE_A | p2 SMOKE_B + rerun | p3 FULL | p4 Merlin GCC 13 | p5 Merlin GCC 11
 DO_UNIT = KP == "p1"
@@ -105,6 +107,12 @@ out["killed_dead"] = (not b.alive()) and (not c.alive())
 print("UNIT " + json.dumps(out))
 """
 rc, txt = run("unit", UNIT, {}, 900) if DO_UNIT else (0, "")
+if DO_UNIT:                       # rev 3d: the real gate functions of the FULL notebook against injected faults
+    (T / "nb_gates_FULL.py").write_text(NB["FULL"])
+    _rc, _txt = run("gates", [sys.executable, str(T / "gate_tests.py"), str(T / "nb_gates_FULL.py"), str(T / "e23_lab.py")], {},
+                    600, is_code=False)
+    _m = re.search(r"^GATES (.*)$", _txt, re.M)
+    REP["checks"]["gates"] = json.loads(_m.group(1)) if _m else {"all_ok": False, "tail": _txt[-1500:]}
 m = re.search(r"^UNIT (.*)$", txt, re.M)
 REP["checks"]["unit"] = u = json.loads(m.group(1)) if m else None
 REP["checks"]["unit_ok"] = bool(u) and u.get("compare_same") == "EXACT" and u.get("compare_fail") == "FAIL_HIGH_MARGIN" and \
@@ -240,13 +248,14 @@ print("MERLIN", json.dumps({k: v for k, v in MP.items() if k != "kv"}, default=s
 # errored (CPU-expected: P4 / P5 benches without CUDA, PP4 NO_GO and EAGLE SKIPPED on the fake server), the real
 # Merlin install, and a GCC 13 C++20 CUDA build that loads
 inp = (REP["checks"].get("SMOKE_A") or {}).get("inputs") or {}
-BAD = ("ERROR", "BODY_ERROR", "SERVER_DIED", "FAIL_GPU_RELEASE", "LAUNCH_FAILED", "PATCH_FAILED")
+BAD = ("ERROR", "BODY_ERROR", "SERVER_DIED", "FAIL_GPU_RELEASE", "LAUNCH_FAILED", "PATCH_FAILED", "NO_GO_GPU_FAULT", "FAIL_CHECKPOINT_SHA")
 REP["checks"]["bad_steps"] = {v: {k: st for k, st in ((REP["checks"].get(v) or {}).get("steps") or {}).items() if st in BAD}
                               for v in SMOKES}
 inp = inp or (REP["checks"].get("SMOKE_B") or {}).get("inputs") or {}
 ok = []                                                      # per-part verdict: only what this part ran
 if DO_UNIT:
     ok.append(bool(REP["checks"]["unit_ok"]))
+    ok.append((REP["checks"].get("gates") or {}).get("all_ok") is True)
 for v in list(SMOKES) + (["rerun_FULL"] if DO_RERUN else []) + (["nb_FULL"] if DO_FULL else []):
     ok.append(REP["runs"].get(v, {}).get("rc") == 0 and REP["runs"].get(v, {}).get("tracebacks") == 0)
 if SMOKES:
