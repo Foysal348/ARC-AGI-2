@@ -1,4 +1,4 @@
-"""E23 CPU kit: the three E23 GPU notebooks (SMOKE_A, SMOKE_B, FULL) run against a fake vLLM server on a Kaggle CPU
+"""E23 CPU kit (rev 3h): the three E23 GPU notebooks to run next (TARGET_A, TARGET_B, FULL) run against a fake vLLM server on a Kaggle CPU
 kernel, pinned image (Linux semantics: TIME_WAIT, killpg, ps --sid), with the REAL /kaggle/input mounts of every E23
 input (mount discovery, manifest sizes, kit sha256, identity). Plus the lab unit tests and a competition-RERUN check
 (fallback submission written, no exception, nothing else run). Kernel foysalemonshanto/q27-e23-cpu-kit (Build/cpu_kernel_e23/)."""
@@ -9,8 +9,8 @@ HERE = Path(__file__).resolve().parent
 E23 = HERE.parents[1]
 NB = {v: "".join("".join(c["source"]) + "\n\n" for c in json.load(open(HERE.parent / f"Q27-XHIGH-E23_SIX_LEVERS_{v}.ipynb",
                                                                        encoding="utf-8"))["cells"] if c["cell_type"] == "code")
-      for v in ("SMOKE_A", "SMOKE_B", "FULL")}
-BAKE = {"SMOKE_A": ("SMOKE", "A"), "SMOKE_B": ("SMOKE", "B"), "FULL": ("FULL", "ALL")}
+      for v in ("TARGET_A", "TARGET_B", "FULL")}
+BAKE = {"TARGET_A": ("TARGET", "A"), "TARGET_B": ("TARGET", "B"), "FULL": ("FULL", "ALL")}
 
 
 def bake(code, v):
@@ -32,16 +32,16 @@ T0 = time.time()
 W, T = Path("/kaggle/working"), Path("/tmp/e23kit")
 T.mkdir(parents=True, exist_ok=True)
 NBF = ''' + repr(NB["FULL"]) + r'''
-NB = {"FULL": NBF, "SMOKE_A": NBF.replace('os.environ.get("Q27X_E23_MODE", "FULL")', 'os.environ.get("Q27X_E23_MODE", "SMOKE")', 1)
+NB = {"FULL": NBF, "TARGET_A": NBF.replace('os.environ.get("Q27X_E23_MODE", "FULL")', 'os.environ.get("Q27X_E23_MODE", "TARGET")', 1)
       .replace('os.environ.get("Q27X_E23_PART", "ALL")', 'os.environ.get("Q27X_E23_PART", "A")', 1)}
-NB["SMOKE_B"] = NB["SMOKE_A"].replace('os.environ.get("Q27X_E23_PART", "A")', 'os.environ.get("Q27X_E23_PART", "B")', 1)
+NB["TARGET_B"] = NB["TARGET_A"].replace('os.environ.get("Q27X_E23_PART", "A")', 'os.environ.get("Q27X_E23_PART", "B")', 1)
 (T / "fake_vllm_server.py").write_text(''' + repr(FAKE) + r''')
 (T / "e23_lab.py").write_text(''' + repr(LAB) + r''')
 (T / "gate_tests.py").write_text(''' + repr(GATES) + r''')
 REP = {"checks": {}, "runs": {}, "part": "__KP__"}
-KP = "__KP__"                      # p1 unit + SMOKE_A | p2 SMOKE_B + rerun | p3 FULL | p4 Merlin GCC 13 | p5 Merlin GCC 11
+KP = "__KP__"                      # p1 unit + TARGET_A | p2 TARGET_B + rerun | p3 FULL | p4 Merlin GCC 13 | p5 Merlin GCC 11
 DO_UNIT = KP == "p1"
-SMOKES = {"p1": ("SMOKE_A",), "p2": ("SMOKE_B",)}.get(KP, ())
+SMOKES = {"p1": ("TARGET_A",), "p2": ("TARGET_B",)}.get(KP, ())
 DO_RERUN = KP == "p2"
 DO_FULL = KP == "p3"
 DO_MERLIN = KP in ("p4", "p5")
@@ -109,8 +109,10 @@ print("UNIT " + json.dumps(out))
 rc, txt = run("unit", UNIT, {}, 900) if DO_UNIT else (0, "")
 if DO_UNIT:                       # rev 3d: the real gate functions of the FULL notebook against injected faults
     (T / "nb_gates_FULL.py").write_text(NB["FULL"])
-    _rc, _txt = run("gates", [sys.executable, str(T / "gate_tests.py"), str(T / "nb_gates_FULL.py"), str(T / "e23_lab.py")], {},
-                    600, is_code=False)
+    # rev 3h: the top-level kit file next to the manifest (the dataset also unpacks an older copy under p5_src/)
+    _kb = next(Path("/kaggle/input/datasets/foysalemonshanto/q27-e23-sm89-kernels").rglob("q27_e23_kernels_manifest.json")).parent         / "bench_host_ar.py"
+    _rc, _txt = run("gates", [sys.executable, str(T / "gate_tests.py"), str(T / "nb_gates_FULL.py"), str(T / "e23_lab.py"),
+                              str(_kb)], {}, 600, is_code=False)
     _m = re.search(r"^GATES (.*)$", _txt, re.M)
     REP["checks"]["gates"] = json.loads(_m.group(1)) if _m else {"all_ok": False, "tail": _txt[-1500:]}
 m = re.search(r"^UNIT (.*)$", txt, re.M)
@@ -119,7 +121,7 @@ REP["checks"]["unit_ok"] = bool(u) and u.get("compare_same") == "EXACT" and u.ge
     u.get("steady") == "STEADY" and u.get("port_reuse_after_kill_ready") and u.get("capacity") == "CAPACITY_LIMITED" and \
     u.get("multi") == "AGGREGATE_STEADY" and u.get("killed_dead") and isinstance(u.get("rss_mb"), float)
 
-# 2. SMOKE A and SMOKE B together (ports 8100-8103 vs 8200 / 8300), real mounts, fake server
+# 2. TARGET A or TARGET B (ports 8100-8103 vs 8200 / 8300), real mounts, fake server
 FENV = {"E23_FAKE_SERVER": str(T / "fake_vllm_server.py"), "FAKE_SPEED": "300"}
 procs = {}
 for v in SMOKES:
@@ -247,11 +249,11 @@ print("MERLIN", json.dumps({k: v for k, v in MP.items() if k != "kv"}, default=s
 # verdict: no tracebacks in any notebook run, inputs found on the real mounts, unit tests, rerun format, no step that
 # errored (CPU-expected: P4 / P5 benches without CUDA, PP4 NO_GO and EAGLE SKIPPED on the fake server), the real
 # Merlin install, and a GCC 13 C++20 CUDA build that loads
-inp = (REP["checks"].get("SMOKE_A") or {}).get("inputs") or {}
+inp = (REP["checks"].get("TARGET_A") or {}).get("inputs") or {}
 BAD = ("ERROR", "BODY_ERROR", "SERVER_DIED", "FAIL_GPU_RELEASE", "LAUNCH_FAILED", "PATCH_FAILED", "NO_GO_GPU_FAULT", "FAIL_CHECKPOINT_SHA")
 REP["checks"]["bad_steps"] = {v: {k: st for k, st in ((REP["checks"].get(v) or {}).get("steps") or {}).items() if st in BAD}
                               for v in SMOKES}
-inp = inp or (REP["checks"].get("SMOKE_B") or {}).get("inputs") or {}
+inp = inp or (REP["checks"].get("TARGET_B") or {}).get("inputs") or {}
 ok = []                                                      # per-part verdict: only what this part ran
 if DO_UNIT:
     ok.append(bool(REP["checks"]["unit_ok"]))

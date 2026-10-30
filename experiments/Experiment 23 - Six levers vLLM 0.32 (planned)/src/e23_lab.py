@@ -482,10 +482,28 @@ def chat_probes(port, model="q27", cases=(("Reply with exactly one number: 7 * 6
     return {"ok": all(x["ok"] for x in out), "cases": out}
 
 
+def template_probe(port, messages, want_ids, model="q27", timeout=120):
+    """rev 3h (three GPT SMOKE audits): what the SERVER's chat path renders for `messages` (its own template and default
+    chat-template kwargs, no per-request kwargs) against the production xhigh render `want_ids`. MATCH / MISMATCH /
+    ERROR; the load requests themselves use pre-rendered ids, so this shows chat-path equivalence only."""
+    body = {"model": model, "messages": messages, "add_generation_prompt": True}
+    try:
+        r = json.loads(U.urlopen(U.Request(f"http://127.0.0.1:{port}/tokenize", data=json.dumps(body).encode(),
+                                           headers={"Content-Type": "application/json"}), timeout=timeout).read())
+        got = list(r.get("tokens") or [])
+    except Exception as e:
+        return {"status": "ERROR", "error": repr(e)[:200]}
+    want = list(want_ids)
+    first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None if len(got) == len(want) else min(len(got), len(want)))
+    return {"status": "MATCH" if got == want else "MISMATCH", "server_tokens": len(got), "want_tokens": len(want),
+            "first_diff": first}
+
+
 def teacher_forced(port, ids, last=256, model="q27", timeout=1800):
     """rev 3 (measurement M3): prompt logprobs of the last `last` positions of a long prompt (one prefill, 1 token out),
     for a lossy-KV comparison (NVFP4 vs FP8 KV) at the context lengths that matter. Returns per-position
-    (logprob of the actual token, rank) or an error."""
+    [logprob of the actual token, its rank, the engine's own rank-1 token id] or an error. rev 3h (three GPT SMOKE
+    audits): the rank-1 token id is kept, so top-1 agreement compares the two engines' predictions."""
     body = {"model": model, "prompt": list(ids), "max_tokens": 1, "temperature": 0, "prompt_logprobs": 1,
             "return_tokens_as_token_ids": True}
     try:
@@ -501,8 +519,15 @@ def teacher_forced(port, ids, last=256, model="q27", timeout=1800):
             out.append(None)
             continue
         e = d.get(str(ids[pos])) or d.get(f"token_id:{ids[pos]}")     # rev 3c: no fallback to another token
-        out.append([e.get("logprob"), e.get("rank")] if isinstance(e, dict) else None)
+        top1 = [_tok_id(k) for k, v in d.items() if isinstance(v, dict) and v.get("rank") == 1]
+        out.append([e.get("logprob"), e.get("rank"), top1[0] if len(top1) == 1 else None] if isinstance(e, dict) else None)
     return {"positions": out, "n": len(out)}
+
+
+def _tok_id(k):
+    """A prompt-logprob key ('123' or 'token_id:123') as an int id; anything else stays a tagged string."""
+    m = re.fullmatch(r"(?:token_id:)?(-?\d+)", str(k))
+    return int(m.group(1)) if m else "str:" + str(k)
 
 
 def compare_tf(ref, cand):
@@ -518,17 +543,26 @@ def compare_tf(ref, cand):
         return {"status": "INCONCLUSIVE_INCOMPLETE_TF", "valid": sum(1 for a, b in zip(a_, b_) if a and b and a[0] is not None
                                                                      and b[0] is not None), "expected": len(a_)}
     pairs = list(zip(a_, b_))
+    if any(len(a) < 3 or len(b) < 3 or a[2] is None or b[2] is None for a, b in pairs):
+        return {"status": "INCONCLUSIVE_TOP1_MISSING", "expected": len(pairs),
+                "with_top1": sum(1 for a, b in pairs if len(a) >= 3 and len(b) >= 3 and a[2] is not None and b[2] is not None)}
     d = sorted(abs(a[0] - b[0]) for a, b in pairs)
-    r1 = sum(1 for a, b in pairs if (a[1] == 1) == (b[1] == 1)) / len(pairs)
+    # rev 3h (three GPT SMOKE audits): top-1 agreement = both engines predict the same rank-1 token id. rev 3d-3g counted
+    # "the forced token is rank 1 on both sides or on neither", which reads 1.0 for ranks 2 vs 3.
+    r1 = sum(1 for a, b in pairs if a[2] == b[2]) / len(pairs)
+    both = sum(1 for a, b in pairs if (a[1] == 1) == (b[1] == 1)) / len(pairs)
     p99 = d[min(len(d) - 1, int(round(0.99 * (len(d) - 1))))]          # rev 3e: robust to one outlier position
     return {"status": "MEASURED", "n": len(pairs), "mean_abs_dlogprob": round(statistics.mean(d), 4),
-            "p99_abs_dlogprob": round(p99, 3), "max_abs_dlogprob": round(d[-1], 3), "rank1_agreement": round(r1, 4)}
+            "p99_abs_dlogprob": round(p99, 3), "max_abs_dlogprob": round(d[-1], 3), "rank1_agreement": round(r1, 4),
+            "forced_token_rank1_both_or_neither": round(both, 4)}
 
 
 def tf_complete(rows):
-    """rev 3e: a teacher-forced row set counts as a reference only when every position of every band is valid."""
+    """rev 3e: a teacher-forced row set counts as a reference only when every position of every band is valid
+    (rev 3h: including the rank-1 token id)."""
     return bool(rows) and all(isinstance(r, dict) and not r.get("error") and r.get("positions") and
-                              all(p and p[0] is not None for p in r["positions"]) for r in rows.values())
+                              all(p and p[0] is not None and len(p) >= 3 and p[2] is not None for p in r["positions"])
+                              for r in rows.values())
 
 
 # ------------------------------------------------------------------ steady decode
@@ -740,7 +774,8 @@ def wait_idle(port, wait=90.0):
 # ------------------------------------------------------------------ profiler (FULL-graph proof + per-category time)
 # rev 3: matched on the kernel BASE name, attention before GDN ("fla" is a substring of "flashinfer"), real 0.32 GDN names
 CATS = [("nccl", ("nccl", "allreduce", "all_reduce", "allgather", "all_gather")),
-        ("attention", ("flashinfer", "flash_fwd", "unified_attention", "paged", "attn", "attention", "batchdecode", "batchprefill")),
+        ("attention", ("flashinfer", "flash_fwd", "unified_attention", "paged", "attn", "attention", "batchdecode", "batchprefill",
+                   "reshape_and_cache")),
         ("gdn_linear_attn", ("gdn", "delta_rule", "chunk_", "recurrent", "causal_conv", "l2norm", "solve_tril", "merge_16x16",
                              "recompute_w_u", "kkt", "cumsum", "post_conv", "layer_norm_gated", "gated_delta")),
         ("gemm_marlin", ("marlin",)),
@@ -749,8 +784,33 @@ CATS = [("nccl", ("nccl", "allreduce", "all_reduce", "allgather", "all_gather"))
 
 
 def _cat(name):
-    base = str(name).split("<")[0].split("(")[0].lower()
+    # rev 3h: "void (anonymous namespace)::gdn_decode_post_conv_mtp_kernel<...>(...)" used to reduce to "void " -> other
+    s = re.sub(r"\(anonymous namespace\)::", "", str(name))
+    s = re.sub(r"^\s*void\s+", "", s)
+    base = s.split("<")[0].split("(")[0].lower()
     return next((k for k, pats in CATS if any(p in base for p in pats)), "other")
+
+
+COMPUTE_CATS = ("nccl", "attention", "gdn_linear_attn", "gemm_marlin", "gemm_other")
+# rev 3h: vLLM 0.32 marks each model execution as execute_context_N(N)_generation_N(N) (no gpu_model_runner range)
+SCOPE_RE = re.compile(r"^execute_context_\d+\(\d+\)_generation_\d+\(\d+\)$")
+
+
+def _is_scope(e):
+    n = str(e.get("name", ""))
+    return SCOPE_RE.match(n) is not None or ("forward" in n.lower() and "gpu_model_runner" in n.lower())
+
+
+def _scope_kind(g, compute_eager, unresolved):
+    """FULL = graph-launched with no eager model compute (attention / GDN / GEMM / NCCL) inside the execution scope;
+    eager input-preparation kernels are counted apart and allowed. Unresolved eager launches never read FULL."""
+    if g == 0:
+        return "EAGER"
+    if compute_eager:
+        return "PIECEWISE"
+    if unresolved:
+        return "PIECEWISE" if g > 1 else "MIXED"
+    return "FULL"
 
 
 def trace_summary(pdir):
@@ -765,15 +825,28 @@ def trace_summary(pdir):
     rt = [e for e in ev if e.get("ph") == "X" and str(e.get("cat", "")).lower() in ("cuda_runtime", "cuda_driver")]
     is_graph = lambda e: "GraphLaunch" in str(e.get("name", ""))
     is_kl = lambda e: re.search(r"LaunchKernel|cuLaunchKernel", str(e.get("name", ""))) is not None
-    # per-forward counts inside gpu_model_runner forward annotations (needs VLLM_CUSTOM_SCOPES_FOR_PROFILING=1)
-    fw = sorted([e for e in ev if e.get("ph") == "X" and str(e.get("cat", "")) == "user_annotation"
-                 and "forward" in str(e.get("name", "")).lower() and "gpu_model_runner" in str(e.get("name", "")).lower()],
-                key=lambda e: e.get("ts", 0))           # rev 3c: not the gpu_user_annotation copies (0 launches)
-    per_fw = []
+    # per-scope counts inside the execution annotations (rev 3h: execute_context_*_generation_*; the older
+    # gpu_model_runner forward ranges still count). rev 3c: user_annotation only, not the gpu_user_annotation copies.
+    fw = sorted([e for e in ev if e.get("ph") == "X" and str(e.get("cat", "")) == "user_annotation" and _is_scope(e)],
+                key=lambda e: e.get("ts", 0))
+    kname = {(e.get("args") or {}).get("correlation"): str(e.get("name", "")) for e in kern
+             if (e.get("args") or {}).get("correlation") is not None}
+    per_fw, aux = [], {}
     for a in fw[:400]:
         lo, hi, tid = a.get("ts", 0), a.get("ts", 0) + a.get("dur", 0), a.get("tid")
         inside = [e for e in rt if e.get("tid") == tid and lo <= e.get("ts", -1) <= hi]
-        per_fw.append([sum(1 for e in inside if is_graph(e)), sum(1 for e in inside if is_kl(e))])
+        kls = [e for e in inside if is_kl(e)]
+        ce = un = 0
+        for e in kls:
+            kn = kname.get((e.get("args") or {}).get("correlation"))
+            if kn is None:
+                un += 1
+            elif _cat(kn) in COMPUTE_CATS:
+                ce += 1
+            else:
+                b = re.sub(r"^\s*void\s+", "", re.sub(r"\(anonymous namespace\)::", "", kn)).split("<")[0].split("(")[0][:60]
+                aux[b] = aux.get(b, 0) + 1
+        per_fw.append([sum(1 for e in inside if is_graph(e)), len(kls), ce, un])
     corr = {(e.get("args") or {}).get("correlation"): str(e.get("name", "")) for e in rt
             if (e.get("args") or {}).get("correlation") is not None}
     per, tot, names = {k: 0.0 for k, _ in CATS + [("other", ())]}, 0.0, {}
@@ -790,10 +863,11 @@ def trace_summary(pdir):
     eager_share = round(sum(v["eager"] for v in src.values()) / tot_k, 3) if tot_k else None
     fw_g = statistics.median([x[0] for x in per_fw]) if per_fw else None
     fw_k = statistics.median([x[1] for x in per_fw]) if per_fw else None
+    kinds_l = [_scope_kind(g, ce, un) for g, k, ce, un in per_fw]
     if per_fw:                   # rev 3f (GPT rev 3e audit: 2 FULL + 1 EAGER forwards read FULL by the median)
-        kinds = {"FULL" if g == 1 and k == 0 else "PIECEWISE" if g > 1 else "EAGER" if g == 0 else "MIXED" for g, k in per_fw}
-        verdict = kinds.pop() if len(kinds) == 1 else "MIXED"       # every forward must agree
-        basis = "per_forward_annotation (all forwards)"
+        kinds = set(kinds_l)
+        verdict = kinds.pop() if len(kinds) == 1 else "MIXED"       # every scope must agree
+        basis = "per_scope_annotation (all scopes; eager input-prep kernels allowed, eager model compute is not)"
     elif tot_k:                  # rev 3d (GPT-2 reproduced FULL with 0 forwards): CUPTI alone never proves FULL
         att = src["attention"]
         hint = ("FULL" if att["eager"] == 0 and (eager_share or 0) < 0.05 else
@@ -804,7 +878,12 @@ def trace_summary(pdir):
         verdict, basis = "UNKNOWN", "none"
     return {"file": f.name, "files": len(files), "kernels": len(kern), "kernel_us_sum": round(tot),
             "graph_launches": sum(1 for e in rt if is_graph(e)), "kernel_launches": sum(1 for e in rt if is_kl(e)),
-            "forwards": len(per_fw), "forward_kinds": {k_: sum(1 for g, k in per_fw if ("FULL" if g == 1 and k == 0 else "PIECEWISE" if g > 1 else "EAGER" if g == 0 else "MIXED") == k_) for k_ in ("FULL", "PIECEWISE", "EAGER", "MIXED")}, "per_forward_median_graph_launches": fw_g, "per_forward_median_kernel_launches": fw_k,
+            "forwards": len(per_fw), "forward_kinds": {k_: kinds_l.count(k_) for k_ in ("FULL", "PIECEWISE", "EAGER", "MIXED")},
+            "per_forward_median_graph_launches": fw_g, "per_forward_median_kernel_launches": fw_k,
+            "per_forward_median_compute_eager": statistics.median([x[2] for x in per_fw]) if per_fw else None,
+            "per_forward_unresolved_eager": sum(x[3] for x in per_fw),
+            "scope_names": sorted({str(a.get("name", "")) for a in fw})[:5],
+            "aux_eager_kernels_in_scopes": dict(sorted(aux.items(), key=lambda x: -x[1])[:20]),
             "launch_source": src, "eager_kernel_share": eager_share, "graph_verdict": verdict, "verdict_basis": basis,
             "by_category_pct": {k: round(100 * v / tot, 1) for k, v in per.items()} if tot else {},
             "top_kernels_us": dict(sorted(((k, round(v)) for k, v in names.items()), key=lambda x: -x[1])[:25]),

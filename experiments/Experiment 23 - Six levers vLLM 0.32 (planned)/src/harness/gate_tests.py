@@ -34,11 +34,11 @@ def check(name, got, want):
 
 import re, subprocess, os, signal, hashlib, time   # noqa: E401  (names the extracted functions use)
 G = {"CLEAN": ("EXACT", "NEAR_TIE"), "R": {"sections": {}, "setup": {}, "errors": [], "inputs": {}}, "L": L, "json": json,
-     "re": re, "subprocess": subprocess, "os": os, "signal": signal, "Path": Path, "FAKE": None, "SM": False,
+     "re": re, "subprocess": subprocess, "os": os, "signal": signal, "Path": Path, "FAKE": None, "SM": False, "LITE": False, "TG": False,
      "NVSMI_OK": True, "ABORT": {"why": None}, "time": time, "hashlib": hashlib}
 for node in ast.walk(tree):            # rev 3f: module-level constants the fault gate uses
     if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
-            and node.targets[0].id in ("XID", "XID_RESET", "HEALTH_CODE") and node.targets[0].id not in G:
+            and node.targets[0].id in ("XID", "XID_RESET", "HEALTH_CODE", "NV_BANDS") and node.targets[0].id not in G:
         exec(ast.get_source_segment(src, node), G)
 for node in ast.walk(tree):
     if isinstance(node, ast.FunctionDef) and node.name in ("gpu_health", "fault_gate") and node.name not in code:
@@ -62,15 +62,27 @@ check("gate_inconclusive", og({"oracle": {"errors": [None], "garbage": [None], "
 o = G["gated"]({"oracle": {"errors": [None], "garbage": [None], "vs_x": {"status": "FAIL_HIGH_MARGIN"}}}, need=("x",))
 check("gated_nested_fail_not_done", (o.get("status"), o.get("correctness")), ("NO_GO_ORACLE", "NO_GO_ORACLE"))
 
-# ---- compare_tf completeness (#1a)
-full = {"positions": [[-0.1, 1]] * 256, "n": 256}
-one = {"positions": [[-0.1, 1]] + [None] * 255, "n": 256}
+# ---- compare_tf completeness (#1a); rev 3h: [logprob, rank, rank-1 token id] and true top-1 agreement
+full = {"positions": [[-0.1, 1, 5]] * 256, "n": 256}
+one = {"positions": [[-0.1, 1, 5]] + [None] * 255, "n": 256}
 check("tf_1_of_256_inconclusive", L.compare_tf(full, one)["status"], "INCONCLUSIVE_INCOMPLETE_TF")
 check("tf_missing_ref", L.compare_tf(None, full)["status"], "INCONCLUSIVE")
 check("tf_complete_measured", L.compare_tf(full, full)["status"], "MEASURED")
-bad_tf = {"positions": [[-25.0, 9]] * 256, "n": 256}
+bad_tf = {"positions": [[-25.0, 9, 7]] * 256, "n": 256}
 r = L.compare_tf(full, bad_tf)
 check("tf_bad_is_measurement_only", (r["status"], r["rank1_agreement"]), ("MEASURED", 0.0))
+# the GPT SMOKE-audit repro: forced token rank 2 vs 3 (neither rank 1) with different top-1 ids used to read 1.0
+r23 = L.compare_tf({"positions": [[-1.0, 2, 11]] * 256}, {"positions": [[-1.2, 3, 12]] * 256})
+check("tf_rank2_vs_rank3_diff_top1_is_0", (r23["status"], r23["rank1_agreement"]), ("MEASURED", 0.0))
+r23s = L.compare_tf({"positions": [[-1.0, 2, 11]] * 256}, {"positions": [[-1.2, 3, 11]] * 256})
+check("tf_same_top1_is_1", r23s["rank1_agreement"], 1.0)
+check("tf_top1_missing_inconclusive", L.compare_tf(full, {"positions": [[-0.1, 1, None]] * 256})["status"],
+      "INCONCLUSIVE_TOP1_MISSING")
+check("tf_old_two_field_rows_inconclusive", L.compare_tf(full, {"positions": [[-0.1, 1]] * 256})["status"],
+      "INCONCLUSIVE_TOP1_MISSING")
+check("tf_complete_needs_top1", (L.tf_complete({"40k": full}), L.tf_complete({"40k": {"positions": [[-0.1, 1, None]] * 256}})),
+      (True, False))
+check("tok_id_parse", (L._tok_id("token_id:42"), L._tok_id("17"), L._tok_id("abc")), (42, 17, "str:abc"))
 
 
 # ---- nvfp4_gate (rev 3e: BF16-KV reference; NVFP4 within 3x the FP8-KV drift, rank-1 within 0.02)
@@ -79,12 +91,27 @@ def band(r1, mean, p99):
             "max_abs_dlogprob": p99 * 1.5}
 
 
+def both(b):                          # rev 3h: the gate needs 40k AND 90k on both TF arms
+    return {"40k": b, "90k": dict(b)}
+
+
 def sec5(tgt="DONE", orc="NEAR_TIE", ref="DONE", f8="DONE", nv="DONE", nv_tf=None, f8_tf=None):
+    nv_tf = both(nv_tf["40k"]) if nv_tf and set(nv_tf) == {"40k"} else nv_tf
+    f8_tf = both(f8_tf["40k"]) if f8_tf and set(f8_tf) == {"40k"} else f8_tf
     G["R"]["sections"]["5_nvfp4_kv"] = {
         "nvfp4_target_only": {"status": tgt, "oracle": {"vs_fp8_mtp0": {"status": orc}}},
         "tf_bf16kv_reference": {"status": ref},
-        "tf_fp8kv_vs_bf16": {"status": f8, "teacher_forced": f8_tf or {"40k": band(0.97, 0.03, 0.4)}},
-        "tf_nvfp4_vs_bf16": {"status": nv, "teacher_forced": nv_tf or {"40k": band(0.96, 0.07, 0.9)}}}
+        "tf_fp8kv_vs_bf16": {"status": f8, "teacher_forced": f8_tf or both(band(0.97, 0.03, 0.4))},
+        "tf_nvfp4_vs_bf16": {"status": nv, "teacher_forced": nv_tf or both(band(0.96, 0.07, 0.9))}}
+    return G["nvfp4_gate"]()
+
+
+def sec5_raw(nv_tf, f8_tf=None):            # no auto-completion of the 90k band
+    G["R"]["sections"]["5_nvfp4_kv"] = {
+        "nvfp4_target_only": {"status": "DONE", "oracle": {"vs_fp8_mtp0": {"status": "NEAR_TIE"}}},
+        "tf_bf16kv_reference": {"status": "DONE"},
+        "tf_fp8kv_vs_bf16": {"status": "DONE", "teacher_forced": f8_tf or both(band(0.97, 0.03, 0.4))},
+        "tf_nvfp4_vs_bf16": {"status": "DONE", "teacher_forced": nv_tf}}
     return G["nvfp4_gate"]()
 
 
@@ -100,6 +127,15 @@ check("nv_rank1_drop_blocks", sec5(nv_tf={"40k": band(0.93, 0.03, 0.4)})[0], Fal
 check("nv_p99_4x_blocks", sec5(nv_tf={"40k": band(0.97, 0.03, 1.7)})[0], False)
 check("nv_exact_fp8_floors", sec5(f8_tf={"40k": band(1.0, 0.0, 0.0)}, nv_tf={"40k": band(0.985, 0.015, 0.15)})[0], True)
 check("nv_none_metric_no_crash", sec5(nv_tf={"40k": {"status": "MEASURED", "n": 256, "rank1_agreement": None}})[0], False)
+_g = sec5_raw({"40k": band(0.96, 0.07, 0.9)})                      # rev 3h (GPT SMOKE audits): 40k only must STOP
+check("nv_40k_only_stops", (_g[0], _g[1].get("why")), (False, "MISSING_REQUIRED_TF_BANDS"))
+_g = sec5_raw(both(band(0.96, 0.07, 0.9)), f8_tf={"40k": band(0.97, 0.03, 0.4)})
+check("nv_fp8_calibration_40k_only_stops", (_g[0], _g[1].get("why")), (False, "MISSING_REQUIRED_TF_BANDS"))
+_g = sec5_raw({"40k": band(0.96, 0.07, 0.9), "90k": {**band(0.96, 0.07, 0.9), "n": 200}})
+check("nv_90k_short_band_stops", (_g[0], _g[1].get("why")), (False, "INVALID_TF_BAND"))
+_g = sec5_raw({"40k": band(0.96, 0.07, 0.9), "90k": {"status": "INCONCLUSIVE_TOP1_MISSING"}})
+check("nv_90k_top1_missing_stops", (_g[0], _g[1].get("why")), (False, "INVALID_TF_BAND"))
+check("nv_both_bands_pass", sec5_raw(both(band(0.96, 0.07, 0.9)))[0], True)
 
 # ---- graph_proof + trace_summary (#6)
 gp = G["graph_proof"]
@@ -203,6 +239,81 @@ def fw_trace(kinds):
 check("trace_all_full", fw_trace(["FULL"] * 3), "FULL")
 check("trace_2full_1eager_mixed", fw_trace(["FULL", "FULL", "EAGER"]), "MIXED")
 check("trace_all_piecewise", fw_trace(["PIECEWISE"] * 3), "PIECEWISE")
+
+
+# ---- rev 3h (GPT SMOKE audits): vLLM 0.32 scopes are execute_context_N(N)_generation_N(N); eager input-prep kernels
+# inside a FULL scope are allowed, eager model compute (attention / GDN / GEMM / NCCL) is PIECEWISE, unresolved is not FULL
+def scope_trace(kinds, name="execute_context_0(0)_generation_16(64)"):
+    evs, ts, c = [], 0, 1000
+    for k in kinds:
+        lo = ts
+        evs.append({"ph": "X", "cat": "user_annotation", "name": name, "ts": lo, "dur": 80, "tid": 1})
+        ng = {"FULL": 1, "FULL_PREP": 1, "PIECEWISE_REAL": 5, "ONE_GRAPH_UNRESOLVED": 1}[k]
+        for j in range(ng):
+            c += 1
+            evs.append({"ph": "X", "cat": "cuda_runtime", "name": "cudaGraphLaunch", "ts": lo + 2 + j, "dur": 1, "tid": 1,
+                        "args": {"correlation": c}})
+            evs.append({"ph": "X", "cat": "kernel", "name": "void marlin::Marlin<1>(int4 const*)", "ts": lo + 2 + j, "dur": 3,
+                        "tid": 7, "args": {"correlation": c}})
+        eager = {"FULL": [], "FULL_PREP": ["_prepare_rope_positions_kernel", "void at::native::vectorized_elementwise_kernel<4>()"],
+                 "PIECEWISE_REAL": ["void flashinfer::BatchPrefillWithPagedKVCacheKernel<true>()",
+                                    "void (anonymous namespace)::gdn_decode_post_conv_mtp_kernel<float, 3, false>()"],
+                 "ONE_GRAPH_UNRESOLVED": [None]}[k]
+        for j, kn in enumerate(eager):
+            c += 1
+            evs.append({"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "ts": lo + 20 + j, "dur": 1, "tid": 1,
+                        "args": {"correlation": c}})
+            if kn:
+                evs.append({"ph": "X", "cat": "kernel", "name": kn, "ts": lo + 20 + j, "dur": 2, "tid": 7, "args": {"correlation": c}})
+        ts += 100
+    (tdir / "x_rank0.1.pt.trace.json").write_text(json.dumps({"traceEvents": evs}))
+    return L.trace_summary(tdir)
+
+
+check("scope_full_with_prep_kernels", scope_trace(["FULL_PREP"] * 3)["graph_verdict"], "FULL")
+check("scope_piecewise_attention_gdn_eager", scope_trace(["PIECEWISE_REAL"] * 3)["graph_verdict"], "PIECEWISE")
+check("scope_one_graph_unresolved_mixed", scope_trace(["ONE_GRAPH_UNRESOLVED"] * 3)["graph_verdict"], "MIXED")
+check("scope_full_and_piecewise_mixed", scope_trace(["FULL", "PIECEWISE_REAL"])["graph_verdict"], "MIXED")
+_st = scope_trace(["FULL_PREP"] * 2)
+check("scope_counts", (_st["forwards"], _st["per_forward_median_compute_eager"], _st["per_forward_unresolved_eager"]), (2, 0, 0))
+check("cat_anonymous_namespace_gdn", L._cat("void (anonymous namespace)::gdn_decode_post_conv_mtp_kernel<float, 3, false>(x)"),
+      "gdn_linear_attn")
+check("cat_reshape_and_cache_attention", L._cat("void vllm::reshape_and_cache_flash_kernel<x>(y)"), "attention")
+check("scope_other_names_ignored", scope_trace(["FULL"], name="execute_model_misc")["graph_verdict"], "UNPROVEN")
+
+# ---- rev 3h: P5 int8_eval pass rule (elementwise all within the bound, finite worst <= 1), when the kit bench is given
+if len(sys.argv) > 3:
+    _sb = importlib.util.spec_from_file_location("bench_host_ar", sys.argv[3])
+    B = importlib.util.module_from_spec(_sb)
+    _sb.loader.exec_module(B)
+    import torch
+    n = 1024
+    xs = [torch.randn(n, dtype=torch.float32) for _ in range(4)]
+    ex = torch.stack([x.double() for x in xs]).sum(0)
+    check("p5_eval_exact_ok", B.int8_eval(torch, xs, ex.float(), n, 4, torch.float32)["ok"], True)
+    bnd = B.int8_bound(torch, xs, ex, n, 4, torch.float32)
+    near = (ex + 0.99 * bnd).float()
+    ev = B.int8_eval(torch, xs, near, n, 4, torch.float32)
+    check("p5_eval_099_bound_ok", (ev["ok"], ev["worst_err_over_bound"] <= 1.0), (True, True))
+    over = ex.clone()
+    over[5] += 1.5 * bnd[5]
+    check("p5_eval_over_bound_fails", B.int8_eval(torch, xs, over.float(), n, 4, torch.float32)["ok"], False)
+    xs_nan = [x.clone() for x in xs]
+    xs_nan[0][40] = float("nan")
+    ok_nan = ex.clone()
+    ok_nan[32:64] = float("nan")
+    check("p5_eval_nan_group_all_nan_ok", B.int8_eval(torch, xs_nan, ok_nan.float(), n, 4, torch.float32)["ok"], True)
+    bad_nan = ex.clone()
+    bad_nan[40] = float("nan")
+    check("p5_eval_nan_group_partial_fails", B.int8_eval(torch, xs_nan, bad_nan.float(), n, 4, torch.float32)["ok"], False)
+    big = 245761                                    # the SMOKE fp32 size: mean of all-True reads 0.9999999999999999
+    xb = [torch.randn(big, dtype=torch.float32) for _ in range(4)]
+    eb = torch.stack([x.double() for x in xb]).sum(0)
+    evb = B.int8_eval(torch, xb, eb.float(), big, 4, torch.float32)
+    check("p5_eval_big_all_within_ok", (evb["ok"], evb["all_within_bound"]), (True, True))
+else:
+    RES["p5_eval_tests"] = "not run (no bench path)"
+    BAD.append("p5_eval_tests_not_run")
 
 # ---- rev 3f: Xid recovery classes + GPU health probe
 G.update(FAKE=None, ABORT={"why": None}, STOCK={"py": sys.executable, "env": dict(os.environ)})
@@ -331,6 +442,16 @@ check("gpu_preflight_raises", 'raise RuntimeError("GPU_PREFLIGHT_FAILED' in src,
 check("kit_hash_raises", 'raise RuntimeError("KERNEL_KIT_HASH_FAILED' in src, True)
 check("p4_weights_real", '"--weights", "real"' in src, True)
 check("eagle_cutedsl_first", src.index('"eagle4_fp8_cutedsl"') < src.index('("eagle4_fp8", [], True)'), True)
+# rev 3h (three GPT SMOKE audits)
+check("pp4_after_aa_fill", src.index('step("8_aa_repeats", n, e, fn)') < src.rindex("    pp4()"), True)
+check("merlin_xhigh_template", '"--default-chat-template-kwargs", json.dumps({"enable_thinking": True, "reasoning_effort": "xhigh"})'
+      in src and '"--chat-template", str(CHAT_TEMPLATE_FILE)' in src, True)
+check("prompts_production_template_xhigh", 'reasoning_effort=effort)' in src and '_render("xhigh")' in src
+      and 'assert "Reasoning effort is set to xhigh" in _head_txt' in src, True)
+check("merlin_tp4_long_levels", 'levels(port, "90k", [] if SM else [8, 12, 16, 20]' in src
+      and 'levels(port, "120k", [8] if SM else [8, 12, 16]' in src and 'levels(port, "40k", [8] if SM else [8, 16, 20, 24]' in src, True)
+check("target_runs_fp8_calibration_and_gate", 'step("5_nvfp4_kv", "tf_fp8kv_vs_bf16", TE(14)' in src
+      and '"nvfp4_gate_verdict"' in src, True)
 
 RES["all_ok"] = not BAD and not missing
 RES["failed"] = BAD

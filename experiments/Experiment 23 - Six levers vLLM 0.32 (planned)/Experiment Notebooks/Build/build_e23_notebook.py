@@ -22,7 +22,11 @@ E23 = HERE.parents[1]
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 P60532 = (E23 / "patches" / "pr60532.diff").read_text(encoding="utf-8").replace("\r\n", "\n")
 
-MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3g · __VARIANT__
+MD0 = """# E23 — six levers on 4×L4 (vLLM 0.32, Qwen3.8-27B), target 1500+ tok/s · rev 3h · __VARIANT__
+
+This version: rev 3h fixes from three GPT audits of the rev 3g SMOKE (true top-1 teacher-forced agreement, NVFP4 gate needs
+40k + 90k, graph scopes = execute_context_*, xhigh production-template prompts + Merlin on our template, P5 bound check,
+Merlin TP4 long-context levels, PP4 after the A/A fill) and the TARGET variants (targeted GPU validation before FULL).
 
 The user's six experiments, each with only its own test sequence (DESIGN.md), at the production context
 (thinking up to 120k: `--max-model-len 131072`, bands 2k / 8k / 40k / 90k / 120k):
@@ -34,7 +38,7 @@ The user's six experiments, each with only its own test sequence (DESIGN.md), at
 6. MTP OFF / K1 / K3 at 8/12/16/20 active streams (step time from the iteration histogram)
 plus EAGLE-4 feasibility (SMOKE B; FULL only with E23_EAGLE_FULL=1).
 
-This copy runs `MODE=__MODE__`, `PART=__PART__` by default (the code is identical in the three E23 notebooks).
+This copy runs `MODE=__MODE__`, `PART=__PART__` by default (the code is identical in every E23 rev 3h notebook).
 Every number is a measured counter; a missing measurement is INCONCLUSIVE / SKIPPED, never PASS or zero.
 """
 
@@ -42,12 +46,14 @@ CELL1 = r'''# ==================================================================
 import os, sys, json, time, re, shutil, subprocess, hashlib, tarfile, threading, traceback
 from pathlib import Path
 T_START = time.time()
-MODE = os.environ.get("Q27X_E23_MODE", "__MODE__").upper()        # SMOKE | FULL (baked per notebook)
-PART = os.environ.get("Q27X_E23_PART", "__PART__").upper()        # SMOKE: A (Merlin) | B (stock + EAGLE) | ALL
-assert MODE in ("SMOKE", "FULL") and PART in ("A", "B", "ALL"), (MODE, PART)
+MODE = os.environ.get("Q27X_E23_MODE", "__MODE__").upper()        # SMOKE | TARGET | FULL (baked per notebook)
+PART = os.environ.get("Q27X_E23_PART", "__PART__").upper()        # SMOKE / TARGET: A (Merlin) | B (stock) | ALL
+assert MODE in ("SMOKE", "TARGET", "FULL") and PART in ("A", "B", "ALL"), (MODE, PART)
 RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true", "yes"}
 FAKE = os.environ.get("E23_FAKE_SERVER")                          # local CPU harness only
-BUDGET = int(os.environ.get("E23_BUDGET_SEC") or {"SMOKE": {"A": 105, "B": 135, "ALL": 240}[PART] * 60, "FULL": 690 * 60}[MODE])
+# rev 3h: TARGET = the targeted GPU validation of the three GPT SMOKE-audit fixes before the 690-min FULL
+BUDGET = int(os.environ.get("E23_BUDGET_SEC") or {"SMOKE": {"A": 105, "B": 135, "ALL": 240}[PART] * 60,
+                                                  "TARGET": {"A": 120, "B": 120, "ALL": 240}[PART] * 60, "FULL": 690 * 60}[MODE])
 HARD_STOP = T_START + BUDGET
 MAX_LEN = 131072                                                  # user 2026-10-29: thinking up to 120k
 OUT = Path(os.environ.get("E23_OUT", "/kaggle/working/e23"))
@@ -56,7 +62,7 @@ LOGS = OUT / "logs"
 LOGS.mkdir(exist_ok=True)
 TMP = Path(os.environ.get("E23_TMP", "/tmp"))
 INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
-R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3g",
+R = {"mode": MODE, "part": PART, "budget_min": BUDGET // 60, "max_len": MAX_LEN, "rev": "3h",
      "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "setup": {}, "sections": {}, "errors": [], "order": []}
 _SAVE_LOCK = threading.Lock()
 
@@ -115,7 +121,7 @@ else:
         MERLIN_OK = all((MERLIN / n).is_file() and (MERLIN / n).stat().st_size == s
                         for n, (s, _) in mt["files"].items() if n != ".gitattributes")
     R["inputs"]["merlin_files_ok"] = MERLIN_OK
-    if MODE == "SMOKE" and PART in ("A", "ALL") and (not MERLIN_OK or MERLIN_PAY is None):
+    if MODE in ("SMOKE", "TARGET") and PART in ("A", "ALL") and (not MERLIN_OK or MERLIN_PAY is None):
         save()                   # rev 3c: SMOKE A exists for Merlin; never a silent rc 0 with only P4 / P5 data
         raise RuntimeError("SMOKE A needs the Merlin checkpoint (qwen3-8-27b-w4a16-merlin/Transformers/default/1) and env "
                            "(e23-merlin-env/Other/v1/1): " + json.dumps({"MERLIN": str(MERLIN), "MERLIN_PAY": str(MERLIN_PAY),
@@ -125,7 +131,7 @@ else:
                                   for n, v in km.items() if isinstance(v, dict) and n.endswith((".so", ".py"))}
     _need = ("p4_sm89_fp8.so", "p5_host_ar.so", "bench_fp8_gemm.py", "bench_host_ar.py")
     _bad = sorted(n for n in _need if R["inputs"]["kits_sha_ok"].get(n) is not True)
-    if _bad and (MODE == "FULL" or PART in ("A", "ALL")):   # rev 3d (#9) / 3e: only the runs that use P4 / P5
+    if _bad and (MODE == "FULL" or PART in ("A", "ALL")):   # rev 3d (#9) / 3e: only the runs that use P4 / P5 (A)
         R["errors"].append("KERNEL_KIT_HASH_FAILED: " + repr(_bad))
         save()
         raise RuntimeError("KERNEL_KIT_HASH_FAILED: " + repr(_bad))
@@ -246,6 +252,10 @@ def merlin_server(name, profile, gpus, port, kv_bytes, seqs=None, capture=None):
     GCC 13 (+ its libstdc++ when present) unless a GCC 13 compile failed earlier (then the system GCC 11)."""
     eng = merlin_install()
     extra = ["--served-model-name", "q27", "--max-model-len", str(MAX_LEN), "--port", str(port)]
+    # rev 3h (three GPT SMOKE audits): Merlin's profile serves the froggeric v22.5 template with reasoning_effort "medium";
+    # production = the checkpoint's own template at xhigh (argparse: the last occurrence wins over the profile's flags)
+    extra += ["--chat-template", str(CHAT_TEMPLATE_FILE),
+              "--default-chat-template-kwargs", json.dumps({"enable_thinking": True, "reasoning_effort": "xhigh"})]
     if seqs:
         extra += ["--max-num-seqs", str(seqs)]
     if capture:
@@ -375,12 +385,41 @@ def _task_text(k):
     return "\n\n".join(parts)
 
 
-_HEAD = TOK.encode("<|im_start|>user\nFind the transformation rule of each ARC task below and solve the test inputs.\n\n",
-                   add_special_tokens=False).ids
-_TAIL = TOK.encode("\n<|im_end|>\n<|im_start|>assistant\n<think>\n", add_special_tokens=False).ids
+# rev 3h (three GPT SMOKE audits): the load prompts are rendered by the PRODUCTION chat template exactly like the
+# production notebooks (tokenizer.apply_chat_template(..., add_generation_prompt=True, enable_thinking=True,
+# reasoning_effort="xhigh"), Experiment 1 make_q27x.py:343). With xhigh the template adds a system message with the
+# reasoning instructions; rev 3g's hand-built prompt had none (= no-effort / medium rendering).
+from transformers import AutoTokenizer
+_HF = AutoTokenizer.from_pretrained(str(FP8), trust_remote_code=True)
+_INTRO = "Find the transformation rule of each ARC task below and solve the test inputs.\n\n"
+_PH = "E23_BODY"
+
+
+def _render(effort):
+    return _HF.apply_chat_template([{"role": "user", "content": _INTRO + _PH}], tokenize=False, add_generation_prompt=True,
+                                   enable_thinking=True, reasoning_effort=effort)
+
+
+_RX, _RM = _render("xhigh"), _render("medium")
+assert _RX.count(_PH) == 1, "the production template must keep the user body verbatim"
+_head_txt, _tail_txt = _RX.split(_PH)
+assert "Reasoning effort is set to xhigh" in _head_txt, "production template did not render the xhigh instructions"
+_HEAD = TOK.encode(_head_txt, add_special_tokens=False).ids
+_TAIL = TOK.encode(_tail_txt, add_special_tokens=False).ids
 for _t in ("<|im_start|>", "<|im_end|>", "<think>"):             # rev 3: the chat markers are single special tokens
     _id = TOK.token_to_id(_t)
     assert _id is not None and _id in (_HEAD + _TAIL), (_t, _id)
+_tmpl = getattr(_HF, "chat_template", None) or ""
+TPL_MSG = [{"role": "user", "content": _INTRO + _task_text(_ids[0])}]     # rev 3h: the chat-path template probe
+TPL_IDS = TOK.encode(_HF.apply_chat_template(TPL_MSG, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+                                             reasoning_effort="xhigh"), add_special_tokens=False).ids
+CHAT_TEMPLATE_FILE = TMP / "e23_production_chat_template.jinja"     # Merlin serves with this one too (rev 3h)
+CHAT_TEMPLATE_FILE.write_text(_tmpl if isinstance(_tmpl, str) else json.dumps(_tmpl))
+R["prompt_render"] = {"effort": "xhigh", "enable_thinking": True, "head_text": _head_txt, "tail_text": _tail_txt,
+                      "head_tokens": len(_HEAD), "tail_tokens": len(_TAIL),
+                      "xhigh_differs_from_medium": _RX != _RM,
+                      "template_sha256": hashlib.sha256(CHAT_TEMPLATE_FILE.read_bytes()).hexdigest(),
+                      "tokenizer_json_sha256": hashlib.sha256((FP8 / "tokenizer.json").read_bytes()).hexdigest()}
 _TASK_IDS = {k: TOK.encode(_task_text(k) + "\n\n", add_special_tokens=False).ids for k in _ids}
 
 
@@ -410,7 +449,7 @@ save()
 '''
 
 CELL4 = r'''# ==================================================================== CELL 4 — the step runner (budget, GPU gate, fail-closed)
-WIN = float(os.environ.get("E23_WIN_SEC") or {"SMOKE": 30.0, "FULL": 120.0}[MODE])   # 120 s FULL windows (noise)
+WIN = float(os.environ.get("E23_WIN_SEC") or {"SMOKE": 30.0, "TARGET": 60.0, "FULL": 120.0}[MODE])   # 120 s FULL windows
 EST_SCALE = float(os.environ.get("E23_EST_SCALE") or 1.0) if FAKE else 1.0   # local harness only: walk the whole order
 SM_TF = MODE == "SMOKE"                                            # SMOKE teacher-forced: the 40k row only
 ROWS = {}            # oracle greedy rows by key (same weights)
@@ -518,6 +557,8 @@ def oracle(port, key=None, refs=()):
         R["errors"].append(f"oracle {key}: reference not stored (error / empty / garbage row)")
     res = {"garbage": [L.degenerate(r["text"]) for r in rows], "errors": [r["error"] for r in rows],
            "text_head": [r["text"][:120] for r in rows]}
+    if not FAKE:                 # rev 3h: chat-path render vs the production xhigh render (recorded per arm)
+        res["template_probe"] = L.template_probe(port, TPL_MSG, TPL_IDS)
     for ref in refs:
         res["vs_" + ref] = L.compare(ROWS.get(ref), rows) if ROWS.get(ref) else {"status": "INCONCLUSIVE_NO_ORACLE"}
     return res
@@ -569,8 +610,11 @@ CELL5 = r'''# ==================================================================
 import concurrent.futures as CF
 import signal
 SM = MODE == "SMOKE"
-DO_A = (not SM) or PART in ("A", "ALL")          # Merlin, P5, P4
-DO_B = (not SM) or PART in ("B", "ALL")          # stock vLLM + EAGLE + PP4
+TG = MODE == "TARGET"                            # rev 3h: targeted validation (FULL levels where it measures, SMOKE elsewhere)
+LITE = SM or TG                                  # steps TARGET only needs as references / controls run their SMOKE form
+DO_A = MODE == "FULL" or PART in ("A", "ALL")    # Merlin, P5, P4
+DO_B = MODE == "FULL" or PART in ("B", "ALL")    # stock vLLM + EAGLE + PP4
+PP4_RESERVE = 25 if MODE == "FULL" else 0                        # rev 3h: PP4 eager runs after the A/A fill
 CAP_TP1 = [1, 2, 5, 10, 15, 20]                                  # seqs 4 x (1 + MTP 4) = 20 (V2 runner rounds to x5)
 CAP_TP4 = [1, 2, 4, 5, 8, 10, 15, 20, 25, 30, 35, 40, 60, 80, 100, 120]   # seqs 24 x 5 = 120
 KV_TP1, KV_TP4 = 8055029760, 16301686784                         # Merlin preflight's L4 (22.5 GiB) pins
@@ -654,8 +698,9 @@ def gpu_health():
         rows = [l for l in q.stdout.strip().splitlines() if l.strip()]
         out["nvidia_smi_rows"] = rows
         out["reset_required"] = any("yes" in l.lower() for l in rows) if q.returncode == 0 else None
-        if q.returncode != 0:              # an old driver without reset_status: fall back to the plain query
+        if q.returncode != 0 or any("not a valid field" in l for l in rows):   # Kaggle's driver has no reset_status
             out["reset_required"] = None
+            out["reset_status_field"] = "unsupported (health = 4 GPUs + the CUDA probe)"
             rows = [l for l in subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True,
                                               text=True, timeout=60).stdout.strip().splitlines() if l.strip()]
         out["gpus"] = len(rows)
@@ -719,11 +764,11 @@ def s2():
     out = str(OUT / "p5_bench.json")
     Path(out).unlink(missing_ok=True)
     cmd = [STOCK["py"], kit("bench_host_ar.py"), "--so", kit("p5_host_ar.so"), "--out", out,
-           "--timeout-s", "900" if SM else "3000"] + (["--quick"] if SM else [])
+           "--timeout-s", "900" if LITE else "3000"] + (["--quick"] if LITE else [])
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=STOCK["env"],
                          start_new_session=True)
     try:
-        so, _ = p.communicate(timeout=1000 if SM else 3300)
+        so, _ = p.communicate(timeout=1000 if LITE else 3300)
         rc, tail = p.returncode, (so or "")[-2000:]
     except subprocess.TimeoutExpired:
         _killpg(p)                                    # rev 3c: the bench's children die with it
@@ -838,9 +883,9 @@ def _tp1_body(ss):
     if all(not r.get("error") and r.get("tokens") and not L.degenerate(r.get("text")) for r in g90):
         ROWS["merlin_90k"] = g90                                     # rev 3e: clean references only
     o["greedy_90k"] = {"garbage": [L.degenerate(r["text"]) for r in g90], "errors": [r["error"] for r in g90]}
-    o["steady"] = levels(port, "40k", [2] if SM else [2, 3, 4], server=s, **TP1_KW)
-    o["steady"].update(levels(port, "90k", [] if SM else [1, 2, 3, 4], server=s, **TP1_KW))   # SMOKE: 90k = the greedy row
-    o["steady"].update(levels(port, "120k", [1] if SM else [1, 2], server=s, **TP1_KW))
+    o["steady"] = levels(port, "40k", [2] if LITE else [2, 3, 4], server=s, **TP1_KW)
+    o["steady"].update(levels(port, "90k", [] if LITE else [1, 2, 3, 4], server=s, **TP1_KW))   # SMOKE: 90k = the greedy row
+    o["steady"].update(levels(port, "120k", [1] if LITE else [1, 2], server=s, **TP1_KW))
     if s.alive():                    # Merlin's fork budgets prompt-logprob memory; still last (nothing measured after it)
         o["teacher_forced"] = tforced(port, key="merlin")
     g90 = {"status": "EXACT"} if not (any(o["greedy_90k"]["garbage"]) or any(o["greedy_90k"]["errors"])) else \
@@ -907,9 +952,10 @@ def s1_tp4():
         g90 = L.greedy(port, [PROMPTS["90k"][4]], n_tok=NTOK, timeout=max(300, min(1800, left() / 6)))
         o["greedy_90k_vs_tp1"] = L.compare(ROWS.get("merlin_90k"), g90) if ROWS.get("merlin_90k") else \
             {"status": "INCONCLUSIVE_NO_ORACLE"}
-        o["steady"] = levels(port, "40k", [8] if SM else [8, 16, 24], server=s)
-        o["steady"].update(levels(port, "90k", [] if SM else [8, 16], server=s))
-        o["steady"].update(levels(port, "120k", [8] if SM else [8, 12], server=s))
+        # rev 3h (third GPT SMOKE audit): the long-context sweep the plan needs; a KV-bound band stops at its fit
+        o["steady"] = levels(port, "40k", [8] if SM else [8, 16, 20, 24], server=s)
+        o["steady"].update(levels(port, "90k", [] if SM else [8, 12, 16, 20], server=s))
+        o["steady"].update(levels(port, "120k", [8] if SM else [8, 12, 16], server=s))
         if s.alive():
             o["teacher_forced_vs_tp1"] = tforced(port, ref="merlin")
             o["teacher_forced_vs_tp1_note"] = "info only: same engine, same weights (TP4 vs TP1 numerics)"
@@ -940,14 +986,14 @@ def s6(depth, profile=False, tag=None):
                  "oracle": oracle(port, key=("fp8_mtp0" if depth == 0 else ("fp8_g0" if depth == 3 else None)) if not tag else None,
                                   refs=() if depth == 0 and not tag else ("fp8_mtp0",))}
             if depth == 0:
-                o["steady"] = {} if SM else levels(port, "40k", [8, 12, 16, 20], server=s)
-                if not SM:
+                o["steady"] = {} if LITE else levels(port, "40k", [8, 12, 16, 20], server=s)
+                if not LITE:
                     o["steady"].update(levels(port, "90k", [12, 20], server=s))
             elif depth == 1:
                 o["steady"] = levels(port, "40k", [8, 12, 16, 20], server=s)
             else:
-                o["steady"] = levels(port, "40k", [16] if SM else [8, 12, 16, 20], server=s)
-                if not SM:
+                o["steady"] = levels(port, "40k", [16] if LITE else [8, 12, 16, 20], server=s)
+                if not LITE:
                     o["steady"].update(levels(port, "90k", [8, 12, 20], server=s))
                     o["steady"].update(levels(port, "120k", [8], server=s))
             if profile and s.alive():
@@ -1101,6 +1147,9 @@ def _num(x, default):
     return x if isinstance(x, (int, float)) else default
 
 
+NV_BANDS = {"40k", "90k"}          # rev 3h: the NVFP4 gate needs both long-context bands on both TF arms
+
+
 def nvfp4_gate():
     """rev 3e (four agent reports on rev 3d): an FP8-vs-FP8 A/A is exactly 0 on a deterministic engine, so the
     tolerance is calibrated against the production KV dtype instead. BF16 KV (kv auto) is the teacher-forced
@@ -1116,6 +1165,13 @@ def nvfp4_gate():
         return False, {**out, "why": "TARGET_ONLY_NOT_CLEAN"}
     if out["tf_bf16_reference"] != "DONE" or out["tf_fp8"] != "DONE" or out["tf_nvfp4"] != "DONE":
         return False, {**out, "why": "TEACHER_FORCED_INCOMPLETE"}
+    for arm, row in (("tf_fp8kv_vs_bf16", f8), ("tf_nvfp4_vs_bf16", nv)):   # rev 3h (GPT SMOKE audits): both bands
+        bands = row.get("teacher_forced") or {}
+        miss = sorted(NV_BANDS - set(bands))
+        if miss:
+            return False, {**out, "why": "MISSING_REQUIRED_TF_BANDS", "arm": arm, "missing": miss}
+        if any((bands[b] or {}).get("status") != "MEASURED" or (bands[b] or {}).get("n") != 256 for b in NV_BANDS):
+            return False, {**out, "why": "INVALID_TF_BAND", "arm": arm}
     ok = True
     for b, r in (nv.get("teacher_forced") or {}).items():
         a = (f8.get("teacher_forced") or {}).get(b) or {}
@@ -1154,7 +1210,7 @@ def s5(spec, tag=None):
                 if g:
                     o.update(status=g, correctness=g)
                     return o
-                o["steady"] = levels(port, "120k", [8], server=s) if SM else levels(port, "90k", [12], server=s)
+                o["steady"] = levels(port, "120k", [8], server=s) if LITE else levels(port, "90k", [12], server=s)
             else:
                 o["steady"] = levels(port, "90k", [12, 16, 20, 24], server=s)
                 o["steady"].update(levels(port, "120k", [12, 16, 20], server=s))
@@ -1350,10 +1406,33 @@ def start_prefetch():
 # -> NVFP4 target-only -> TF NVFP4 -> [kvauto oracle + EAGLE] -> PP4. FULL: P5, Merlin a-d, mtp0, INT4 control, mtp1,
 # mtp3/G0, G1, G2, G3, TF FP8 ref, NVFP4 target-only, TF NVFP4, NVFP4 + MTP3, PP4, then A/A repeats fill the time.
 PREF = []
-if DO_A:
+if TG:
+    # rev 3h TARGET (user choice 2026-10-30, option ka): GPU-validate the three GPT SMOKE-audit fixes before FULL.
+    # A: P5 (fixed bound check), Merlin TP1 (the TP1 reference rows) -> Merlin TP4 long-context sweep on xhigh prompts.
+    # B: FP8 MTP0 oracle -> G0 / G3 graph proof (new scope parser) -> corrected NVFP4 gate (40k + 90k, top-1 ids).
+    TE = int                     # TARGET estimates (not part of the FULL main-sequence estimate below)
+    if DO_A:
+        step("2_host_allreduce", "p5_bench", TE(12), s2)
+    PREF = start_prefetch() if not ABORT["why"] else []
+    if DO_A:
+        step("1_tp1x4_pp4", "a_merlin_tp1_gpu0", TE(30), s1_tp1)
+        step("1_tp1x4_pp4", "d_merlin_tp4", TE(70), s1_tp4)
+    if DO_B:
+        step("6_mtp_depth", "mtp0_target_only", TE(12), s6(0))
+        step("6_mtp_depth", "mtp3_eq_G0_piecewise", TE(18), s6(3, profile=True))
+        step("3_full_graph", "G3_flashinfer_pr60532", TE(18), s3("G3", "FLASHINFER", "FULL_AND_PIECEWISE", patch=True))
+        step("5_nvfp4_kv", "tf_bf16kv_reference", TE(14), s5_tf("auto", key="bf16kv_tf"))
+        step("5_nvfp4_kv", "tf_fp8kv_vs_bf16", TE(14), s5_tf("fp8_e4m3", ref="bf16kv_tf"))
+        step("5_nvfp4_kv", "nvfp4_target_only", TE(22), s5(0))
+        step("5_nvfp4_kv", "tf_nvfp4_vs_bf16", TE(14), s5_tf("nvfp4", ref="bf16kv_tf"))
+        _ok, _gate = nvfp4_gate()
+        R["sections"].setdefault("5_nvfp4_kv", {})["nvfp4_gate_verdict"] = {"status": "PASS" if _ok else "STOP", **_gate}
+        save()
+if DO_A and not TG:
     step("2_host_allreduce", "p5_bench", 12 if SM else 30, s2)      # before the prefetch (host memory + PCIe quiet)
-PREF = start_prefetch() if not ABORT["why"] else []
-if DO_A:
+if not TG:
+    PREF = start_prefetch() if not ABORT["why"] else []
+if DO_A and not TG:
     if not ABORT["why"] and left() > (40 if SM else 50) * 60 + 300:     # rev 3e: never after the P5 release abort
         P4_FUT = CF.ThreadPoolExecutor(1).submit(s4_thread)
     step("1_tp1x4_pp4", "a_merlin_tp1_gpu0", 30 if SM else 50, s1_tp1)
@@ -1364,7 +1443,7 @@ if DO_A:
     step("1_tp1x4_pp4", "d_merlin_tp4", 30 if SM else 62, s1_tp4)
     if SM:
         step("1_tp1x4_pp4", "c_merlin_tp1_x4", 20, s1_rep(4, bands=("40k",)))
-if DO_B:
+if DO_B and not TG:
     if INT4:
         PREF.append(prefetch_bg([INT4], "int4"))
     step("6_mtp_depth", "mtp0_target_only", 12 if SM else 45, s6(0))
@@ -1388,8 +1467,7 @@ if DO_B:
     if os.environ.get("E23_EAGLE_FULL") == "1" and left() >= (11 + 40 + 30) * 60:   # rev 3g: not in the 8 h SMOKE      # rev 3e: EAGLE window 40 min, PP4 eager 30 min after it
         step("7_eagle4", "fp8_kvauto_target_only_oracle", 11, s7_kvauto_oracle)
         step("7_eagle4", "eagle4_fp8_tp4", 40, s7_eagle)
-    pp4()
-if not SM:      # A/A repeats of the decisive comparisons fill whatever time is left (greedy; nothing reserved after)
+if MODE == "FULL":      # A/A repeats of the decisive comparisons fill whatever time is left (greedy; nothing reserved after)
     def _done(path):              # rev 3d (#3): DONE and a clean correctness record (rev 3e: a GPU fault elsewhere only labels)
         sec, name = path.split("/")
         rec = (R["sections"].get(sec) or {}).get(name) or {}
@@ -1401,11 +1479,13 @@ if not SM:      # A/A repeats of the decisive comparisons fill whatever time is 
              (f"nvfp4_mtp3_rep{i}", 75, s5(3, tag=f"nvfp4_mtp3_rep{i}"), "5_nvfp4_kv/nvfp4_mtp3")]
         return [(n, e, fn) for n, e, fn, main in c if _done(main)]
     for i in range(1, 7):
-        todo = [(n, e, fn) for n, e, fn in AA(i) if left() >= e * EST_SCALE * 60 + 300]
+        todo = [(n, e, fn) for n, e, fn in AA(i) if left() >= e * EST_SCALE * 60 + 300 + PP4_RESERVE * 60]
         if not todo or ABORT["why"]:
             break
         for n, e, fn in todo:
             step("8_aa_repeats", n, e, fn)
+if DO_B and not TG:      # rev 3h (third GPT SMOKE audit): PP4 last, after the A/A fill (its 8k fault cannot touch them)
+    pp4()
 '''
 
 CELL6 = r'''# ==================================================================== CELL 6 — report
@@ -1437,11 +1517,14 @@ for sec in sorted(R["sections"]):
             continue
         o = rec.get("oracle") or {}
         vs = ", ".join(f"{k[3:]}={v.get('status')}" for k, v in o.items() if k.startswith("vs_") and isinstance(v, dict))
+        if isinstance(o.get("template_probe"), dict):          # rev 3h: chat-path render vs production xhigh
+            vs += f"; template={o['template_probe'].get('status')}"
         sv = next(iter((rec.get("servers") or {}).values()), {}) if rec.get("servers") else {}
         tr_ = (rec.get("profile") or {}).get("trace") or {}
         gv = tr_.get("graph_verdict") or tr_.get("error") or "-"
         if tr_.get("graph_verdict"):
-            gv += f" (g/fw {tr_.get('per_forward_median_graph_launches')}, k/fw {tr_.get('per_forward_median_kernel_launches')})"
+            gv += (f" (g/fw {tr_.get('per_forward_median_graph_launches')}, k/fw {tr_.get('per_forward_median_kernel_launches')}, "
+                   f"compute-eager/fw {tr_.get('per_forward_median_compute_eager')}, scopes {tr_.get('forwards')})")
         wins = list((rec.get("steady") or {}).values())
         ws = f"{sum(1 for w in wins if w.get('status') in ('STEADY', 'CAPACITY_LIMITED'))}/{len(wins)}" if wins else "-"
         st.append(f"| {sec} | {name} | {rec.get('status')} | {rec.get('correctness', '-')} | {ws} | "
@@ -1475,7 +1558,9 @@ for _m in _re.finditer(r'step\("([^"]+)", "([^"]+)", (?:(\d+) if SM else (\d+)|(
     _full += int(_m.group(4) or _m.group(5))
 assert _full <= 670, f"FULL step estimates {_full} min leave no room in the 690-min budget"
 print("FULL main-sequence estimate", _full, "min of 690")
-VARIANTS = {"SMOKE_A": ("SMOKE", "A"), "SMOKE_B": ("SMOKE", "B"), "FULL": ("FULL", "ALL")}
+# rev 3h: the rev 3g SMOKE_A / SMOKE_B notebooks ran on Kaggle and stay as they are (never rebuild a run notebook);
+# TARGET_A / TARGET_B (the targeted validation, user option ka 2026-10-30) and FULL are generated.
+VARIANTS = {"TARGET_A": ("TARGET", "A"), "TARGET_B": ("TARGET", "B"), "FULL": ("FULL", "ALL")}
 for variant, (mode, part) in VARIANTS.items():
     c1 = CELL1.replace("__MODE__", mode).replace("__PART__", part).replace("__LAB__", repr(LAB)).replace("__P60532__", repr(P60532))
     md = MD0.replace("__VARIANT__", variant).replace("__MODE__", mode).replace("__PART__", part)
