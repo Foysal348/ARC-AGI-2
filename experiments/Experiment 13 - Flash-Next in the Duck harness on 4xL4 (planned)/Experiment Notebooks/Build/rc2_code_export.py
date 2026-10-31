@@ -62,6 +62,9 @@ else:
         try:
             _stream_run(self)
         finally:
+            if not self.err and any(m is not None and not (isinstance(m, (int, float)) and math.isfinite(m))
+                                    for m in self.margins):
+                self.err = "NONFINITE_LOGPROB"           # final audit H2: NaN / Inf logprobs are never data
             try:
                 r = self.row()
                 pr = self.body.get("prompt") or []
@@ -811,6 +814,46 @@ if not RERUN:
 
 
 
+    def _finite(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+    _compare_e23, _compare_tf_e23 = L.compare, L.compare_tf
+
+
+    def _compare_rc2(ref, cand):
+        """Final audit H2: a non-finite margin on either side makes the comparison INCONCLUSIVE before any token logic
+        (E23's compare read a NaN reference margin as NEAR_TIE)."""
+        for rows in (ref or [], cand or []):
+            for r in rows:
+                if any(m is not None and not _finite(m) for m in (r.get("margins") or [])):
+                    return {"status": "INCONCLUSIVE_NONFINITE"}
+        return _compare_e23(ref, cand)
+
+
+    def _compare_tf_rc2(ref, cand):
+        """Final audit H2: a non-finite teacher-forced logprob is never MEASURED."""
+        for side in (ref, cand):
+            for p in ((side or {}).get("positions") or []):
+                if p and p[0] is not None and not _finite(p[0]):
+                    return {"status": "INCONCLUSIVE_NONFINITE"}
+        return _compare_tf_e23(ref, cand)
+
+
+    L.compare, L.compare_tf = _compare_rc2, _compare_tf_rc2
+
+
+    def short_gate_failed(o):
+        """Final audit H1: a failed probe (real servers; the fake has no chat) or a failed / garbage sampled request stops
+        the boot's body at once; gated() then gives the NO_GO verdict."""
+        p, s = o.get("probes") or {}, o.get("sampled") or {}
+        return (p.get("ok") is not True and not FAKE) or s.get("ok") is not True or bool(s.get("garbage"))
+
+
+    def oracle_ok(orc):
+        return bool(orc) and orc.get("complete") is True and not any(orc.get("errors") or []) and not any(orc.get("garbage") or [])
+
+
     def _windows(o):
         """Every load window of a record: the ladder AND the long census (audit: census_long was not gated)."""
         out = []
@@ -927,6 +970,54 @@ if not RERUN:
         return {"prompt": len(ids), "ttft_sec": round(sec, 1), "tok_s": round(len(ids) / max(1e-3, sec), 1), "error": g.err, "ok": ok}
 
 
+    def window_garbage(ids, win=2000, min_len=200):
+        """Final audit H3: the first garbage 2,000-token window of a row (None if every window is clean). A whole-text check
+        would read 100k tokens of healthy reasoning as LOW_VARIETY (unique words < 8 %), so windows are checked one by one."""
+        for i in range(0, len(ids), win):
+            seg = ids[i:i + win]
+            if len(seg) < min_len:
+                break
+            v = L.degenerate(TOK.decode(seg))
+            if v:
+                return {"start_token": i, "verdict": v}
+        return None
+
+
+    def long_quality(name, r):
+        if not isinstance(r, dict):
+            return "MISSING_LONG"
+        if r.get("error"):
+            return "FAIL_LONG_REQUEST"
+        if r.get("window_garbage"):
+            return "FAIL_LONG_GARBAGE"
+        if name == "forced60k" and not r.get("reached_60k"):
+            return "INCOMPLETE_LONG"
+        if name == "natural" and r.get("cut_by_cap"):
+            return "INCOMPLETE_LONG"
+        return "PASS_LONG"
+
+
+    def long_gate(o):
+        """None when the record has no long rows or both rows PASS_LONG; otherwise the verdict for the top-level status.
+        Priority: request error > natural garbage > forced garbage (synthetic past its first EOS) > incomplete."""
+        lo = o.get("long")
+        if not isinstance(lo, dict):
+            return None
+        q = {n: long_quality(n, lo.get(n)) for n in ("natural", "forced60k")}
+        lo["long_quality"] = q
+        if "MISSING_LONG" in q.values():
+            return "INCONCLUSIVE_LONG_MISSING"
+        if "FAIL_LONG_REQUEST" in q.values():
+            return "NO_GO_LONG_REQUEST_ERROR"
+        if q["natural"] == "FAIL_LONG_GARBAGE":
+            return "NO_GO_LONG_GARBAGE"
+        if q["forced60k"] == "FAIL_LONG_GARBAGE":
+            return "NO_GO_FORCED60K_GARBAGE"
+        if "INCOMPLETE_LONG" in q.values():
+            return "INCONCLUSIVE_LONG_INCOMPLETE"
+        return None
+
+
     def long_rows(port, secs_cap=3000):
         """One natural xhigh ARC request (its own stop, up to 120,000 new tokens) and one forced 60,000-token row
         (ignore_eos: 'synthetic' past its first EOS), CONCURRENTLY (concurrency 2). Full text in traces/ + requests.jsonl.
@@ -955,8 +1046,9 @@ if not RERUN:
             for k, end in (("to_8k", 8000), ("to_32k", 32000), ("to_60k", 60000), ("to_100k", 100000)):
                 sl[k] = L.degenerate(TOK.decode(ids[end - 2000:end])) if n_tok >= end else "NOT_REACHED"
             out[name] = {"tokens": n_tok, "sec": round(sec, 1), "tok_s": round(n_tok / max(1e-6, sec), 1), "error": row["error"],
-                         "finish": row["finish_reason"], "garbage": sl, "think_closed": "</think>" in row["text"],
-                         "cut_by_cap": row["finish_reason"] is None, "tail": row["text"][-400:]}
+                         "finish": row["finish_reason"], "garbage": sl, "window_garbage": window_garbage(ids),
+                         "think_closed": "</think>" in row["text"], "cut_by_cap": row["finish_reason"] is None,
+                         "tail": row["text"][-400:]}
         out["forced60k"]["reached_60k"] = out["forced60k"]["tokens"] >= 60000
         out["forced60k"]["label"] = "synthetic past the first EOS (ignore_eos)"
         try:
@@ -1017,6 +1109,10 @@ if not RERUN:
         g = gated(o, need=need, expected_rows=expected_rows, require_sampled=require_sampled)
         if g.get("status") == "TF_OOM" and g.get("correctness") != "CLEAN":
             g["status"] = g["correctness"]
+        lg = long_gate(g)                                  # final audit H3: the long rows have their own verdict
+        g["long_verdict"] = lg or ("PASS_LONG" if isinstance(g.get("long"), dict) else None)
+        if lg and g.get("status") in ("DONE", "TF_OOM"):
+            g["status"] = lg
         return g
 
 
@@ -1025,9 +1121,15 @@ if not RERUN:
             s = ss[0]
             p = s.port
             o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o.update(early_stop="SHORT_CORRECTNESS_GATE_FAILED", census_end=kv_census(s))
+                return o
             o["prefill"] = prefill_probe(p)
             o["oracle"] = oracle(p, key="bf16")
             o["census_end"] = kv_census(s)
+            if not oracle_ok(o["oracle"]):
+                o["early_stop"] = "ORACLE_INCOMPLETE"          # no reference: the TF A/A would measure nothing usable
+                return o
             o["tf"] = tf_last(s, key="bf16", aa=True)
             o["tf_died"] = not o["tf"]["alive_after"]
             return o
@@ -1056,6 +1158,10 @@ if not RERUN:
             s = ss[0]
             p = s.port
             o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o.update(early_stop="SHORT_CORRECTNESS_GATE_FAILED", census_end=kv_census(s),
+                         fp8_gate="FAIL_SAMPLED" if (o["sampled"] or {}).get("ok") is not True else "FAIL_PROBES")
+                return o
             if not PREFILL["measured"]:
                 o["prefill"] = prefill_probe(p)
             o["oracle"] = oracle(p, refs=("bf16",))
@@ -1070,8 +1176,9 @@ if not RERUN:
                 o["load_tests_skipped"] = f"FP8 comparison gate: {o['fp8_gate']}"
                 o["status"] = "NO_GO_FP8_KV" if o["fp8_gate"].startswith("FAIL") else "INCONCLUSIVE_FP8_KV"
             o["census_end"] = kv_census(s)
-            o["tf"] = tf_last(s, ref="bf16")
-            o["tf_died"] = not o["tf"]["alive_after"]
+            if o["fp8_gate"] == "PASS" or os.environ.get("RC2_TF_ON_FP8_FAIL") == "1":   # default: fail fast
+                o["tf"] = tf_last(s, ref="bf16")
+                o["tf_died"] = not o["tf"]["alive_after"]
             return o
         return merlin_boot("merlin_fp8", "fp8", 8001, 40 * 60, body, need=("bf16",))
 
@@ -1083,7 +1190,9 @@ if not RERUN:
             s = ss[0]
             p = s.port
             o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
-            if o["sampled"]["ok"] is True:
+            if short_gate_failed(o):
+                o["early_stop"] = "SHORT_CORRECTNESS_GATE_FAILED"
+            else:
                 kw = {"server": s, "temperature": TEMP, "prefill_tok_s": PREFILL["tok_s"]}
                 o["steady"] = levels(p, "40k", [1, 2, 3], **kw)
                 o["census_long"] = levels(p, "116k", [1, 2], **kw)
@@ -1103,8 +1212,11 @@ if not RERUN:
             s = ss[0]
             p = s.port
             o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o["early_stop"] = "SHORT_CORRECTNESS_GATE_FAILED"
+                return o
             o["oracle"] = oracle(p, key="stock", prompts=ORACLE_P)          # 2k / 2k / 8k (32k max length: no 40k row)
-            if o["sampled"]["ok"] is True:
+            if oracle_ok(o["oracle"]):
                 o["steady"] = levels(p, "8k", [1, 2, 3], server=s, temperature=TEMP)
             return o
         gate = boot_gate()
@@ -1146,7 +1258,7 @@ if not RERUN:
                 return r
             keep = ("status", "correctness", "fp8_gate", "probes", "sampled", "prefill", "census", "steady", "census_long", "long",
                     "tf", "tries", "kv_bytes", "boot_gate", "why", "error", "status_note", "load_tests_skipped",
-                    "certification")
+                    "certification", "early_stop", "long_verdict")
             return {k: r.get(k) for k in keep if k in r}
         R["summary"] = {f"{s}/{n}": _brief(r) for s, st in R["sections"].items() if isinstance(st, dict) for n, r in st.items()
                         if isinstance(r, dict) and "status" in r}

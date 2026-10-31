@@ -131,6 +131,114 @@ ns["sampled_check"] = lambda s: {"ok": True, "garbage": None}
 o = ns["arm_fp8"]()
 check("FP8 PASS -> load tests run", o["fp8_gate"] == "PASS" and calls["levels"] >= 1 and calls["long_rows"] == 1, str(calls))
 
+# 4b. final audit H1: fail-fast after the short checks (A1 / A3), TF skipped without a reference or an FP8 PASS
+cnt = {"prefill": 0, "oracle": 0, "tf": 0, "levels": 0, "long": 0}
+order = []
+def _c(k, ret):
+    def f(*a, **kw):
+        cnt[k] += 1; order.append(k); return ret() if callable(ret) else ret
+    return f
+ns["sha_gate"] = lambda t: (True, "ok")
+ns["prefill_probe"] = _c("prefill", {"ok": True})
+ns["tf_last"] = _c("tf", {"alive_after": True})
+ns["levels"] = _c("levels", {})
+ns["long_rows"] = _c("long", {})
+ns["kv_census"] = lambda s: order.append("census") or {}
+ORC_OK = {"errors": [None] * 4, "garbage": [None] * 4, "row_count": 4, "complete": True, "vs_bf16": {"status": "EXACT"}}
+def run_a1(probes_ok=True, sampled_ok=True, orc=None):
+    for k in cnt: cnt[k] = 0
+    order.clear()
+    ns["L"].chat_probes = lambda p: {"ok": probes_ok}
+    ns["sampled_check"] = lambda s: {"ok": sampled_ok, "garbage": None}
+    ns["oracle"] = _c("oracle", dict(orc or ORC_OK))
+    return ns["arm_bf16"]()
+o = run_a1(probes_ok=False)
+check("H1 A1 probe failure -> 0 prefill / oracle / TF, NO_GO_SHORT_PROBE",
+      cnt["prefill"] == cnt["oracle"] == cnt["tf"] == 0 and o.get("early_stop") and gated(o)["correctness"] == "NO_GO_SHORT_PROBE", str(cnt))
+o = run_a1(sampled_ok=False)
+check("H1 A1 sampled failure -> 0 prefill / oracle / TF, NO_GO_SAMPLED_PATH",
+      cnt["prefill"] == cnt["oracle"] == cnt["tf"] == 0 and gated(o)["correctness"] == "NO_GO_SAMPLED_PATH", str(cnt))
+o = run_a1(orc={"errors": [None] * 3, "garbage": [None] * 3, "row_count": 3, "complete": False})
+check("H1 A1 incomplete oracle -> TF skipped", cnt["oracle"] == 1 and cnt["tf"] == 0 and o.get("early_stop") == "ORACLE_INCOMPLETE", str(cnt))
+o = run_a1()
+check("H1 A1 all short gates pass -> order probes/sampled -> prefill -> oracle -> census_end -> TF",
+      [x for x in order if x != "census"][:3] == ["prefill", "oracle", "tf"] and order.index("tf") > max(i for i, x in enumerate(order) if x == "census"),
+      str(order))
+for k in cnt: cnt[k] = 0
+ns["L"].chat_probes = lambda p: {"ok": True}
+ns["sampled_check"] = lambda s: {"ok": False, "error": "HTTP 500"}
+o = ns["arm_fp8"]()
+check("H1 A3 sampled failure -> no oracle / load / TF", cnt["oracle"] == cnt["levels"] == cnt["long"] == cnt["tf"] == 0
+      and o["fp8_gate"] == "FAIL_SAMPLED", str(cnt))
+ns["sampled_check"] = lambda s: {"ok": True, "garbage": None}
+for k in cnt: cnt[k] = 0
+ns["oracle"] = _c("oracle", {"errors": [None] * 4, "garbage": [None] * 4, "row_count": 4, "complete": True,
+                             "vs_bf16": {"status": "INCONCLUSIVE_NO_ORACLE"}})
+o = ns["arm_fp8"]()
+check("H1 A3 FP8 INCONCLUSIVE -> 0 ladder, 0 long rows, TF skipped by default",
+      cnt["levels"] == cnt["long"] == cnt["tf"] == 0 and o["fp8_gate"] == "INCONCLUSIVE", str(cnt))
+for k in cnt: cnt[k] = 0
+ns["oracle"] = _c("oracle", ORC_OK)
+o = ns["arm_fp8"]()
+check("H1 A3 FP8 PASS -> load + TF run", o["fp8_gate"] == "PASS" and cnt["levels"] >= 1 and cnt["long"] == 1 and cnt["tf"] == 1, str(cnt))
+
+# 4c. final audit H2: non-finite logprobs never pass
+Lm = ns["L"]
+def row(tokens, margins): return {"tokens": tokens, "margins": margins, "text": "alpha beta", "error": None}
+check("H2 compare: NaN reference margin + differing token -> not NEAR_TIE / EXACT",
+      Lm.compare([row([1, 9], [1.0, float("nan")])], [row([1, 8], [1.0, 0.2])])["status"] == "INCONCLUSIVE_NONFINITE")
+check("H2 compare: Inf margin -> INCONCLUSIVE_NONFINITE",
+      Lm.compare([row([1, 9], [1.0, float("inf")])], [row([1, 9], [1.0, 0.2])])["status"] == "INCONCLUSIVE_NONFINITE")
+check("H2 compare: valid near-tie stays NEAR_TIE",
+      Lm.compare([row([1, 9], [1.0, 0.1])], [row([1, 8], [1.0, 0.2])])["status"] == "NEAR_TIE")
+tfr = {"positions": [[-0.1, 1, 5], [float("nan"), 1, 6]], "n": 2}
+tfc = {"positions": [[-0.1, 1, 5], [-0.2, 1, 6]], "n": 2}
+check("H2 compare_tf: NaN teacher-forced logprob -> never MEASURED", Lm.compare_tf(tfr, tfc)["status"] == "INCONCLUSIVE_NONFINITE")
+check("H2 compare_tf: finite rows still MEASURED", Lm.compare_tf(tfc, tfc)["status"] == "MEASURED")
+st_ = Lm.Stream(1, [1, 2, 3], 4, temperature=0.0, logprobs=2)
+ns["_stream_run"] = lambda self: self.margins.extend([0.5, float("nan")])
+Lm.Stream.run(st_)
+check("H2 Stream: a NaN streamed margin -> error NONFINITE_LOGPROB", st_.err == "NONFINITE_LOGPROB", str(st_.err))
+ns["_stream_run"] = lambda self: self.margins.extend([0.5, 0.25])
+st2 = Lm.Stream(1, [1, 2, 3], 4, temperature=0.0, logprobs=2)
+Lm.Stream.run(st2)
+check("H2 Stream: finite margins -> no error", st2.err is None, str(st2.err))
+
+# 4d. final audit H3: long rows gated (windows, long_quality, propagated status)
+import random as _r
+TOKr = ns["TOK"]
+_syl = ["ka", "lo", "mi", "ne", "ru", "sa", "ti", "vo", "ze", "pa", "qu", "ri", "bel", "dor", "fen", "gul"]
+_words = [a + b + c for a in _syl for b in _syl for c in _syl]
+_rng = _r.Random(7)
+varied = TOKr.encode(" ".join(_rng.choice(_words) for _ in range(70000)), add_special_tokens=False).ids[:100000]
+check("H3 100k tokens of varied text -> no window garbage (no false LOW_VARIETY)", ns["window_garbage"](varied) is None,
+      f"{len(varied)} tokens")
+bang = TOKr.encode("!" * 6000, add_special_tokens=False).ids
+g8 = varied[:8000] + bang + varied[8000:20000]
+wg = ns["window_garbage"](g8)
+check("H3 garbage at 8k -> detected in its window", wg is not None and 6000 <= wg["start_token"] <= 10000, str(wg))
+def lrow(**kw):
+    r = {"tokens": 60000, "error": None, "window_garbage": None, "cut_by_cap": False, "reached_60k": True}
+    r.update(kw); return r
+def lg(nat, frc):
+    return ns["long_gate"]({"long": {"natural": nat, "forced60k": frc}})
+check("H3 clean natural + clean forced 60k -> PASS (None)", lg(lrow(), lrow()) is None)
+check("H3 natural garbage at 8k -> NO_GO_LONG_GARBAGE", lg(lrow(window_garbage={"start_token": 8000, "verdict": "BANG_GARBAGE"}), lrow()) == "NO_GO_LONG_GARBAGE")
+check("H3 forced garbage at 60k -> NO_GO_FORCED60K_GARBAGE", lg(lrow(), lrow(window_garbage={"start_token": 58000, "verdict": "LOW_VARIETY"})) == "NO_GO_FORCED60K_GARBAGE")
+check("H3 request failure -> NO_GO_LONG_REQUEST_ERROR", lg(lrow(error="HTTP 500"), lrow()) == "NO_GO_LONG_REQUEST_ERROR")
+check("H3 forced cut by the cap -> INCONCLUSIVE_LONG_INCOMPLETE", lg(lrow(), lrow(reached_60k=False, cut_by_cap=True, tokens=41000)) == "INCONCLUSIVE_LONG_INCOMPLETE")
+check("H3 no long rows -> no long verdict", ns["long_gate"]({"steady": {}}) is None)
+ns2_mb = runpy.run_path(str(HERE / "rc2_code_export.py"), run_name="rc2h3")["gated"].__globals__
+ns2_mb["FAKE"] = None
+ns2_mb["boot_gate"] = lambda: {"ok": True, "gpus": []}
+ns2_mb["merlin_fn_server"] = lambda *a, **k: None
+ns2_mb["shm_cleanup"] = lambda before: {}
+ns2_mb["with_servers"] = lambda servers, timeout, body: dict(ev(), long={"natural": lrow(window_garbage={"start_token": 0, "verdict": "BANG_GARBAGE"}),
+                                                                         "forced60k": lrow()})
+o = ns2_mb["merlin_boot"]("m", "fp8", 8001, 60, None)
+check("H3 merlin_boot: short checks CLEAN but natural long garbage -> status NO_GO_LONG_GARBAGE, correctness stays CLEAN",
+      o["status"] == "NO_GO_LONG_GARBAGE" and o["correctness"] == "CLEAN" and o["long_verdict"] == "NO_GO_LONG_GARBAGE", f"{o['status']} {o['correctness']}")
+
 # 5. host_phase failure stops the boot before any server
 started = []
 ns["MServer"] = lambda *a, **k: started.append(a) or None
