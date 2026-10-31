@@ -28,7 +28,7 @@ E23_BUILDER = (E23 / "Experiment Notebooks" / "Build" / "build_e23_notebook.py")
 LAB = (E23 / "src" / "e23_lab.py").read_text(encoding="utf-8").replace("\r\n", "\n")
 PARTS = json.loads((E13 / "prep" / "merlin_fn_ckpt" / "kernels" / "parts.json").read_text(encoding="utf-8"))
 OUT_NB = HERE.parent / "Q27-XHIGH-E13_FLASHNEXT_RC2.ipynb"
-PUSHED = set()   # shas of RC2 versions that ran on Kaggle (never overwrite one; rebuilds go to *_REBUILD)
+PUSHED = {"12eaa96cea2ced510ef54bca83586a3f545cb0609ccdb5634cf32ecfb9fcafa5"}   # foysalemonshanto v1 GPU commit 2026-10-31; shas of RC2 versions that ran on Kaggle (never overwrite one; rebuilds go to *_REBUILD)
 if OUT_NB.exists() and hashlib.sha256(OUT_NB.read_bytes()).hexdigest() in PUSHED:
     OUT_NB = OUT_NB.with_name(OUT_NB.stem + "_REBUILD.ipynb")
 
