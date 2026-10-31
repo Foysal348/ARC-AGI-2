@@ -8,7 +8,7 @@ teacher-forced, steady windows), and from its notebook builder the run() helper,
 offline payload with the glibc 2.35 fix), the step / with_servers runner, oracle / tforced / levels.
 
 Flash-Next specific (new here): checkpoint merge (5 kernel-output parts + the 10 FP8 PLE shards of
-dfranzen/albucino-qwen3.8-flash-next-w4a16-fp8ple, every size checked, every sha256 checked in the background before the
+foysalemonshanto/qwen38-flash-next-fp8ple-overlay (= albucino's shards), all at exact Model mount paths, every size checked, every sha256 checked in the background before the
 first launch), Merlin launch.build("flash-next", "fn-quad-24g-sm89", kv=bf16|fp8) with the L4 KV pin, the checkpoint's own
 template at reasoning_effort xhigh, Merlin's host_phase checks (recorded), the arms below, a 60k-token generation check,
 and a stock-vLLM fallback (Intel W4A16, TP4+EP, with the shim) only when Merlin cannot serve.
@@ -111,16 +111,12 @@ def log(*a):
     print(f"[{(time.time() - T_START) / 60:6.1f} min]", *a, flush=True)
 
 
-def find(pattern, root=INP, must=True):
-    hits = sorted(Path(root).rglob(pattern)) if Path(root).exists() else []
-    if not hits and must:
-        raise FileNotFoundError(f"{pattern} not under {root}: attach the input")
-    return hits[0] if hits else None
+COMP = INP / "competitions" / "arc-prize-2026-arc-agi-2"
 
 
 def write_fallback_submission():
-    tp = find("arc-agi_test_challenges.json", must=False)
-    if tp:
+    tp = COMP / "arc-agi_test_challenges.json"
+    if tp.is_file():
         tasks = json.load(open(tp))
         sub = {k: [{"attempt_1": [[0]], "attempt_2": [[0]]} for _ in v["test"]] for k, v in tasks.items()}
         Path(os.environ.get("RC2_SUBMISSION", "/kaggle/working/submission.json")).write_text(json.dumps(sub))
@@ -154,17 +150,28 @@ else:
                 pass
     L.Stream.run = _traced_run
     PLE_EXPECTED = json.loads(r"""__PLE__""")                     # 10 FP8 PLE shards: [size, sha256]
+    # exact Kaggle mount paths (foysalemonshanto Models, checked through the API 2026-10-31; no recursive search)
+    MD = INP / "models" / "foysalemonshanto"
+    PART_DIRS = {1: MD / "qwen3-8-flash-next-w4a16-merlin-p1/transformers/default/1",
+                 2: MD / "qwen3-8-flash-next-w4a16-merlin-p2/transformers/default/1",
+                 3: MD / "qwen3-8-flash-next-w4a16-merlin-p3/transformers/default/1",
+                 4: MD / "qwen3-8-flash-next-w4a16-merlin-p4/transformers/default/1",
+                 5: MD / "qwen3-8-flash-next-w4a16-merlin-p5/transformers/default/1"}
     PARTS = {}
-    for k in range(1, 6):                                           # the five checkpoint parts (kernel outputs)
-        mf = find(f"q27_fn_merlin_part{k}_manifest.json", must=False)
-        PARTS[k] = (mf.parent, json.loads(mf.read_text())) if mf else None
-    _ple0 = find("model-plefp8-00000.safetensors", INP / "models" / "dfranzen", must=False)
-    PLE_DIR = _ple0.parent if _ple0 else None
-    MERLIN_PAY = find("merlin_offline_tar.bin", INP / "models" / "foysalemonshanto" / "e23-merlin-env", must=False)
-    _intel = find("quantization_config.json", INP / "models" / "dfranzen" / "intel-qwen3.8-flash-next-w4a16-autoround", must=False)
-    INTEL = _intel.parent if _intel else None
-    WHEELHOUSE = find("install_wheelhouse.py", INP / "datasets" / "foysalemonshanto" / "vllm-0-32-0-cu13-wheelhouse", must=False)
-    ARC = find("arc-agi_evaluation_challenges.json")
+    for k, d in PART_DIRS.items():                                  # the five checkpoint parts (Models from the kernel outputs)
+        mf = d / f"q27_fn_merlin_part{k}_manifest.json"
+        PARTS[k] = (d, json.loads(mf.read_text())) if mf.is_file() else None
+    PLE_DIR = MD / "qwen38-flash-next-fp8ple-overlay/pytorch/albucino-fp8ple/1"      # our FP8 PLE overlay = albucino's shards
+    PLE_DIR = PLE_DIR if (PLE_DIR / "model-plefp8-00000.safetensors").is_file() else None
+    MERLIN_PAY = MD / "e23-merlin-env/other/v1/1/merlin_offline_tar.bin"
+    MERLIN_PAY = MERLIN_PAY if MERLIN_PAY.is_file() else None
+    INTEL = INP / "models/dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/transformers/default/1"
+    INTEL = INTEL if (INTEL / "config.json").is_file() else None
+    WHEELHOUSE = INP / "datasets/foysalemonshanto/vllm-0-32-0-cu13-wheelhouse/install_wheelhouse.py"
+    WHEELHOUSE = WHEELHOUSE if WHEELHOUSE.is_file() else None
+    ARC = COMP / "arc-agi_evaluation_challenges.json"
+    if not ARC.is_file():
+        raise FileNotFoundError(f"{ARC}: attach the competition data")
     MERLIN_OK = all(PARTS.values()) and PLE_DIR is not None and MERLIN_PAY is not None
     R["inputs"] = {"parts": {k: (str(v[0]) if v else None) for k, v in PARTS.items()}, "ple_dir": str(PLE_DIR),
                    "merlin_pay": str(MERLIN_PAY), "intel": str(INTEL), "wheelhouse": str(WHEELHOUSE), "arc": str(ARC),
