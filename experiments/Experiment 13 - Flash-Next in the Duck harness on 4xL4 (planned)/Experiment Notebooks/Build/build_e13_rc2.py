@@ -260,16 +260,27 @@ def _telemetry():
 threading.Thread(target=_telemetry, daemon=True).start()
 
 
-def shm_cleanup():
-    """Between boots: what the dead server left in /dev/shm (PLE file-system-shared storages, torch / psm segments)."""
+SHM = Path(os.environ.get("RC2_SHM", "/dev/shm"))
+
+
+def shm_names():
+    try:
+        return {p.name for p in SHM.iterdir()}
+    except Exception:
+        return set()
+
+
+def shm_cleanup(before):
+    """After a boot's server is dead: only /dev/shm entries that appeared during THIS boot (absent from `before`) and
+    match the engine's prefixes are unlinked; everything else is recorded, never touched."""
     out = {"host_before": host_mem(), "removed": [], "kept": []}
     try:
-        for p in sorted(Path("/dev/shm").iterdir()):
+        for p in sorted(SHM.iterdir()):
             try:
                 sz = p.stat().st_size >> 20
             except Exception:
                 sz = None
-            if re.match(r"(torch_|psm_|vllm|ple|nccl|sem\.mp-|cuda\.shm)", p.name, re.I):
+            if p.name not in before and re.match(r"(torch_|psm_|vllm|ple|nccl|sem\.mp-|cuda\.shm)", p.name, re.I):
                 try:
                     p.unlink() if not p.is_dir() else shutil.rmtree(p)
                     out["removed"].append([p.name, sz])
@@ -303,7 +314,7 @@ class MServer(L.Server):
 def boot_gate():
     """Merlin's pin leaves ~0.9 GiB free per card: every boot needs near-empty GPUs (< 150 MiB, not E23's 1024)."""
     g = L.wait_gpu_release(300, fake=bool(FAKE), gpus="0,1,2,3", free_mib=150)
-    return {"ok": g, "gpus": L.gpu_mem()}
+    return {"ok": g, "gpus": L.gpu_mem(), "host": host_mem()}       # callers launch only on ok is True
 
 
 CKPT = TMP / "fn_merlin"
@@ -312,6 +323,7 @@ SHA = {"thread": None, "ok": None, "bad": [], "sec": None}
 
 def merge_ckpt():
     """Symlink the 5 parts + 10 PLE shards into one directory; names and sizes now, sha256 in a background thread."""
+    SHA.update(thread=None, ok=None, bad=[], sec=None)        # a stale result never gates a new merge
     shutil.rmtree(CKPT, ignore_errors=True)
     CKPT.mkdir(parents=True)
     expected = {}
@@ -398,11 +410,14 @@ def merlin_fn_server(name, kv, port, kv_bytes):
     if kv == "fp8":
         base["SCALES"] = str(CKPT / "qsa_kv_scales_262k.json")
     plan = eng["ML"].build("flash-next", PROFILE, str(CKPT), base, extra=extra, kv=kv, checkpoint="flash-next", status="untested")
-    try:
-        eng["ML"].host_phase(plan)
+    try:                                               # audits: tree products, venv, checkpoint marker, PLE dtype, toolchain,
+        eng["ML"].host_phase(plan)                     # scales file: a failure stops this boot before any server starts
         HOST_PHASE[name] = "ok"
-    except BaseException as e:                         # recorded, not fatal (E23 served without host_phase)
+    except BaseException as e:
         HOST_PHASE[name] = f"{type(e).__name__}: {e}"[:600]
+        R["setup"].setdefault("host_phase_error", {})[name] = HOST_PHASE[name]
+        save()
+        raise RuntimeError("MERLIN_HOST_PHASE_FAILED: " + HOST_PHASE[name])
     env = dict(plan.env)
     env.update(LD_PRELOAD=kvv["MERLIN_SHIM"], CUDA_HOME=eng["cuda_home"], VLLM_USE_RUST_FRONTEND="0", HF_HUB_OFFLINE="1",
                TRANSFORMERS_OFFLINE="1", LIBRARY_PATH=f"{SHIM}:{os.environ.get('LIBRARY_PATH', '')}",
@@ -478,15 +493,20 @@ save()
 TOKDIR = TMP / "fn_tok"
 shutil.rmtree(TOKDIR, ignore_errors=True)
 TOKDIR.mkdir()
-_src = CKPT if (CKPT / "tokenizer.json").exists() else None
+# the Merlin checkpoint's tokenizer when the merge is OK; otherwise the Intel (stock fallback) checkpoint's own
+MERLIN_PROMPTS = bool(R["sections"]["A0"]["merge"].get("ok")) and (CKPT / "tokenizer.json").exists()
+_src = CKPT if MERLIN_PROMPTS else INTEL
+if _src is None or not (_src / "tokenizer.json").exists():
+    raise FileNotFoundError("no tokenizer: the Merlin merge failed and the Intel fallback checkpoint is not attached")
 for _n in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
-    if _src is not None:
+    if (_src / _n).exists():
         shutil.copyfile(_src / _n, TOKDIR / _n)
 from tokenizers import Tokenizer
 from transformers import AutoTokenizer
 TOK = Tokenizer.from_file(str(TOKDIR / "tokenizer.json"))
 _HF = AutoTokenizer.from_pretrained(str(TOKDIR))
-_tpl = (TOKDIR / "chat_template.jinja").read_text()
+_tpl = ((TOKDIR / "chat_template.jinja").read_text() if (TOKDIR / "chat_template.jinja").exists()
+        else json.loads((TOKDIR / "tokenizer_config.json").read_text())["chat_template"])
 _tasks = json.load(open(ARC))
 _ids = sorted(_tasks)
 
@@ -540,9 +560,11 @@ def prompt(band, variant):
 
 TOK_SHA = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"   # = the 27B Merlin tokenizer.json
 TPL_SHA = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"   # = the 27B FP8 chat_template.jinja
+R["prompt_render"]["source"] = "merlin" if MERLIN_PROMPTS else "intel_fallback"
 R["prompt_render"]["hashes_ok"] = (R["prompt_render"]["tokenizer_json_sha256"] == TOK_SHA and
                                    R["prompt_render"]["template_sha256"] == TPL_SHA)
-assert R["prompt_render"]["hashes_ok"], "Flash-Next tokenizer / template differ from the pinned Merlin checkpoint"
+if MERLIN_PROMPTS:                    # the pinned hashes belong to the Merlin checkpoint only (Intel's are recorded)
+    assert R["prompt_render"]["hashes_ok"], "Flash-Next tokenizer / template differ from the pinned Merlin checkpoint"
 assert R["prompt_render"]["xhigh_sentence"] and R["prompt_render"]["xhigh_differs_from_medium"], "xhigh render missing"
 BANDS = {"2k": 2048, "8k": 8192, "40k": 40000, "90k": 90000, "116k": 116000}
 NSTREAM = 8
@@ -571,12 +593,90 @@ OOM_STEP = 268435456                     # Merlin's note: lower KV_BYTES in 0.25
 # Pre-run capacity (Merlin's rule: blocks per request = ceil(L / 4096) + 7; FP8 149 usable blocks, BF16 ~78)
 R["capacity_plan"] = {
     "fp8": {"pool_blocks": 149, "40k@5": 5 * (math.ceil(130560 / 4096) + 7), "8k@8": 8 * (math.ceil(32000 / 4096) + 7),
-            "90k@4": 4 * (math.ceil(131072 / 4096) + 7), "116k@4": 4 * (math.ceil(131072 / 4096) + 7),
-            "note": "blocks if every stream grows to max length; the ladder windows are 90 s, so real use is far lower"},
+            "90k@4": 4 * (math.ceil(131072 / 4096) + 7), "116k@3": 3 * (math.ceil(131072 / 4096) + 7),
+            "116k@4": 4 * (math.ceil(131072 / 4096) + 7),
+            "note": "blocks if every stream grew to max length; the ladder windows are 90 s, so real use is far lower; "
+                    "90k@4 and 116k@4 are capacity-limit probes"},
     "bf16": {"pool_blocks": 78, "40k@3": 3 * (math.ceil(130560 / 4096) + 7)},
-    "long_rows": "1 natural xhigh ARC row (max 120,000 new) + 1 forced 60,000-token row, temperature 0.6",
+    "long_rows": "1 natural xhigh ARC row (max 120,000 new) + 1 forced 60,000-token row, temperature 0.6, run CONCURRENTLY "
+                 "(concurrency 2): not a single-stream latency number",
 }
+R["correctness_meaning"] = ("Both Merlin boots run MTP K3: CLEAN = BF16_MTP3 vs FP8_MTP3 parity plus probes / sampled / greedy "
+                            "evidence; it is NOT target-only (MTP off) correctness. A production GO needs an MTP-off oracle and "
+                            "a forced-rejection test.")
 ''' + GATES + r'''
+
+
+def _windows(o):
+    """Every load window of a record: the ladder AND the long census (audit: census_long was not gated)."""
+    out = []
+    for key in ("steady", "census_long"):
+        for v in (o.get(key) or {}).values():
+            if isinstance(v, dict):
+                out.append(v)
+    return out
+
+
+def evidence_gate(o, expected_rows, require_sampled=True):
+    """Fail-closed evidence (three pre-GPU audits): probes, the sampled path and a COMPLETE oracle are mandatory;
+    a missing piece is never CLEAN. expected_rows None = no oracle in this arm (diagnostic arms)."""
+    pr = o.get("probes")
+    if not isinstance(pr, dict):
+        return "INCONCLUSIVE_PROBES_MISSING"
+    if pr.get("ok") is not True and not FAKE:          # the fake server has no chat endpoint (E23 rule)
+        return "NO_GO_SHORT_PROBE"
+    if require_sampled:
+        sm = o.get("sampled")
+        if not isinstance(sm, dict):
+            return "INCONCLUSIVE_NO_SAMPLED_TEST"
+        if sm.get("ok") is not True or sm.get("garbage"):
+            return "NO_GO_SAMPLED_PATH"
+    if expected_rows is None:
+        return None
+    orc = o.get("oracle")
+    if not isinstance(orc, dict):
+        return "INCONCLUSIVE_NO_ORACLE"
+    if any(orc.get("errors") or []):
+        return "NO_GO_ORACLE_REQUEST_ERROR"
+    if any(orc.get("garbage") or []):
+        return "NO_GO_ORACLE_GARBAGE"
+    if orc.get("row_count") != expected_rows or orc.get("complete") is not True:
+        return "INCONCLUSIVE_ORACLE_INCOMPLETE"
+    return None
+
+
+_gated_e23 = gated
+
+
+def gated(o, need=(), extra=(), expected_rows=4, require_sampled=True):
+    g = evidence_gate(o, expected_rows, require_sampled)
+    if g:
+        o["correctness"] = g
+        if o.get("status") in (None, "DONE"):
+            o["status"] = g
+        return o
+    return _gated_e23(o, need, extra)
+
+
+def oracle(port, key=None, refs=(), prompts=None):
+    """E23's oracle plus completeness: every expected row present, no error, exactly NTOK tokens (greedy rows run with
+    ignore_eos, so a short row is a defect); a reference is stored only when complete and garbage-free."""
+    prompts = list(prompts) if prompts is not None else ORACLE_P + LONG_P
+    rows = L.greedy(port, prompts, n_tok=NTOK, timeout=max(120, min(900, left() / 6)))
+    garbage = [L.degenerate(r.get("text")) for r in rows]
+    complete = len(rows) == len(prompts) and all(not r.get("error") and len(r.get("tokens") or []) == NTOK for r in rows)
+    if key and complete and not any(garbage):
+        ROWS[key] = rows
+    elif key:
+        R["errors"].append(f"oracle {key}: reference not stored (incomplete / error / garbage)")
+    res = {"garbage": garbage, "errors": [r.get("error") for r in rows], "text_head": [(r.get("text") or "")[:120] for r in rows],
+           "row_count": len(rows), "expected_rows": len(prompts), "tokens": [len(r.get("tokens") or []) for r in rows],
+           "complete": complete}
+    if not FAKE:
+        res["template_probe"] = L.template_probe(port, TPL_MSG, TPL_IDS)
+    for ref in refs:
+        res["vs_" + ref] = L.compare(ROWS.get(ref), rows) if ROWS.get(ref) else {"status": "INCONCLUSIVE_NO_ORACLE"}
+    return res
 
 
 def kv_census(s):
@@ -623,9 +723,10 @@ def prefill_probe(port):
     return {"prompt": len(ids), "ttft_sec": round(sec, 1), "tok_s": round(len(ids) / max(1e-3, sec), 1), "error": g.err, "ok": ok}
 
 
-def long_rows(port, secs_cap=2700):
+def long_rows(port, secs_cap=3000):
     """One natural xhigh ARC request (its own stop, up to 120,000 new tokens) and one forced 60,000-token row
-    (ignore_eos: 'synthetic' past its first EOS). Full text of both in traces/ and requests.jsonl."""
+    (ignore_eos: 'synthetic' past its first EOS), CONCURRENTLY (concurrency 2). Full text in traces/ + requests.jsonl.
+    A row cut by the time cap is incomplete, not a correctness failure."""
     cap = max(60, min(secs_cap, left() - 900))
     jobs = {"natural": L.Stream(port, TPL_IDS, min(120000, MAX_LEN - len(TPL_IDS) - 512), temperature=TEMP, seed=11,
                                 ignore_eos=False),
@@ -639,7 +740,7 @@ def long_rows(port, secs_cap=2700):
         if g.is_alive():
             g.stop()
             g.join(10)
-    out = {}
+    out = {"concurrency": 2, "cap_sec": round(cap)}
     for name, g in jobs.items():
         row = g.row()
         (TRACES / f"long_{port}_{name}.txt").write_text(row["text"])
@@ -665,8 +766,8 @@ def long_rows(port, secs_cap=2700):
 
 
 def tf_last(s, key=None, ref=None, aa=False):
-    """Teacher-forced 40k LAST in a boot (chunk x 248k-vocab prompt logits can OOM the last PP rank): free memory first,
-    a server death during it is TF_OOM, not a model failure."""
+    """Teacher-forced 40k LAST in a boot (chunk x 248k-vocab prompt logits can OOM the last PP rank); free memory first.
+    How a server death here is classified is decided from its log in merlin_boot (TF_OOM vs TF_SERVER_DIED)."""
     o = {"gpu_before": L.gpu_mem()}
     if key:
         o["ref"] = tforced(s.port, key=key)
@@ -681,16 +782,18 @@ def tf_last(s, key=None, ref=None, aa=False):
     return o
 
 
-def merlin_boot(name, kv, port, timeout, body, need=()):
-    """Boot gate (< 150 MiB per GPU), one Merlin boot, /dev/shm cleanup; a boot OOM retries once 0.25 GiB lower."""
+def merlin_boot(name, kv, port, timeout, body, need=(), expected_rows=4, require_sampled=True):
+    """Boot gate (ok must be True), one Merlin boot, cleanup of the /dev/shm entries this boot created; a boot OOM
+    retries once 0.25 GiB lower. A server death during TF is TF_OOM only with an OOM line and no device fault."""
     kvb = KV_FP8 if kv == "fp8" else KV_BF16
     tries = []
     while True:
         gate = boot_gate()
-        if gate["ok"] is False:
+        if gate["ok"] is not True:
             return {"status": "GPU_NOT_EMPTY", "boot_gate": gate, "tries": tries}
+        shm0 = shm_names()
         o = with_servers([merlin_fn_server(name, kv, port, kvb)], timeout, body)
-        o.update(kv_bytes=kvb, boot_gate=gate, shm_cleanup=shm_cleanup())
+        o.update(kv_bytes=kvb, boot_gate=gate, shm_cleanup=shm_cleanup(shm0))
         srv = (o.get("servers") or {}).get(name) or {}
         oom = o.get("status") == "LAUNCH_FAILED" and bool(OOM_ERR.search(srv.get("log_tail") or ""))
         tries.append({"kv_bytes": kvb, "status": o.get("status"), "oom": oom})
@@ -700,9 +803,14 @@ def merlin_boot(name, kv, port, timeout, body, need=()):
         log("boot OOM:", name, "retry with KV_BYTES", kvb)
     o["tries"] = tries
     if o.get("tf_died") and o.get("status") == "SERVER_DIED":
-        o["status"] = "TF_OOM"
-        o["status_note"] = "the server died in the teacher-forced call (run last); everything before it is valid"
-    g = gated(o, need=need)
+        srv = (o.get("servers") or {}).get(name) or {}
+        if OOM_ERR.search(srv.get("log_tail") or "") and not srv.get("xid"):
+            o["status"] = "TF_OOM"
+            o["status_note"] = "the server died of OOM in the teacher-forced call (run last); everything before it is valid"
+        else:
+            o["status"] = "TF_SERVER_DIED"
+            o["status_note"] = "the server died in the teacher-forced call without an OOM line (or with a device fault)"
+    g = gated(o, need=need, expected_rows=expected_rows, require_sampled=require_sampled)
     if g.get("status") == "TF_OOM" and g.get("correctness") != "CLEAN":
         g["status"] = g["correctness"]
     return g
@@ -715,15 +823,28 @@ def arm_bf16():
         o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
         o["prefill"] = prefill_probe(p)
         o["oracle"] = oracle(p, key="bf16")
+        o["census_end"] = kv_census(s)
         o["tf"] = tf_last(s, key="bf16", aa=True)
         o["tf_died"] = not o["tf"]["alive_after"]
-        o["census_end"] = kv_census(s)
         return o
     ok, why = sha_gate(min(1500, left() - 900))
     R["setup"]["sha_gate"] = {"ok": ok, "why": why}
     if not ok:
         return {"status": "SKIPPED_SHA_GATE", "why": why}
     return merlin_boot("merlin_bf16", "bf16", 8000, 45 * 60, body)
+
+
+def fp8_gate(o):
+    vs = (o["oracle"].get("vs_bf16") or {}).get("status")
+    if (o.get("sampled") or {}).get("ok") is not True:
+        return "FAIL_SAMPLED"
+    if (o.get("probes") or {}).get("ok") is not True and not FAKE:
+        return "FAIL_PROBES"
+    if any(o["oracle"].get("errors") or []) or any(o["oracle"].get("garbage") or []) or vs == "FAIL_HIGH_MARGIN":
+        return "FAIL"
+    if o["oracle"].get("complete") is True and vs in CLEAN:
+        return "PASS"
+    return "INCONCLUSIVE"
 
 
 def arm_fp8():
@@ -734,57 +855,71 @@ def arm_fp8():
         if not PREFILL["measured"]:
             o["prefill"] = prefill_probe(p)
         o["oracle"] = oracle(p, refs=("bf16",))
-        vs = (o["oracle"].get("vs_bf16") or {}).get("status")
-        o["fp8_gate"] = ("FAIL" if vs == "FAIL_HIGH_MARGIN" or any(o["oracle"].get("garbage") or []) else
-                         "PASS" if vs in CLEAN else "INCONCLUSIVE")
-        if o["fp8_gate"] != "FAIL":
+        o["fp8_gate"] = fp8_gate(o)
+        if o["fp8_gate"] == "PASS":                      # load tests only on a PASS (audits: INCONCLUSIVE never runs them)
             kw = {"server": s, "temperature": TEMP, "prefill_tok_s": PREFILL["tok_s"]}
             o["steady"] = levels(p, "40k", LADDER, **kw)
             o["steady"].update(levels(p, "8k", [8], **kw))
             o["census_long"] = {**levels(p, "90k", [3, 4], **kw), **levels(p, "116k", [3, 4], **kw)}
             o["long"] = long_rows(p)
+        else:
+            o["load_tests_skipped"] = f"FP8 comparison gate: {o['fp8_gate']}"
+            o["status"] = "NO_GO_FP8_KV" if o["fp8_gate"].startswith("FAIL") else "INCONCLUSIVE_FP8_KV"
+        o["census_end"] = kv_census(s)
         o["tf"] = tf_last(s, ref="bf16")
         o["tf_died"] = not o["tf"]["alive_after"]
-        o["census_end"] = kv_census(s)
         return o
     return merlin_boot("merlin_fp8", "fp8", 8001, 40 * 60, body, need=("bf16",))
 
 
 def arm_bf16_load():
-    """Only when FP8 fails the greedy comparison: the ladder, the census and the long rows on BF16 KV (seqs 3)."""
+    """Only when FP8 fails: the ladder, the census and the long rows on BF16 KV (seqs 3). DIAGNOSTIC_ONLY: this arm
+    has no oracle of its own (the A1 boot is the BF16 reference)."""
     def body(ss):
         s = ss[0]
         p = s.port
-        kw = {"server": s, "temperature": TEMP, "prefill_tok_s": PREFILL["tok_s"]}
-        return {"census": kv_census(s), "probes": L.chat_probes(p), "steady": levels(p, "40k", [1, 2, 3], **kw),
-                "census_long": levels(p, "116k", [1, 2], **kw), "long": long_rows(p), "census_end": kv_census(s)}
-    return merlin_boot("merlin_bf16_load", "bf16", 8002, 30 * 60, body)
+        o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+        if o["sampled"]["ok"] is True:
+            kw = {"server": s, "temperature": TEMP, "prefill_tok_s": PREFILL["tok_s"]}
+            o["steady"] = levels(p, "40k", [1, 2, 3], **kw)
+            o["census_long"] = levels(p, "116k", [1, 2], **kw)
+            o["long"] = long_rows(p)
+        o["census_end"] = kv_census(s)
+        o["certification"] = "DIAGNOSTIC_ONLY"
+        return o
+    return merlin_boot("merlin_bf16_load", "bf16", 8002, 30 * 60, body, expected_rows=None)
 
 
 def arm_stock():
     """Fallback when Merlin cannot serve: stock vLLM 0.32 + Intel W4A16 (RC1's correct engine), -lcuda shim, FP8 KV."""
+    if INTEL is None or WHEELHOUSE is None:
+        return {"status": "FALLBACK_UNAVAILABLE", "why": f"intel={INTEL} wheelhouse={WHEELHOUSE}"}
+
     def body(ss):
         s = ss[0]
         p = s.port
-        rows = L.greedy(p, ORACLE_P, n_tok=NTOK)                    # 2k / 2k / 8k (32k max length: no 40k row)
-        orc = {"garbage": [L.degenerate(r["text"]) for r in rows], "errors": [r["error"] for r in rows],
-               "text_head": [r["text"][:120] for r in rows]}
-        return {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s), "oracle": orc,
-                "steady": levels(p, "8k", [1, 2, 3], server=s, temperature=TEMP)}
+        o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+        o["oracle"] = oracle(p, key="stock", prompts=ORACLE_P)          # 2k / 2k / 8k (32k max length: no 40k row)
+        if o["sampled"]["ok"] is True:
+            o["steady"] = levels(p, "8k", [1, 2, 3], server=s, temperature=TEMP)
+        return o
     gate = boot_gate()
-    o = gated(with_servers([stock_fn_server("stock_fn", 8003)], 40 * 60, body))
-    o["boot_gate"] = gate
+    if gate["ok"] is not True:
+        return {"status": "GPU_NOT_EMPTY", "boot_gate": gate}
+    shm0 = shm_names()
+    o = gated(with_servers([stock_fn_server("stock_fn", 8003)], 40 * 60, body), expected_rows=len(ORACLE_P))
+    o.update(boot_gate=gate, shm_cleanup=shm_cleanup(shm0))
     return o
 
 
-if not RERUN:
+if not RERUN and not os.environ.get("RC2_UNIT"):
     m = R["sections"]["A0"]["merge"]
     if m.get("ok"):
         rec = step("A0", "merlin_install", 10, lambda: {"install": (lambda e: {"ok": True, "tree": e["kv"].get("MERLIN_TREE")} if not FAKE else {"fake": True})(merlin_install())})
         a1 = step("A1", "merlin_bf16", 45, arm_bf16)
         if a1.get("status") in ("DONE", "TF_OOM") and a1.get("correctness") == "CLEAN":
             a3 = step("A3", "merlin_fp8", 110, arm_fp8)
-            if a3.get("fp8_gate") == "FAIL":
+            if str(a3.get("fp8_gate", "")).startswith("FAIL"):
                 step("A3", "merlin_bf16_load", 60, arm_bf16_load)
         else:
             step("F", "stock_fn", 40, arm_stock)
@@ -799,13 +934,14 @@ if not RERUN:
 '''
 
 CELL6 = r'''# ==================================================================== CELL 6 — report + fallback submission
-if not RERUN:
+if not RERUN and not os.environ.get("RC2_UNIT"):
     write_fallback_submission()
     def _brief(r):
         if not isinstance(r, dict):
             return r
         keep = ("status", "correctness", "fp8_gate", "probes", "sampled", "prefill", "census", "steady", "census_long", "long",
-                "tf", "tries", "kv_bytes", "boot_gate", "why", "error", "status_note")
+                "tf", "tries", "kv_bytes", "boot_gate", "why", "error", "status_note", "load_tests_skipped",
+                "certification")
         return {k: r.get(k) for k in keep if k in r}
     R["summary"] = {f"{s}/{n}": _brief(r) for s, st in R["sections"].items() if isinstance(st, dict) for n, r in st.items()
                     if isinstance(r, dict) and "status" in r}
