@@ -104,7 +104,7 @@ else:
     ABORT = {"why": None}
     NVSMI_OK = bool(L.gpu_mem()) and not FAKE
     R["setup"]["gpus_at_start"] = L.gpu_mem()
-    if not FAKE and len(R["setup"]["gpus_at_start"] or []) != 4:
+    if not FAKE and not os.environ.get("RC2_CPU_KIT") and len(R["setup"]["gpus_at_start"] or []) != 4:   # CPU kit: no GPUs
         R["errors"].append(f"expected 4 GPUs, nvidia-smi shows {R['setup']['gpus_at_start']}")
         save()
         raise RuntimeError("GPU_PREFLIGHT_FAILED: " + repr(R["setup"]["gpus_at_start"]))
