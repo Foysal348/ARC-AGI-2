@@ -1,0 +1,163 @@
+--- E29_DFLASH_D3S (readable cells)
++++ E32_LEVERS (readable cells)
+@@ -49,6 +49,14 @@
+ E29_DIRECT2 = {'on': True, 'think': 104000, 'answer': 8192, 'temperature': 1.0, 'drain_min': 26, 'phase': 'C1'}   # E29 rev 2: DIRECT = the 2nd branch (attempt_2); 'on': False = no DIRECT; 'phase': 'C1' = DIRECT only on train-fail C items (Duck C on train-pass), 'C' = every C item (edit freely, no rebuild)
+ E29_QSA = {'max_logits_mb': 128, 'granule_mb': 64}   # E29 rev 2c: QSA prefill workspace, DFlash tries (Merlin 256/256)
++E32_SEQS = 28   # E32 lever S28/S32: --max-num-seqs + captures of the DFlash tries (24 = off = E29; 28 | 32)
++E32_SPEC = 'DYN'   # E32 lever D4s/DYN: 'K3' = off (E29 D3s) | 'D4s' (K4) | 'DYN' (K4 + per-batch K [[1,8,4],[9,seqs,3]])
++E32_LP = True   # E32 lever LP: --max-num-batched-tokens 2048 --long-prefill-token-threshold 1024 (+ adaptive)
++E32_SPC = True   # E32 lever SPC: --enable-mamba-shared-prefix-checkpoint
++E32_IDX = True   # E32 lever IDX: --attention-config {"indexer_kv_dtype":"fp8"}
++E32_G1 = True   # E32 lever G1: VLLM_GDN_DECODE_FASTPATH=1
++E32_G2 = True   # E32 lever G2: VLLM_GDN_SHARED_ALIGN_INDEX=1
++E32_SPEED = {'on': True, 'windows': [['8k', 16], ['20k', 24], ['90k', 8], ['116k', 6]], 'cap_min': 15}   # E32: speed pass (record only, commit only)
+ E29_PROFILE = "E28EVAL120"   # E29 rev 2e: the commit profile (E28EVAL120 = production 6 h EVAL120; E29SMOKE = the ~70-min GPU smoke)
+-E29_SMOKE = {'tasks': ['1818057f', '2ba387bc', '31f7f899', '409aa875', '446ef5d2', '45a5af55', '7b5033c1', '800d221b', 'a47bf94d', 'b6f77b65', 'bf45cf4b', 'd59b0160'], 'window_min': 40, 'budget_min': 70}   # E29 rev 2e: the E29SMOKE profile (eval, 12 tasks, plain sorted; HARD_STOP = budget - 5, deadman = budget)
++E29_SMOKE = {'tasks': ['1818057f', '2ba387bc', '31f7f899', '409aa875', '446ef5d2', '45a5af55', '7b5033c1', '800d221b', 'a47bf94d', 'b6f77b65', 'bf45cf4b', 'd59b0160'], 'window_min': 40, 'budget_min': 100}   # E32: 70 -> 100; E29 rev 2e: the E29SMOKE profile (eval, 12 tasks, plain sorted; HARD_STOP = budget - 5, deadman = budget)
+ # ==================================================================== CELL 1 — NB5 configuration (E25 FN-Duck)
+ # ---- E26 K100 (user 2026-11-01): the commit's ABSOLUTE DEADMAN (E28 K100: HARD_STOP 410 min + 5 = 415 min), armed first (CELL 0 has written the fallback
+@@ -2124,4 +2132,5 @@
+     log("!!!!!!!!!! E29 lever dropped:", lever, "|", str(why)[:300], "| try", try_name, "| still on", E29_RT["on"])
+     if lever == "df":
++        e32_call("df_dropped", None, why)   # E32: the bundle levers go with DFlash
+         E29_RT["df_try"] = E29_RT["df_live"] = False
+         if SSEQ is not None and not FAKE:
+@@ -2231,4 +2240,5 @@
+                                                              draft_sw_block=E29_RT["df"]["sw_block"]).items()})
+         env.update({} if E29_RT.get("qsa_off") else E29L.qsa_env(E29_QSA))   # E29 rev 2c / 2d: the QSA workspace (DFlash tries)
++        env.update(e32_call("env", {}, df))   # E32: G1 / G2 (DFlash tries)
+     elif "vocab" in E29_RT["on"]:
+         env.update(VLLM_DRAFT_VOCAB_FILE=E29_RT["vocab"]["file"], VLLM_DRAFT_VOCAB_SHA256=E29_RT["vocab"]["sha256"])
+@@ -2241,5 +2251,6 @@
+ def e29_extra(df):
+     """The trailing argv of this try's E29 levers (after --max-num-seqs; the DFlash spec + captures come last: last wins)."""
+-    return (list(E29L.IDX_ARGS) if "idx" in E29_RT["on"] else []) + (list(E29_RT["df"]["tail"]) if df else [])
++    return ((list(E29L.IDX_ARGS) if "idx" in E29_RT["on"] else []) + (e32_call("argv", [], df) if df else [])   # E32: LP / SPC / IDX
++            + (list(E29_RT["df"]["tail"]) if df else []))
+ 
+ 
+@@ -2305,4 +2316,5 @@
+     removed), the top pin, the booted 24 seqs, the seam / QSA env removed, the INT8 head when E28's I8 is on (e29_drop
+     restores it)."""
++    e32_call("mtp", None)   # E32: the bundle argv / env / seqs leave the booted config (the E28 top rung = E29)
+     lv = {k_: v_ for k_, v_ in dict(NB5_ACTIVE_BOOT.get("levers") or {}).items() if k_ not in DS.ALL_ENVS + E29L.QSA_KEYS}
+     NB5_ACTIVE_BOOT.update(extra=E29L.strip_df_argv(NB5_ACTIVE_BOOT.get("extra"), E29_RT["df"]["tail"]), kv_bytes=E29L.D_PIN0,
+@@ -2464,4 +2476,57 @@
+     except Exception as e:
+         E29_RT["errors"].append(f"relaunch plan: {e!r}"[:300])
++
++
++
++# ==================================================================== E32 (Build/build_e32_levers.py): the 1500 lever bundle
++# CELL 1's E32_<LEVER> lines = the switches. e32_lib.py (pure: switch parse, argv / env, the DFlash plan, the drop rule, the
++# read-back, the fingerprint) + e32_nbx.py (the hook bodies _e32x_*) come from the E32 payload dataset by name + sha. Every
++# hook is e32_call(<name>, <default>, ...): no payload / not ON / an exception -> the default = E29_DFLASH_D3S exactly. The
++# levers act on the DFlash tries only; a real failure of a D try drops ONE lever and boots the same D rung again.
++E32_FILES = {"lib": ["e32_lib.py", "f0ea5856f4e11627e4343f266d840e305a0c82e3a433f38f832b27a220c23920"], "nbx": ["e32_nbx.py", "218c7f8f58e866e0144d894e81b6c91e1ef3b8dc121a3a1e30684ed9fa5d4ed2"]}
++E32_RT = {"state": None, "errors": [], "files": E32_FILES}
++E32L = None
++
++
++def e32_call(fn, default, *a):
++    f = globals().get("_e32x_" + fn)
++    if f is None or E32_RT.get("state") != "ON":
++        return default
++    try:
++        return f(*a)
++    except Exception as e:
++        E32_RT["errors"].append(f"{fn}: {type(e).__name__}: {e}"[:300])
++        return default
++
++
++def e32_setup():
++    """After e29_setup(): e32_lib (import) + e32_nbx (exec into this namespace), then _e32x_setup(). A miss = every lever
++    off (= E29_DFLASH_D3S), recorded; never raises."""
++    global E32L
++    try:
++        (TMP / E32_FILES["lib"][0]).write_bytes(q27x_payload(*E32_FILES["lib"]))
++        import e32_lib as _l
++        E32L = _l
++        exec(compile(q27x_payload(*E32_FILES["nbx"]).decode("utf-8"), "e32_nbx.py", "exec"), globals())
++        E32_RT["state"] = "ON"
++        globals()["_e32x_setup"]()
++        if not E32_RT.get("active"):
++            E32_RT["state"] = "OFF_NO_DFLASH"
++    except Exception as e:
++        E32_RT.update(state="OFF_SETUP", error=f"{type(e).__name__}: {e}"[:600])
++        try:
++            globals()["_e32x_rollback"]()
++        except Exception:
++            pass
++        log("!!!!!!!!!! E32 levers off (= E29_DFLASH_D3S):", E32_RT["error"][:300])
++    E29_RT["e32"] = E32_RT
++
++
++def e32_report(sm=None):
++    f = globals().get("_e32x_summary")
++    try:
++        return f(sm) if f is not None else dict(E32_RT)
++    except Exception as e:
++        return dict(E32_RT, summary_error=f"{type(e).__name__}: {e}"[:300])
+ 
+ 
+@@ -3321,5 +3386,5 @@
+         _seq = caps.get("max_num_seqs")
+         _w = min(_wr, int(_seq)) if _seq else _wr
+-        if P.get("top_rung_seqs") and _seq and int(_seq) == int(P["top_rung_seqs"]):   # E28 K100 (user 2026-11-01): the top
++        if P.get("top_rung_seqs") and _seq and int(_seq) in (int(P["top_rung_seqs"]), e32_call("seqs_top", -1)):   # E32; E28 K100 (user 2026-11-01): the top
+             _w = int(_seq)                   # rung launched 24 -> 24 workers (lower rungs: K100Q's R2 value, the min above)
+         plan["r2_workers"] = {"rule": _wr, "rule_text": "max(1, floor(pool / (ceil(65536 / B) + F)))", "pool": pool,
+@@ -3941,5 +4006,5 @@
+             return False, "GPU release / host RAM gate failed"
+         global NB5_BOOT_EXTRA, NB5_BOOT_LEVERS
+-        e29_relaunch_plan(old)   # E29 rev 2: an in-run DFlash OOM -> the next D rung / MTP K3
++        e32_call("relaunch", False, old) or e29_relaunch_plan(old)   # E32; E29 rev 2
+         _ab = dict(NB5_ACTIVE_BOOT)                       # E26 K100: the exact booted config (kv bytes, seqs, captures, levers)
+         if _ab:
+@@ -4023,4 +4088,6 @@
+             if trec["e29_df_readback"]["label"] not in ("ENGAGED", "FAKE_SERVER"):
+                 trec["status"] = "E29_QSA_ENV_MISMATCH" if trec["e29_df_readback"]["label"] == "QSA_ENV_MISMATCH" else "E29_DFLASH_NOT_ENGAGED"
++                return {}
++            if e32_call("readback", False, s, trec):   # E32
+                 return {}
+         if E29_RT.get("seam_unverified") and not E29_RT.get("df_try") and not FAKE:   # E29 rev 2d F11
+@@ -4093,4 +4160,5 @@
+                 trec["status"] = _e29p
+                 return {}
++            e32_call("speed", None, s, trec)   # E32 speed pass
+         if not RERUN and not P.get("no_pure_decode"):
+             try:
+@@ -4169,11 +4237,11 @@
+         NB5_BOOT_LEVERS = dict(levers, **(E28_I8_ENV if E28_I8["on"] and not _e29d else {}))   # E28 K100 I8: DRAFT_HEAD=int8 into build()
+         NB5_BOOT_LEVERS.update(e29_env(_e29d))     # E29: seam env / draft vocab / GDN switches
+-        seqs = int(E29_CFG["workers"]) if _e29d else NB5L.seqs_for(NB5_BOOT_KV, tr["gib"]) if NB5_SEQS_RULE == "table" else (K100_SEQS_TABLE[round(float(tr["gib"]), 2)] if NB5_SEQS_RULE == "k100" else None)   # E26 K100
+-        if P.get("top_rung_seqs") and abs(float(tr["gib"]) - K100_PIN_STEPS_GIB[0]) < 1e-9:   # E28 K100 (user 2026-11-01):
++        seqs = e32_call("seqs", int(E29_CFG["workers"])) if _e29d else NB5L.seqs_for(NB5_BOOT_KV, tr["gib"]) if NB5_SEQS_RULE == "table" else (K100_SEQS_TABLE[round(float(tr["gib"]), 2)] if NB5_SEQS_RULE == "k100" else None)   # E26 K100
++        if P.get("top_rung_seqs") and not _e29d and abs(float(tr["gib"]) - K100_PIN_STEPS_GIB[0]) < 1e-9:   # E32; E28 K100:
+             seqs = int(P["top_rung_seqs"])            # 24 on the TOP rung only (an I8 -> BF16 retry there keeps 24)
+         NB5_BOOT_EXTRA = base_extra + (["--max-num-seqs", str(seqs)] if seqs else []) + e29_extra(_e29d)   # E29: indexer / DFlash last
+         name = (tag if not P.get("pin_ladder") else f"{tag}_pin{int(round(tr['gib'] * 100))}" + ("" if levers or not NB5_LEVER_ENV else "_nolever")
+                 + ("_i8" if E28_I8["on"] and not _e29d else "") + (f"_df{E29_RT['df']['k']}r{_e29d['rung']}" if _e29d else "")
+-                + "".join("_" + x for x in E29_RT["on"] if x != "df"))   # E28 K100; E29
++                + "".join("_" + x for x in E29_RT["on"] if x != "df") + e32_call("tag", "", _e29d))   # E28 K100; E29; E32
+         trec = {"name": name, "pin_gib": tr["gib"], "kv_bytes": tr["kv_bytes"], "max_num_seqs_launch": seqs, "levers": dict(levers),
+                 "e28_i8": bool(E28_I8["on"]) and not _e29d,   # E28 K100
+@@ -4198,4 +4266,6 @@
+             if _e29s == "E29_QSA_ENV_MISMATCH" and not E29_RT.get("qsa_off"):   # E29 rev 2d F3: same rung, Merlin 256/256
+                 E29_RT["qsa_off"] = True
++                continue
++            if e32_call("pick", False, trec, _e28_log, _e29s):   # E32: drop one lever, same rung
+                 continue
+             _e29o = bool(trec.get("e29_df")) and (E29L.df_oom_step(_e29s, _e28_log) or _e29s == "E29_DFLASH_LOW_FREE")   # rev 2 / 2d F2
+@@ -5471,4 +5541,5 @@
+         (E28_I8.get("static") or {}).get("verdict"), "| scheduler applied", E28_SCHED_REC.get("applied"))
+     e29_setup()   # E29 FINAL: the switchable levers (vocab / DFlash drafter + seam / indexer / GDN); a miss = that lever off
++    e32_setup()   # E32 lever bundle
+     if P.get("fixed_window_sec"):    # E26 K100: NB5 QUALITY's solve window, fixed (not split: one phase)
+         NB5_EQ.update(window_sec=float(P["fixed_window_sec"]), plan={"window_sec": float(P["fixed_window_sec"]), "fixed": True,
+@@ -5664,4 +5735,5 @@
+         print("[SMOKE SUMMARY]" if PROFILE == "E29SMOKE" else "[E29 RUN SUMMARY]", "\n" + E29L.summary_text(_sm), flush=True)
+         print(json.dumps(_sm, default=str), flush=True)
++        E28_OUT["e32"] = e32_report(_sm)   # E32 (record only)
+     except BaseException:
+         E28_OUT["e29_error"] = traceback.format_exc()[-1500:]

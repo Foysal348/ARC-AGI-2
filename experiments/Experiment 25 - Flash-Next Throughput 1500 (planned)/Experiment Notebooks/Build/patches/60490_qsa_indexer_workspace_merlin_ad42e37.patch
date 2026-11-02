@@ -1,0 +1,66 @@
+# vLLM PR #60490 (issue #60489) rebased onto Merlin v3.0.0 (commit ad42e37feb7611c4ffd24017bf20a7e2dc94c6e5,
+# tree 07c16a79d077f1e06c19d0eea84efd64f0b63540 = the tree the Kaggle payload installs, install_merlin.log).
+# Same code as upstream; only the import context differs (Merlin's import block). One marker comment added.
+# pre-patch sha256  a23d5f90507ad5185f8b8e8d6ba13ae0cb53b2506264fdfbbf6a60b1171dc653
+# post-patch sha256 88fe0a8f4dd2ef90fc6aefb5771b5b48e40c0b1d575039283c52aeca19b8bd6b
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -18,8 +18,9 @@
+ from torch import nn
+ from transformers import Qwen4ExpTextConfig
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, get_current_vllm_config_or_none
+ from vllm.config.cache import CacheConfig, CacheDType
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.forward_context import get_forward_context
+@@ -45,6 +46,7 @@
+ )
+ from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
++from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+     _encode_layer_name,
+@@ -75,6 +77,7 @@
+ from . import model
+ from .indexer_qsa import QSAIndexer
+ from .ops.qsa import qsa_e4m3_uses_native_cast
++from .ops.qsa_indexer import _TOPK_WORKSPACE_BYTES
+ 
+ logger = init_logger(__name__)
+ 
+@@ -782,6 +785,31 @@
+         if isinstance(metadata, list):
+             metadata = metadata[0]
+         if not isinstance(metadata, dict):
++            # E25 NB1: backport of vLLM PR #60490 (issue #60489).
++            # Profiling/dummy run: the indexer allocates its selection scratch
++            # on demand, so touch its peak here for the memory profiler (as
++            # sparse_attn_indexer does): the prefill logits budget or the
++            # worst-case decode logits [decode tokens, compressed columns],
++            # plus the top-k workspace.
++            logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            cfg = get_current_vllm_config_or_none()
++            if cfg is not None:
++                spec = cfg.speculative_config
++                num_spec = spec.num_speculative_tokens if spec is not None else 0
++                decode_tokens = min(
++                    cfg.scheduler_config.max_num_seqs * (num_spec + 1),
++                    cfg.scheduler_config.max_num_batched_tokens,
++                )
++                block_size = cfg.cache_config.block_size
++                columns = cdiv(cfg.model_config.max_model_len, block_size) * cdiv(
++                    block_size, self.indexer.compress_ratio
++                )
++                logits_bytes = max(logits_bytes, decode_tokens * columns * 4)
++            _ = torch.empty(
++                logits_bytes + _TOPK_WORKSPACE_BYTES,
++                dtype=torch.uint8,
++                device=output.device,
++            )
+             output.zero_()
+             return
+         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])

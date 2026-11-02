@@ -1,0 +1,2716 @@
+# ==================================================================== CELL 0 — mode + fallback submission (stdlib only)
+import os, sys, json, time, random, hashlib, re, shutil, subprocess, threading, traceback, zipfile, math
+from pathlib import Path
+from datetime import datetime, timezone
+import concurrent.futures as cf
+
+NOTEBOOK_T0 = time.perf_counter()
+# S1 (CLOCK): Kaggle's 12 h counts from kernel start; R5's cell 0 began 7 s later. Anchor the clock at the kernel
+# process start (capped at 10 min in case the value is odd).
+try:
+    import psutil as _ps
+    _since_kernel_start = max(0.0, min(600.0, time.time() - _ps.Process(os.getpid()).create_time()))
+except Exception:
+    _since_kernel_start = 0.0
+NOTEBOOK_T0 -= _since_kernel_start
+RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true", "yes"}
+ARC_ROOT = Path(os.environ.get("Q27X_ARC_ROOT", "/kaggle/input/competitions/arc-prize-2026-arc-agi-2"))
+if not ARC_ROOT.exists():
+    for _alt in ("/kaggle/input/arc-prize-2026-arc-agi-2",):
+        if Path(_alt).exists():
+            ARC_ROOT = Path(_alt)
+WORKING = Path(os.environ.get("Q27X_WORKING", "/kaggle/working")); WORKING.mkdir(parents=True, exist_ok=True)
+OUT = WORKING / "q27x"; OUT.mkdir(parents=True, exist_ok=True)
+SUBMISSION_PATH = WORKING / "submission.json"
+
+def _load_json(p):
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+test_challenges = _load_json(ARC_ROOT / "arc-agi_test_challenges.json")
+
+def write_json_atomic(path, obj):
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+def identity_submission(challenges):
+    return {tid: [{"attempt_1": q["input"], "attempt_2": q["input"]} for q in task["test"]]
+            for tid, task in challenges.items()}
+
+write_json_atomic(SUBMISSION_PATH, identity_submission(test_challenges))
+print("MODE:", "COMPETITION RERUN (hidden test)" if RERUN else "COMMIT / INTERACTIVE (evaluation)",
+      "| fallback submission.json:", len(test_challenges), "tasks | RUN_ID", RUN_ID,
+      "| clock anchored", round(_since_kernel_start, 1), "s before cell 0")
+
+
+# ==================================================================== E25 NB-S2 ARM SWITCHES (edit before the commit)
+# True = the arm runs, False = it is not booted (recorded SKIPPED_SWITCH_OFF; the other arms are unaffected).
+# B = the DFlash2 base (NBDF-K100 D3s); B off: the levers still run. A key left out = that arm off.
+# Editing this line needs no rebuild and no new kit (it is outside the sha-pinned payload; every arm is kit-checked).
+NBS2_ON = {'B': True, 'IDX': True, 'S28': True, 'LP': True, 'S32': True, 'SPC': True}
+# ==================================================================== CELL 1 — config, inputs, lab module (RC2 verbatim + E25 NB1 / NB4S / NB4T / E27 NBDF / E27 K100 / E25 NB-S2 marked edits)
+import os, sys, json, math, time, re, shutil, subprocess, hashlib, tarfile, threading, traceback
+from pathlib import Path
+T_START = time.time()
+MODE = "FULL"
+RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true", "yes"}
+FAKE = os.environ.get("E23_FAKE_SERVER")                          # local CPU harness only
+BUDGET = int(os.environ.get("RC2_BUDGET_SEC") or 175 * 60)     # E25 NB-S2: hard stop 175 min (150 GPU-min of arms + boot / setup)
+HARD_STOP = T_START + BUDGET
+MAX_LEN = 131072                                                  # user 2026-10-29: thinking up to 120k
+OUT = Path(os.environ.get("E23_OUT", "/kaggle/working/nbs2"))   # E25 NB-S2
+OUT.mkdir(parents=True, exist_ok=True)
+LOGS = OUT / "logs"
+LOGS.mkdir(exist_ok=True)
+TRACES = OUT / "traces"                                           # memory rule: the full text of every long generation
+TRACES.mkdir(exist_ok=True)
+TMP = Path(os.environ.get("E23_TMP", "/tmp"))
+INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
+R = {"what": "E25 NB-S2 CAPACITY: indexer fp8 / seqs 28 / 32 / D4-D3 dynamic K / long-prefill / shared-prefix checkpoint on the DFlash2 base B (NBDF-K100 D3s), 8k-116k",   # E25 NB-S2
+      "budget_min": BUDGET // 60, "max_len": MAX_LEN,
+     "start_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "setup": {}, "sections": {}, "errors": [], "order": []}
+_SAVE_LOCK = threading.Lock()
+NB1_EXTRA, NB1_ENV, NB1_KV = {}, {}, {}   # E25 NB1: per-boot trailing vllm flags, env and KV pin (filled by the boot plan)
+
+# ---- E27 NBDF (user 2026-11-01; the E26 K100Q pattern): the commit's ABSOLUTE DEADMAN, 5 min after the 150-min hard stop. A
+# daemon thread sleeps until NOTEBOOK_T0 + NBDF_DEADMAN_SEC, then: one marker line (stdout fd + stderr fd +
+# /kaggle/working/nbdf_deadman.txt), SIGKILL every child (psutil tree; else os.killpg on the live servers' groups + pkill -9 -f
+# vllm), os._exit(0). No lock, no main thread, no cell. The competition rerun has no deadman (CELL 0 wrote its submission).
+NBDF_DEADMAN_SEC = 10800   # E25 NB-S2: 5 min after the hard stop
+NBDF_DEADMAN = {"armed": False, "fire_pc": None}
+
+
+def nbdf_deadman(t_fire_pc, marker, poll=5.0, use_psutil=True):
+    """Sleep until perf_counter >= t_fire_pc, then the marker, SIGKILL every child process (group), os._exit(0)."""
+    while True:
+        d = t_fire_pc - time.perf_counter()
+        if d <= 0:
+            break
+        time.sleep(min(poll, d))
+    line = f"@@NBDF_DEADMAN_FIRED@@ t={round(time.perf_counter() - NOTEBOOK_T0, 1)}s pid={os.getpid()}\n"
+    for fd in (1, 2):
+        try:
+            os.write(fd, line.encode())
+        except Exception:
+            pass
+    try:
+        with open(marker, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+    killed = False
+    if use_psutil:
+        try:
+            import psutil
+            for c in psutil.Process(os.getpid()).children(recursive=True):
+                try:
+                    c.kill()
+                except Exception:
+                    pass
+            killed = True
+        except Exception:
+            killed = False
+    lab = globals().get("L")
+    for s in list(getattr(lab, "LIVE", None) or []):
+        pid = getattr(getattr(s, "proc", None), "pid", None)
+        if pid and hasattr(os, "killpg"):
+            try:
+                os.killpg(int(pid), 9)                    # e23_lab.Server starts each server in its own session (pgid = pid)
+            except Exception:
+                pass
+    if not killed:
+        try:
+            subprocess.run(["pkill", "-9", "-f", "vllm"], timeout=10)
+        except Exception:
+            pass
+    os._exit(0)
+
+
+if not RERUN and not os.environ.get("RC2_UNIT"):
+    NBDF_DEADMAN.update(fire_pc=NOTEBOOK_T0 + NBDF_DEADMAN_SEC, marker=str(WORKING / "nbdf_deadman.txt"))
+    NBDF_DEADMAN["thread"] = threading.Thread(target=nbdf_deadman, args=(NBDF_DEADMAN["fire_pc"], NBDF_DEADMAN["marker"]),
+                                              daemon=True, name="nbdf_deadman")
+    NBDF_DEADMAN["thread"].start()
+    NBDF_DEADMAN["armed"] = True
+    print(f"NBDF DEADMAN armed: fires at +{NBDF_DEADMAN_SEC / 60:.0f} min after the notebook start (in "
+          f"{round((NBDF_DEADMAN['fire_pc'] - time.perf_counter()) / 60, 1)} min)", flush=True)
+
+
+def save():
+    with _SAVE_LOCK:
+        tmp = OUT / "nbs2_results.json.tmp"                      # E25 NB-S2
+        tmp.write_text(json.dumps(R, indent=1, default=str))
+        tmp.replace(OUT / "nbs2_results.json")                   # E25 NB-S2
+
+
+def left():
+    return HARD_STOP - time.time()
+
+
+def log(*a):
+    print(f"[{(time.time() - T_START) / 60:6.1f} min]", *a, flush=True)
+
+
+COMP = INP / "competitions" / "arc-prize-2026-arc-agi-2"
+
+
+def write_fallback_submission():
+    """E25 NB4T: the proven E18 R2 format (CELL 0's writer): the identity submission of every test task (attempt_1 =
+    attempt_2 = the test input), written atomically to CELL 0's SUBMISSION_PATH; never a [[0]] placeholder."""
+    write_json_atomic(SUBMISSION_PATH, identity_submission(test_challenges))
+
+
+if RERUN:                                                         # E25 NB4T: CELL 0 already wrote the identity file
+    print("E25 NB-S2 capacity: competition rerun -> CELL 0's identity fallback submission.json only (E18 R2 format)")   # E25 NB-S2
+else:
+    K100_LAB_SHA = "ef393fbb2ff7669ee4c2c99ee841b60da66514a3b86b7c0ce81fd5f64689ab5e"     # E25 klee100 R1-18: the E23 lab = a sha-checked file of the NB0 reference dataset (< 400 kB)
+    K100_LAB_FILE = next((d / "k100load_lab.py" for d in (INP / "datasets/foysalemonshanto/q27-e25-nb0-tf-ref", INP / "q27-e25-nb0-tf-ref",
+                                                          Path(os.environ.get("K100_PAYLOAD_DIR") or "/nonexistent"))
+                          if (d / "k100load_lab.py").is_file()), None)
+    if K100_LAB_FILE is None or hashlib.sha256(K100_LAB_FILE.read_bytes()).hexdigest() != K100_LAB_SHA:
+        raise RuntimeError(f"K100_PAYLOAD_LAB missing or sha mismatch: {K100_LAB_FILE} (dataset q27-e25-nb0-tf-ref, k100load_lab.py)")
+    LAB_SRC = K100_LAB_FILE.read_bytes().decode("utf-8")   # E27 K100: klee100 LOAD R1-18 (the lab of the tf-ref dataset)
+    (TMP / "e23_lab.py").write_text(LAB_SRC)
+    sys.path.insert(0, str(TMP))
+    import e23_lab as L
+    REQ_LOG = TRACES / "requests.jsonl"                           # memory rule: the full text of EVERY request
+    _stream_run = L.Stream.run
+
+    def _traced_run(self):
+        try:
+            _stream_run(self)
+        finally:
+            if not self.err and any(m is not None and not (isinstance(m, (int, float)) and math.isfinite(m))
+                                    for m in self.margins):
+                self.err = "NONFINITE_LOGPROB"           # final audit H2: NaN / Inf logprobs are never data
+            try:
+                r = self.row()
+                pr = self.body.get("prompt") or []
+                r.update(port=self.port, sampling={k: v for k, v in self.body.items() if k != "prompt"}, prompt_len=len(pr),
+                         prompt_sha=hashlib.sha256(json.dumps(pr).encode()).hexdigest()[:16],
+                         ttft=round(self.t_first - self.t_start, 2) if self.t_first and self.t_start else None,
+                         sec=round(self.t_end - self.t_start, 2) if self.t_end and self.t_start else None, t=time.time())
+                with _SAVE_LOCK, open(REQ_LOG, "a") as fh:
+                    fh.write(json.dumps(r) + "\n")
+            except Exception:
+                pass
+    L.Stream.run = _traced_run
+    PLE_EXPECTED = json.loads(r"""{"model-plefp8-00000.safetensors": [5200027199, "dc2e845b7edd35bda92834fba3626bf7d199e28d6aceac99fee654aade390cfd"], "model-plefp8-00001.safetensors": [5200027202, "899eaa0716e28594468a1389ee58cb065c23907f1270de3831f5ecb0a4f82d56"], "model-plefp8-00002.safetensors": [5200027198, "06fd8a11abf0419a669f89397b8d70dd6ff42d401e6b2a037c65e49704faaf71"], "model-plefp8-00003.safetensors": [5200027189, "c6aaa1fc08e84eced3c8151ac8679ed943888eba0fcef2556963693430f95bd9"], "model-plefp8-00004.safetensors": [5200027190, "d94e97c96d3ea09208614da016960f3f4b429f47a044c898a51b493f42f74ba2"], "model-plefp8-00005.safetensors": [5200027190, "03d5d4792e14a4ab55bae50bb459624b01786f818bbcfcaed1a5d0235af484c6"], "model-plefp8-00006.safetensors": [5200027190, "586cccbc12383021bc9bc02f206d9b19fbd1672373ed9a5d91e3b0ce34c2418f"], "model-plefp8-00007.safetensors": [5200027190, "c4a23bcc10f3cde6b633e82c282a9a518e3a64d433628283e1bc592c94cf3d6c"], "model-plefp8-00008.safetensors": [5200027190, "2dc8098c0d020bff277c9cf499a6b908e17836b70a5f949dfa24793371c9a87e"], "model-plefp8-00009.safetensors": [4400023163, "61de98b89bb79f386795787d7a76827a26f1e292c26edbb0a1b613da455f5a9c"]}""")                     # 10 FP8 PLE shards: [size, sha256]
+    # exact Kaggle mount paths (foysalemonshanto Models, checked through the API 2026-10-31; no recursive search)
+    MD = INP / "models" / "foysalemonshanto"
+    PART_DIRS = {1: MD / "qwen3-8-flash-next-w4a16-merlin-p1/transformers/default/1",
+                 2: MD / "qwen3-8-flash-next-w4a16-merlin-p2/transformers/default/1",
+                 3: MD / "qwen3-8-flash-next-w4a16-merlin-p3/transformers/default/1",
+                 4: MD / "qwen3-8-flash-next-w4a16-merlin-p4/transformers/default/1",
+                 5: MD / "qwen3-8-flash-next-w4a16-merlin-p5/transformers/default/1"}
+    PARTS = {}
+    for k, d in PART_DIRS.items():                                  # the five checkpoint parts (Models from the kernel outputs)
+        mf = d / f"q27_fn_merlin_part{k}_manifest.json"
+        PARTS[k] = (d, json.loads(mf.read_text())) if mf.is_file() else None
+    PLE_DIR = MD / "qwen38-flash-next-fp8ple-overlay/pytorch/albucino-fp8ple/1"      # our FP8 PLE overlay = albucino's shards
+    PLE_DIR = PLE_DIR if (PLE_DIR / "model-plefp8-00000.safetensors").is_file() else None
+    MERLIN_PAY = MD / "e23-merlin-env/other/v1/1/merlin_offline_tar.bin"
+    MERLIN_PAY = MERLIN_PAY if MERLIN_PAY.is_file() else None
+    INTEL = INP / "models/dfranzen/intel-qwen3.8-flash-next-w4a16-autoround/transformers/default/1"
+    INTEL = INTEL if (INTEL / "config.json").is_file() else None
+    WHEELHOUSE = INP / "datasets/foysalemonshanto/vllm-0-32-0-cu13-wheelhouse/install_wheelhouse.py"
+    WHEELHOUSE = WHEELHOUSE if WHEELHOUSE.is_file() else None
+    ARC = COMP / "arc-agi_evaluation_challenges.json"
+    if not ARC.is_file():
+        raise FileNotFoundError(f"{ARC}: attach the competition data")
+    PARTS = {}                                     # E25 klee100: no W4 parts; klee100 + the FP8 PLE overlay + the Merlin env
+    K100_DIR = MD / "qwen38-flash-next-klee100-3bpw-mtp/pytorch/autoround-3bpw-mtp-nople/1"            # E25 klee100
+    if not (K100_DIR / "KAGGLE_MIRROR_MANIFEST.json").is_file():                                          # E25 klee100
+        _g = sorted((MD / "qwen38-flash-next-klee100-3bpw-mtp").glob("*/*/*/KAGGLE_MIRROR_MANIFEST.json"))  # E25 klee100
+        K100_DIR = _g[0].parent if len(_g) == 1 else None                                                 # E25 klee100
+    REF_DIR = next((d for d in (INP / "datasets/foysalemonshanto/q27-e25-nb0-tf-ref", INP / "q27-e25-nb0-tf-ref")   # E25 klee100
+                    if (d / "nb0_reference.json").is_file()), None)                                       # E25 klee100
+    MERLIN_OK = K100_DIR is not None and PLE_DIR is not None and MERLIN_PAY is not None                   # E25 klee100
+    R["inputs"] = {"klee100_dir": str(K100_DIR), "ref_dir": str(REF_DIR), "ple_dir": str(PLE_DIR),   # E25 klee100
+                   "merlin_pay": str(MERLIN_PAY), "intel": str(INTEL), "wheelhouse": str(WHEELHOUSE), "arc": str(ARC),
+                   "merlin_inputs_ok": MERLIN_OK}
+    ABORT = {"why": None}
+    NVSMI_OK = bool(L.gpu_mem()) and not FAKE
+    R["setup"]["gpus_at_start"] = L.gpu_mem()
+    if not FAKE and not os.environ.get("RC2_CPU_KIT") and len(R["setup"]["gpus_at_start"] or []) != 4:   # CPU kit: no GPUs
+        R["errors"].append(f"expected 4 GPUs, nvidia-smi shows {R['setup']['gpus_at_start']}")
+        save()
+        raise RuntimeError("GPU_PREFLIGHT_FAILED: " + repr(R["setup"]["gpus_at_start"]))
+    L.start_watchdog(HARD_STOP, lambda: ABORT.update(why="HARD_STOP reached: watchdog killed live servers"))
+    log("RC2 | budget", BUDGET // 60, "min |", json.dumps(R["inputs"])[:900])
+    save()
+
+
+if not RERUN:
+    # ==================================================================== CELL 2 — host facts, checkpoint merge, engines
+    def run(name, cmd, timeout=3600, env=None):
+        t = time.time()
+        try:
+            with open(LOGS / f"{name}.log", "w") as f:
+                r = subprocess.run(["bash", "-c", "set -o pipefail; " + cmd], stdout=f, stderr=subprocess.STDOUT, timeout=timeout,
+                                   env={**os.environ, **(env or {})})
+            rc = r.returncode
+        except subprocess.TimeoutExpired:
+            rc = -9
+        txt = (LOGS / f"{name}.log").read_text(errors="replace")
+        R["setup"][name] = {"rc": rc, "sec": round(time.time() - t, 1), "tail": txt[-1500:]}
+        log(name, "rc", rc, f"{time.time() - t:.0f}s")
+        save()
+        return rc, txt
+
+
+    SHIM = TMP / "e23_libcuda"          # FlashInfer JIT links -lcuda; Kaggle has only libcuda.so.1
+    SHIM.mkdir(exist_ok=True)
+    for d in ("/usr/local/nvidia/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/compat", "/usr/lib64"):
+        c = sorted(Path(d).glob("libcuda.so.1")) if Path(d).is_dir() else []
+        if c and not (SHIM / "libcuda.so").exists():
+            (SHIM / "libcuda.so").symlink_to(c[0])
+
+
+    def host_facts():
+        """A0: what the Kaggle box gives us (glibc, driver, GPUs, PCIe, peer access, cgroup memory, /dev/shm, disk)."""
+        f = {}
+        for k, cmd in (("glibc", "ldd --version | head -1"), ("uname", "uname -a"),
+                       ("nvidia_smi", "nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,pcie.link.gen.max,pcie.link.width.max --format=csv,noheader"),
+                       ("cuda_version", "nvidia-smi | grep -o 'CUDA Version: [0-9.]*'"), ("shm", "df -h /dev/shm | tail -1"),
+                       ("tmp_disk", f"df -h {TMP} | tail -1"), ("nproc", "nproc"),
+                       ("cgroup_max", "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes"),
+                       ("cgroup_cur", "cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes"),
+                       ("meminfo", "grep -E 'MemTotal|MemAvailable' /proc/meminfo"), ("ulimit_l", "ulimit -l"),
+                       ("omp", "echo OMP_NUM_THREADS=$OMP_NUM_THREADS"), ("topo", "nvidia-smi topo -m; nvidia-smi topo -p2p r"),
+                       ("pcie_now", "nvidia-smi --query-gpu=index,pcie.link.gen.current,pcie.link.width.current,power.limit --format=csv,noheader")):
+            try:
+                f[k] = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=60).stdout.strip()[:600]
+            except Exception as e:
+                f[k] = repr(e)[:200]
+        try:
+            import torch
+            n = torch.cuda.device_count()
+            f["peer_access"] = [[torch.cuda.can_device_access_peer(i, j) if i != j else None for j in range(n)] for i in range(n)]
+        except Exception as e:
+            f["peer_access"] = repr(e)[:200]
+        return f
+
+
+    def host_mem():
+        """MiB. avail_mib = max - (current - inactive_file), Merlin's own rule (RC1's guard counted page cache as used and
+        skipped arm 3 with MemAvailable 55 GB); /dev/shm counts against the cgroup."""
+        out = {}
+        try:
+            cur = int(Path("/sys/fs/cgroup/memory.current").read_text())
+            mx = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+            st = dict(l.split() for l in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines() if len(l.split()) == 2)
+            out.update(cgroup_cur_mib=cur >> 20, cgroup_max_mib=None if mx == "max" else int(mx) >> 20,
+                       **{k + "_mib": int(st[k]) >> 20 for k in ("anon", "file", "shmem", "inactive_file") if k in st})
+            if mx != "max":
+                out["avail_mib"] = (int(mx) - (cur - int(st.get("inactive_file", 0)))) >> 20
+        except Exception:
+            pass
+        try:
+            for l in open("/proc/meminfo"):
+                if l.startswith(("MemAvailable", "MemTotal")):
+                    out[l.split(":")[0] + "_mib"] = int(l.split()[1]) >> 10
+        except Exception:
+            pass
+        try:
+            out["dev_shm_used_mib"] = shutil.disk_usage("/dev/shm").used >> 20
+        except Exception:
+            pass
+        return out
+
+
+    TELEMETRY = OUT / "telemetry.jsonl"
+
+
+    def _telemetry():
+        """Host RAM + GPU memory every 10 s for the whole run (Merlin's floor ~69 GiB inside a ~173 GiB cgroup)."""
+        while True:
+            try:
+                with open(TELEMETRY, "a") as fh:
+                    fh.write(json.dumps({"t": round(time.time() - T_START, 1), "host": host_mem(), "gpu": L.gpu_mem()}) + "\n")
+            except Exception:
+                pass
+            time.sleep(10)
+
+
+    threading.Thread(target=_telemetry, daemon=True).start()
+
+
+    SHM = Path(os.environ.get("RC2_SHM", "/dev/shm"))
+
+
+    def shm_names():
+        try:
+            return {p.name for p in SHM.iterdir()}
+        except Exception:
+            return set()
+
+
+    def shm_cleanup(before):
+        """After a boot's server is dead: only /dev/shm entries that appeared during THIS boot (absent from `before`) and
+        match the engine's prefixes are unlinked; everything else is recorded, never touched."""
+        out = {"host_before": host_mem(), "removed": [], "kept": []}
+        try:
+            for p in sorted(SHM.iterdir()):
+                try:
+                    sz = p.stat().st_size >> 20
+                except Exception:
+                    sz = None
+                if p.name not in before and re.match(r"(torch_|psm_|vllm|ple|nccl|sem\.mp-|cuda\.shm)", p.name, re.I):
+                    try:
+                        p.unlink() if not p.is_dir() else shutil.rmtree(p)
+                        out["removed"].append([p.name, sz])
+                    except Exception as e:
+                        out["kept"].append([p.name, sz, repr(e)[:80]])
+                else:
+                    out["kept"].append([p.name, sz])
+        except Exception as e:
+            out["error"] = repr(e)[:200]
+        out["host_after"] = host_mem()
+        out["removed"], out["kept"] = out["removed"][:60], out["kept"][:60]
+        return out
+
+
+    class MServer(L.Server):
+        """Merlin passes --shutdown-timeout 60 and the PLE transport unlinks its /dev/shm storages only on a graceful
+        teardown: SIGTERM, wait 75 s, then E23's kill (SIGTERM + 40 s + SIGKILL of the whole session)."""
+        def kill(self):
+            if self.proc is not None and self.proc.poll() is None:
+                try:
+                    os.killpg(self.proc.pid, 15) if hasattr(os, "killpg") else self.proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=75)
+                except Exception:
+                    pass
+            super().kill()
+
+
+    def boot_gate():
+        """Merlin's pin leaves ~0.9 GiB free per card: every boot needs near-empty GPUs (< 150 MiB, not E23's 1024)."""
+        g = L.wait_gpu_release(300, fake=bool(FAKE), gpus="0,1,2,3", free_mib=150)
+        return {"ok": g, "gpus": L.gpu_mem(), "host": host_mem()}       # callers launch only on ok is True
+
+
+    CKPT = TMP / "fn_merlin"
+    SHA = {"thread": None, "ok": None, "bad": [], "sec": None}
+
+
+    def merge_ckpt():
+        """Symlink the 5 parts + 10 PLE shards into one directory; names and sizes now, sha256 in a background thread."""
+        SHA.update(thread=None, ok=None, bad=[], sec=None)        # a stale result never gates a new merge
+        shutil.rmtree(CKPT, ignore_errors=True)
+        CKPT.mkdir(parents=True)
+        expected = {}
+        for k, (d, man) in PARTS.items():
+            for n, (size, sha) in man["files"].items():
+                expected[n] = (d / man.get("model_subdir", ".") / n, size, sha)
+        for n, (size, sha) in PLE_EXPECTED.items():
+            expected[n] = (PLE_DIR / n, size, sha)
+        bad = []
+        for n, (src, size, sha) in sorted(expected.items()):
+            if not src.is_file():
+                bad.append(f"missing {n}")
+                continue
+            if not FAKE and src.stat().st_size != size:
+                bad.append(f"{n}: {src.stat().st_size} bytes, expected {size}")
+            try:
+                (CKPT / n).symlink_to(src)
+            except OSError:
+                if not FAKE:
+                    raise
+                shutil.copyfile(src, CKPT / n)               # local Windows harness only (no symlink privilege)
+        idx = json.loads((CKPT / "model.safetensors.index.json").read_text())
+        need = set(idx["weight_map"].values())
+        bad += [f"index needs {n}, not merged" for n in sorted(need - set(expected))]
+        cfg = json.loads((CKPT / "config.json").read_text())
+        if (cfg.get("text_config") or {}).get("ple_embedding_dtype") != "float8_e4m3fn":
+            bad.append("config.json: text_config.ple_embedding_dtype is not float8_e4m3fn")
+        rec = {"files": len(expected), "index_files": len(need), "bad": bad[:20], "ok": not bad}
+
+        def hash_all():
+            t = time.time()
+            import concurrent.futures as CF
+
+            def one(item):
+                n, (src, size, sha) = item
+                if FAKE:
+                    return n, True
+                with open(src, "rb") as fh:
+                    return n, hashlib.file_digest(fh, "sha256").hexdigest() == sha
+            with CF.ThreadPoolExecutor(6) as ex:
+                res = list(ex.map(one, sorted(expected.items())))
+            SHA.update(ok=all(ok for _, ok in res), bad=[n for n, ok in res if not ok], sec=round(time.time() - t, 1))
+            R["setup"]["sha256"] = {k: SHA[k] for k in ("ok", "bad", "sec")}
+            save()
+        if rec["ok"]:
+            SHA["thread"] = threading.Thread(target=hash_all, daemon=True)
+            SHA["thread"].start()
+        return rec
+
+
+    def sha_gate(timeout):
+        """The first launch waits for the full sha256 check (Merlin itself never hashes shards)."""
+        th = SHA["thread"]
+        if th is not None:
+            th.join(max(1, timeout))
+        if th is None or th.is_alive():
+            return False, "sha256 check not finished"
+        return bool(SHA["ok"]), ("ok" if SHA["ok"] else f"sha256 mismatch: {SHA['bad'][:5]}")
+
+
+    def prefetch_bg(paths, tag):
+        """rev 3: warm the page cache of a cold 17-30 GB /kaggle/input checkpoint in the background (many readers)."""
+        def go():
+            R["setup"]["prefetch_" + tag] = L.prefetch([p for p in paths if p]) if not FAKE else {"fake": True}
+            save()
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        return th
+
+
+    MERLIN_ENG = None
+
+
+    def merlin_install():
+        """P2 payload (.bin = a tar Kaggle does not unpack) -> install_merlin_offline.sh (UV_OFFLINE); payload deleted after;
+        a failure is cached so later Merlin steps fail fast (rev 3)."""
+        global MERLIN_ENG
+        if MERLIN_ENG is not None:
+            if MERLIN_ENG.get("failed"):
+                raise RuntimeError("Merlin install failed earlier: " + MERLIN_ENG["failed"])
+            return MERLIN_ENG
+        if not MERLIN_OK or MERLIN_PAY is None:
+            MERLIN_ENG = {"failed": "Merlin checkpoint / env not attached or incomplete"}
+            raise RuntimeError(MERLIN_ENG["failed"])
+        if FAKE:
+            MERLIN_ENG = {"fake": True}
+            return MERLIN_ENG
+        try:
+            pay_root = TMP / "merlin_pay"
+            shutil.rmtree(pay_root, ignore_errors=True)
+            pay_root.mkdir()
+            t = time.time()
+            with tarfile.open(MERLIN_PAY) as tf:
+                tf.extractall(pay_root, filter="data")
+            R["setup"]["merlin_extract_sec"] = round(time.time() - t, 1)
+            pay = pay_root / "merlin_offline"
+            shutil.rmtree(TMP / "merlin_off", ignore_errors=True)
+            rc, txt = run("install_merlin", f"bash {pay}/install_merlin_offline.sh {pay} {TMP}/merlin_off", timeout=int(max(600, left() - 90 * 60)))   # E25 klee100 R1-7 (E27 K100)
+            kv = dict(re.findall(r"^(MERLIN_[A-Z]+)=(.*)$", txt, re.M))
+            shutil.rmtree(pay_root, ignore_errors=True)
+            if rc or "INSTALL OK" not in txt:
+                raise RuntimeError("Merlin offline install failed (logs/install_merlin.log)")
+            sys.path.insert(0, kv["MERLIN_TREE"] + "/tools/merlin")
+            import launch as ML
+            site = subprocess.run([kv["MERLIN_VENV"] + "/bin/python", "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
+                                  capture_output=True, text=True).stdout.strip()
+            MERLIN_ENG = {"kv": kv, "ML": ML, "cuda_home": site + "/nvidia/cu13"}
+            return MERLIN_ENG
+        except Exception as e:
+            MERLIN_ENG = {"failed": f"{type(e).__name__}: {e}"[:300]}
+            raise
+
+
+    MERLIN_CC = {"mode": "gcc13"}       # rev 3c: Merlin README:229 / install-env.sh: FlashInfer JIT at first start needs GCC >= 13
+
+
+
+    KV_FP8, KV_BF16 = 2479838700, 2464415744      # Merlin's own L4 pins (23,034 MiB cards; preflight.kv_bytes_for_vram, 150 / 79 blocks)
+    PROFILE = "fn-quad-24g-sm89"
+    XHIGH = json.dumps({"enable_thinking": True, "reasoning_effort": "xhigh"})
+    HOST_PHASE = {}
+
+
+    def merlin_fn_server(name, kv, port, kv_bytes):
+        """Merlin's launch.build() for Flash-Next on the L4 profile: KV pin lowered for 22.49 GiB cards, the checkpoint's own
+        chat template at xhigh (Merlin passes medium otherwise), Merlin's host_phase checks recorded, E23's env overrides."""
+        eng = merlin_install()
+        extra = ["--served-model-name", "q27", "--max-model-len", str(MAX_LEN), "--port", str(port),
+                 "--default-chat-template-kwargs", XHIGH] + list(NB1_EXTRA.get(name) or [])   # E25 NB1: per-boot flags (last wins)
+        if FAKE:
+            return MServer(name, [sys.executable, FAKE, str(CKPT) + "-w4a16", "--tensor-parallel-size", "2", "--max-num-seqs",
+                                  "8" if kv == "fp8" else "3", "--port", str(port), "--max-model-len", str(MAX_LEN),
+                                  "--kv-cache-memory-bytes", str(kv_bytes)] + list(NB1_EXTRA.get(name) or []),   # E25 NB1 (fake only)
+                           {**os.environ, **(NB1_ENV.get(name) or {})}, port, LOGS)
+        kvv = eng["kv"]
+        gcc_bin = str(Path(kvv["MERLIN_CC"]).parent) if kvv.get("MERLIN_CC") else ""
+        base = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CUDA_PATH", "CUDA_HOME", "LD_PRELOAD", "CC", "CXX")}
+        base.update(GPUS="0,1,2,3", PORT=str(port), KV_BYTES=str(kv_bytes), P2P="off",
+                    VENV=kvv["MERLIN_VENV"], TREE=kvv["MERLIN_TREE"], CHAT_TEMPLATE="", WARM="0", CACHE_ROOT=f"{TMP}/merlin-cache",
+                    PATH=f"{kvv['MERLIN_VENV']}/bin:{gcc_bin}:{eng['cuda_home']}/bin:{os.environ.get('PATH', '')}",
+                    CUDA_HOME=eng["cuda_home"])
+        if kv == "fp8":
+            base["SCALES"] = str(CKPT / "qsa_kv_scales_262k.json")
+        base.update((globals().get("NB4T_BUILD_ENV") or {}).get(name) or {})   # E25 NB4T: launcher knobs (DRAFT_HEAD) into build()
+        plan = eng["ML"].build("flash-next", PROFILE, str(CKPT), base, extra=extra, kv=kv, checkpoint="flash-next", status="untested")
+        try:                                               # audits: tree products, venv, checkpoint marker, PLE dtype, toolchain,
+            eng["ML"].host_phase(plan)                     # scales file: a failure stops this boot before any server starts
+            HOST_PHASE[name] = "ok"
+        except BaseException as e:
+            HOST_PHASE[name] = f"{type(e).__name__}: {e}"[:600]
+            R["setup"].setdefault("host_phase_error", {})[name] = HOST_PHASE[name]
+            save()
+            raise RuntimeError("MERLIN_HOST_PHASE_FAILED: " + HOST_PHASE[name])
+        env = dict(plan.env)
+        env.update(LD_PRELOAD=kvv["MERLIN_SHIM"], CUDA_HOME=eng["cuda_home"], VLLM_USE_RUST_FRONTEND="0", HF_HUB_OFFLINE="1",
+                   TRANSFORMERS_OFFLINE="1", LIBRARY_PATH=f"{SHIM}:{os.environ.get('LIBRARY_PATH', '')}",
+                   PATH=base["PATH"], VLLM_CACHE_ROOT=f"{TMP}/merlin-cache", TRITON_CACHE_DIR=f"{TMP}/merlin-triton",
+                   FLASHINFER_WORKSPACE_BASE=f"{TMP}/merlin-fi", CUDA_DEVICE_ORDER="PCI_BUS_ID", VLLM_PLE_OFFLOAD_READY_TIMEOUT="3600")
+        for k in ("CC", "CXX", "CUDAHOSTCXX"):
+            env.pop(k, None)
+        if MERLIN_CC["mode"] == "gcc13" and kvv.get("MERLIN_CC") and kvv.get("MERLIN_CXX"):
+            env.update(CC=kvv["MERLIN_CC"], CXX=kvv["MERLIN_CXX"], CUDAHOSTCXX=kvv["MERLIN_CXX"])
+            lib13 = Path(kvv["MERLIN_CC"]).parents[1] / "lib"
+            if (lib13 / "libstdc++.so.6").exists():
+                env["LD_LIBRARY_PATH"] = f"{lib13}:{env.get('LD_LIBRARY_PATH', '')}"
+        try:                                               # Merlin's own scheme: PORT 8000..8355 -> 29500+d / 30000+100d
+            mp, vp = eng["ML"].distributed_ports(str(port))
+            env.update(MASTER_PORT=str(mp), VLLM_PORT=str(vp))
+        except Exception:
+            env.update(MASTER_PORT=str(29500 + port - 8000), VLLM_PORT=str(30000 + 100 * (port - 8000)))
+        env.update(NB1_ENV.get(name) or {})              # E25 NB1: after build(), which strips every MERLIN_* variable
+        argv = plan.argv()
+        HELP[name] = L.help_check("merlin", argv[:argv.index("serve") + 1], env, argv)
+        R["setup"].setdefault("merlin_plans", {})[name] = {"argv_tail": argv[-60:], "status": plan.status, "host_phase": HOST_PHASE[name],
+                                                           "env_keys": {k: env[k] for k in sorted(env) if k.startswith(("VLLM_", "NCCL_", "KV_", "P2P", "SCALES", "CUDA_DEVICE_MAX_CONNECTIONS", "DRAFT_HEAD", "DFLASH_"))}}   # E25 NB4S / NB4T / E27 NBDF
+        save()
+        return MServer(name, argv, env, port, LOGS)
+
+
+    STOCK = None
+
+
+    def stock_install():
+        """Fallback only: stock vLLM 0.32 venv (E18 / E23 installer) with the -lcuda shim on LIBRARY_PATH (RC1's sampler crash)."""
+        global STOCK
+        if STOCK is not None:
+            return STOCK
+        if FAKE:
+            STOCK = {"vllm": [sys.executable, FAKE], "env": dict(os.environ)}
+            return STOCK
+        rc, txt = run("install_stock", f"{sys.executable} {WHEELHOUSE} {TMP}/vllm-venv", timeout=2400)
+        kv = dict(l.split("=", 1) for l in txt.splitlines() if l.startswith(("VENV_PYTHON=", "CUDA_HOME=")))
+        if rc or "CUDA_HOME" not in kv:
+            raise RuntimeError("stock vLLM 0.32 install failed (logs/install_stock.log)")
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CUDA_PATH", "LD_PRELOAD")}
+        env.update(CUDA_HOME=kv["CUDA_HOME"], PATH=f"{TMP}/vllm-venv/bin:{kv['CUDA_HOME']}/bin:{env.get('PATH', '')}",
+                   LIBRARY_PATH=f"{SHIM}:{env.get('LIBRARY_PATH', '')}", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+                   VLLM_NO_USAGE_STATS="1", VLLM_CACHE_ROOT=f"{TMP}/vllm-cache", CUDA_DEVICE_ORDER="PCI_BUS_ID",
+                   PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+        STOCK = {"vllm": [f"{TMP}/vllm-venv/bin/vllm", "serve"], "env": env}
+        return STOCK
+
+
+    def stock_fn_server(name, port):
+        eng = stock_install()
+        flags = [str(INTEL), "--served-model-name", "q27", "--host", "127.0.0.1", "--port", str(port),
+                 "--tensor-parallel-size", "4", "--enable-expert-parallel", "--max-model-len", "32768", "--max-num-seqs", "4",
+                 "--max-num-batched-tokens", "4096", "--gpu-memory-utilization", "0.88", "--disable-custom-all-reduce",
+                 "--language-model-only", "--engram-config", json.dumps({"cpu_offload": True}), "--load-format", "safetensors",
+                 "--dtype", "bfloat16", "--kv-cache-dtype", "fp8_e4m3", "--default-chat-template-kwargs", XHIGH]
+        # diagnostic only: RC1 had a 30,208-token BF16 pool at TP4; no MTP here, so prefix caching (default ON) is unaffected
+        if FAKE:
+            flags = [str(INTEL) + "-w4a16", "--tensor-parallel-size", "4", "--max-num-seqs", "4", "--port", str(port), "--max-model-len", "32768"]
+        return L.Server(name, list(eng["vllm"]) + flags, eng["env"], port, LOGS)
+    save()
+
+
+if not RERUN:
+    # ==================================================================== CELL 2b — E27 K100: the klee100 model path (klee100 LOAD rev 3 / K100Q, verbatim)
+    import struct                                    # klee100 LOAD CELL 1 ("import struct   # E25 klee100"): st_header below
+    # ---- E26 K100: ONE sha-pinned file of the tf-ref dataset (the commit notebook stays < 400 kB): klee100 LOAD rev 3's K100_EMB
+    # blobs {name: [sha256, lzma + b85]} (k100load_lib.py, the kit v2 core + tables, the digest manifest) + its worker extension +
+    # NB5 QUALITY's nb5_lib.py (the same bytes as NB5's packed literal: sha 18efcbc1, checked here as NB5 checks it)
+    K100Q_PAYLOAD_NAME = "k100q_payload_emb.json"
+    K100Q_PAYLOAD_SHA = "fd92a814040aea6dda12855badf801675580dcd78b2f2135eb0b86121dd80880"
+    K100Q_PAYLOAD_USED = {}
+
+
+    def k100q_payload():
+        """E26 K100 (klee100 LOAD R1-18 pattern): the payload file from the tf-ref dataset mount; its sha256 is pinned (each blob's
+        sha256 is checked again by klee100 LOAD CELL 2b's own decode loop in the engine cell). Missing / changed -> raise."""
+        f = next((d / K100Q_PAYLOAD_NAME for d in (INP / "datasets/foysalemonshanto/q27-e25-nb0-tf-ref", INP / "q27-e25-nb0-tf-ref",
+                                                   Path(os.environ.get("K100_PAYLOAD_DIR") or "/nonexistent"))
+                  if (d / K100Q_PAYLOAD_NAME).is_file()), None)
+        raw = f.read_bytes() if f is not None else b""
+        if f is None or hashlib.sha256(raw).hexdigest() != K100Q_PAYLOAD_SHA:
+            raise RuntimeError(f"K100Q_PAYLOAD missing or sha mismatch: {f} (dataset q27-e25-nb0-tf-ref, {K100Q_PAYLOAD_NAME})")
+        K100Q_PAYLOAD_USED.update(file=str(f), sha256=K100Q_PAYLOAD_SHA, bytes=len(raw))
+        return json.loads(raw.decode("utf-8"))
+
+
+    K100_EMB = k100q_payload()
+
+
+    def k100q_ds_text(name, want):
+        """E26 K100: one more sha-pinned file of the same tf-ref dataset version (k100q_report.py, nb4_ppack.py). Missing /
+        changed -> raise (the caller decides: the report lib is required, the Q-defer lib optional)."""
+        f = K100Q_PAYLOAD_USED["file"] and Path(K100Q_PAYLOAD_USED["file"]).with_name(name)
+        raw = f.read_bytes() if f and f.is_file() else b""
+        if hashlib.sha256(raw).hexdigest() != want:
+            raise RuntimeError(f"K100Q dataset file {name} missing or sha mismatch: {f}")
+        K100Q_PAYLOAD_USED.setdefault("files", {})[name] = want
+        return raw.decode("utf-8")
+    R["setup"]["k100q_payload"] = K100Q_PAYLOAD_USED
+
+
+    # ==================================================================== CELL 2b — E25 klee100: fixkeys overlay, model dir, K6, digests (NEW)
+    import base64 as _b64
+    import lzma as _lzma
+    K1 = R.setdefault("k100", {})
+    K100_EMB = dict(K100_EMB)   # E27 K100: k100q_payload() (klee100 LOAD rev 3's blobs, tf-ref dataset)
+    K100_PIN = json.loads("{\"klee100_config_sha256\": \"fb17316df83cc1cf6cb4f5336fefb33566102cfeda16d1e9fc89ae1a4c61b9ce\", \"klee100_index_sha256\": \"873191b509904c7007ee9a791ecc18a939afbf11797e1549c0e3279bf31cefd4\", \"klee100_tokenizer_sha256\": \"06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523\", \"overlay_sha256\": {\"config.json\": \"c78d48f36421925a0fdb1c75aafe667c8d4e554d4431faa8f87f8924f09b9e27\", \"quantization_config.json\": \"e55659bc3c7cf29c668fafa45804dec879eb24ff5ab1e25eaa587ca462f2ed35\", \"model.safetensors.index.json\": \"c21d8c98821febdbab08331a4e55cb34c8e56bf4b902f5f45f1a047536213872\", \"FIXKEYS_DIFF.json\": \"70d06119bbea99b1db466fc026b0f4fb584a50b196f05fe2bc9e48595d6d8ab1\"}, \"digests_sha256\": \"b50690a074a884298771cc408238dad9fd881bddbbac89372616114a65e1ae50\", \"ref_sha256\": {\"A_2k_fresh.npz\": \"ea5c2a5a68d50e2e4abe7bd42595599775b867e817bb37b045ee0e0d3a24fe55\", \"A_2k_repeat.npz\": \"ea5c2a5a68d50e2e4abe7bd42595599775b867e817bb37b045ee0e0d3a24fe55\", \"A_40k_fresh.npz\": \"0254ad67ffd27d7e5952c894e9ba6a4b098ae91785b550d008bddd31e9ada1b9\", \"A_40k_repeat.npz\": \"0254ad67ffd27d7e5952c894e9ba6a4b098ae91785b550d008bddd31e9ada1b9\", \"A_8k_fresh.npz\": \"e3332ec70a40ab4377c6815d384fcfbade455a451404d5293c4a5e9d6c6cfe21\", \"A_8k_repeat.npz\": \"e3332ec70a40ab4377c6815d384fcfbade455a451404d5293c4a5e9d6c6cfe21\", \"A_90k_fresh.npz\": \"30c5800f6fa6e1d8cd3848f21ed1ebfa3b24e2b0207ca1553e9dfbdd0e520b35\", \"A_90k_repeat.npz\": \"30c5800f6fa6e1d8cd3848f21ed1ebfa3b24e2b0207ca1553e9dfbdd0e520b35\", \"A_dec2k_cached.npz\": \"da9098138876abc1e321d51eeaff6ffae270fca0d0d79db9dff4fb96e9e81463\", \"A_dec2k_cold.npz\": \"da9098138876abc1e321d51eeaff6ffae270fca0d0d79db9dff4fb96e9e81463\", \"A_dec40k_cached.npz\": \"062fcaebb2e31f489f97e057639d62195414e7a64660f5243abb275eaff15e76\", \"A_dec40k_cold.npz\": \"062fcaebb2e31f489f97e057639d62195414e7a64660f5243abb275eaff15e76\", \"A_dec8k_cached.npz\": \"bf9fbfb9904fe44b8dda56b6fba3b0c5f2ebb8f0e1ca463b4012f5bfac91edff\", \"A_dec8k_cold.npz\": \"bf9fbfb9904fe44b8dda56b6fba3b0c5f2ebb8f0e1ca463b4012f5bfac91edff\", \"A_sc2k_tf.npz\": \"4c0885ce1deeb48da3178843d4a29bf44944be71e4c097246b4d6eaf5d666902\", \"A_sc40k_tf.npz\": \"1e6f07a49cee93c57470c177834633a614c7ccaa8e2a6a22d42459b1cfc45994\", \"A_sc8k_tf.npz\": \"446eec9e4554172bde0fd73f96812ad2e06b779b61adeaca6eb5fb79246319da\", \"C_2k_fresh.npz\": \"ea5c2a5a68d50e2e4abe7bd42595599775b867e817bb37b045ee0e0d3a24fe55\", \"C_2k_repeat.npz\": \"ea5c2a5a68d50e2e4abe7bd42595599775b867e817bb37b045ee0e0d3a24fe55\", \"C_40k_fresh.npz\": \"0254ad67ffd27d7e5952c894e9ba6a4b098ae91785b550d008bddd31e9ada1b9\", \"C_40k_repeat.npz\": \"0254ad67ffd27d7e5952c894e9ba6a4b098ae91785b550d008bddd31e9ada1b9\", \"C_8k_fresh.npz\": \"e3332ec70a40ab4377c6815d384fcfbade455a451404d5293c4a5e9d6c6cfe21\", \"C_8k_repeat.npz\": \"e3332ec70a40ab4377c6815d384fcfbade455a451404d5293c4a5e9d6c6cfe21\", \"k100load_lab.py\": \"ef393fbb2ff7669ee4c2c99ee841b60da66514a3b86b7c0ce81fd5f64689ab5e\", \"nb0_reference.json\": \"e1e7429678abd83315313bd2f095ce1da5e5aab333013f31a801c60e7ece51a7\", \"qsa_kv_scales_262k.json\": \"5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67\"}, \"kit_v2_notebook_sha256\": \"b39db932e2227ab697b7fded01354440d80bb907c52cc99ef5a84a98a6df407b\", \"kit_core_sha256\": \"db19969dcd6be4da263271904f4bdb598cef237a307a9b31960ce2723bcb63ef\", \"lib_sha256\": \"0ba5f7c6328cdaa24276ac92eb22d4b2015b578675e9c36c711d1ad1a7f7f1b9\", \"mtp_tensor_bytes\": 1425540096, \"lab_payload_sha256\": \"ef393fbb2ff7669ee4c2c99ee841b60da66514a3b86b7c0ce81fd5f64689ab5e\", \"scales_sha256\": \"5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67\", \"nb0_builder_sha256\": \"166b5afd7f6d2a052c9496885b358fbc86f397816ca829ad3081cf21f7de65de\", \"nb1_builder_sha256\": \"15a926ad5e23055602a625009dee6a07cce3426972b8e92017e9f0e7c7bc288d\"}")       # build-time facts: v2 overlay shas, klee100 input shas, the NB0 reference SHA256SUMS
+    EMB = TMP / "k100_emb"
+    _emb_ok = {}
+    for _n, (_want, _blob) in K100_EMB.items():
+        _raw = _lzma.decompress(_b64.b85decode(_blob))
+        _emb_ok[_n] = hashlib.sha256(_raw).hexdigest() == _want
+        (EMB / _n).parent.mkdir(parents=True, exist_ok=True)
+        (EMB / _n).write_bytes(_raw)
+    K1["embedded_sha_ok"] = _emb_ok
+    if not all(_emb_ok.values()):
+        raise RuntimeError("K100_EMBEDDED_SHA_MISMATCH: " + json.dumps(_emb_ok))
+    sys.path.insert(0, str(EMB))
+    import k100load_lib as KL                # E25 klee100 pure helpers (unit-tested: merge / K6 / digests / pin ladder / labels)
+    import k100kit_core as KC                # the klee100 CPU kit v2's own core (fixkeys / graft / write_overlay)
+    CKPT = TMP / "fn_klee100"                # E25 klee100: rebinds RC2's merged-checkpoint path (CELL 2)
+    OVERLAY = TMP / "k100_fixkeys_overlay"
+    DIGESTS = json.loads((EMB / "klee100_shard_digests.json").read_text())
+    K100_SHA_THREADS = int(os.environ.get("K100_SHA_THREADS") or min(8, max(2, os.cpu_count() or 4)))
+
+
+    def st_header(p):
+        with open(p, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            return json.loads(fh.read(n))
+
+
+    def k100_overlay():
+        """The fixkeys overlay regenerated by the v2 kit's own code (Kit.fixkeys / graft / write_overlay) from the MOUNTED
+        klee100 config.json (sha pinned) and the kit's compact tensor tables; the three files must equal the v2 kit artifact
+        byte for byte. Cross-checks: the mounted index (sha pinned) weight_map == the klee100 table; the mounted FP8 PLE
+        shard headers == Merlin's PLE entries the graft writes into the index."""
+        rec = {}
+        raw = (K100_DIR / "config.json").read_bytes()
+        rec["config_sha256"] = hashlib.sha256(raw).hexdigest()
+        rec["config_sha_ok"] = rec["config_sha256"] == K100_PIN["klee100_config_sha256"]
+        iraw = (K100_DIR / "model.safetensors.index.json").read_bytes()
+        rec["index_sha256"] = hashlib.sha256(iraw).hexdigest()
+        rec["index_sha_ok"] = rec["index_sha256"] == K100_PIN["klee100_index_sha256"]
+        tabs, enc = {}, {}
+        for who in ("klee100", "merlin"):
+            enc[who] = json.loads((EMB / f"tables/{who}.json").read_text())
+            tabs[who] = KC.expand_table(enc[who])
+            rec[f"table_{who}_ok"] = KC.canon_sha(tabs[who]) == enc[who]["canon_sha256"] and len(tabs[who]) == enc[who]["n_tensors"]
+        rec["mounted_index_equals_table"] = json.loads(iraw)["weight_map"] == {n: v[2] for n, v in tabs["klee100"].items()}
+        ple = {n: v for n, v in tabs["merlin"].items() if n.startswith(KC.PLE_PFX + "ngram_embedding.")}
+        bad = []
+        for f in sorted({v[2] for v in ple.values()}):
+            try:
+                h = st_header(PLE_DIR / f)
+                got = {n: (v["dtype"], tuple(v["shape"]), f) for n, v in h.items() if n != "__metadata__"}
+                if got != {n: v for n, v in ple.items() if v[2] == f}:
+                    bad.append(f)
+            except Exception as e:
+                bad.append(f"{f}: {e!r}"[:120])
+        rec["ple_headers_equal_graft"], rec["ple_header_mismatch"] = not bad, bad
+        kit = KC.Kit.__new__(KC.Kit)
+        kit.R, kit.log, kit.tabs, kit.enc_klee100 = {"artifacts": {}}, log, tabs, enc["klee100"]
+        kit.kcfg_raw, kit.kcfg = raw, json.loads(raw)
+        cfg_fix, diff = kit.fixkeys()
+        idx, _tab, chk = kit.graft()
+        files = kit.write_overlay(OVERLAY, cfg_fix, diff, idx)
+        rec.update(graft={k: v for k, v in chk.items() if k != "files"}, diff_problems=diff["problems"], files=files,
+                   equal_v2_artifact={n: files[n]["sha256"] == K100_PIN["overlay_sha256"][n] for n in KL.OVERLAY_FILES})
+        rec["ok"] = bool(rec["config_sha_ok"] and rec["index_sha_ok"] and rec["table_klee100_ok"] and rec["table_merlin_ok"]
+                         and rec["mounted_index_equals_table"] and rec["ple_headers_equal_graft"] and chk["ok"] and not diff["problems"]
+                         and all(rec["equal_v2_artifact"].values()))
+        shutil.copyfile(OVERLAY / "FIXKEYS_DIFF.json", OUT / "FIXKEYS_DIFF.json")
+        return rec
+
+
+    def mirror_compare(plan):
+        """KAGGLE_MIRROR_MANIFEST.json (the uploader's streaming hashes) vs the trusted digest manifest, for every planned file
+        it lists (recorded; the streaming sha256 below is the gate)."""
+        try:
+            raw = (K100_DIR / "KAGGLE_MIRROR_MANIFEST.json").read_bytes()
+            mm = json.loads(raw)
+        except Exception as e:
+            return {"error": repr(e)[:200]}
+        want, found = {n: s for n, _, _, s, _ in plan}, {}
+
+        def walk(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    if k in want and isinstance(v, dict) and isinstance(v.get("sha256"), str):
+                        found[k] = v["sha256"]
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+        walk(mm)
+        return {"sha256": hashlib.sha256(raw).hexdigest(), "listed": len(found), "agree": sum(found[k] == want[k] for k in found),
+                "disagree": sorted(k for k in found if found[k] != want[k])}
+
+
+    K100_SCALES_SHA = "5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67"      # R3-1: qsa_kv_scales_262k.json (12 QSA layers) = the W4 Merlin p1 checkpoint's sidecar
+    SCALES_CALIBRATION = "EXPERIMENTAL_REUSED_CALIBRATION (the W4-calibrated QSA sidecar reused on klee100)"   # V-7
+
+
+    def k100_scales(tree=None):
+        """R3-1: the FP8 E4M3 QSA static K/V scales sidecar for K3: <MERLIN_TREE>/models/flash-next/scales/qsa_kv_scales_262k.json
+        when the install has it, else qsa_kv_scales_262k.json of the reference dataset; sha-checked (K100_SCALES_SHA) and copied
+        into the klee100 model dir, where Merlin's FP8 plan reads it (SCALES / VLLM_QSA_KV_SCALES). Missing / changed -> ok
+        False: K3 is skipped (SKIPPED_NO_SCALES); the BF16 boots do not need it."""
+        cands = ([Path(tree) / "models/flash-next/scales/qsa_kv_scales_262k.json"] if tree else []) + \
+                ([REF_DIR / "qsa_kv_scales_262k.json"] if REF_DIR is not None else [])
+        looked, src, raw = [], None, None
+        for c in cands:                                         # V-5: the first SHA-VERIFIED candidate, every one recorded
+            if not c.is_file():
+                looked.append({"path": str(c), "exists": False})
+                continue
+            b_ = c.read_bytes()
+            h_ = hashlib.sha256(b_).hexdigest()
+            looked.append({"path": str(c), "exists": True, "sha256": h_, "ok": h_ == K100_SCALES_SHA})
+            if h_ == K100_SCALES_SHA and src is None:
+                src, raw = c, b_
+        if src is None:
+            return {"ok": False, "why": "no sha-verified qsa_kv_scales_262k.json (Merlin tree, then the reference dataset)", "looked": looked}
+        (CKPT / "qsa_kv_scales_262k.json").write_bytes(raw)
+        return {"ok": True, "sha256": K100_SCALES_SHA, "layers": len(json.loads(raw)), "src": str(src), "looked": looked,
+                "file": str(CKPT / "qsa_kv_scales_262k.json"), "calibration": SCALES_CALIBRATION}
+
+
+    def merge_ckpt():
+        """E25 klee100 (rebinds RC2's merge; same contract): the fixkeys overlay (regenerated, sha-checked), one model dir of
+        symlinks (every klee100 file + the 10 FP8 PLE shards) + the overlay files, K6 (every indexed shard resolves), then the
+        streaming sha256 of every used file vs the trusted HF LFS digest manifest in a background thread (sha_gate waits for
+        it before the first launch). Fail closed: any miss -> ok False, no boot."""
+        SHA.update(thread=None, ok=None, bad=[], sec=None)
+        rec = {"dir": str(CKPT)}
+        try:
+            rec["overlay"] = k100_overlay()
+        except Exception as e:
+            rec["overlay"] = {"ok": False, "error": f"{type(e).__name__}: {e}"[:600], "tb": traceback.format_exc()[-1500:]}
+        if not rec["overlay"].get("ok"):
+            return dict(rec, ok=False, bad=["FIXKEYS_OVERLAY"],
+                        why="FIXKEYS_OVERLAY: " + json.dumps({k: v for k, v in rec["overlay"].items() if k not in ("files", "tb")}, default=str)[:600])
+        md = KL.build_model_dir(CKPT, K100_DIR, PLE_DIR, OVERLAY, sorted(PLE_EXPECTED))
+        rec["model_dir"] = {k: (len(v) if k in ("klee100_links", "ple_links") else v) for k, v in md.items()}
+        rec["k6"] = k6 = KL.k6_check(CKPT)
+        plan = KL.digest_plan(DIGESTS, K100_DIR, PLE_DIR)
+        rec["digest_plan"] = {"files": len(plan), "gb": round(sum(x[2] for x in plan) / 1e9, 2), "threads": K100_SHA_THREADS,
+                              "names": [x[0] for x in plan]}
+        ple_d = {f: [v["size"], v["sha256"]] for f, v in DIGESTS["repos"]["merlin_fp8_ple"]["shards"].items()}
+        rec["ple_expected_equals_digests"] = ple_d == {k: list(v) for k, v in PLE_EXPECTED.items()}
+        rec["digest_manifest_sha_ok"] = hashlib.sha256((EMB / "klee100_shard_digests.json").read_bytes()).hexdigest() == K100_PIN["digests_sha256"]
+        rec["mirror_manifest"] = mirror_compare(plan)
+        bad = ([] if md["ok"] else ["MODEL_DIR: " + "; ".join(md["errors"][:3])]) + ([] if k6["ok"] else [k6["why"]])
+        if not rec["ple_expected_equals_digests"]:
+            bad.append("PLE_EXPECTED (RC2) != the digest manifest's FP8 PLE shards")
+        if not rec["digest_manifest_sha_ok"]:
+            bad.append("digest manifest sha")
+        rec.update(ok=not bad, bad=bad, why="; ".join(bad) or None)
+
+        def hash_all():
+            res = KL.verify_digests(plan, threads=K100_SHA_THREADS, log=log)
+            with _SAVE_LOCK:                   # R1-13: never mutate R while another thread's save() dumps it
+                SHA.update(ok=res["ok"], bad=res["bad"], sec=res["sec"])
+                K1["digests"] = res
+                R["setup"]["sha256"] = {k: res[k] for k in ("ok", "bad", "n_planned", "n_checked", "gb", "sec", "gb_per_s", "threads")}
+            save()
+        if rec["ok"]:
+            SHA["thread"] = threading.Thread(target=hash_all, daemon=True)
+            SHA["thread"].start()
+        return rec
+    save()
+
+
+    # ---- E27 K100: klee100 LOAD rev 3 CELL 7's launch additions around NBDF's merlin_fn_server (wrapped once)
+    K100_CFG = json.loads(r"""{"arms": ["Q", "D3s", "D4s"], "seqs": 24, "conc_ladder": [2, 8, 23], "q_pin": 7933526016, "q_ladder": [7933526016, 7665090560], "d_retry": [[7933526016, {"DFLASH_DRAFT_EMBED_HOST": "1"}], [7665090560, {"DFLASH_DRAFT_EMBED_HOST": "1"}], [7396655104, {"DFLASH_DRAFT_EMBED_HOST": "1"}], [6859784192, {"DFLASH_DRAFT_EMBED_HOST": "1"}]], "pin_ladder": [7933526016, 7665090560, 7396655104, 6859784192], "memory_gate": "flag", "q_ref": "k100_none", "method_map_need_mtp": "q_only", "q_i8": true, "q_captures": [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 64, 80, 96], "wkeys": ["8k@16#1", "8k@16#2", "profile_8k@16", "40k@16"], "windows": [["8k", 16, "#1"], ["8k", 16, "#2"], ["20k", 24, ""], ["40k", 16, ""], ["90k", 8, ""], ["116k", 6, ""]], "profile_level": 16, "tf_bands": ["2k", "8k", "40k"], "tf_mean_margin": 0.05, "tf_rank1_margin": 0.03, "long_thr_floor": {"90k": 0.037, "116k": 0.054}, "shorten_arm": "D4s", "shorten_min_left_min": 25, "tap_mode_alt": "pre_combine", "tap_est_min": 15, "tap_cap_min": 10, "prefill_admit_floor_tok_s": 3000}""")
+
+
+    def _k100_wrap_server(prev):
+        def merlin_fn_server_k100(name, kv, port, kv_bytes):
+            """K6 before every launch (one missing indexed shard -> no server), NBDF's launcher, VLLM_QSA_KV_SCALES on FP8 (Merlin
+            also sets it from SCALES), the --help flag gate (KL.cli_flags_check: a missing flag -> FAIL_CLI_FLAGS, no launch)."""
+            if not FAKE:
+                k6 = KL.k6_check(CKPT)
+                K1.setdefault("k6_before_launch", {})[name] = {k: k6.get(k) for k in ("ok", "why", "index_files", "missing")}
+                if not k6["ok"]:
+                    save()
+                    raise RuntimeError("K6_INDEXED_SHARD_MISSING before launch: " + str(k6["why"]))
+            s = prev(name, kv, port, kv_bytes)
+            if kv == "fp8" and not FAKE:
+                s.env["VLLM_QSA_KV_SCALES"] = str(CKPT / "qsa_kv_scales_262k.json")
+            if not FAKE and HELP.get(name) is not None:
+                cli = K1.setdefault("cli_flags", {})[name] = KL.cli_flags_check(HELP[name])
+                if cli.get("ok") is False:
+                    save()
+                    raise RuntimeError("FAIL_CLI_FLAGS: " + str(cli.get("why")))
+            return s
+        merlin_fn_server_k100._k100_orig = prev
+        return merlin_fn_server_k100
+
+
+    if not hasattr(merlin_fn_server, "_k100_orig"):
+        merlin_fn_server = _k100_wrap_server(merlin_fn_server)
+
+
+    def k100_setup():
+        """Before the first boot (K100Q's k100_setup, NBDF's install order): the overlay merge + K6 (CELL 3's merge record), the
+        FP8 QSA static scales sidecar (the installed Merlin tree first, then the tf-ref dataset; sha 5cbe6ae8) copied into the
+        klee100 dir. NBDF's apply_60490 writes the worker extension; nb4_ppack (Q-defer) is NBDF's own sequence."""
+        m = (R["sections"].get("A0") or {}).get("merge") or {}
+        out = {"overlay_merge_k6": {"ok": m.get("ok") is True, "why": m.get("why") or m.get("bad")}}
+        if FAKE:
+            return dict(out, scales={"ok": None, "fake": True}, ok=out["overlay_merge_k6"]["ok"])
+        K1["scales"] = out["scales"] = k100_scales(((MERLIN_ENG or {}).get("kv") or {}).get("MERLIN_TREE"))
+        out["ok"] = out["overlay_merge_k6"]["ok"] and out["scales"].get("ok") is True
+        out["why"] = None if out["ok"] else ("K100_OVERLAY_MERGE_K6_FAILED" if not out["overlay_merge_k6"]["ok"] else "K100_NO_SCALES")
+        return out
+
+
+    def k100_boot_gates(p, s, arm, t):
+        """klee100 LOAD rev 3 K-7 / V-4 on every boot: GPU_METHOD_MAP_PASS (the 48 routed layers' humming method + bits / group
+        per PP stage; MTP experts required only when the arm speculates with MTP, K100_CFG method_map_need_mtp) and
+        STATIC_SCALES_APPLIED (every rank applied its stage's QSA K/V scales; an MTP layer at DEFAULT 1.0 is recorded only).
+        Returns {"method_map", "scales", "real_failure", "why"}; the caller decides (PROVISIONAL gate set)."""
+        part = KL.parse_partition((getattr(s, "env", None) or {}).get("VLLM_PP_LAYER_PARTITION"))
+        need_mtp = arm.get("method") != "dflash" if K100_CFG.get("method_map_need_mtp") == "q_only" else True
+        raw = rpc(p, "k100_method_map")
+        mm = KL.method_map_check((raw or {}).get("results"), need_mtp=need_mtp, partition=part)
+        try:
+            side = json.loads((CKPT / "qsa_kv_scales_262k.json").read_text())
+        except Exception as e:
+            side = {"_error": repr(e)[:200]}
+        sc = KL.scales_check(t, {k: v for k, v in side.items() if not k.startswith("_")}, part)
+        sc["calibration"] = SCALES_CALIBRATION
+        why = ([] if mm.get("gate_ok") is True else ["GPU_METHOD_MAP: " + str(mm.get("why") or mm.get("verdict"))]) + \
+              ([] if sc.get("ok") is True else ["STATIC_SCALES: " + str(sc.get("why"))])
+        return {"method_map": mm, "method_map_raw": raw, "scales": sc, "scales_rpc": rpc(p, "k100_kv_scales"), "need_mtp": need_mtp,
+                "real_failure": bool(why), "why": "; ".join(why)[:800] or None}
+
+
+    # ---- E28 K100 / NB4T: the I8 draft-head read-back (e28k100_lib.py, verbatim functions)
+    def last_value(argv, flag):
+        """The value after the LAST occurrence of `flag` in argv (vLLM's argparse: the last one wins), or None. (nb4t_lib)"""
+        a = [str(x) for x in (argv or ())]
+        idx = [i for i, x in enumerate(a) if x == flag]
+        return a[idx[-1] + 1] if idx and idx[-1] + 1 < len(a) else None
+
+
+    def spec_from_argv(argv):
+        """The effective --speculative-config of an argv (last occurrence) as a dict; {"error": ...} when unparsable. (nb4t_lib)"""
+        v = last_value(argv, "--speculative-config")
+        if v is None:
+            return None
+        try:
+            d = json.loads(v)
+            return d if isinstance(d, dict) else {"error": "not a dict"}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"[:120]}
+
+
+    _WTAG = re.compile(r"\(Worker_PP(\d+)_TP(\d+)")
+
+
+    _HEAD_RX = re.compile(r"Draft lm_head: (INT8|INT4) weight-only copy of the (\d+)x(\d+) shard \(([\d.]+) MiB")
+
+
+    _SPEC_RX = re.compile(r"'speculative_config': (\{[^{}]*\})")
+
+
+    def _literal(s):
+        import ast
+        try:
+            v = ast.literal_eval(s)
+            return v if isinstance(v, dict) else None
+        except Exception:
+            return None
+
+
+    def i8_readback(log_text, argv, want):
+        """NB4T's I8 read-back (nb4t_lib.launch_check / config_readback, the draft-head part) on one boot: the argv spec's
+        draft_lm_head_quant, the non-default-args spec, the 'Draft lm_head:' build lines. want = "int8" (I8 on) or None (BF16 head).
+        label: I8_ENGAGED (int8 everywhere + INT8 lines) | I8_SPEC_ONLY (spec int8, no build line seen) | I8_CONTRADICTION (a
+        value against the plan) | BF16_HEAD (want None, no quantized head) | BF16_HEAD_CONTRADICTION. Recorded only, never fatal."""
+        t = log_text or ""
+        lines = t.splitlines()
+        sp = spec_from_argv(argv)
+        na = next((l for l in lines if "non-default args:" in l), "")
+        m = _SPEC_RX.search(na)
+        lsp = _literal(m.group(1)) if m else None
+        heads = []
+        for l in lines:
+            h = _HEAD_RX.search(l)
+            if h:
+                w = _WTAG.search(l)
+                heads.append({"mode": h.group(1), "n": int(h.group(2)), "k": int(h.group(3)), "mib": float(h.group(4)),
+                              "worker": f"PP{w.group(1)}_TP{w.group(2)}" if w else None})
+        modes = sorted({h["mode"] for h in heads})
+        any_head = any("Draft lm_head:" in l for l in lines)
+        a_q = (sp or {}).get("draft_lm_head_quant") if isinstance(sp, dict) else None
+        l_q = (lsp or {}).get("draft_lm_head_quant") if isinstance(lsp, dict) else None
+        checks = {"argv_spec": a_q == want, "log_spec": (l_q == want) if lsp is not None else None,
+                  "head_built": (modes == [str(want).upper()]) if want else (not any_head)}
+        contra = []
+        if a_q != want:
+            contra.append(f"argv draft_lm_head_quant {a_q!r} != {want!r}")
+        if lsp is not None and l_q != want:
+            contra.append(f"log draft_lm_head_quant {l_q!r} != {want!r}")
+        if want and any_head and modes != [str(want).upper()]:
+            contra.append(f"draft head built {modes}, expected {str(want).upper()}")
+        if not want and any_head:
+            contra.append(f"a quantized draft head was built ({modes}) on a BF16-head boot")
+        if want:
+            label = ("I8_CONTRADICTION" if contra else "I8_ENGAGED" if checks["head_built"] and checks["log_spec"] is not False
+                     else "I8_SPEC_ONLY")
+        else:
+            label = "BF16_HEAD_CONTRADICTION" if contra else "BF16_HEAD"
+        return {"label": label, "want": want, "checks": checks, "contradictions": contra, "argv_spec": sp, "log_spec": lsp,
+                "draft_head_lines": heads[:8], "head_mib_total": round(sum(h["mib"] for h in heads), 1) if heads else None}
+
+
+if not RERUN:
+    # ==================================================================== CELL 3 — prompts (Flash-Next tokenizer + its own template at xhigh)
+    R["sections"]["A0"] = {}
+    _t = time.time()
+    R["sections"]["A0"]["host"] = host_facts()
+    R["sections"]["A0"]["merge"] = merge_ckpt() if MERLIN_OK else {"ok": False, "why": "Merlin inputs missing", "inputs": R["inputs"]}
+    R["sections"]["A0"]["host_mem"] = host_mem()
+    log("A0 host", json.dumps(R["sections"]["A0"]["host"])[:1200])
+    log("A0 merge", json.dumps(R["sections"]["A0"]["merge"])[:800])
+    save()
+    TOKDIR = TMP / "fn_tok"
+    shutil.rmtree(TOKDIR, ignore_errors=True)
+    TOKDIR.mkdir()
+    # the Merlin checkpoint's tokenizer when the merge is OK; otherwise the Intel (stock fallback) checkpoint's own
+    MERLIN_PROMPTS = bool(R["sections"]["A0"]["merge"].get("ok")) and (CKPT / "tokenizer.json").exists()
+    _src = CKPT if MERLIN_PROMPTS else (K100_DIR or INTEL)   # E25 klee100: the mount's own tokenizer when the merge failed (E27 K100)
+    if _src is None or not (_src / "tokenizer.json").exists():
+        raise FileNotFoundError("no tokenizer: the Merlin merge failed and the Intel fallback checkpoint is not attached")
+    for _n in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        if (_src / _n).exists():
+            shutil.copyfile(_src / _n, TOKDIR / _n)
+    from tokenizers import Tokenizer
+    from transformers import AutoTokenizer
+    TOK = Tokenizer.from_file(str(TOKDIR / "tokenizer.json"))
+    _HF = AutoTokenizer.from_pretrained(str(TOKDIR))
+    _tpl = ((TOKDIR / "chat_template.jinja").read_text() if (TOKDIR / "chat_template.jinja").exists()
+            else json.loads((TOKDIR / "tokenizer_config.json").read_text())["chat_template"])
+    _tasks = json.load(open(ARC))
+    _ids = sorted(_tasks)
+
+
+    def _grid(g):
+        return "\n".join("".join(str(v) for v in row) for row in g)
+
+
+    def _task_text(k):
+        t = _tasks[k]
+        parts = [f"## Task {k}"]
+        for i, ex in enumerate(t["train"]):
+            parts.append(f"Example {i + 1} input:\n{_grid(ex['input'])}\nExample {i + 1} output:\n{_grid(ex['output'])}")
+        for ex in t["test"]:
+            parts.append(f"Test input:\n{_grid(ex['input'])}")
+        return "\n\n".join(parts)
+
+
+    _INTRO = "Find the transformation rule of each ARC task below and solve the test inputs.\n\n"
+    _PH = "E13_BODY"
+
+
+    def _render(effort):
+        return _HF.apply_chat_template([{"role": "user", "content": _INTRO + _PH}], tokenize=False, add_generation_prompt=True,
+                                       enable_thinking=True, reasoning_effort=effort, chat_template=_tpl)
+
+
+    _RX, _RM = _render("xhigh"), _render("medium")
+    assert _RX.count(_PH) == 1
+    _head_txt, _tail_txt = _RX.split(_PH)
+    _HEAD = TOK.encode(_head_txt, add_special_tokens=False).ids
+    _TAIL = TOK.encode(_tail_txt, add_special_tokens=False).ids
+    TPL_MSG = [{"role": "user", "content": _INTRO + _task_text(_ids[0])}]
+    TPL_IDS = TOK.encode(_HF.apply_chat_template(TPL_MSG, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+                                                 reasoning_effort="xhigh", chat_template=_tpl), add_special_tokens=False).ids
+    R["prompt_render"] = {"head_text": _head_txt[-600:], "tail_text": _tail_txt, "head_tokens": len(_HEAD), "tail_tokens": len(_TAIL),
+                          "xhigh_differs_from_medium": _RX != _RM, "xhigh_sentence": "xhigh" in _head_txt,
+                          "template_sha256": hashlib.sha256(_tpl.encode()).hexdigest(),
+                          "tokenizer_json_sha256": hashlib.sha256((TOKDIR / "tokenizer.json").read_bytes()).hexdigest()}
+    _TASK_IDS = {k: TOK.encode(_task_text(k) + "\n\n", add_special_tokens=False).ids for k in _ids}
+
+
+    def prompt(band, variant):
+        body, i = [], (variant * 7) % len(_ids)
+        need = band - len(_HEAD) - len(_TAIL)
+        while len(body) < need:
+            body += _TASK_IDS[_ids[i % len(_ids)]]
+            i += 1
+        return _HEAD + body[:need] + _TAIL
+
+
+    TOK_SHA = "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"   # E25 klee100: klee100@600715b3 tokenizer.json (E27 K100)
+    TPL_SHA = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"   # = the 27B FP8 chat_template.jinja
+    R["prompt_render"]["source"] = "merlin" if MERLIN_PROMPTS else "intel_fallback"
+    R["prompt_render"]["hashes_ok"] = (R["prompt_render"]["tokenizer_json_sha256"] == TOK_SHA and
+                                       R["prompt_render"]["template_sha256"] == TPL_SHA)
+    if MERLIN_PROMPTS:                    # the pinned hashes belong to the Merlin checkpoint only (Intel's are recorded)
+        assert R["prompt_render"]["hashes_ok"], "Flash-Next tokenizer / template differ from the pinned Merlin checkpoint"
+    assert R["prompt_render"]["xhigh_sentence"] and R["prompt_render"]["xhigh_differs_from_medium"], "xhigh render missing"
+    BANDS = {"2k": 2048, "8k": 8192, "40k": 40000, "90k": 90000, "116k": 116000}
+    NSTREAM = 8
+    PROMPTS = {b: [prompt(n, v) for v in range(NSTREAM)] for b, n in BANDS.items()}
+    MAX_NEW = {b: MAX_LEN - n - 512 for b, n in BANDS.items()}
+    ORACLE_P = [PROMPTS["2k"][0], PROMPTS["2k"][1], PROMPTS["8k"][2]]
+    LONG_P = [PROMPTS["40k"][3]]
+    TF_P = {"40k": PROMPTS["40k"][5]}
+    R["prompts"] = {b: {"n": len(p), "len": len(p[0])} for b, p in PROMPTS.items()}
+    log("prompts", json.dumps(R["prompts"]), "| render", json.dumps({k: v for k, v in R["prompt_render"].items() if "text" not in k}))
+    save()
+
+
+if not RERUN:
+    # ==================================================================== CELL 4 — the step runner (E23, verbatim)
+    HELP = HELP if "HELP" in globals() else {}
+    WIN = float(os.environ.get("E23_WIN_SEC") or 90.0)   # 120 s FULL windows
+    EST_SCALE = float(os.environ.get("E23_EST_SCALE") or 1.0) if FAKE else 1.0   # local harness only: walk the whole order
+    SM_TF = MODE == "SMOKE"                                            # SMOKE teacher-forced: the 40k row only
+    ROWS = {}            # oracle greedy rows by key (same weights)
+    TF = {}              # teacher-forced rows by key
+    NTOK = 128 if MODE == "FULL" else 64
+    LIVE = {"rec": None}                 # rev 3c: windows land in the step record before every save (a hard kill keeps them)
+    COMPILE_ERR = re.compile(r"ninja: build stopped|Error building extension|error: command '.*(nvcc|g\+\+|gcc|c\+\+)' failed|"
+                             r"GLIBCXX_[0-9.]+' not found|unsupported GNU version|fatal error: ")
+    OOM_ERR = re.compile(r"OutOfMemoryError|CUDA out of memory|out of memory")
+    XID = re.compile(r"NVRM: Xid|\bXid \d+|CUDA error: an illegal memory access|illegal memory access was encountered|"
+                     r"unspecified launch failure|CUDA error: misaligned address")       # rev 3e: device faults, not any CUDA error
+
+
+    def keep_after_error(rec, e):
+        """E25 NB1 R2: an exception after the measurements (post-processing) keeps the whole record + postprocess_error /
+        postprocess_tb. A clean boot (status None / NOT_RUN / DONE / TF_OOM, correctness CLEAN, quality PASS) keeps its status
+        (None / NOT_RUN -> DONE), so its dependent boots still run; any other record -> POSTPROCESS_ERROR (status_before kept).
+        R2 audit N1-3: postprocess_ok False; whether the dependents run is decided by core_measurements_complete (core_check)."""
+        rec["postprocess_ok"] = False
+        rec["postprocess_error"] = f"{type(e).__name__}: {e}"[:800]
+        rec["postprocess_tb"] = traceback.format_exc()[-2500:]
+        if (rec.get("status") in (None, "NOT_RUN", "DONE", "TF_OOM") and rec.get("correctness") == "CLEAN"
+                and rec.get("quality_gate") == "PASS"):
+            if rec.get("status") in (None, "NOT_RUN"):
+                rec["status"] = "DONE"
+        else:
+            rec["status_before_postprocess"] = rec.get("status")
+            rec["status"] = "POSTPROCESS_ERROR"
+        return rec
+
+
+    def step(sec, name, est_min, fn):
+        """One measured step: skipped when the budget cannot hold it, recorded on any exception, never PASS by default."""
+        rec = R["sections"].setdefault(sec, {}).setdefault(name, {"status": "NOT_RUN"})
+        R["order"].append(f"{sec}/{name}")
+        if ABORT["why"]:
+            rec.update(status="SKIPPED_ABORT", why=ABORT["why"])
+            log("---", sec, name, "SKIPPED_ABORT")
+            save()
+            return rec
+        if left() < est_min * EST_SCALE * 60 + 300:
+            rec.update(status="SKIPPED_BUDGET", left_min=round(left() / 60, 1), est_min=est_min)
+            log("---", sec, name, "SKIPPED_BUDGET", f"(est {est_min} min, left {left() / 60:.0f} min)")
+            save()
+            return rec
+        LIVE["rec"] = rec
+        LIVE["out"] = None                       # E25 NB1 R2: the body's record once it returned (set by watched() / run_boot())
+        t = time.time()
+        log(">>>", sec, name, f"(est {est_min} min, left {left() / 60:.0f} min)")
+        out = None                               # E25 NB1 R2
+        try:
+            out = fn() or {}
+            rec.update(out)
+            if rec.get("status") in (None, "NOT_RUN"):
+                rec["status"] = "DONE"
+        except Exception as e:
+            part = out if isinstance(out, dict) and out else LIVE.get("out")   # E25 NB1 R2: never discard what the body produced
+            if isinstance(part, dict) and part:                               # E25 NB1 R2
+                rec.update(part)                                              # E25 NB1 R2
+                keep_after_error(rec, e)                                      # E25 NB1 R2: clean -> DONE + postprocess_error
+            else:                                                             # E25 NB1 R2
+                rec.update(status="ERROR", error=f"{type(e).__name__}: {e}"[:800], tb=traceback.format_exc()[-2500:])
+        rec["sec"] = round(time.time() - t, 1)
+        LIVE["rec"] = None
+        LIVE["out"] = None                       # E25 NB1 R2
+        if ABORT["why"] and rec["status"] in ("DONE", "SERVER_DIED", "LAUNCH_FAILED", "BODY_ERROR"):
+            rec["status"] = "PARTIAL_HARD_STOP"
+        log("<<<", sec, name, rec.get("status"), f"{rec['sec']:.0f}s")
+        save()
+        return rec
+
+
+    def with_servers(servers, timeout, body):
+        """Start, wait ready, record facts + memory, run body(servers), always kill; then the GPU-release gate on these
+        servers' GPUs only; abort the lab if they stay held."""
+        out = {"servers": {}}
+        timeout = max(60, min(timeout, left() - 120))
+        try:
+            for s in servers:
+                s.start()
+            for s in servers:
+                ok, why = s.wait_ready(timeout)
+                out["servers"][s.name] = {"ready": ok, "why": why, **s.facts(), "argv_tail": s.argv[-44:], "gpus": s.gpus,
+                                          "help_check": HELP.get(s.name)}
+                if not ok:
+                    out["status"] = "LAUNCH_FAILED"
+                    out["servers"][s.name]["log_tail"] = s.log()[-4000:]
+                    _xl = [l for l in (s.log() or "").splitlines() if XID.search(l)][:8]   # rev 3e/3f: start-up / capture faults
+                    out["servers"][s.name].update(xid=bool(_xl), xid_lines=_xl)
+                    return out
+            mem0 = L.gpu_mem()
+            for s in servers:
+                out["servers"][s.name].update(gpu_mem_after_ready=mem0, host_rss_mb=s.rss_mb())
+            try:                             # rev 3: an exception in the body keeps everything measured so far
+                out.update(body(servers) or {})
+            except Exception as e:
+                out.update(status="BODY_ERROR", body_error=f"{type(e).__name__}: {e}"[:800], body_tb=traceback.format_exc()[-2000:])
+            for s in servers:
+                out["servers"][s.name].update(s.facts(), gpu_mem_end=L.gpu_mem(), host_rss_mb_end=s.rss_mb(),
+                                              alive_after_body=s.alive(), rc=None if s.alive() else s.proc.returncode,
+                                              xid_lines=[l for l in (s.log() or "").splitlines() if XID.search(l)][:8])
+                out["servers"][s.name]["xid"] = bool(out["servers"][s.name]["xid_lines"])
+                if not s.alive():
+                    out["status"] = "SERVER_DIED"
+                    out["servers"][s.name]["log_tail"] = s.log()[-4000:]
+            return out
+        finally:
+            for s in servers:
+                s.kill()
+            gpus = ",".join(sorted({g for s in servers for g in s.gpus.split(",")}))
+            rel = L.wait_gpu_release(180, fake=bool(FAKE), gpus=gpus)
+            if rel is False:                 # rev 3c: one more kill + 300 s before the lab aborts
+                for s in servers:
+                    s.kill()
+                rel = L.wait_gpu_release(300, fake=bool(FAKE), gpus=gpus)
+            if rel is None and NVSMI_OK:     # nvidia-smi worked at start: a failure now is not "released"
+                rel = False
+            out["gpu_released"] = rel
+            if rel is False:
+                ABORT["why"] = f"GPUs {gpus} still held after {[s.name for s in servers]}"
+                out["status"] = "FAIL_GPU_RELEASE"
+
+
+    def oracle(port, key=None, refs=()):
+        """Greedy rows (2k, 2k, 8k) + one 40k row; saved under `key` (a target-only oracle) or compared with ROWS[ref]."""
+        rows = L.greedy(port, ORACLE_P + LONG_P, n_tok=NTOK, timeout=max(120, min(900, left() / 6)))
+        clean = all(not r.get("error") and r.get("tokens") and not L.degenerate(r.get("text")) for r in rows)
+        if key and clean:            # rev 3d: an errored / empty / garbage reference is never stored (consumers: NO_ORACLE)
+            ROWS[key] = rows
+        elif key:
+            R["errors"].append(f"oracle {key}: reference not stored (error / empty / garbage row)")
+        res = {"garbage": [L.degenerate(r["text"]) for r in rows], "errors": [r["error"] for r in rows],
+               "text_head": [r["text"][:120] for r in rows]}
+        if not FAKE:                 # rev 3h: chat-path render vs the production xhigh render (recorded per arm)
+            res["template_probe"] = L.template_probe(port, TPL_MSG, TPL_IDS)
+        for ref in refs:
+            res["vs_" + ref] = L.compare(ROWS.get(ref), rows) if ROWS.get(ref) else {"status": "INCONCLUSIVE_NO_ORACLE"}
+        return res
+
+
+    def tforced(port, key=None, ref=None):
+        """Teacher-forced 40k / 90k prompt logprobs (last 256 positions); saved under `key` or compared with TF[ref].
+        rev 3c: on stock vLLM only on its own short launch (prompt logprobs = chunk x 248k-vocab logits: OOM at 0.90)."""
+        rows = {b: L.teacher_forced(port, ids) for b, ids in TF_P.items() if not (SM_TF and b != "40k")}
+        if key and L.tf_complete(rows):                                 # rev 3e: complete references only
+            TF[key] = rows
+        elif key:
+            R["errors"].append(f"teacher-forced {key}: reference not stored (incomplete band)")
+        if ref:
+            return {b: L.compare_tf((TF.get(ref) or {}).get(b), rows[b]) for b in rows}
+        return {b: {"n": (rows[b] or {}).get("n"), "error": (rows[b] or {}).get("error")} for b in rows}
+
+
+    def levels(port, band, lv, server=None, **kw):
+        """rev 3c: the guard includes admission (prefill) time; a band stops once KV-bound (the fit is recorded); a dead
+        server stops the band; every window is written into the live step record before save()."""
+        out, fit = {}, None
+        for n in lv:
+            k = f"{band}@{n}"
+            need = WIN + 90 + min(3600, n * BANDS[band] / 1500)
+            if ABORT["why"] or left() < need + 120:
+                out[k] = {"status": "SKIPPED_BUDGET", "need_sec": round(need)}
+            elif fit is not None:
+                out[k] = {"status": "SKIPPED_KV_BOUND", "streams_fit": fit}
+            elif server is not None and not server.alive():
+                out[k] = {"status": "SKIPPED_SERVER_DEAD"}
+            else:
+                try:                         # rev 3: one failing level never loses the others
+                    out[k] = L.steady(port, PROMPTS[band], n, secs=WIN, max_new=MAX_NEW[band], **kw)
+                except Exception as e:
+                    out[k] = {"status": "ERROR", "error": f"{type(e).__name__}: {e}"[:300]}
+                rm = out[k].get("running_max")
+                if out[k].get("status") == "CAPACITY_LIMITED" or (rm is not None and 0 < rm < n and
+                                                                  str(out[k].get("status")).startswith("INCONCLUSIVE")):
+                    fit = rm
+            if LIVE["rec"] is not None:
+                LIVE["rec"].setdefault("live_windows", {})[k] = out[k]
+            save()
+        return out
+    save()
+
+
+if not RERUN:
+    # ==================================================================== CELL 5 — the arms
+    LADDER = [1, 2, 4, 5]                    # 40k: 8 streams would need 8 x (10 + 7) blocks of 4096 > 149 FP8 blocks (preempts)
+    TEMP = 0.6                               # production sampling (Merlin's --override-generation-config is T 1.0)
+    E23_TF_SCALE = {"tp4_vs_tp1_layout": 0.0772, "nvfp4_vs_bf16_kv": 0.3787}   # E23 SMOKE rev3g mean |d logprob|, for scale
+    PREFILL = {"tok_s": 700.0, "measured": False}
+    OOM_STEP = 268435456                     # Merlin's note: lower KV_BYTES in 0.25 GiB steps if the boot OOMs
+    # Pre-run capacity (Merlin's rule: blocks per request = ceil(L / 4096) + 7; FP8 149 usable blocks, BF16 ~78)
+    R["capacity_plan"] = {
+        "fp8": {"pool_blocks": 149, "40k@5": 5 * (math.ceil(130560 / 4096) + 7), "8k@8": 8 * (math.ceil(32000 / 4096) + 7),
+                "90k@4": 4 * (math.ceil(131072 / 4096) + 7), "116k@3": 3 * (math.ceil(131072 / 4096) + 7),
+                "116k@4": 4 * (math.ceil(131072 / 4096) + 7),
+                "note": "blocks if every stream grew to max length; the ladder windows are 90 s, so real use is far lower; "
+                        "90k@4 and 116k@4 are capacity-limit probes"},
+        "bf16": {"pool_blocks": 78, "40k@3": 3 * (math.ceil(130560 / 4096) + 7)},
+        "long_rows": "1 natural xhigh ARC row (max 120,000 new) + 1 forced 60,000-token row, temperature 0.6, run CONCURRENTLY "
+                     "(concurrency 2): not a single-stream latency number",
+    }
+    R["correctness_meaning"] = ("Both Merlin boots run MTP K3: CLEAN = BF16_MTP3 vs FP8_MTP3 parity plus probes / sampled / greedy "
+                                "evidence; it is NOT target-only (MTP off) correctness. A production GO needs an MTP-off oracle and "
+                                "a forced-rejection test.")
+    CLEAN = ("EXACT", "NEAR_TIE")
+
+
+    def _windows(o):
+        """Every steady window of a step record (levels dicts + steady_multi replicas)."""
+        out = []
+        for v in (o.get("steady") or {}).values():
+            if isinstance(v, dict):
+                out.append(v)
+        for k in ("40k", "90k"):
+            for r in ((o.get(k) or {}).get("replicas") or []) if isinstance(o.get(k), dict) else []:
+                if isinstance(r, dict):
+                    out.append(r)
+        return out
+
+
+    def oracle_gate(o, need=(), extra=()):
+        """None when clean; otherwise the NO_GO / INCONCLUSIVE status. `need` = refs that must compare clean; `extra` =
+        further comparison dicts (replica greedy, 90k greedy) that must compare clean too. rev 3e (audits B-O1, C-F2):
+        garbage under load in any window and failed arithmetic probes (real servers; the fake has no chat) are NO_GO too."""
+        orc = o.get("oracle") or {}
+        if any(orc.get("errors") or []):
+            return "NO_GO_ORACLE_REQUEST_ERROR"
+        if any(orc.get("garbage") or []):
+            return "NO_GO_ORACLE_GARBAGE"
+        if any(w.get("status") == "FAIL_GARBAGE_UNDER_LOAD" for w in _windows(o)):
+            return "NO_GO_GARBAGE_UNDER_LOAD"
+        if not FAKE and isinstance(o.get("probes"), dict) and o["probes"].get("ok") is False:
+            return "NO_GO_SHORT_PROBE"
+        sts = [(orc.get("vs_" + k) or {}).get("status") for k in need] + [(x or {}).get("status") for x in extra]
+        if any(s == "FAIL_HIGH_MARGIN" for s in sts):
+            return "NO_GO_ORACLE"
+        if any(s not in CLEAN for s in sts):
+            return "INCONCLUSIVE_NO_ORACLE" if any(s in (None, "INCONCLUSIVE_NO_ORACLE") for s in sts) else "INCONCLUSIVE_ORACLE"
+        return None
+
+
+    def gated(o, need=(), extra=()):
+        g = oracle_gate(o, need, extra)
+        o["correctness"] = g or "CLEAN"
+        if g and o.get("status") in (None, "DONE"):
+            o["status"] = g
+        return o
+
+
+
+
+    def _finite(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+    _compare_e23, _compare_tf_e23 = L.compare, L.compare_tf
+
+
+    def _compare_rc2(ref, cand):
+        """Final audit H2: a non-finite margin on either side makes the comparison INCONCLUSIVE before any token logic
+        (E23's compare read a NaN reference margin as NEAR_TIE)."""
+        for rows in (ref or [], cand or []):
+            for r in rows:
+                if any(m is not None and not _finite(m) for m in (r.get("margins") or [])):
+                    return {"status": "INCONCLUSIVE_NONFINITE"}
+        return _compare_e23(ref, cand)
+
+
+    def _compare_tf_rc2(ref, cand):
+        """Final audit H2: a non-finite teacher-forced logprob is never MEASURED."""
+        for side in (ref, cand):
+            for p in ((side or {}).get("positions") or []):
+                if p and p[0] is not None and not _finite(p[0]):
+                    return {"status": "INCONCLUSIVE_NONFINITE"}
+        return _compare_tf_e23(ref, cand)
+
+
+    L.compare, L.compare_tf = _compare_rc2, _compare_tf_rc2
+
+
+    def short_gate_failed(o):
+        """Final audit H1: a failed probe (real servers; the fake has no chat) or a failed / garbage sampled request stops
+        the boot's body at once; gated() then gives the NO_GO verdict."""
+        p, s = o.get("probes") or {}, o.get("sampled") or {}
+        return (p.get("ok") is not True and not FAKE) or s.get("ok") is not True or bool(s.get("garbage"))
+
+
+    def oracle_ok(orc):
+        return bool(orc) and orc.get("complete") is True and not any(orc.get("errors") or []) and not any(orc.get("garbage") or [])
+
+
+    def _windows(o):
+        """Every load window of a record: the ladder AND the long census (audit: census_long was not gated)."""
+        out = []
+        for key in ("steady", "census_long"):
+            for v in (o.get(key) or {}).values():
+                if isinstance(v, dict):
+                    out.append(v)
+        return out
+
+
+    def evidence_gate(o, expected_rows, require_sampled=True):
+        """Fail-closed evidence (three pre-GPU audits): probes, the sampled path and a COMPLETE oracle are mandatory;
+        a missing piece is never CLEAN. expected_rows None = no oracle in this arm (diagnostic arms)."""
+        pr = o.get("probes")
+        if not isinstance(pr, dict):
+            return "INCONCLUSIVE_PROBES_MISSING"
+        if pr.get("ok") is not True and not FAKE:          # the fake server has no chat endpoint (E23 rule)
+            return "NO_GO_SHORT_PROBE"
+        if require_sampled:
+            sm = o.get("sampled")
+            if not isinstance(sm, dict):
+                return "INCONCLUSIVE_NO_SAMPLED_TEST"
+            if sm.get("ok") is not True or sm.get("garbage"):
+                return "NO_GO_SAMPLED_PATH"
+        if expected_rows is None:
+            return None
+        orc = o.get("oracle")
+        if not isinstance(orc, dict):
+            return "INCONCLUSIVE_NO_ORACLE"
+        if any(orc.get("errors") or []):
+            return "NO_GO_ORACLE_REQUEST_ERROR"
+        if any(orc.get("garbage") or []):
+            return "NO_GO_ORACLE_GARBAGE"
+        if orc.get("row_count") != expected_rows or orc.get("complete") is not True:
+            return "INCONCLUSIVE_ORACLE_INCOMPLETE"
+        return None
+
+
+    _gated_e23 = gated
+
+
+    def gated(o, need=(), extra=(), expected_rows=4, require_sampled=True):
+        g = evidence_gate(o, expected_rows, require_sampled)
+        if g:
+            o["correctness"] = g
+            if o.get("status") in (None, "DONE"):
+                o["status"] = g
+            return o
+        return _gated_e23(o, need, extra)
+
+
+    def oracle(port, key=None, refs=(), prompts=None):
+        """E23's oracle plus completeness: every expected row present, no error, exactly NTOK tokens (greedy rows run with
+        ignore_eos, so a short row is a defect); a reference is stored only when complete and garbage-free."""
+        prompts = list(prompts) if prompts is not None else ORACLE_P + LONG_P
+        rows = L.greedy(port, prompts, n_tok=NTOK, timeout=max(120, min(900, left() / 6)))
+        garbage = [L.degenerate(r.get("text")) for r in rows]
+        complete = len(rows) == len(prompts) and all(not r.get("error") and len(r.get("tokens") or []) == NTOK for r in rows)
+        if key and complete and not any(garbage):
+            ROWS[key] = rows
+        elif key:
+            R["errors"].append(f"oracle {key}: reference not stored (incomplete / error / garbage)")
+        res = {"garbage": garbage, "errors": [r.get("error") for r in rows], "text_head": [(r.get("text") or "")[:120] for r in rows],
+               "row_count": len(rows), "expected_rows": len(prompts), "tokens": [len(r.get("tokens") or []) for r in rows],
+               "complete": complete}
+        if not FAKE:
+            res["template_probe"] = L.template_probe(port, TPL_MSG, TPL_IDS)
+        for ref in refs:
+            res["vs_" + ref] = L.compare(ROWS.get(ref), rows) if ROWS.get(ref) else {"status": "INCONCLUSIVE_NO_ORACLE"}
+        return res
+
+
+    def kv_census(s):
+        log_t = s.log() or ""
+        lines = log_t.splitlines()
+        kv = re.findall(r"GPU KV cache size: ([\d,]+) tokens", log_t)
+        conc = re.findall(r"Maximum concurrency for ([\d,]+) tokens per request: ([\d.]+)x", log_t)
+        pick = lambda rx, n=24: [l[:240] for l in lines if re.search(rx, l, re.I)][:n]
+        return {"kv_tokens": [int(x.replace(",", "")) for x in kv][:2], "max_concurrency": conc[:2],
+                "scale_lines": pick(r"K/V scale|kv scale|scaling factor|DEFAULT 1\.0|static K/V"),
+                "engine_lines": pick(r"WNA16 MoE backend|MarlinExperts|PLE offload|engram|cudagraph_mode|CUDAGraphMode|PIECEWISE"),
+                "startup_lines": pick(r"Loading weights took|Model loading took|torch\.compile takes|torch\.compile took|"
+                                      r"Graph capturing finished|init engine|PLE.*ready|Available KV cache memory"),
+                "oom_lines": [l[:240] for l in lines if OOM_ERR.search(l)][:6], "host_mem": host_mem()}
+
+
+    def sampled_check(s):
+        """RC1 died at its first sampled request (FlashInfer sampling JIT: ld cannot find -lcuda): one short sampled request
+        right after ready, then the engine must still be alive."""
+        g = L.Stream(s.port, PROMPTS["2k"][1], 64, temperature=TEMP, seed=5)
+        g.start()
+        g.join(900)
+        if g.is_alive():
+            g.stop()
+            g.join(10)
+        r = g.row()
+        return {"tokens": len(r["tokens"]), "error": r["error"], "finish": r["finish_reason"], "alive_after": s.alive(),
+                "garbage": L.degenerate(r["text"]), "ok": len(r["tokens"]) == 64 and not r["error"] and s.alive()}
+
+
+    def prefill_probe(port):
+        """Time to first token of one cold 40k prompt (1 new token): the measured prefill rate the ladder admission uses."""
+        ids = PROMPTS["40k"][7]
+        g = L.Stream(port, ids, 1, temperature=0.0)
+        g.start()
+        g.join(1800)
+        if g.is_alive():
+            g.stop()
+            g.join(10)
+        sec = (g.t_first or g.t_end or time.perf_counter()) - (g.t_start or time.perf_counter())
+        ok = not g.err and g.t_first is not None
+        if ok:
+            PREFILL.update(tok_s=round(len(ids) / max(1e-3, sec), 1), measured=True)
+        return {"prompt": len(ids), "ttft_sec": round(sec, 1), "tok_s": round(len(ids) / max(1e-3, sec), 1), "error": g.err, "ok": ok}
+
+
+    def window_garbage(ids, win=2000, min_len=200):
+        """Final audit H3: the first garbage 2,000-token window of a row (None if every window is clean). A whole-text check
+        would read 100k tokens of healthy reasoning as LOW_VARIETY (unique words < 8 %), so windows are checked one by one."""
+        for i in range(0, len(ids), win):
+            seg = ids[i:i + win]
+            if len(seg) < min_len:
+                break
+            v = L.degenerate(TOK.decode(seg))
+            if v:
+                return {"start_token": i, "verdict": v}
+        return None
+
+
+    def long_quality(name, r):
+        if not isinstance(r, dict):
+            return "MISSING_LONG"
+        if r.get("error"):
+            return "FAIL_LONG_REQUEST"
+        if r.get("window_garbage"):
+            return "FAIL_LONG_GARBAGE"
+        if name == "forced60k" and not r.get("reached_60k"):
+            return "INCOMPLETE_LONG"
+        if name == "natural" and r.get("cut_by_cap"):
+            return "INCOMPLETE_LONG"
+        return "PASS_LONG"
+
+
+    def long_gate(o):
+        """None when the record has no long rows or both rows PASS_LONG; otherwise the verdict for the top-level status.
+        Priority: request error > natural garbage > forced garbage (synthetic past its first EOS) > incomplete."""
+        lo = o.get("long")
+        if not isinstance(lo, dict):
+            return None
+        q = {n: long_quality(n, lo.get(n)) for n in ("natural", "forced60k")}
+        lo["long_quality"] = q
+        if "MISSING_LONG" in q.values():
+            return "INCONCLUSIVE_LONG_MISSING"
+        if "FAIL_LONG_REQUEST" in q.values():
+            return "NO_GO_LONG_REQUEST_ERROR"
+        if q["natural"] == "FAIL_LONG_GARBAGE":
+            return "NO_GO_LONG_GARBAGE"
+        if q["forced60k"] == "FAIL_LONG_GARBAGE":
+            return "NO_GO_FORCED60K_GARBAGE"
+        if "INCOMPLETE_LONG" in q.values():
+            return "INCONCLUSIVE_LONG_INCOMPLETE"
+        return None
+
+
+    def long_rows(port, secs_cap=3000):
+        """One natural xhigh ARC request (its own stop, up to 120,000 new tokens) and one forced 60,000-token row
+        (ignore_eos: 'synthetic' past its first EOS), CONCURRENTLY (concurrency 2). Full text in traces/ + requests.jsonl.
+        A row cut by the time cap is incomplete, not a correctness failure."""
+        cap = max(60, min(secs_cap, left() - 900))
+        jobs = {"natural": L.Stream(port, TPL_IDS, min(120000, MAX_LEN - len(TPL_IDS) - 512), temperature=TEMP, seed=11,
+                                    ignore_eos=False),
+                "forced60k": L.Stream(port, PROMPTS["8k"][0], 60000, temperature=TEMP, seed=12, ignore_eos=True)}
+        t = time.time()
+        for g in jobs.values():
+            g.start()
+        for g in jobs.values():
+            g.join(max(1, cap - (time.time() - t)))
+        for g in jobs.values():
+            if g.is_alive():
+                g.stop()
+                g.join(10)
+        out = {"concurrency": 2, "cap_sec": round(cap)}
+        for name, g in jobs.items():
+            row = g.row()
+            (TRACES / f"long_{port}_{name}.txt").write_text(row["text"])
+            ids = row["tokens"]
+            n_tok = len(ids)
+            sec = (g.t_end or time.perf_counter()) - (g.t_start or time.perf_counter())
+            sl = {}
+            for k, end in (("to_8k", 8000), ("to_32k", 32000), ("to_60k", 60000), ("to_100k", 100000)):
+                sl[k] = L.degenerate(TOK.decode(ids[end - 2000:end])) if n_tok >= end else "NOT_REACHED"
+            out[name] = {"tokens": n_tok, "sec": round(sec, 1), "tok_s": round(n_tok / max(1e-6, sec), 1), "error": row["error"],
+                         "finish": row["finish_reason"], "garbage": sl, "window_garbage": window_garbage(ids),
+                         "think_closed": "</think>" in row["text"], "cut_by_cap": row["finish_reason"] is None,
+                         "tail": row["text"][-400:]}
+        out["forced60k"]["reached_60k"] = out["forced60k"]["tokens"] >= 60000
+        out["forced60k"]["label"] = "synthetic past the first EOS (ignore_eos)"
+        try:
+            m = {k: v for k, v in L.prom(port).items() if k.startswith(("vllm:spec_decode", "vllm:num_preemptions", "vllm:kv_cache_usage"))}
+        except Exception as e:
+            m = {"error": repr(e)[:200]}
+        acc, drf = m.get(L.ACC), m.get(L.DRF)
+        out["metrics_end"] = m
+        out["mtp_accept_per_draft"] = round(acc / drf, 3) if acc and drf else None
+        return out
+
+
+    def tf_last(s, key=None, ref=None, aa=False):
+        """Teacher-forced 40k LAST in a boot (chunk x 248k-vocab prompt logits can OOM the last PP rank); free memory first.
+        How a server death here is classified is decided from its log in merlin_boot (TF_OOM vs TF_SERVER_DIED)."""
+        o = {"gpu_before": L.gpu_mem()}
+        if key:
+            o["ref"] = tforced(s.port, key=key)
+            if aa and s.alive():
+                o["aa"] = tforced(s.port, ref=key)              # A/A: the same boot, the same prompt (the noise floor)
+                TF["aa"] = o["aa"]
+        if ref:
+            o["vs_" + ref] = tforced(s.port, ref=ref)
+            o["aa_" + ref] = TF.get("aa")
+            o["e23_scale"] = E23_TF_SCALE
+        o["alive_after"] = s.alive()
+        return o
+
+
+    def merlin_boot(name, kv, port, timeout, body, need=(), expected_rows=4, require_sampled=True):
+        """Boot gate (ok must be True), one Merlin boot, cleanup of the /dev/shm entries this boot created; a boot OOM
+        retries once 0.25 GiB lower. A server death during TF is TF_OOM only with an OOM line and no device fault."""
+        kvb = NB1_KV.get(name) or (KV_FP8 if kv == "fp8" else KV_BF16)   # E25 NB1: the B3 pin step
+        tries = []
+        while True:
+            gate = boot_gate()
+            if gate["ok"] is not True:
+                return {"status": "GPU_NOT_EMPTY", "boot_gate": gate, "tries": tries}
+            shm0 = shm_names()
+            o = with_servers([merlin_fn_server(name, kv, port, kvb)], timeout, body)
+            o.update(kv_bytes=kvb, boot_gate=gate, shm_cleanup=shm_cleanup(shm0))
+            srv = (o.get("servers") or {}).get(name) or {}
+            oom = o.get("status") == "LAUNCH_FAILED" and bool(OOM_ERR.search(srv.get("log_tail") or ""))
+            tries.append({"kv_bytes": kvb, "status": o.get("status"), "oom": oom})
+            if not oom or len(tries) > 1 or left() < timeout + 900:
+                break
+            kvb -= OOM_STEP
+            log("boot OOM:", name, "retry with KV_BYTES", kvb)
+        o["tries"] = tries
+        if o.get("tf_died") and o.get("status") == "SERVER_DIED":
+            srv = (o.get("servers") or {}).get(name) or {}
+            if OOM_ERR.search(srv.get("log_tail") or "") and not srv.get("xid"):
+                o["status"] = "TF_OOM"
+                o["status_note"] = "the server died of OOM in the teacher-forced call (run last); everything before it is valid"
+            else:
+                o["status"] = "TF_SERVER_DIED"
+                o["status_note"] = "the server died in the teacher-forced call without an OOM line (or with a device fault)"
+        g = gated(o, need=need, expected_rows=expected_rows, require_sampled=require_sampled)
+        if g.get("status") == "TF_OOM" and g.get("correctness") != "CLEAN":
+            g["status"] = g["correctness"]
+        lg = long_gate(g)                                  # final audit H3: the long rows have their own verdict
+        g["long_verdict"] = lg or ("PASS_LONG" if isinstance(g.get("long"), dict) else None)
+        if lg and g.get("status") in ("DONE", "TF_OOM"):
+            g["status"] = lg
+        return g
+
+
+    def arm_bf16():
+        def body(ss):
+            s = ss[0]
+            p = s.port
+            o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o.update(early_stop="SHORT_CORRECTNESS_GATE_FAILED", census_end=kv_census(s))
+                return o
+            o["prefill"] = prefill_probe(p)
+            o["oracle"] = oracle(p, key="bf16")
+            o["census_end"] = kv_census(s)
+            if not oracle_ok(o["oracle"]):
+                o["early_stop"] = "ORACLE_INCOMPLETE"          # no reference: the TF A/A would measure nothing usable
+                return o
+            o["tf"] = tf_last(s, key="bf16", aa=True)
+            o["tf_died"] = not o["tf"]["alive_after"]
+            return o
+        ok, why = sha_gate(min(1500, left() - 900))
+        R["setup"]["sha_gate"] = {"ok": ok, "why": why}
+        if not ok:
+            return {"status": "SKIPPED_SHA_GATE", "why": why}
+        return merlin_boot("merlin_bf16", "bf16", 8000, 45 * 60, body)
+
+
+    def fp8_gate(o):
+        vs = (o["oracle"].get("vs_bf16") or {}).get("status")
+        if (o.get("sampled") or {}).get("ok") is not True:
+            return "FAIL_SAMPLED"
+        if (o.get("probes") or {}).get("ok") is not True and not FAKE:
+            return "FAIL_PROBES"
+        if any(o["oracle"].get("errors") or []) or any(o["oracle"].get("garbage") or []) or vs == "FAIL_HIGH_MARGIN":
+            return "FAIL"
+        if o["oracle"].get("complete") is True and vs in CLEAN:
+            return "PASS"
+        return "INCONCLUSIVE"
+
+
+    def arm_fp8():
+        def body(ss):
+            s = ss[0]
+            p = s.port
+            o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o.update(early_stop="SHORT_CORRECTNESS_GATE_FAILED", census_end=kv_census(s),
+                         fp8_gate="FAIL_SAMPLED" if (o["sampled"] or {}).get("ok") is not True else "FAIL_PROBES")
+                return o
+            if not PREFILL["measured"]:
+                o["prefill"] = prefill_probe(p)
+            o["oracle"] = oracle(p, refs=("bf16",))
+            o["fp8_gate"] = fp8_gate(o)
+            if o["fp8_gate"] == "PASS":                      # load tests only on a PASS (audits: INCONCLUSIVE never runs them)
+                kw = {"server": s, "temperature": TEMP, "prefill_tok_s": PREFILL["tok_s"]}
+                o["steady"] = levels(p, "40k", LADDER, **kw)
+                o["steady"].update(levels(p, "8k", [8], **kw))
+                o["census_long"] = {**levels(p, "90k", [3, 4], **kw), **levels(p, "116k", [3, 4], **kw)}
+                o["long"] = long_rows(p)
+            else:
+                o["load_tests_skipped"] = f"FP8 comparison gate: {o['fp8_gate']}"
+                o["status"] = "NO_GO_FP8_KV" if o["fp8_gate"].startswith("FAIL") else "INCONCLUSIVE_FP8_KV"
+            o["census_end"] = kv_census(s)
+            if o["fp8_gate"] == "PASS" or os.environ.get("RC2_TF_ON_FP8_FAIL") == "1":   # default: fail fast
+                o["tf"] = tf_last(s, ref="bf16")
+                o["tf_died"] = not o["tf"]["alive_after"]
+            return o
+        return merlin_boot("merlin_fp8", "fp8", 8001, 40 * 60, body, need=("bf16",))
+
+
+    def arm_bf16_load():
+        """Only when FP8 fails: the ladder, the census and the long rows on BF16 KV (seqs 3). DIAGNOSTIC_ONLY: this arm
+        has no oracle of its own (the A1 boot is the BF16 reference)."""
+        def body(ss):
+            s = ss[0]
+            p = s.port
+            o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o["early_stop"] = "SHORT_CORRECTNESS_GATE_FAILED"
+            else:
+                kw = {"server": s, "temperature": TEMP, "prefill_tok_s": PREFILL["tok_s"]}
+                o["steady"] = levels(p, "40k", [1, 2, 3], **kw)
+                o["census_long"] = levels(p, "116k", [1, 2], **kw)
+                o["long"] = long_rows(p)
+            o["census_end"] = kv_census(s)
+            o["certification"] = "DIAGNOSTIC_ONLY"
+            return o
+        return merlin_boot("merlin_bf16_load", "bf16", 8002, 30 * 60, body, expected_rows=None)
+
+
+    def arm_stock():
+        """Fallback when Merlin cannot serve: stock vLLM 0.32 + Intel W4A16 (RC1's correct engine), -lcuda shim, FP8 KV."""
+        if INTEL is None or WHEELHOUSE is None:
+            return {"status": "FALLBACK_UNAVAILABLE", "why": f"intel={INTEL} wheelhouse={WHEELHOUSE}"}
+
+        def body(ss):
+            s = ss[0]
+            p = s.port
+            o = {"census": kv_census(s), "probes": L.chat_probes(p), "sampled": sampled_check(s)}
+            if short_gate_failed(o):
+                o["early_stop"] = "SHORT_CORRECTNESS_GATE_FAILED"
+                return o
+            o["oracle"] = oracle(p, key="stock", prompts=ORACLE_P)          # 2k / 2k / 8k (32k max length: no 40k row)
+            if oracle_ok(o["oracle"]):
+                o["steady"] = levels(p, "8k", [1, 2, 3], server=s, temperature=TEMP)
+            return o
+        gate = boot_gate()
+        if gate["ok"] is not True:
+            return {"status": "GPU_NOT_EMPTY", "boot_gate": gate}
+        shm0 = shm_names()
+        o = gated(with_servers([stock_fn_server("stock_fn", 8003)], 40 * 60, body), expected_rows=len(ORACLE_P))
+        o.update(boot_gate=gate, shm_cleanup=shm_cleanup(shm0))
+        return o
+
+
+    save()
+
+
+if not RERUN:
+    # ==================================================================== CELL 6 — E25 NB1: measurement tools (NB1 R2 verbatim; E25 NB4S dropped the unused capacity / prefix / routing / PP2-trace functions: commit_mode, commit_ab, commit_counter_delta, pool_blocks_from_usage, reset_cache, _hits, alloc_sequence, reset_succeeded, fit_alloc, kv_accounting, n_fit, admission_test, residency_bound, residency_capacity, _f_valid, resolve_F, f_from_log, residency_probes, block_layout, nb1_complete, nb1_tf_req, lp_compare, fp8_self_check, nb1_ladder, _prefix_counts, _reuse, prefix_tests, _merge, _clip, _inter, microbatch_costs, pp2_trace, merge_routing, pp2_profile)
+    import gzip
+    import statistics
+    from collections import Counter
+    NB1 = R.setdefault("nb1", {})
+    SCORECARD = OUT / "lever_scorecard.json"
+    TF_RAW = OUT / "tf_raw"
+    TF_RAW.mkdir(exist_ok=True)
+    HOSTMEM = OUT / "hostmem"
+    HOSTMEM.mkdir(exist_ok=True)
+    BLOCK = 4096
+    PIN_STEPS_GIB = (1.0, 0.75, 0.5)             # B3 pin ladder (addendum 5): the largest step predicted safe first, then down
+    PIN_FREE_MIN_MIB = 512                       # a step must leave >= 0.5 GiB free per rank after warm-up + a 90k prefill
+    KV_STEP = 512 << 20                          # the smallest step (+0.5 GiB per card)
+    RAM_NEED_MIB = (69 + 4) * 1024               # Merlin's ~69 GiB resident floor + 4 GiB margin, on its own rule
+    BOOT_READY_SEC = 30 * 60                     # readiness gate per boot
+    SEQS_HI = 16
+    CAPTURE_HI = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 64]   # Merlin registry.capture_sizes_for(16, K=3): seqs x (1 + K)
+    COMPILE_HI = json.dumps({"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": CAPTURE_HI})
+    PROF_DIR = TMP / "nb1_profile"
+    PROFILER_CFG = json.dumps({"profiler": "torch", "torch_profiler_dir": str(PROF_DIR), "torch_profiler_with_stack": False,
+                               "ignore_frontend": True})      # idle unless /start_profile (annotations only while running)
+    EXT_FLAG = ["--worker-extension-cls", "nb1_worker_ext.NB1WorkerExt"]
+    DIAG_ENV = {"VLLM_SERVER_DEV_MODE": "1"}     # /collective_rpc (read-only extension) + /reset_prefix_cache; 127.0.0.1 only
+    NCCL_DIAG = {"NCCL_DEBUG": "INFO", "NCCL_DEBUG_SUBSYS": "INIT,NET"}   # B1 only: the real NCCL transport per group
+    COMMIT_GRAPH_ENV = {"VLLM_RECOVERSSM_COMMIT_GRAPH": "graph"}         # B2 boot: commit graphs captured; flipped to eager at once
+    RC2_FP8 = json.loads(r"""{"argv_tail": ["127.0.0.1", "--port", "8001", "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2", "--enable-expert-parallel", "--disable-custom-all-reduce", "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"probabilistic\"}", "--max-model-len", "262144", "--max-num-seqs", "8", "--max-num-batched-tokens", "1024", "--gpu-memory-utilization", "0.96", "--kv-cache-memory-bytes", "2479838700", "--kv-cache-dtype", "fp8_e4m3", "--limit-mm-per-prompt", "{\"image\":42,\"video\":0}", "--mm-processor-cache-gb", "0", "--mm-processor-kwargs", "{\"size\":{\"longest_edge\":8388608,\"shortest_edge\":65536}}", "--compilation-config", "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,24,32]}", "--enable-prefix-caching", "--mamba-cache-mode", "align", "--enable-prompt-tokens-details", "--no-enable-flashinfer-autotune", "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3", "--override-generation-config", "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}", "--default-chat-template-kwargs", "{\"enable_thinking\": true, \"reasoning_effort\": \"medium\"}", "--shutdown-timeout", "60", "--block-size", "4096", "--use-replayssm", "--prefix-match-unit", "64", "--served-model-name", "q27", "--max-model-len", "131072", "--port", "8001", "--default-chat-template-kwargs", "{\"enable_thinking\": true, \"reasoning_effort\": \"xhigh\"}"], "env": {"KV_BYTES": "2479838700", "NCCL_P2P_DISABLE": "1", "NCCL_VERSION": "2.25.1-1", "P2P": "off", "SCALES": "/tmp/fn_merlin/qsa_kv_scales_262k.json", "VLLM_CACHE_ROOT": "/tmp/merlin-cache", "VLLM_E2_GUARD_MODE": "warn", "VLLM_E2_PLE_EARLY_REQUEST": "1", "VLLM_E2_PLE_FAST_IDS": "1", "VLLM_E2_QSA_LOGITS_GRANULE_MB": "256", "VLLM_HOST_EMBED_TABLE": "1", "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "0", "VLLM_PLE_OFFLOAD_HOME_DEVICE": "0", "VLLM_PLE_OFFLOAD_READY_TIMEOUT": "3600", "VLLM_PORT": "30100", "VLLM_PP_LAYER_PARTITION": "25,23", "VLLM_QSA_KV_SCALES": "/tmp/fn_merlin/qsa_kv_scales_262k.json", "VLLM_SKIP_P2P_CHECK": "1", "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "256", "VLLM_USE_BREAKABLE_CUDAGRAPH": "0", "VLLM_USE_RUST_FRONTEND": "0", "VLLM_USE_V2_MODEL_RUNNER": "1"}, "kv_bytes": 2479838700, "kv_tokens": 513940, "max_concurrency": 3.92, "pool_blocks": 149, "F_rule": 6, "F_engine": 6, "seqs": 8, "gpu_mem_after_ready": [[0, 20903, 23034], [1, 20903, 23034], [2, 20863, 23034], [3, 21389, 23034]], "gpu_mem_end": [[0, 21427, 23034], [1, 21427, 23034], [2, 21387, 23034], [3, 21401, 23034]], "windows": {"40k@1": {"status": "STEADY", "tok_s": 70.0, "mal": 3.086, "step_ms": 44.1, "running": [1.0, 1.0]}, "40k@2": {"status": "STEADY", "tok_s": 107.4, "mal": 3.251, "step_ms": 30.3, "running": [2.0, 2.0]}, "40k@4": {"status": "STEADY", "tok_s": 161.0, "mal": 3.017, "step_ms": 37.5, "running": [4.0, 4.0]}, "40k@5": {"status": "STEADY", "tok_s": 190.5, "mal": 3.073, "step_ms": 40.3, "running": [5.0, 5.0]}, "8k@8": {"status": "STEADY", "tok_s": 261.8, "mal": 3.154, "step_ms": 48.2, "running": [8.0, 8.0]}, "90k@3": {"status": "INCONCLUSIVE_PREFILL_IN_WINDOW", "tok_s": 48.7, "mal": 2.93, "step_ms": 60.1, "running": [1.0, 3.0]}, "90k@4": {"status": "STEADY", "tok_s": 159.8, "mal": 3.022, "step_ms": 37.8, "running": [4.0, 4.0]}, "116k@3": {"status": "STEADY", "tok_s": 140.5, "mal": 3.223, "step_ms": 34.4, "running": [3.0, 3.0]}, "116k@4": {"status": "STEADY", "tok_s": 160.3, "mal": 3.016, "step_ms": 37.6, "running": [4.0, 4.0]}}, "tf_40k_vs_bf16": {"status": "MEASURED", "n": 256, "mean_abs_dlogprob": 1.8764, "p99_abs_dlogprob": 5.464, "max_abs_dlogprob": 7.15, "rank1_agreement": 0.3672, "forced_token_rank1_both_or_neither": 0.457}, "ready_sec": 999.1, "bf16": {"kv_tokens": 269042, "max_concurrency": 2.05, "pool_blocks": 78, "seqs": 3, "gpu_mem_after_ready": [[0, 20905, 23034], [1, 20905, 23034], [2, 20693, 23034], [3, 20693, 23034]], "gpu_mem_end": [[0, 21425, 23034], [1, 21425, 23034], [2, 21215, 23034], [3, 21215, 23034]], "ready_sec": 411.1}, "rank_load_gib": {"2": 16.87, "1": 17.33, "0": 17.33, "3": 16.87}, "rank_graph_gib": {"0": 0.33, "1": 0.33, "2": 0.43, "3": 0.43}}""")      # RC2's real boots: argv tail, env keys, pool, memory, windows (rc2_results.json)
+    RC2_ORACLE = json.loads(r"""{"bf16": [{"text": "We need solve ARC task. Need infer transformation from examples. User gives Task 0934a4d8 with Example 1 input/output, Example 2 input/output, Example 3 input only? Need solve test inputs? They provided Example 3 input: 194499276 maybe incomplete? Need output? Need find transformation rule and solve test inputs. We need analyze.\n\nWe have ARC tasks represented as strings of digits? Example 1 input is 31 rows? Let's count. Example 1 input lines:\n1 3533665414", "tokens": [1596, 1144, 11290, 67964, 3274, 13, 14235, 22846, 17454, 494, 9989, 13, 2570, 6486, 5261, 220, 15, 24, 18, 19, 64, 19, 67, 23, 440, 12996, 220, 16, 1879, 45447, 11, 12996, 220, 17, 1879, 45447, 11, 12996, 220, 18, 1879, 1132, 30, 14235, 11290, 1228, 10804, 30, 2302, 3766, 12996, 220, 18, 1879, 25, 220, 16, 24, 19, 19, 24, 24, 17, 22, 21, 6970, 31084, 30, 14235, 2468, 30, 14235, 1423, 17454, 5728, 321, 11290, 1228, 10804, 13, 1165, 1144, 22903, 13, 271, 1596, 599, 67964, 8806, 14807, 430, 8796, 314, 17955, 30, 12996, 220, 16, 1879, 369, 220, 18, 16, 6761, 30, 6558, 579, 1698, 13, 12996, 220, 16, 1879, 4965, 25, 198, 16, 220, 18, 20, 18, 18, 21, 21, 20, 19, 16, 19], "margins": [11.375, 10.75, 0.25, 3.5, 0.125, 1.75, 2.375, 0.625, 4.375, 0.125, 4.125, 1.375, 0.125, 1.0, 1.25, 4.875, 8.6875, 10.375, 10.375, 9.6875, 8.25, 10.1875, 14.0, 10.4375, 0.125, 0.875, 1.25, 8.375, 3.875, 1.0, 3.75, 7.375, 3.75, 12.0, 2.625, 8.375, 6.75, 2.5, 8.75, 10.5, 6.625, 0.125, 0.375, 0.5, 0.75, 8.25, 4.125, 1.0, 1.0, 0.125, 0.25, 4.625, 6.375, 9.25, 2.875, 0.375, 4.125, 4.25, 10.9375, 11.5625, 10.625, 10.5625, 9.5625, 11.5, 10.6875, 0.5, 2.25, 4.875, 2.125, 1.25, 0.125, 0.5, 0.625, 0.625, 4.25, 1.125, 2.875, 3.125, 3.125, 4.125, 0.75, 1.375, 1.75, 0.75, 1.0, 4.25, 1.5, 0.5, 1.125, 0.625, 4.625, 1.625, 0.25, 4.5, 1.0, 0.0, 1.25, 8.5, 5.0, 1.125, 2.75, 3.375, 0.625, 0.125, 1.125, 1.875, 7.25, 1.875, 2.125, 0.25, 0.875, 6.25, 1.875, 1.625, 2.625, 2.875, 2.125, 2.375, 8.125, 10.9375, 10.0625, 9.0625, 9.875, 9.375, 11.25, 11.375, 11.875, 12.9375], "error": null, "prompt_sha": "8df9ed2c640ef5bd", "prompt_len": 2048, "finish_reason": "length"}, {"text": "We need solve ARC tasks. Need infer transformation rules from examples and apply to test inputs. We have two tasks: 1818057f and 195c6913. Need output transformed test grids. Need analyze carefully.\n\nWe need produce final answer likely grids. Need infer rules.\n\nTask 1818057f:\nExamples: inputs/outputs with colors 2,4,8. Output changes some 4s to 8? Let's inspect.\n\nExample1 input 10x12? rows:\n1 22224", "tokens": [1596, 1144, 11290, 67964, 8806, 13, 14235, 22846, 17454, 5426, 494, 9989, 321, 3668, 310, 1228, 10804, 13, 1165, 599, 1330, 8806, 25, 220, 16, 23, 16, 23, 15, 20, 22, 69, 321, 220, 16, 24, 20, 66, 21, 24, 16, 18, 13, 14235, 2468, 22773, 1228, 54455, 13, 14235, 22903, 15060, 13, 271, 1596, 1144, 7936, 1534, 4087, 4222, 54455, 13, 14235, 22846, 5426, 13, 271, 6065, 220, 16, 23, 16, 23, 15, 20, 22, 69, 25, 198, 39044, 25, 10804, 14, 39652, 440, 7736, 220, 17, 11, 19, 11, 23, 13, 8984, 4203, 1010, 220, 19, 82, 310, 220, 23, 30, 6558, 579, 23331, 13, 271, 12929, 16, 1879, 220, 16, 15, 87, 16, 17, 30, 6761, 25, 198, 16, 220, 17, 17, 17, 17, 19], "margins": [11.875, 11.375, 0.75, 3.375, 2.625, 3.0, 3.25, 0.5, 3.125, 0.25, 0.625, 4.75, 1.125, 3.25, 2.0, 5.5, 0.875, 3.75, 0.375, 0.5, 1.375, 6.5, 1.125, 2.25, 12.625, 12.0625, 11.3125, 12.9375, 12.4375, 8.875, 10.8125, 10.75, 1.75, 7.375, 13.5625, 13.875, 11.6875, 11.25, 10.75, 12.375, 12.375, 10.75, 2.25, 2.25, 1.625, 0.875, 1.0, 0.375, 0.875, 1.375, 0.125, 1.875, 6.5, 1.5, 1.0, 1.375, 1.0, 4.75, 4.625, 1.75, 1.0, 1.625, 0.875, 0.625, 0.25, 3.5, 1.0, 1.25, 4.625, 11.625, 5.75, 11.125, 12.3125, 10.8125, 10.9375, 11.0, 11.8125, 0.125, 0.0, 2.625, 0.375, 0.25, 0.875, 7.875, 0.75, 0.875, 1.875, 8.125, 0.75, 7.375, 2.875, 3.875, 2.125, 0.25, 2.0, 3.25, 2.625, 0.625, 2.625, 2.125, 10.75, 10.625, 0.75, 1.75, 7.5, 2.75, 6.375, 0.25, 1.75, 1.375, 0.75, 3.25, 8.375, 4.625, 3.75, 4.375, 2.625, 1.5, 0.25, 0.5, 5.375, 1.375, 0.5, 9.75, 4.625, 12.625, 11.4375, 8.375], "error": null, "prompt_sha": "8750743e9dcadca9", "prompt_len": 2048, "finish_reason": "length"}, {"text": "We need solve ARC tasks. Need find transformation rule for each task and solve test inputs. We have multiple tasks: 247ef758, 269e22fb, 271d71e2, 28a6681f, 291dc1e1. Need output transformed grids for test inputs. Need infer rules from examples. Need be careful. We need produce final answer likely grids. Need analyze each task.\n\nWe need parse tasks. There are two test inputs for 247ef758? It says Test input: ...", "tokens": [1596, 1144, 11290, 67964, 8806, 13, 14235, 1423, 17454, 5728, 364, 1754, 3274, 321, 11290, 1228, 10804, 13, 1165, 599, 5081, 8806, 25, 220, 17, 19, 22, 797, 22, 20, 23, 11, 220, 17, 21, 24, 68, 17, 17, 10481, 11, 220, 17, 22, 16, 67, 22, 16, 68, 17, 11, 220, 17, 23, 64, 21, 21, 23, 16, 69, 11, 220, 17, 24, 16, 7385, 16, 68, 16, 13, 14235, 2468, 22773, 54455, 364, 1228, 10804, 13, 14235, 22846, 5426, 494, 9989, 13, 14235, 381, 16097, 13, 1165, 1144, 7936, 1534, 4087, 4222, 54455, 13, 14235, 22903, 1754, 3274, 13, 271, 1596, 1144, 4563, 8806, 13, 2532, 513, 1330, 1228, 10804, 364, 220, 17, 19, 22, 797, 22, 20, 23, 30, 1049, 2640, 3284, 1879, 25, 2423], "margins": [11.75, 9.875, 1.125, 1.25, 3.875, 2.0, 2.875, 0.375, 5.25, 0.875, 1.5, 5.625, 0.875, 3.0, 2.875, 3.125, 7.75, 6.75, 0.5, 0.5, 1.5, 5.625, 1.375, 3.0, 11.75, 13.375, 12.625, 11.3125, 12.0, 13.5, 12.625, 0.625, 8.4375, 11.625, 11.0, 12.5625, 10.5625, 11.0, 10.375, 8.375, 7.375, 9.75, 11.5625, 9.125, 10.0, 9.75, 9.4375, 10.3125, 10.4375, 9.0, 8.1875, 9.4375, 12.625, 9.75, 11.0, 11.3125, 10.9375, 9.625, 9.5625, 10.0, 8.1875, 7.625, 12.375, 11.125, 11.375, 10.625, 10.25, 10.375, 10.0, 2.5, 3.0, 2.125, 0.125, 0.125, 1.875, 0.125, 4.125, 3.125, 2.0, 0.75, 3.0, 0.75, 8.75, 4.125, 0.125, 1.25, 3.875, 2.75, 0.125, 0.25, 0.625, 3.875, 1.625, 1.875, 0.75, 1.0, 0.375, 2.375, 2.125, 0.5, 0.5, 2.5, 1.875, 0.125, 0.75, 0.375, 3.625, 0.125, 1.375, 0.0, 4.125, 7.375, 2.5, 0.375, 12.75, 6.75, 12.375, 4.625, 8.75, 12.1875, 10.25, 2.0, 0.625, 0.25, 1.125, 7.625, 1.75, 2.125], "error": null, "prompt_sha": "fc63e297d382cd8f", "prompt_len": 8192, "finish_reason": "length"}, {"text": "We need solve ARC tasks. Need find transformation rule for each task and solve test inputs. We need output likely transformed grids. Need analyze many tasks. Need be careful. We have multiple tasks with examples and test inputs. Need infer rules.\n\nWe need produce final answer with transformed test inputs for each task. There are tasks: 2c181942, 2d0172a1 (two test inputs?), 31f7f899, 332f06d7, 35ab12c3, 36a08778", "tokens": [1596, 1144, 11290, 67964, 8806, 13, 14235, 1423, 17454, 5728, 364, 1754, 3274, 321, 11290, 1228, 10804, 13, 1165, 1144, 2468, 4222, 22773, 54455, 13, 14235, 22903, 1599, 8806, 13, 14235, 381, 16097, 13, 1165, 599, 5081, 8806, 440, 9989, 321, 1228, 10804, 13, 14235, 22846, 5426, 13, 271, 1596, 1144, 7936, 1534, 4087, 440, 22773, 1228, 10804, 364, 1754, 3274, 13, 2532, 513, 8806, 25, 220, 17, 66, 16, 23, 16, 24, 19, 17, 11, 220, 17, 67, 15, 16, 22, 17, 64, 16, 318, 19186, 1228, 10804, 66926, 220, 18, 16, 69, 22, 69, 23, 24, 24, 11, 220, 18, 18, 17, 69, 15, 21, 67, 22, 11, 220, 18, 20, 365, 16, 17, 66, 18, 11, 220, 18, 21, 64, 15, 23, 22, 22, 23], "margins": [10.125, 11.5, 1.125, 0.25, 3.5, 2.125, 2.625, 0.5, 5.25, 1.0, 1.75, 5.75, 0.375, 2.375, 3.625, 4.25, 6.625, 7.375, 0.25, 0.125, 1.25, 0.5, 0.25, 2.0, 0.5, 1.625, 1.0, 1.0, 4.375, 2.875, 0.75, 2.125, 4.125, 4.0, 0.375, 0.5, 1.625, 3.875, 0.375, 2.125, 2.125, 2.125, 2.875, 1.625, 2.875, 1.125, 0.75, 1.375, 0.125, 1.625, 2.25, 1.0, 2.875, 2.5, 3.0, 0.125, 1.125, 0.75, 1.25, 2.375, 1.75, 1.625, 0.625, 3.0, 0.125, 4.5, 0.5, 11.625, 10.625, 12.0625, 13.0625, 9.5625, 10.9375, 10.375, 10.875, 1.0, 6.5, 9.8125, 10.25, 11.9375, 13.5, 12.3125, 11.625, 11.25, 11.25, 0.375, 2.5, 4.125, 7.25, 0.625, 5.375, 9.75, 9.625, 12.4375, 11.25, 10.4375, 9.0, 11.4375, 10.8125, 3.25, 8.375, 11.875, 7.375, 11.5, 11.0, 10.5625, 8.8125, 10.875, 10.375, 5.625, 10.125, 13.125, 8.625, 7.375, 11.1875, 10.5, 10.25, 10.9375, 5.25, 9.75, 10.1875, 7.25, 11.4375, 12.0, 8.9375, 11.0625, 9.5, 10.3125], "error": null, "prompt_sha": "49b3958bb234d4fd", "prompt_len": 40000, "finish_reason": "length"}], "fp8": [{"text": "We need solve ARC task. Need infer transformation from examples. User gives Task 0934a4d8. Example 1 input 30x30? output 9x4? Example 2 input 30x30? output 4x5? Example 3 input: \"194499276\" only one row? Maybe truncated? Need find transformation rule and solve test inputs. But only one test input? It says Example 3 input: 194499276. Maybe that's the test input? Need output. Need infer from", "tokens": [1596, 1144, 11290, 67964, 3274, 13, 14235, 22846, 17454, 494, 9989, 13, 2570, 6486, 5261, 220, 15, 24, 18, 19, 64, 19, 67, 23, 13, 12996, 220, 16, 1879, 220, 18, 15, 87, 18, 15, 30, 2468, 220, 24, 87, 19, 30, 12996, 220, 17, 1879, 220, 18, 15, 87, 18, 15, 30, 2468, 220, 19, 87, 20, 30, 12996, 220, 18, 1879, 25, 328, 16, 24, 19, 19, 24, 24, 17, 22, 21, 1, 1132, 799, 2713, 30, 10380, 57739, 30, 14235, 1423, 17454, 5728, 321, 11290, 1228, 10804, 13, 1921, 1132, 799, 1228, 1879, 30, 1049, 2640, 12996, 220, 18, 1879, 25, 220, 16, 24, 19, 19, 24, 24, 17, 22, 21, 13, 10380, 421, 579, 279, 1228, 1879, 30, 14235, 2468, 13, 14235, 22846, 494], "margins": [11.5, 11.25, 0.25, 3.625, 0.375, 2.25, 2.25, 0.875, 4.125, 0.25, 4.25, 1.25, 0.125, 1.0, 1.75, 4.625, 9.0, 9.9375, 10.375, 9.5, 8.875, 10.6875, 14.0, 10.625, 0.125, 0.75, 0.875, 7.5, 4.5, 1.25, 3.5, 0.75, 0.0, 1.75, 4.0, 2.625, 1.25, 9.375, 5.5, 4.25, 2.0, 0.25, 2.625, 0.875, 8.875, 3.75, 4.375, 5.75, 5.5, 4.25, 3.5, 5.5, 0.0, 8.0, 7.25, 7.375, 4.625, 5.875, 1.5, 3.75, 4.875, 9.125, 6.75, 0.25, 0.625, 8.25, 8.25, 12.3125, 11.5, 10.3125, 11.0, 10.1875, 11.625, 9.875, 4.375, 2.25, 0.375, 1.0, 4.875, 0.0, 0.25, 5.75, 2.125, 0.0, 0.25, 2.375, 2.875, 6.75, 9.125, 5.125, 1.875, 0.75, 2.375, 0.0, 0.875, 1.875, 2.125, 0.75, 2.25, 1.625, 9.1875, 7.125, 9.125, 5.625, 1.125, 7.9375, 7.0625, 10.375, 11.375, 10.8125, 10.5625, 11.1875, 11.5, 11.625, 1.0, 1.625, 1.375, 2.625, 0.5, 2.375, 1.75, 2.625, 2.0, 2.625, 0.125, 1.5, 0.25, 1.5], "error": null, "prompt_sha": "8df9ed2c640ef5bd", "prompt_len": 2048, "finish_reason": "length"}, {"text": "We need solve ARC tasks. Need infer transformation rules from examples and apply to test inputs. We have two tasks: 1818057f and 195c6913. Need output transformed test grids. Need analyze carefully.\n\nWe need produce final answer likely grids. Need infer rules.\n\nTask 1818057f examples:\nInput/output grids with colors 2,4,8. Output changes some 4s to 8? Let's inspect.\n\nExample1 10x12? Input rows:\n1 222244", "tokens": [1596, 1144, 11290, 67964, 8806, 13, 14235, 22846, 17454, 5426, 494, 9989, 321, 3668, 310, 1228, 10804, 13, 1165, 599, 1330, 8806, 25, 220, 16, 23, 16, 23, 15, 20, 22, 69, 321, 220, 16, 24, 20, 66, 21, 24, 16, 18, 13, 14235, 2468, 22773, 1228, 54455, 13, 14235, 22903, 15060, 13, 271, 1596, 1144, 7936, 1534, 4087, 4222, 54455, 13, 14235, 22846, 5426, 13, 271, 6065, 220, 16, 23, 16, 23, 15, 20, 22, 69, 9989, 25, 198, 2425, 45447, 54455, 440, 7736, 220, 17, 11, 19, 11, 23, 13, 8984, 4203, 1010, 220, 19, 82, 310, 220, 23, 30, 6558, 579, 23331, 13, 271, 12929, 16, 220, 16, 15, 87, 16, 17, 30, 5396, 6761, 25, 198, 16, 220, 17, 17, 17, 17, 19, 19], "margins": [11.875, 11.75, 0.5, 3.125, 2.625, 3.0, 3.125, 0.5, 3.0, 0.5, 0.625, 4.875, 1.0, 3.25, 2.0, 5.625, 0.625, 3.875, 0.375, 0.75, 1.375, 6.75, 1.375, 2.125, 12.8125, 11.9375, 11.6875, 13.1875, 12.0625, 8.4375, 10.3125, 10.5, 1.625, 7.25, 13.5625, 12.625, 10.5625, 9.375, 12.0, 12.6875, 11.3125, 11.0625, 2.0, 2.375, 1.625, 0.875, 1.0, 0.125, 0.5, 1.25, 0.125, 1.875, 6.625, 1.625, 1.5, 1.5, 1.0, 4.75, 4.625, 2.0, 0.875, 1.5, 1.0, 0.625, 0.5, 3.375, 1.0, 1.125, 4.5, 12.375, 5.625, 11.125, 12.625, 10.0625, 9.875, 10.125, 11.625, 0.125, 1.375, 0.5, 1.0, 0.75, 0.375, 1.25, 1.0, 1.75, 7.75, 0.75, 7.75, 2.375, 3.625, 1.625, 0.25, 2.0, 3.5, 2.75, 1.125, 2.25, 2.375, 10.8125, 10.75, 0.75, 1.875, 7.5, 2.75, 5.25, 0.25, 2.125, 1.25, 0.0, 7.125, 3.625, 5.5, 4.5, 2.0, 1.5, 0.75, 0.875, 0.0, 6.375, 1.0, 0.75, 10.0, 4.75, 12.625, 11.5625, 8.375, 11.4375], "error": null, "prompt_sha": "8750743e9dcadca9", "prompt_len": 2048, "finish_reason": "length"}, {"text": "We need solve ARC tasks. Need find transformation rule for each task and solve test inputs. We have multiple tasks: 247ef758, 269e22fb, 271d71e2, 28a6681f, 291dc1e1. Need output transformed test inputs. Need infer rules from examples. Need be careful. We can analyze each.\n\nWe need produce final answer likely grids for each test input. Need determine exact transformations.\n\nLet's parse tasks.\n\nTask 247ef758: examples show", "tokens": [1596, 1144, 11290, 67964, 8806, 13, 14235, 1423, 17454, 5728, 364, 1754, 3274, 321, 11290, 1228, 10804, 13, 1165, 599, 5081, 8806, 25, 220, 17, 19, 22, 797, 22, 20, 23, 11, 220, 17, 21, 24, 68, 17, 17, 10481, 11, 220, 17, 22, 16, 67, 22, 16, 68, 17, 11, 220, 17, 23, 64, 21, 21, 23, 16, 69, 11, 220, 17, 24, 16, 7385, 16, 68, 16, 13, 14235, 2468, 22773, 1228, 10804, 13, 14235, 22846, 5426, 494, 9989, 13, 14235, 381, 16097, 13, 1165, 628, 22903, 1754, 13, 271, 1596, 1144, 7936, 1534, 4087, 4222, 54455, 364, 1754, 1228, 1879, 13, 14235, 7995, 4581, 51192, 13, 271, 9764, 579, 4563, 8806, 13, 271, 6065, 220, 17, 19, 22, 797, 22, 20, 23, 25, 9989, 1420], "margins": [11.875, 9.75, 1.25, 1.5, 3.625, 2.125, 3.0, 0.125, 5.25, 0.875, 1.625, 5.5, 0.875, 3.125, 2.875, 2.875, 8.5, 7.125, 0.375, 0.375, 1.875, 5.375, 1.625, 3.0, 12.125, 13.3125, 12.9375, 11.8125, 11.8125, 13.5, 12.5, 0.375, 8.875, 11.6875, 10.9375, 12.25, 11.0625, 10.6875, 10.375, 8.3125, 7.375, 10.4375, 11.1875, 9.0, 9.8125, 10.125, 10.25, 10.8125, 10.125, 9.3125, 8.0625, 9.5, 12.4375, 10.4375, 11.0, 11.1875, 11.1875, 9.6875, 10.375, 9.0, 7.75, 7.625, 12.875, 10.8125, 11.375, 9.625, 10.625, 11.0625, 9.875, 2.375, 2.875, 2.125, 0.125, 0.0, 0.875, 0.75, 2.0, 0.625, 3.125, 0.875, 8.375, 3.875, 0.125, 1.25, 4.125, 2.875, 0.375, 0.125, 0.5, 0.125, 0.875, 1.375, 2.5, 2.25, 0.75, 4.0, 1.75, 2.0, 0.875, 0.625, 1.125, 3.375, 4.25, 3.75, 0.875, 0.125, 0.5, 0.875, 6.25, 1.5, 3.125, 10.25, 2.625, 2.25, 3.25, 3.625, 3.625, 6.75, 10.375, 7.625, 12.5, 11.75, 11.25, 11.875, 13.4375, 1.5, 0.0, 0.25], "error": null, "prompt_sha": "fc63e297d382cd8f", "prompt_len": 8192, "finish_reason": "length"}, {"text": "We need solve ARC tasks. Need find transformation rule for each task and solve test inputs. We have multiple tasks with examples and test inputs. Need output transformed grids likely. Need infer rules. This is complex. Need analyze each task carefully. Need produce final answer with outputs for each test input. Need be accurate.\n\nWe have tasks:\n2c181942 (one test input)\n2d0172a1 (two test inputs? It lists Test input twice)\n31f7f899 (one test)\n332f06d7 (one test)", "tokens": [1596, 1144, 11290, 67964, 8806, 13, 14235, 1423, 17454, 5728, 364, 1754, 3274, 321, 11290, 1228, 10804, 13, 1165, 599, 5081, 8806, 440, 9989, 321, 1228, 10804, 13, 14235, 2468, 22773, 54455, 4222, 13, 14235, 22846, 5426, 13, 1061, 369, 6150, 13, 14235, 22903, 1754, 3274, 15060, 13, 14235, 7936, 1534, 4087, 440, 15796, 364, 1754, 1228, 1879, 13, 14235, 381, 12995, 13, 271, 1596, 599, 8806, 25, 198, 17, 66, 16, 23, 16, 24, 19, 17, 318, 588, 1228, 1879, 8, 198, 17, 67, 15, 16, 22, 17, 64, 16, 318, 19186, 1228, 10804, 30, 1049, 11140, 3284, 1879, 10598, 8, 198, 18, 16, 69, 22, 69, 23, 24, 24, 318, 588, 1228, 8, 198, 18, 18, 17, 69, 15, 21, 67, 22, 318, 588, 1228, 8], "margins": [10.0, 11.25, 1.0, 0.625, 3.375, 2.5, 2.875, 0.375, 5.125, 0.875, 1.75, 5.875, 0.375, 2.875, 3.625, 4.125, 6.375, 7.5, 0.25, 0.0, 0.25, 6.25, 0.25, 3.75, 2.0, 2.625, 3.125, 2.875, 4.125, 2.75, 0.5, 1.375, 0.625, 0.5, 1.875, 0.125, 1.375, 0.25, 0.0, 9.625, 0.125, 1.375, 1.0, 0.625, 3.125, 4.125, 0.25, 1.875, 0.125, 0.875, 3.875, 1.5, 2.75, 0.0, 2.5, 0.875, 3.0, 4.75, 1.25, 1.0, 0.125, 1.75, 10.625, 1.875, 2.625, 0.125, 3.0, 3.5, 1.125, 0.25, 10.5, 13.375, 13.3125, 12.0625, 10.375, 9.625, 11.0, 0.125, 1.625, 7.5, 1.0, 3.5, 7.75, 7.0, 10.375, 13.0625, 13.1875, 12.0, 11.1875, 11.875, 11.1875, 7.125, 5.75, 5.25, 8.5, 0.625, 0.75, 0.75, 1.375, 7.375, 0.75, 0.0, 4.375, 8.9375, 9.875, 12.8125, 11.8125, 10.6875, 10.1875, 10.5625, 12.125, 4.625, 5.25, 1.125, 0.0, 10.875, 11.6875, 6.875, 13.0, 11.125, 12.0, 10.0625, 11.375, 10.5, 9.25, 9.0, 2.625, 5.25], "error": null, "prompt_sha": "49b3958bb234d4fd", "prompt_len": 40000, "finish_reason": "length"}]}""")   # RC2's recorded greedy oracle rows (traces/requests.jsonl), BF16 + FP8
+    GEN_RATE = 45.0                              # tok/s per stream used only to project window growth (RC2: 33 at 8, 70 at 1)
+    PP = 2                                       # pipeline stages of the profile: one engine step = one micro-batch (C/2 requests)
+    TF_BANDS = ("2k", "8k")                      # FP8 self-consistency only (< 2 min); the BF16 / FP8 isolation is NB0's
+    TF_P = {b: PROMPTS[b][5] for b in TF_BANDS}  # RC2's TF prompt (variant 5)
+    RETENTION_KNOBS = {   # Merlin source (ad42e37), recorded, not changed
+        "MAX_GRACE_PINS": "16 finished turns keep their cached prefix referenced (kv_cache_manager.py:735, class constant)",
+        "MAX_PINNED_WAITERS": "16 waiting requests' hits pinned until admission (kv_cache_manager.py:940, class constant)",
+        "enable_grace_pins": "enable_caching and partial hash hits (prefix-match-unit 64), kv_cache_manager.py:234",
+        "VLLM_E2_SCHED_MISS_DEFER_S": "120 s default (merlin/envs.py:40): a cold miss may wait for protected waiters",
+        "VLLM_E2_SCHED_COHERENT_YIELD": "on by default (merlin/envs.py:41): need-sized, session-coherent yields",
+        "reset": "/reset_prefix_cache (VLLM_SERVER_DEV_MODE=1) drops grace and waiter pins when they alone block the reset "
+                 "(kv_cache_manager.py:1107-1113); it fails while requests run"}
+    for _b, _n in (("8k", 34), ("40k", 16)):     # distinct prompts (RC2 has 8 per band)
+        PROMPTS[_b] += [prompt(BANDS[_b], v) for v in range(len(PROMPTS[_b]), _n)]
+    BANDS["60k"] = 60000                         # residency probe band (addendum 7); RC2's PROMPTS bands are unchanged
+    PROMPTS["60k"] = [prompt(BANDS["60k"], v) for v in range(8)]
+    MAX_NEW["60k"] = MAX_LEN - BANDS["60k"] - 512
+    RESIDENCY_BANDS = ("8k", "40k", "60k", "90k", "116k")
+    V_CENSUS = {"8k": list(range(24, 32)), "40k": list(range(9, 13))}   # never used by a steady window in the same boot
+    V_PREFIX = {"8k": 32, "40k": 8}
+    V_ABORT = 33
+    SUFFIX_TXT = ("\n</think>\n\nI have a first rule.<|im_end|>\n<|im_start|>user\nCheck the rule on every training pair, "
+                  "then give the final test grid." + _tail_txt)
+    SUFFIX_IDS = TOK.encode(SUFFIX_TXT, add_special_tokens=False).ids
+    R["prompts"] = {b: {"n": len(p), "len": len(p[0])} for b, p in PROMPTS.items()}
+
+
+    def psha(ids):
+        return hashlib.sha256(json.dumps(list(ids)).encode()).hexdigest()
+
+
+    R["nb1_prompt_sha256"] = {b: psha(TF_P[b]) for b in TF_BANDS}
+    _osha = [psha(p)[:16] for p in ORACLE_P + LONG_P]          # RC2's own prompt_sha formula (16 hex)
+    NB1["rc2_oracle_prompts_match"] = {k: [r["prompt_sha"] for r in v] == _osha for k, v in RC2_ORACLE.items()}
+    for _k, _v in RC2_ORACLE.items():                          # RC2's recorded rows become references only for identical prompts
+        if NB1["rc2_oracle_prompts_match"][_k] and not FAKE:    # (the fake server's text differs: it builds its own reference)
+            ROWS["rc2_" + _k] = [{"text": r["text"], "tokens": r["tokens"], "margins": r["margins"], "error": r["error"]} for r in _v]
+    NB1["retention_knobs"] = RETENTION_KNOBS
+    NB1["sampling"] = ("every request passes its own sampling (greedy: temperature 0; load: T 0.6, top_p 0.95, top_k 20; "
+                       "Merlin's --override-generation-config is T 1.0)")
+    R["capacity_plan"] = {
+        "rule": "blocks per running request = ceil(L / 4096) + F, F = 6 (3 mamba groups x 2; RC2 analysis: 149 / 3.92 = 38 = 32 + 6, "
+                "live transitions 6.0 / 6.1); a finished session keeps floor(L / 4096) + 3 blocks (up to 16) until re-admitted or yielded",
+        "rc2_pool_blocks": {"fp8": 149, "bf16": 78},
+        "worst_case_F6": {"8k@8": 8 * (math.ceil((8192 + 8000) / 4096) + 6), "40k@5": 5 * (math.ceil((40000 + 8000) / 4096) + 6),
+                          "8k x 8 hold (cold sequence)": 8 * (math.ceil(9000 / 4096) + 6), "40k x 4 hold": 4 * (math.ceil(41000 / 4096) + 6),
+                          "90k x 5 admission (max_new 3000)": 5 * (math.ceil(93000 / 4096) + 6), "pool": 149},
+        "retention": "every capacity test starts from /reset_prefix_cache (retained sessions released); windows record the idle "
+                     "(retained) blocks before them, so running = used - retained",
+        "highest_levels": "computed at run time from the measured pool and F, never above max_num_seqs read from the server log",
+        "tf": "B1 only: 2k + 8k FP8 self-consistency (teacher-forced A/A + greedy cached-repeat), < 2 min",
+        "c3_note": "at BLOCK_SIZE 4096 the attention page is larger than the mamba page (RC2 log: 'Padding mamba page size by "
+                   "21.01%'), so bf16 SSM state cannot change the pool's block count; B2 records the smaller minimum block it allows"}
+
+    # ---- trace classifier fix (A7): QSA / Marlin MoE / top-k before the generic patterns; GDN '(anonymous namespace)' is
+    # already handled by the lab's rev 3h _cat
+    L.CATS = [("nccl_sendrecv", ("sendrecv", "send_recv", "nccldevkernel_send", "nccldevkernel_recv")), L.CATS[0],
+              ("recoverssm_commit", ("recoverssm", "commit_", "boundary_fold", "final_fold", "conv_compaction")),
+              ("qsa", ("qsa",)), ("moe_marlin", ("marlin_moe", "fused_marlin_moe", "moe_wna16")),
+              ("topk", ("persistent_topk", "cooperative_topk"))] + list(L.CATS[1:])
+    L.COMPUTE_CATS = tuple(L.COMPUTE_CATS) + ("nccl_sendrecv", "recoverssm_commit", "qsa", "moe_marlin", "topk")
+
+    # ---- RC2 long-row gate, stricter (audit 2): a natural row needs finish == stop and a closed think; forced rows
+    # (ignore_eos) are stability tests only. NB1 runs no long rows; the reused gate is fixed for any later reuse.
+    _long_quality_rc2, _long_gate_rc2 = long_quality, long_gate
+
+
+    def long_quality(name, r):
+        q = _long_quality_rc2(name, r)
+        if q == "PASS_LONG" and name == "natural":
+            if r.get("finish") != "stop":
+                return "INCOMPLETE_NATURAL_FINISH"
+            if r.get("think_closed") is not True:
+                return "INCOMPLETE_THINKING"
+        return q
+
+
+    def long_gate(o):
+        g = _long_gate_rc2(o)
+        lo = o.get("long") if isinstance(o.get("long"), dict) else None
+        if lo and isinstance(lo.get("forced60k"), dict):
+            lo["forced60k"]["counts_as"] = "stability test only (ignore_eos)"
+        if g is None and lo and any(v in ("INCOMPLETE_NATURAL_FINISH", "INCOMPLETE_THINKING") for v in (lo.get("long_quality") or {}).values()):
+            return "INCONCLUSIVE_LONG_INCOMPLETE"
+        return g
+
+
+    # ---- the #60490 backport + the worker extension (written before B1)
+    P60490 = "# vLLM PR #60490 (issue #60489) rebased onto Merlin v3.0.0 (commit ad42e37feb7611c4ffd24017bf20a7e2dc94c6e5,\n# tree 07c16a79d077f1e06c19d0eea84efd64f0b63540 = the tree the Kaggle payload installs, install_merlin.log).\n# Same code as upstream; only the import context differs (Merlin's import block). One marker comment added.\n# pre-patch sha256  a23d5f90507ad5185f8b8e8d6ba13ae0cb53b2506264fdfbbf6a60b1171dc653\n# post-patch sha256 88fe0a8f4dd2ef90fc6aefb5771b5b48e40c0b1d575039283c52aeca19b8bd6b\n--- a/vllm/models/qwen4_exp/nvidia/qsa.py\n+++ b/vllm/models/qwen4_exp/nvidia/qsa.py\n@@ -18,8 +18,9 @@\n from torch import nn\n from transformers import Qwen4ExpTextConfig\n \n+import vllm.envs as envs\n from vllm.compilation.breakable_cudagraph import eager_break_during_capture\n-from vllm.config import VllmConfig\n+from vllm.config import VllmConfig, get_current_vllm_config_or_none\n from vllm.config.cache import CacheConfig, CacheDType\n from vllm.distributed import get_tensor_model_parallel_world_size\n from vllm.forward_context import get_forward_context\n@@ -45,6 +46,7 @@\n )\n from vllm.platforms import current_platform\n from vllm.platforms.interface import DeviceCapability\n+from vllm.utils.math_utils import cdiv\n from vllm.utils.torch_utils import (\n     LayerNameType,\n     _encode_layer_name,\n@@ -75,6 +77,7 @@\n from . import model\n from .indexer_qsa import QSAIndexer\n from .ops.qsa import qsa_e4m3_uses_native_cast\n+from .ops.qsa_indexer import _TOPK_WORKSPACE_BYTES\n \n logger = init_logger(__name__)\n \n@@ -782,6 +785,31 @@\n         if isinstance(metadata, list):\n             metadata = metadata[0]\n         if not isinstance(metadata, dict):\n+            # E25 NB1: backport of vLLM PR #60490 (issue #60489).\n+            # Profiling/dummy run: the indexer allocates its selection scratch\n+            # on demand, so touch its peak here for the memory profiler (as\n+            # sparse_attn_indexer does): the prefill logits budget or the\n+            # worst-case decode logits [decode tokens, compressed columns],\n+            # plus the top-k workspace.\n+            logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024\n+            cfg = get_current_vllm_config_or_none()\n+            if cfg is not None:\n+                spec = cfg.speculative_config\n+                num_spec = spec.num_speculative_tokens if spec is not None else 0\n+                decode_tokens = min(\n+                    cfg.scheduler_config.max_num_seqs * (num_spec + 1),\n+                    cfg.scheduler_config.max_num_batched_tokens,\n+                )\n+                block_size = cfg.cache_config.block_size\n+                columns = cdiv(cfg.model_config.max_model_len, block_size) * cdiv(\n+                    block_size, self.indexer.compress_ratio\n+                )\n+                logits_bytes = max(logits_bytes, decode_tokens * columns * 4)\n+            _ = torch.empty(\n+                logits_bytes + _TOPK_WORKSPACE_BYTES,\n+                dtype=torch.uint8,\n+                device=output.device,\n+            )\n             output.zero_()\n             return\n         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])\n"
+    P60490_REL = "vllm/models/qwen4_exp/nvidia/qsa.py"
+    P60490_PRE, P60490_POST = "a23d5f90507ad5185f8b8e8d6ba13ae0cb53b2506264fdfbbf6a60b1171dc653", "88fe0a8f4dd2ef90fc6aefb5771b5b48e40c0b1d575039283c52aeca19b8bd6b"
+    P60490_MARKER = "# E25 NB1: backport of vLLM PR #60490 (issue #60489)."
+    NB1_EXT_SRC = (lambda _t: _t if hashlib.sha256(_t.encode()).hexdigest() == "a258e6a1595f4fb7695f0949298158ef62c478c5c0ef58370c24660d68142fa2" else (_ for _ in ()).throw(
+        RuntimeError("NB1_EXT_SRC sha mismatch")))(__import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;8QOc2weaXXbna~Q3)_)a?O~7&8s&XzCrDUt$=>+AW^&O`u)m#g}wasYu6yziojx^fdlzib|`tVSZ!7j=mk{#>a}I2B*tnxVF|^0b_hG(N<&EA(FGYC2|8MwvElLUfib7m-MSKl6EQ{lF}xbgJL7kvZ7ewB^?M*n1-%AU;SUbD47>A$+pJ0E%wrYu@Nmb)VnUw>Fe*^ieWq+;b3WNh*=sSXY3`^l4kKGp(Xu}+a%KP5EMFO3ng>O%pyW7uh+RsmX)w&4`P20>-~z_=$wD!B{8+%APE(zV*Zndo@9K~{JPIgBE6N+=XU*6Y8@thuiqKM`*OWtEmo!t7n7*hlJW_)L1?$&ML~|e^bBT<AwgX^^YEbB%-Lmpy*XoAWeEg`fnPgnsu5En`YdPX76~p4QyK8eLm6LP|zq5|Mb8CW?D)8bYr>J}UVSHU+B~|+RzT=;1lVLpWqwQ&lvxRWTtgDIdEhIIq@WWcNOlMA+LiQzPG)8B)&bvR&+}}3YJ1r&s;#If;Wl;dccZpjeSBPV2pdq1juSt2md{=xf7U;ZdKmO3LEq>$0DI}V1X{2GaloO<FyLz8!;DjuP@bN->rX7w(F2yRSQSE_Dr6}SUdp`ZHBZDiI*I2zHP<)#?zk*ZIY8tuK!2?d>Yev^xdCHR8H^R%IPU&Z?j`~=)T@z7-IAjjZQoc>1y{Fw}?M-S;K<Cp5I-ka*ZNy?+*qaRtyVdpeVs>lkZ*ZC~m#hX}%4=JT@d~IQOvh1*m(9Xp@~tM!Lk|0|KmD&<T}Egao4|9u)51UHhyw_tP^3U}MOzzD3@7|}?kPC`#HK$_`;Fkoq+g3<@#sYg=}Vd*(YBF#L|cKa^Vb@!nc-&*!5ELk<#Q{7G;CDI{<?gDZZtCNQc*1S$w`#=_$OuoH<MCi;>A-#m@2DG6A5QWCZNZhj&EOu%Bs6VMGcucouf%DSl$gdN&?!Ngl_Z$sj55^0s!)^ewT)_(UZbAIHn~0%=(y@jS913St?%oO?56SswWd+du2Knf?P2M<6ICSoa3|dXx}uP#S1p`6XfW=FXErd!;N@b$b*n$M9aMK-k3NS(i~00@WNPUb7$6kB&h6BCV*1-VZkV`Hfea=D8ZcAPE=F$p$ZyMcS8qWdXKj5HV>u5M`DuxY$DdzE#<wpPE>OdUabdnW;RE)-y|7@(<{z+VCf5VW=I5}sSv#SwpDr*4nm2St|1P(sY=ntwI}q{P4PWe1Ot`BhXH!`n|`8v((uRHrZUH1e~?9cwk~_A<nNrc{nBP{wL-ld0{5e3>036~7zo`9c_GhGQl!JOO@o!J6x7tyUYu7wIwGtvek7VlUvG5|%m`}`Sf3J2PdpTdU_riLA9t{&DnyD$U{SHt{z~XL8V!#%vRK~H7gI9Sy>yJK+i1YzFR>{(bF*>3K(_8uFMM1u8@LlZY!WOgNn26LO#zYWFm-;HM09*sw`I)bKM%4*4nEv~%$-#Z#8Os+Yf@1!EA`yE*370KLYVUvF(jTs6DhxQz37))ei*83pJ)qCqxh5m{*`;29PrCL2D!2AD=37YSZ?LG?{aJ|RC~Q=5u1@CkR%z4``;Uws{mNTR@|h2a&S7Ia(ZLADFQX3|BJX>KJWwxgc!UJ$({iYEj`k|Q;k%4t)JnZLGWe`>JVA9V|%=DJPn+5esiHn?&eXP4+XHUhSW(#1XE|PtJApty1(a<zTMsq=$Lwy-MiHJD!LJP6rW*K)eFEO{R?t4EKsL8^N1J;5mvutl;zkG<f6_kb!dH~`<y8N+=vq~CUv}!dD9t|4UV6udk8@M{MJ&=cb*gHP9FRBu?0D=)fJ%KLi*QT(rwW5_lGx=P1wvA#W7`bppY2;$AAc}Z2q>p+Ka!#2oTIWuAuZL!0Pbet#g-E2h_Q&V(MwJ*rQj12x1=Is87fWj-R95-kar}sCnSu$5ItEt%z#*efUvWfSC`d^C4)FVnwce^_l3$bmPDU&XH))3jt=#HD<wMD&C7~;TTq?H3co6{HbeTFKWCakJj=(Rl?`1a+H;aW)>2>6^x<voBy?iwK!QgSBgQv+J}{sK=o)crR>OtHQ>;xeU*~@&~%KkT8=?8j7We<bbKwe+1YDXQo1b)T&KZp+jBYBut~~9IY9Ba@tL(k8m@Y6QoJn{UAPi10knTDoCcr)qitTd+v8X!2J`737M=j76an_iVHD>qma{ED(XZ=@NFbUE{APV%zrLN}PDKo~l$l`n?;wiqx<Df5YqAcA6~Wm+QF347D7Ba$rg6>xZChUZ_N}ZKb<vJYX5T0G_`8i|)GzKj8CnEx`9Q#tMJ}06VkH~{DR^y!r|aVXWce(|mXKzPXzuVp!wb?dpRwBxQTmtZjvT)BX)?<yJP6kcWM^|T@%h=#9{5I;$z-iz+lB;80t`h>>HNC02MJbQP*q`xwW^mwjdS4%B&d?23IirKU1(3rL*$E6sYS8{)!<lSj+i9H!Z2X*26Ek-ySt=OY@`M)q+iinc?ZwkE9v34^J)*|7u-)HA4XRXQ*64trh1mAF>I2pEX0tYU1q2az-%ZAmuI(aJKp%p`uf$#mc=@ZV8<3fvF(W8!_zR3!?(P@#S$@g27#H*%lJTq%?RhE$!{gy$h(|@D>v#Kc;je)WB+E_ys2$}_bS`-2eI!xs(^C5;W4}@+VIY&npUMF1@XXqut-&pM<-)ar8F0z<)dR{?3dhv!vi(2c#FUrDBU{EJ=SH15YfOzas`AYRLNx&>Kv(z;@)-XliL4zpcP0gCm4ZG<8Yap>prPFVOK9cgT^ab8&}h+>7Kfo!eOuONo4#cVq=;Qg^kE_sD)Il>bWRz-)hT0H+htF6Wb|Ty(qg`u_IGb(TTK_u%MroIChOv?0?H3c_9IE_6c;6$y}O_(ueq{#GeJ1@Z`>@T*Y)m;X~I@)p|=71ItPXD#$)X<|qD)mhXK57LTvf5Gw1@eR4(fE_bqsFlWXx?VpCo{6LqW9E@$~Q?LxJ4>o001l+K-+Y&-o>m}Wax+CD;B={;*H3cm?UE5(2bwW_ApC;)Le-5e=pn-q!r}H;m*|8TR>v0R%?1Tm3AUL=%8umKK4g}~Dht4PZtqDY?3jS&gAm@%=S6B|>xODW+bdC@cXFw>`%I*S@3R<21UQa+MtE##EuvtuFfCf&eq!Ko&4RY*t6Eb@ljC5P#Frv!v+lCieDFMsQ;=cSYyNFDA4L&6;w4P~A7EoL~K7*^2C$4~$L0L7oC@Yl!d4ijxVPhWpVvrW4L>iRddyp9W&zZvRemSp#$gzENebd+zD2*=5_94Gk@Gr{BYq4<hLYL1NjqIbX_v@#`l0L&f=ShoESwJlw*eBeZ8r&lT8pEu(r~<xs#q^<nFehgpk9+AH<lLPaCt*r^g^?qULGf2y9T}oMQp2gcvS1Vt^{S-0@L0-5xqcYYNX$z*(C(qb#MVy(Y7-GW0O`?z+Eq2Y@eYIpi;<0M$$pMsp-tp))queC#fLa@6&2hGRFMEb+YD(LKZp11_gTMvxG0IBBk6oeP+|w**Gh=TjF-TFg#{TF*Xhxzle!~x4ij?l@xdtQwo^K9h=!00sm*t)d~QNTxb?YTM{*j3v@*u`k>x33MMbRJp5?(6S8o?6e5@?|CQt1H?Mif~wx0_h@pNS}vaFIiC<v_Y`2ZY^K9*C<>~DF%KBe}4@g}4a!N&m-<f3nZ<iQ9t<Xd?ycIr3XojND-oiAow?i7*!OJKy9yd#mQzGSp%dy7r$7~FnopRAvul18d9zKPW&AA$pU8#V69HuX)uMHD9$hd~}T?K}JmO8qb+*xGR^q7P+A>q>S|BKokPEykf;WNYedrpZlW7l1ZcxRBA1*T#9yus@!TSqPS)o#1f?lU$lK#GN6UAtCc+a)`>TxiX;4d#@)cv5|)WSr2D|q|RR~mP$+{8PQ!Q<4wm2{B{@C>YE=;v0;FXS{0RM1a}v`^dz%S<#t<>?j%H@Zm=z2%^OBhB<jm4z`#(=sJPde?x0KNBZ2R;%~=z@-U-rT8RY3}@~4%^H%aEGe=Li>`C%Rkp+O2MrBB#^QxteH5QJu6EWA;JO768Y6L$?;yOn<DXrM%<j~}_wZj)38QIO;E1!Zh$y66y(48((-TTQ&p%f(WGy+47;njIDZj|^muUD+e&0g9uvJTFcEVvKAg&AH=DhST~D0*(G{`#MMN(bPll!j1!vTicHN{i|v*e?PC9Df@919npwgOtYXP8qJH2Om$K{lhHsuc!{shqqXdpPlcD1OKu4}>w5|cIit(;YXbirF+fHpj+EUGdSk*riI5L?j6q6zI~f3CUpErhT&0A|rUTXKtm0aCwIfKpK5FclG`2hly}q&AlsjwGD3@YH^Wf63{}EXf0Fu5xFsR}XO$(t-&s51vJ0plfR?Q4omh13{95#C)f~PZqBhH$0_-pmDWwcI}jLmU%CODm15~+Ba+!wl#2o5(pblU&xo<ce<u#0KaRb1C(^GO?iv^$B(l1-aMa*2tuFanWmI-Z$HyukuMV~nW_H)Qc6sGYl=4OzXc=vpffHGte&2@gvlxR>-1Sy5rR^w6IqsBon`a>zM_L@`Zbd4)nYsr{}Fw1Rzz3vP;iNVA<n4(az1Vi>VArWE@i6l>(-4>&_`7?OrA5V)K@@ybFc_lL5wk+qyT*SZykPRV7K@iqj5EkSnshzY1<bo(9jkXDtZ<&hd1WPnLEHcS|HI|Nyj7bCogzGaHlEddspv)JdsGFk;uSw=M4KayVTVk`$<hg|;MkrjllWE$CN#%fB`uf~6|wLoqg$^aGy9mCM`S;EFKsPW&5kh&0WY{||Ng;c1u(3NjFQ-a4Tltg)vjILa^>EvH~q(v2%xsj^a0|)qV)8=@Fk-!87K&tE(;9S%il}2p(P=Ci~&B=lX(B!x7s9Kw4)!bw`w<bCnML+WlyGP6tQXp2pE43%6CHP;FF_0MwsA?_SCQ@=t7C}vFw|l07BlQ{~4N0qGC4EX{Db<&%Bg2K1oM!5^!}Voodp|71-Dq$~DC=$E{F=HkMtiU4N~St(ut3Rmzcg*3T;uH!zi&lXnlB+R$dZx&GZ&RSa&SfIXpsl#s=9#Dvmg6x??7;^4jZ!a60ow)jAa&&Zug3>kcyh#&O*c=Xx(BOCS!xrTp4eKM~E~egpo9UI*Mu$Y3ic0eUy9JVjO~`zQt8gYYM@3Jy^6M0+6+0K!g*vrFO#-7CgctU-})$?p#H^^~Pu&Fgm^wnj&T~!e>Lv*A@<zJ%rEkOm$Ia=_t}KQi9rqnd15-8J3;xr1C*4jKb!&!pz`4Q7du9Pmxa|JJ#r(%4g3>wELDuHHfp(qq7V!2C=TrF4;Lz^va3A3~S6o!?MY_fd8>6*y|0DUN~!$jH2=fl{yL`i3qGVNKupYBGW}Z2{aY*JK4cPJFUTYI7SNN`2CFL?EE<JD?HBTEr<33ykQLWHFeElw?s{Cwt|emS2}MnVE@ZR^^t`HU=VdwNT5rD5I^|oh6_`)48=%-nof;@7__@hnp^^?AfuoSqNWc-*Y>u^1-dhP)J+|H`1`wRJ@}DZHc;hzz4?qk^Xi8~)4`AKhzKoLUES=eky8tC=~Akg0ND%A4yCr|&nlSRoDM?=9w*6J!bc+=($Kk>oxBT@b)-Mn<}p99wRO-BPW0Ab{r{oO8fEE<yi(CkMf&geJiu+PogNNpkV?(o^Th$hV;xq|Vr@+o`2sVA4&eMON%l}pd<FaOhKHjry5{^|+JCYq+<H2RsMHsnum#4>xFyI$&P4m@p~M&+JUkY8q<^$W<fafpX)cM;CY#<$z{2RfoO>_v8k<lu9%O<;<dHtO8XEzOL!5V7{!q-)p!a5*pXF=Ds-U$x&u9g!WbUOSpoZy%y3j`P{+)Olo9q6OBUS7IP)kw(0~UJRj=c{yqAqxV@}>W*Jsn&VhVteZhGCU@h-bKay16yrFLBwn7qTi|n*aKvWAI{us$WT12cBUTp{schzcv%yDvgaW>O-i&PY~6t-QmB%B;bO&=`OzLfpiU2jTrr%bq6oS8teG{JXju0Ek~Fh?t}wp6@muEqDVF?n7+9!W%A`#pvqcSmUpPS5znxYknjio*7;YP?4^16%WgcgA&T49vPovm=DEe5_CPCn_$)g#HA~LHe+g)bPAg>*x92fE#^n7H1V{f3$iQz4ma%<rTMxRE{Ccr*l4;QE+qHb-GN9*58;O8&o5KSq8&zD_j<I3q;;v;$0^(1<AHW=<Kb4eLr)j};ZoDai+lkrmBveWudi}|cS7jdRaY~?pq@$+&%XQE;vk97Qw*R>e_1$4<sX^c;!Rq{aSqm#Ypx6Mo4>0kU-TID426z0VVMz)2q0<cQP2O1a2+HY^VoBtT-v%{?2UE^q1qq`RI4=zo(;%9{j7CHo6{t9eHe2s$Rnf0y+KgqM3+K|(VCW>$cFPH6LTM4WsYl0xG|pD6!V*a*&ct^IHh1R(U1(D(f&&c@W!$-M?ST%VJ>E_gt$&RplxFeaEO!I4<vESL)TYpi4pSdrNO!eH+y}xR20ZRx?4nw0!w7VC+lEAGe|M^VtYe-N2*8E!AIpuzEH9>}4?0v~&^w0cirp8sj1RZChTNY$Bn5gAJ@E<gG4o_;Wh-EDdxgy+ca}E_P<YL&wSxA{aXmfg_@S_!WrS;dtLN#v7KyJFpZLn*5c*g^*WVO1I-7!);9*|YmA#bQgGbwDA|C*5BwIk7RG5$dQinLiz$sHe29pFum#7kkMy-&G6PBFW_TMLNp0k)M$-Etl9L>0j;{IJV;0^#0J8;YC?hq|F+n+dB6$eN~Bs!rI%9Hi8*1~{Db*_<&&{EC%)0})B%{ye?%)uL~1OL?6#sF_N-^mHl=I?t>WYnJ3%M&O!1E|U`tEu%mX+Oi&4!tWQbt3VMay>vW=qW|VK4G>qGws({9KV&HdAj33{-As~c*LvXIDICEFVN4`h;U45Nf@B;>EP4W)Xsu9Yo%%ZZ{0OVGEC*C(26TiD8r^x8a};;SCwd4YH@-EmS~{_e()Bz1Nl-{3&H0IGR;*<%D8I;3cyY3hl-ogNt0AVsE1$17R%`RxE%z9i;sCx%|btD<xJc3JbYrU3LV&ff6~i-&J};)-r?-@cS*FGdV~gJ8Ny26jOz=djCx>nh>QRz1+U{$8vY8>HlC7!U3=G=y61fJ)b_3|A%m1EI6C)`)}jRr3N<hgqvj3Kg5dKtIs7D4@4{q(&iVHK!SH7|UuU32aRE63`A`u7MG@vL-5WwaYDl~?>1I><@tO1KfDr4#&z}}^%7z=lIjUWLw%;{v#|;eCWpj{l?I<>;jD>R$+iL|F^qij^XsL)dRrHR*)F?-$0A@rKm;1-Ev9@X@(Otc$;F@oh<4ym1MOM`(%JYwM;4T1qwg~%)evsChBfPGu-#?Rnw})D*YDmiz_587Dx$UmDhVJXQ8OKXxt#ot@U8&z0Etn&;<+rQ18BBtsfpf6fPF`BE4utr1uqql?cl@QgP&s=~ubTV5U7?yQWUL)kP+E3)?=_W#%OvVFa<PwU_<qyflEB1pO#0v))XKOg)FV#6gxY!h`$pmmZ*IvQ^#g(nV_PPeatrhFBPNvfIuw5=bbJmC=J;;alMU!`!vysIfT?KYagCFaubOloAvE=akgaFwX#az%JE#kBcX%1THmhVs3%eaT%?RgK<}(r0fm|)m`6gKCZB*2q!R{t$&h^^6OwbxwILh3`it(?I;pl(aJ{}lMa9$EUmIPJote~zX=61U;l4ILPd<rj_<YlXP6i)eKea)wZGon8(G*?5k9b`ZsjOF>dYWil+gYMxz$6G}MZY*9`2D`3iM>mM#<RBzU>R>VhxvR4P8UwO4s7Ttjmd?PI8F%eTsDlOwe>2lZ@;hMik@#M0Kv?(cW7#GL-H7Y}Z3-SdlHK4300E>hu%-b3s$pe0vBYQl0ssI200dcD")).decode("utf-8"))   # E27 K100: NBDF's extension (NB1 + nb4s_env) + klee100 LOAD rev 3's method map / kv scales
+
+    def apply_unified(text, patch):
+        """Strict unified-diff applier (no fuzz, no offset): every context / removed line must match at its stated line,
+        else ValueError. Lines before the first hunk (comments, ---/+++ headers) are ignored."""
+        src = text.splitlines(True)
+        hunks, cur = [], None
+        for ln in patch.splitlines(True):
+            if ln.startswith("@@"):
+                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", ln)
+                if not m:
+                    raise ValueError("bad hunk header: " + ln[:80])
+                cur = [int(m.group(1)), int(m.group(2) or 1), []]
+                hunks.append(cur)
+            elif cur is not None and ln[:1] in (" ", "-", "+"):
+                cur[2].append(ln)
+            elif cur is not None and ln.startswith("\\"):
+                raise ValueError("'No newline at end of file' hunks are not supported")
+        if not hunks:
+            raise ValueError("patch has no hunks")
+        out, pos = [], 0
+        for start, n_old, body in hunks:
+            i = start - 1
+            if i < pos:
+                raise ValueError(f"overlapping hunk at line {start}")
+            out += src[pos:i]
+            old_seen = 0
+            for ln in body:
+                tag, s = ln[0], ln[1:]
+                if tag in " -":
+                    if i >= len(src) or src[i] != s:
+                        raise ValueError(f"context mismatch at line {i + 1}: {s[:60]!r}")
+                    i += 1
+                    old_seen += 1
+                if tag in " +":
+                    out.append(s)
+            if old_seen != n_old:
+                raise ValueError(f"hunk at line {start}: {old_seen} old lines, header says {n_old}")
+            pos = i
+        return "".join(out + src[pos:])
+
+
+    def apply_60490():
+        """After merlin_install, before B1: patch the installed tree's qsa.py (pre-sha must be Merlin ad42e37's), verify the
+        post-sha, the marker, a py_compile with the Merlin venv and that `vllm` resolves to the tree; write the read-only
+        worker extension next to the tree's vllm/ (on the server's PYTHONPATH). Any miss raises: no boot is started."""
+        if FAKE:
+            tree = os.environ.get("NB1_FAKE_TREE")
+            if not tree:
+                raise RuntimeError("PATCH_60490_NO_TREE: NB1_FAKE_TREE is not set (local harness)")
+            tree, py = Path(tree), sys.executable
+        else:
+            eng = merlin_install()
+            tree, py = Path(eng["kv"]["MERLIN_TREE"]), eng["kv"]["MERLIN_VENV"] + "/bin/python"
+        f = tree / P60490_REL
+        raw = f.read_bytes()
+        h0 = hashlib.sha256(raw).hexdigest()
+        rec = {"file": str(f), "sha_before": h0, "pre_expected": P60490_PRE, "post_expected": P60490_POST}
+        if h0 == P60490_POST:
+            rec["applied"] = "already_applied"
+        elif h0 != P60490_PRE:
+            raise RuntimeError(f"PATCH_60490_PRE_SHA_MISMATCH: {h0} (expected Merlin ad42e37 {P60490_PRE})")
+        else:
+            new = apply_unified(raw.decode("utf-8"), P60490).encode("utf-8")
+            if hashlib.sha256(new).hexdigest() != P60490_POST:
+                raise RuntimeError("PATCH_60490_POST_SHA_MISMATCH: " + hashlib.sha256(new).hexdigest())
+            tmp = f.with_name(f.name + ".nb1tmp")
+            tmp.write_bytes(new)
+            os.replace(tmp, f)
+            rec["applied"] = "applied"
+        for pyc in (f.parent / "__pycache__").glob("qsa.*.pyc"):
+            pyc.unlink()
+        data = f.read_bytes()
+        rec.update(sha_after=hashlib.sha256(data).hexdigest(), marker=P60490_MARKER.encode() in data)
+        ext = tree / "nb1_worker_ext.py"
+        ext.write_text(NB1_EXT_SRC)
+        rec["worker_ext"] = {"file": str(ext), "sha256": hashlib.sha256(ext.read_bytes()).hexdigest()}
+        cp = subprocess.run([py, "-c", "import py_compile, sys\nfor f in sys.argv[1:]: py_compile.compile(f, doraise=True)", str(f), str(ext)],
+                            capture_output=True, text=True, timeout=300)
+        rec["py_compile"] = {"rc": cp.returncode, "err": cp.stderr[-400:]}
+        origin_ok = True
+        if not FAKE:
+            envp = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            envp["PYTHONPATH"] = str(tree)            # what Merlin's build() exports for the server
+            cp2 = subprocess.run([py, "-c", "import importlib.util as u; print(u.find_spec('vllm').origin); print(u.find_spec('nb1_worker_ext').origin)"],
+                                 capture_output=True, text=True, timeout=300, env=envp)
+            rec["vllm_origin"] = cp2.stdout.strip()[-400:]
+            origin_ok = all(l.startswith(str(tree)) for l in cp2.stdout.strip().splitlines()[-2:]) and len(cp2.stdout.strip().splitlines()) >= 2
+        if rec["sha_after"] != P60490_POST or not rec["marker"] or cp.returncode or not origin_ok:
+            raise RuntimeError("PATCH_60490_VERIFY_FAILED: " + json.dumps({k: rec.get(k) for k in ("sha_after", "marker", "py_compile", "vllm_origin")})[:600])
+        rec["ok"] = True
+        rec["forward_test"] = "B1's greedy oracle vs RC2's recorded FP8 rows (unpatched RC2 FP8; B1 adds text-only): B1 oracle.vs_rc2_fp8"
+        return rec
+
+
+    # ---- host memory: previous engine gone, our leaked shm removed, page cache dropped (measured), Merlin's rule
+    def cgroup_snapshot(tag):
+        """memory.current / stat / events / pressure (first 12 kB each) to hostmem/<tag>.txt; key numbers returned."""
+        rec, txt = {"tag": tag}, []
+        for n in ("memory.current", "memory.stat", "memory.events", "memory.pressure"):
+            try:
+                s = (Path("/sys/fs/cgroup") / n).read_text()[:12000]
+            except Exception:
+                continue
+            txt.append(f"--- {n} ---\n{s}")
+            if n == "memory.current":
+                rec["current_mib"] = int(s.strip()) >> 20
+            elif n == "memory.events":
+                rec["events"] = {a: int(b) for a, b in (l.split() for l in s.splitlines() if len(l.split()) == 2)}
+            elif n == "memory.pressure":
+                rec["pressure"] = s.strip().splitlines()[:2]
+        try:
+            (HOSTMEM / f"{tag}.txt").write_text("\n".join(txt))
+        except Exception:
+            pass
+        rec["host_mem"] = host_mem()
+        return rec
+
+
+    ENGINE_RX = re.compile(r"vllm|PleOffload|ple_offload|EngineCore|merlin_off/venv", re.I)
+
+
+    def engine_procs():
+        """Processes of an engine (vLLM server, workers, PLE offload) other than this notebook; None off Linux."""
+        if not Path("/proc/self/stat").exists():
+            return None
+        me, out = os.getpid(), []
+        for d in Path("/proc").glob("[0-9]*"):
+            try:
+                pid = int(d.name)
+                if pid == me:
+                    continue
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                if ENGINE_RX.search(cmd) and "py_compile" not in cmd:
+                    out.append([pid, cmd[:160]])
+            except Exception:
+                pass
+        return out
+
+
+    def clear_engine_procs():
+        left0 = engine_procs()
+        rec = {"found": left0}
+        if left0:
+            for pid, _ in left0:
+                try:
+                    os.kill(pid, 9)
+                except Exception:
+                    pass
+            time.sleep(10)
+            rec["after_kill"] = engine_procs()
+        rec["ok"] = not (rec.get("after_kill") if left0 else left0)
+        return rec
+
+
+    def drop_page_cache():
+        """posix_fadvise(DONTNEED) on every checkpoint file (merged dir symlinks resolved + the Model mounts); only after the
+        previous server is dead (never on the pinned PLE pages of a live server). A measured attempt, not an assumed fix."""
+        if not hasattr(os, "posix_fadvise"):
+            return {"available": False}
+        t, seen, n, b, err = time.time(), set(), 0, 0, 0
+        roots = [CKPT] + [v[0] for v in PARTS.values() if v] + ([PLE_DIR] if PLE_DIR else [])
+        for root in roots:
+            for dp, _, fns in os.walk(str(root)):
+                for x in fns:
+                    p = os.path.realpath(os.path.join(dp, x))
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    try:
+                        fd = os.open(p, os.O_RDONLY)
+                        try:
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            b += os.fstat(fd).st_size
+                            n += 1
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        err += 1
+        return {"available": True, "files": n, "gib": round(b / 2 ** 30, 1), "errors": err, "sec": round(time.time() - t, 1)}
+
+
+    def host_ram_gate(tag):
+        before = cgroup_snapshot(tag + "_before_drop")
+        drops, tries = [drop_page_cache()], 0
+        after = host_mem()
+        while True:
+            av = after.get("avail_mib", after.get("MemAvailable_mib"))
+            if av is None:
+                ok = bool(FAKE)               # local harness only; on Kaggle an unreadable host is never "enough"
+                why = "no cgroup / meminfo reading" + (" (local harness: skipped)" if FAKE else ": HOST_RAM_GATE fails closed")
+                break
+            if av >= RAM_NEED_MIB:
+                ok, why = True, f"avail {av} MiB >= {RAM_NEED_MIB}"
+                break
+            if FAKE:                          # local / CPU-kit harness only (a 30 GiB CPU box): recorded, never enforced
+                ok, why = True, f"avail {av} MiB < {RAM_NEED_MIB} MiB (local harness: recorded, not enforced)"
+                break
+            tries += 1
+            if tries > 3:
+                ok, why = False, f"HOST_RAM_GATE: avail {av} MiB < {RAM_NEED_MIB} MiB after {tries} page-cache drops"
+                break
+            time.sleep(20)
+            drops.append(drop_page_cache())
+            after = host_mem()
+        return {"ok": ok, "why": why, "need_mib": RAM_NEED_MIB, "before": before, "after_drop": cgroup_snapshot(tag + "_after_drop"),
+                "drops": drops}
+
+
+    _boot_gate_rc2, _shm_cleanup_rc2 = boot_gate, shm_cleanup
+    BOOT = {"deadline": None, "fired": None, "tag": "boot"}
+
+
+    def boot_gate():
+        """RC2's GPU release gate (< 150 MiB per card), the previous engine's processes gone, then the host-RAM gate."""
+        g = _boot_gate_rc2()
+        if g.get("ok") is not True:
+            return g
+        g["engine_procs"] = clear_engine_procs()
+        if not g["engine_procs"]["ok"]:
+            g["ok"], g["why"] = False, "ENGINE_PROCS_LEFT: " + json.dumps(g["engine_procs"].get("after_kill"))[:300]
+            return g
+        h = host_ram_gate(BOOT["tag"])
+        g["host_ram"] = h
+        if not h["ok"]:
+            g["ok"], g["why"] = False, h["why"]
+        return g
+
+
+    def shm_cleanup(before):
+        """RC2's /dev/shm cleanup (this boot's torch_/psm_/vllm/ple/nccl/sem.mp-/cuda.shm entries) + the loky semaphores the
+        RC2 log reported leaked at shutdown (sem.loky-*), only when created during this boot."""
+        out = _shm_cleanup_rc2(before)
+        out["removed_loky"] = []
+        try:
+            for p in sorted(SHM.iterdir()):
+                if p.name not in before and re.match(r"sem\.loky-", p.name):
+                    try:
+                        p.unlink()
+                        out["removed_loky"].append(p.name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return out
+
+
+    class LoadMonitor(threading.Thread):
+        """Every 10 s from launch until ready: per process of the server's session, major faults and /proc/<pid>/io
+        (rchar, read_bytes) + the cgroup current; a slow worker (RC2: 873 s vs 125 s) becomes diagnosable."""
+        def __init__(self, name):
+            super().__init__(daemon=True)
+            self.sname, self.stop_ev, self.path, self.last = name, threading.Event(), OUT / f"load_monitor_{name}.jsonl", None
+
+        def sample(self, sid):
+            rows = []
+            for d in Path("/proc").glob("[0-9]*"):
+                try:
+                    st = (d / "stat").read_text()
+                    rp = st.rindex(")")
+                    f = st[rp + 2:].split()
+                    if int(f[3]) != sid:
+                        continue
+                    io = dict(l.split(": ", 1) for l in (d / "io").read_text().splitlines() if ": " in l)
+                    rows.append([int(d.name), st[st.index("(") + 1:rp][:24], int(f[9]), int(io.get("rchar", 0)) >> 20,
+                                 int(io.get("read_bytes", 0)) >> 20])
+                except Exception:
+                    pass
+            return rows
+
+        def run(self):
+            while not self.stop_ev.is_set():
+                srv = next((x for x in list(L.LIVE) if x.name == self.sname), None)
+                if srv is not None and srv.proc is not None and Path("/proc/self/stat").exists():
+                    rec = {"t": round(time.time() - T_START, 1), "procs[pid,comm,majflt,rchar_mib,read_mib]": self.sample(srv.proc.pid),
+                           "cgroup_mib": (host_mem() or {}).get("cgroup_cur_mib")}
+                    self.last = rec
+                    try:
+                        with open(self.path, "a") as fh:
+                            fh.write(json.dumps(rec) + "\n")
+                    except Exception:
+                        pass
+                    if srv.ready_sec is not None:
+                        break
+                self.stop_ev.wait(10)
+
+
+    # ---- per-boot watchdog
+    def boot_left():
+        d = BOOT["deadline"]
+        return min(left(), (d - time.time()) if d else float("inf"))
+
+
+    def due(sec):
+        return boot_left() > sec and not ABORT["why"]
+
+
+    def watched(body, cap_sec, name):
+        """The boot body gets `cap_sec`; every step checks due(); at cap + 300 s the server is killed (hard backstop)."""
+        def b(ss):
+            BOOT.update(deadline=time.time() + cap_sec, fired=None)
+
+            def fire():
+                BOOT["fired"] = name
+                for x in ss:
+                    try:
+                        x.kill()
+                    except Exception:
+                        pass
+            tm = threading.Timer(cap_sec + 300, fire)
+            tm.daemon = True
+            tm.start()
+            try:
+                o = body(ss)
+                LIVE["out"] = o if isinstance(o, dict) else None   # R2: step() keeps it if anything after the body raises
+            finally:
+                tm.cancel()
+                BOOT["deadline"] = None
+            if BOOT["fired"]:
+                o["boot_watchdog"] = f"FIRED after {cap_sec + 300:.0f} s: server killed"
+            return o
+        return b
+
+
+    # ---- server facts read from the log and from the workers
+    def _pick(t, rx, n=6):
+        return [l.strip()[:300] for l in t.splitlines() if re.search(rx, l)][:n]
+
+
+    def server_caps(t, argv=()):
+        na = next((l for l in t.splitlines() if "non-default args:" in l), "")
+        caps = {"source": "log" if na else "argv"}
+        for k in ("max_num_seqs", "max_num_batched_tokens", "block_size", "max_model_len", "kv_cache_memory_bytes", "num_speculative_tokens"):
+            m = re.search(rf"'{k}': (\d+)", na)
+            caps[k] = int(m.group(1)) if m else None
+        for k in ("kv_cache_dtype", "mamba_ssm_cache_dtype", "mamba_cache_mode", "worker_extension_cls"):
+            m = re.search(rf"'{k}': '([^']+)'", na)
+            caps[k] = m.group(1) if m else None
+        m = re.search(r"'language_model_only': (True|False)", na)
+        caps["language_model_only"] = m.group(1) == "True" if m else False
+        m = re.search(r"'cudagraph_capture_sizes': \[([\d, ]+)\]", na)
+        caps["capture_sizes"] = [int(x) for x in m.group(1).split(",")] if m else None
+        m = re.findall(r"Setting attention block size to (\d+) tokens", t)
+        if m:
+            caps["block_size"] = int(m[-1])
+        if not na:                                     # fallback (the E23 fake has no args line): the argv, last wins
+            a = [str(x) for x in argv]
+            for flag, key in (("--max-num-seqs", "max_num_seqs"), ("--block-size", "block_size")):
+                idx = [i for i, x in enumerate(a) if x == flag]
+                if idx and idx[-1] + 1 < len(a):
+                    caps[key] = int(a[idx[-1] + 1])
+        caps["block_size"] = caps.get("block_size") or BLOCK
+        sizes = caps.get("capture_sizes") or []
+        k = caps.get("num_speculative_tokens") or 3
+        caps["captures_cover_seqs_x_1pk"] = bool(sizes) and caps.get("max_num_seqs") is not None and max(sizes) >= caps["max_num_seqs"] * (1 + k)
+        return caps
+
+
+    def pool_facts(t):
+        f = {}
+        m = re.findall(r"GPU KV cache size: ([\d,]+) tokens", t)
+        f["kv_tokens"] = int(m[-1].replace(",", "")) if m else None
+        m = re.findall(r"Maximum concurrency for ([\d,]+) tokens per request: ([\d.]+)x", t)
+        f["max_concurrency"] = float(m[-1][1]) if m else None
+        f["max_concurrency_tokens"] = int(m[-1][0].replace(",", "")) if m else None     # R2: M of the line (F_log)
+        m = re.findall(r"Padding mamba page size by ([\d.]+)%", t)
+        f["mamba_pad_pct"] = float(m[-1]) if m else None
+        f["min_block_for_mamba"] = math.ceil(BLOCK / (1 + f["mamba_pad_pct"] / 100)) if m else None
+        f["kv_group_sizes"] = (re.findall(r"kv cache group sizes \(([^)]*)\)", t) or [None])[-1]
+        f["side_cache_layout"] = _pick(t, r"Side-cache layout", 2)
+        f["initial_free_reserved_gib"] = [[float(a), float(b)] for a, b in re.findall(r"Initial free memory ([\d.]+) GiB, reserved ([\d.]+) GiB", t)][:4]
+        f["model_load_gib_sec"] = [[float(a), float(b)] for a, b in re.findall(r"Model loading took ([\d.]+) GiB memory and ([\d.]+) seconds", t)][:4]
+        f["graph_capture_sec_gib"] = [[int(a), float(b)] for a, b in re.findall(r"Graph capturing finished in (\d+) secs, took ([\d.]+) GiB", t)][:4]
+        f["rank_load_gib"] = {int(p) * 2 + int(q): float(g) for p, q, g in re.findall(
+            r"\(Worker_PP(\d)_TP(\d)\S*(?: pid=\d+)?\) INFO [^\n]*?Model loading took ([\d.]+) GiB memory", t)}
+        f["rank_load_sec"] = {int(p) * 2 + int(q): float(g) for p, q, g in re.findall(
+            r"\(Worker_PP(\d)_TP(\d)\S*(?: pid=\d+)?\) INFO [^\n]*?Model loading took [\d.]+ GiB memory and ([\d.]+) seconds", t)}
+        f["rank_graph_gib"] = {int(p) * 2 + int(q): float(g) for p, q, g in re.findall(
+            r"\(Worker_PP(\d)_TP(\d)\S*(?: pid=\d+)?\) INFO [^\n]*?Graph capturing finished in \d+ secs, took ([\d.]+) GiB", t)}
+        f["ssm_dtype_lines"] = _pick(t, r"mamba_ssm_dtype|mamba-ssm-cache-dtype")
+        f["gdn_fallback_lines"] = _pick(t, r"Falling back to the Triton GDN spec decode path")
+        f["share_workspace_lines"] = _pick(t, r"MERLIN_SHARE_DRAFT_WORKSPACE")
+        f["mm_warmup_lines"] = _pick(t, r"Multi-modal warmup completed")
+        f["host_ram_lines"] = _pick(t, r"host memory available now|Cgroup memory preflight|Skipping auto-prefetch", 6)
+        f["sched_warn_lines"] = _pick(t, r"max_num_scheduled_tokens", 2)
+        f["oom_lines"] = _pick(t, r"OutOfMemoryError|CUDA out of memory", 4)
+        f["static_scale_lines"] = _pick(t, r"applied static K/V scales", 8)
+        f["default_scale_lines"] = _pick(t, r"DEFAULT 1\.0|no static calibration", 4)    # audit 2: the MTP layer's QSA FP8 KV
+        f["ext_lines"] = _pick(t, r"Injected .*NB1WorkerExt|nb1_worker_ext", 2)
+        f["shm_leak_lines"] = _pick(t, r"leaked (semaphore|shared_memory) objects", 4)
+        return f
+
+
+    def graph_facts(t):
+        caps = sorted({(a, int(c)) for a, b, c in re.findall(r"Capturing CUDA graphs \((\w+)\):\s*100%\|[^|]*\|\s*(\d+)/(\d+)", t)})
+        return {"captured": caps, "resolved_modes": _pick(t, r"resolved cudagraph modes before capture", 8),
+                "draft_identity": _pick(t, r"e2-identity\[.*role=draft", 4), "recoverssm_commit": _pick(t, r"\[recoverssm-commit\]"),
+                "recoverssm_path": _pick(t, r"RecoverSSM path taken", 4), "jit": jit_kernels(t)}
+
+
+    def jit_kernels(t):
+        return re.findall(r"JIT compilation during inference: (\w+)", t)
+
+
+    def nccl_transport(t):
+        via = Counter(re.findall(r"NCCL INFO Channel \d+/\d+ ?: ?\d+\[\d+\] -> \d+\[\d+\] (?:\[\w+\] )?via (\S+)", t))
+        return {"channel_via": dict(via), "net": sorted(set(re.findall(r"NCCL INFO (Using network \w+|NET/\w+ : Using [^\n]{0,60})", t)))[:6],
+                "comm_inits": len(re.findall(r"NCCL INFO comm 0x[0-9a-f]+ rank \d+ nranks \d+", t)),
+                "pynccl_groups": _pick(t, r"all-reduce backends .* for group", 6),
+                "debug_on": "NCCL INFO" in t}
+
+
+    def rpc_cache_info(port):
+        """The read-only worker extension over /collective_rpc (dev mode): actual cache tensor dtypes, specs, free memory."""
+        body = {"method": "nb1_cache_info", "timeout": 120}
+        try:
+            r = json.loads(L.U.urlopen(L.U.Request(f"http://127.0.0.1:{port}/collective_rpc", data=json.dumps(body).encode(),
+                                                   headers={"Content-Type": "application/json"}), timeout=180).read())
+            res = r.get("results") or []
+        except Exception as e:
+            return {"error": repr(e)[:300]}
+        out = {"ranks": res}
+        dts = sorted({x["dtype"] for w in res if isinstance(w, dict) for g in (w.get("cache_tensors") or [])
+                      if "mamba" in g.get("module", "").lower() or "gdn" in g.get("module", "").lower() or "linear" in g.get("module", "").lower()
+                      for x in g.get("tensors") or []})
+        out["recurrent_tensor_dtypes"] = dts
+        out["num_gpu_blocks"] = sorted({w.get("num_gpu_blocks") for w in res if isinstance(w, dict)} - {None})
+        out["free_mib_per_rank"] = [((w or {}).get("mem") or {}).get("free_mib") for w in res if isinstance(w, dict)]
+        pads = []
+        for w in res:
+            for s in ((w or {}).get("kv_cache_specs") or []) if isinstance(w, dict) else []:
+                if s.get("unpadded_page_bytes") and s.get("page_size_bytes"):
+                    pads.append({"rank": w.get("rank"), "type": s.get("type"), "layers": s.get("layers"), "state_dtypes": s.get("state_dtypes"),
+                                 "padded": s["page_size_bytes"], "unpadded": s["unpadded_page_bytes"],
+                                 "pad_pct": round(100 * (s["page_size_bytes"] - s["unpadded_page_bytes"]) / s["unpadded_page_bytes"], 2)})
+        out["mamba_padding"] = pads[:16]
+        return out
+
+
+    def rpc(port, method, *args, timeout=120):
+        """POST /collective_rpc (dev mode): a worker method by name with string args; the per-rank results or the error."""
+        body = {"method": method, "args": [str(a) for a in args], "timeout": timeout}
+        try:
+            r = json.loads(L.U.urlopen(L.U.Request(f"http://127.0.0.1:{port}/collective_rpc", data=json.dumps(body).encode(),
+                                                   headers={"Content-Type": "application/json"}), timeout=timeout + 60).read())
+            return {"results": r.get("results")}
+        except Exception as e:
+            return {"error": repr(e)[:300]}
+
+
+
+
+
+
+
+
+    def scales_dump():
+        """The static QSA K/V scales file (all values) + which layers it covers; the MTP layer is not in it (default 1.0)."""
+        p = CKPT / "qsa_kv_scales_262k.json"
+        try:
+            d = json.loads(p.read_text())
+        except Exception as e:
+            return {"error": repr(e)[:200]}
+        lay = sorted(int(m.group(1)) for k in d for m in [re.search(r"layers\.(\d+)\.", k)] if m)
+        ks = [v.get("k_scale") for v in d.values() if isinstance(v, dict)]
+        vs = [v.get("v_scale") for v in d.values() if isinstance(v, dict)]
+        return {"file": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "values": d, "layers": lay, "n": len(d),
+                "k_scale_min_max": [min(ks), max(ks)] if ks else None, "v_scale_min_max": [min(vs), max(vs)] if vs else None,
+                "mtp_layer_in_file": any("mtp" in k for k in d)}
+
+
+    def free_per_card(rec, name):
+        """MiB free per card = total - the highest used reading of this boot (after ready, end, every window peak)."""
+        srv = ((rec or {}).get("servers") or {}).get(name) or {}
+        rows = [r for r in (srv.get("gpu_mem_after_ready"), srv.get("gpu_mem_end")) if r]
+        if not rows:
+            return None
+        tot = {i: t for row in rows for i, _, t in row}
+        used = {i: max(u for row in rows for j, u, _ in row if j == i) for i in tot}
+        st = (rec or {}).get("steady")             # R2: nb1_ladder's steady holds "_plan" (list), "_fit" (dict), "_seqs_cap" (int)
+        ws = list(st.values()) if isinstance(st, dict) else []
+        for w in ws + [(rec or {}).get("profile")]:
+            if not isinstance(w, dict):            # R2: only window dicts carry gpu_mem_peak_mib
+                continue
+            pk = w.get("gpu_mem_peak_mib")
+            for i, u in enumerate(pk if isinstance(pk, list) else []):
+                if i in used and isinstance(u, (int, float)):
+                    used[i] = max(used[i], u)
+        return [tot[i] - used[i] for i in sorted(tot)]
+
+
+    def free_after_ready(rec, name):
+        srv = ((rec or {}).get("servers") or {}).get(name) or {}
+        row = srv.get("gpu_mem_after_ready")
+        return [t - u for _, u, t in row] if row else None
+
+
+    # ---- KV accounting: pool blocks from usage denominators; cold-cache cumulative admission (physical snapshots)
+    def kvu(port):
+        return L.prom(port).get(L.KVU)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    F_MAX_BLOCKS = 40                                # R2: a per-request fixed-block F above 40 blocks is not physical here
+    FIT_MIN_SAMPLES = 3                              # R2 audit N1-6: a fit is trusted only with >= 3 all-resident snapshots,
+    FIT_MAX_RESID_BLOCKS = 2.0                       # a max |residual| <= 2 blocks
+    FIT_LOG_TOL_BLOCKS = 1                           # and |ceil(fit F) - log F| <= 1 block
+    F_LOG_SOURCE = "server max-concurrency line (this boot)"
+
+
+
+
+
+
+
+
+
+
+
+
+    def profiler_tools():
+        """ncu / nsys availability (DRAM bytes per stage need a server LAUNCHED under one of them: a separate boot)."""
+        out = {}
+        cands = ["ncu", "nsys", "/usr/local/cuda/bin/ncu", "/usr/local/cuda/bin/nsys"]
+        try:
+            eng = MERLIN_ENG if isinstance(MERLIN_ENG, dict) else {}
+            if eng.get("cuda_home"):
+                cands += [eng["cuda_home"] + "/bin/ncu", eng["cuda_home"] + "/bin/nsys"]
+        except Exception:
+            pass
+        for c in cands:
+            path = shutil.which(c) if "/" not in c else (c if os.path.exists(c) else None)
+            if path:
+                try:
+                    v = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=60).stdout.strip()[:200]
+                except Exception as e:
+                    v = repr(e)[:100]
+                out[c] = {"path": path, "version": v}
+        return {"found": out, "dram_bytes": "not measured in NB1: ncu / nsys cannot attach to a running vLLM server; DRAM bytes per "
+                "stage need a boot launched under ncu (dram__bytes_read.sum on the Marlin MoE + dense kernels) or nsys: NB3 / NB4 item",
+                "torch_profiler_window": "the PP2 trace window runs after the ladder, on its own streams; no benchmark window overlaps it"}
+
+
+    # ---- requests with usage (cached tokens), greedy logprobs and teacher-forced rows with the cache counters
+
+
+
+
+
+
+
+
+    # ---- JIT warm-up (excluded from every metric) and per-position acceptance
+    def warmup(port, n, secs=None):
+        """Multi-stream 2k decode, ramped 1 -> n streams, excluded from every metric: compiles the kernels RC2 saw compiled
+        during inference (_fill_num_accepted_kernel, _causal_conv1d_update_kernel, _gdn_recoverssm_verify_kernel,
+        _ple_conv_kernel, _ple_conv_writeback_kernel) before any measured window."""
+        secs = secs or (45.0 if not FAKE else 4.0)
+        srv = next((x for x in list(L.LIVE) if x.port == port), None)
+        j0 = jit_kernels(srv.log()) if srv else []
+        ss, t0 = [], time.time()
+        try:
+            for i in range(n):
+                g = L.Stream(port, PROMPTS["2k"][i % len(PROMPTS["2k"])], 4096, temperature=TEMP, seed=900 + i, ignore_eos=True)
+                g.start()
+                ss.append(g)
+                time.sleep(min(3.0, secs / max(1, 2 * n)))
+            while time.time() - t0 < secs:
+                time.sleep(1)
+        finally:
+            for g in ss:
+                g.stop()
+            for g in ss:
+                g.join(10)
+        L.wait_idle(port, 60)
+        j1 = jit_kernels(srv.log()) if srv else []
+        return {"streams": n, "sec": round(time.time() - t0, 1), "jit_before": j0, "jit_compiled_in_warmup": j1[len(j0):],
+                "errors": sorted({g.err for g in ss if g.err})[:3]}
+
+
+    def accept_pos(port):
+        try:
+            txt = L.U.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=15).read().decode("utf-8", "replace")
+        except Exception:
+            return None
+        pos = {}
+        for m in re.finditer(r"^vllm:spec_decode_num_accepted_tokens_per_pos_total\{([^}]*)\}\s+(\S+)", txt, re.M):
+            p = re.search(r'position="(\d+)"', m.group(1))
+            if p:
+                pos[int(p.group(1))] = pos.get(int(p.group(1)), 0.0) + float(m.group(2))
+        return {"pos": pos, "drafts": L.prom(port).get(L.DRF, 0.0)}
+
+
+    def _prefill_done(r, n):
+        tail = ((r.get("admission") or {}).get("tail") or [])
+        t = tail[-1] if tail else None
+        return bool(t) and t[1] == n and t[2] == 0 and t[3] >= n
+
+
+    def _req_lines():
+        try:
+            with open(REQ_LOG) as fh:
+                return sum(1 for _ in fh)
+        except Exception:
+            return 0
+
+
+    def _ttfts(port, start_line):
+        out = []
+        try:
+            with open(REQ_LOG) as fh:
+                for i, l in enumerate(fh):
+                    if i >= start_line:
+                        r = json.loads(l)
+                        if r.get("port") == port and r.get("ttft") is not None:
+                            out.append(r["ttft"])
+        except Exception:
+            pass
+        return out
+
+
+    def _counters(port):
+        try:
+            m = L.prom(port)
+            return m.get(L.PROMPT, 0.0), m.get("vllm:prefix_cache_hits_total", 0.0)
+        except Exception:
+            return None, None
+
+
+    def window(port, s, band, n, max_new=None, secs=None):
+        """One steady window, timed only after every stream finished admission + prefill (the lab's settle needs all running
+        streams to have emitted and be gaining, then an explicit check of the last admission sample; Merlin's cost-aware
+        admission may hold a cold miss up to 120 s, inside the lab's >= 420 s admission limit); a window with prefill inside is
+        retried once. Recorded: tick_ms (one engine step = one micro-batch of C/2 requests under PP2) AND cycle_ms (= PP x
+        tick, the per-request advance time), per-request TTFT, uncached prefill tok/s (prompt minus prefix-hit tokens),
+        retained (idle) blocks before the window, per-position acceptance."""
+        retained_before = None
+        if L.wait_idle(port, 60):
+            retained_before = kvu(port)
+        def run():
+            if max_new is None:                 # RC2 / E23 levels(): MAX_NEW[band], WIN, the budget / KV-bound guards
+                return levels(port, band, [n], server=s, temperature=TEMP, prefill_tok_s=PREFILL["tok_s"]).get(f"{band}@{n}") or {}
+            return L.steady(port, PROMPTS[band], n, secs=secs or WIN, max_new=max_new, temperature=TEMP, prefill_tok_s=PREFILL["tok_s"])
+        a0, c0, l0 = accept_pos(port), _counters(port), _req_lines()
+        r = run()
+        if r.get("status") == "INCONCLUSIVE_PREFILL_IN_WINDOW" and due(WIN + 120 + n * BANDS[band] / max(500.0, PREFILL["tok_s"])):
+            c0, l0 = _counters(port), _req_lines()
+            r = dict(run(), retried_after="INCONCLUSIVE_PREFILL_IN_WINDOW")
+        a1, c1 = accept_pos(port), _counters(port)
+        r["prefill_done_before_window"] = _prefill_done(r, n)
+        r["running_eq_level"] = r.get("running_min") == r.get("running_max") == n
+        if r.get("status") == "STEADY" and not (r["running_eq_level"] and r["prefill_done_before_window"]):
+            r["status"] = "INCONCLUSIVE_RUNNING_NE_LEVEL" if not r["running_eq_level"] else "INCONCLUSIVE_PREFILL_NOT_DONE"
+        if r.get("step_ms"):
+            r["tick_ms"] = r["step_ms"]
+            r["cycle_ms"] = round(PP * r["step_ms"], 1)
+            r["requests_per_tick"] = round(n / PP, 2)
+            r["microbatches_per_s"] = round(1000.0 / r["step_ms"], 2)
+            r["wall_clock_tok_s"] = r.get("tok_s")
+            r["tick_note"] = ("tick_ms = step_ms = one PP tick (one completed micro-batch of C/2 requests); cycle_ms = 2 ticks = the "
+                              "per-request advance time; microbatches_per_s = completed micro-batches per second; wall_clock_tok_s = "
+                              "generated tokens / window seconds")
+        adm = (r.get("admission") or {}).get("sec")
+        if None not in (c0[0], c1[0]) and adm:
+            unc = (c1[0] - c0[0]) - (c1[1] - c0[1])
+            r["prefill_uncached_tokens"] = int(unc)
+            r["prefill_tok_s_uncached"] = round(unc / adm, 1)
+            r["prefill_note"] = "admission.prefill_tok_s counts cached prompt tokens; prefill_tok_s_uncached does not (incl. a retry)"
+        r["ttft_per_request"] = _ttfts(port, l0)
+        if retained_before is not None:
+            r["retained_usage_before"] = retained_before
+        if a0 and a1 and a1["drafts"] > a0["drafts"]:
+            r["accept_rate_per_position_incl_admission"] = {p: round((a1["pos"].get(p, 0) - a0["pos"].get(p, 0)) / (a1["drafts"] - a0["drafts"]), 3)
+                                                            for p in sorted(a1["pos"])}
+        return r
+
+
+
+
+    # ---- prefix continuation (2-turn replay) and after an abort
+
+
+
+
+
+
+    # ---- PP2 trace window: every rank's trace, stage overlap, idle, verify rows per micro-batch
+    SCOPE_ROWS = re.compile(r"^execute_context_(\d+)\((\d+)\)_generation_(\d+)\((\d+)\)$")
+
+
+
+
+
+
+
+
+
+
+
+
+    CAPTURE_SIZES = None
+    ROUTING_FILE = OUT / "nb1_routing_ids.npz"   # NB3 reads it (dataset foysalemonshanto/e25-nb1-routing-ids after a run)
+
+
+
+
+
+
+    def quality_gate(o, ref):
+        """RC2's fp8_gate with the reference as a parameter (B1 vs RC2's recorded FP8 rows, B2 / B3 vs B1)."""
+        vs = ((o.get("oracle") or {}).get("vs_" + ref) or {}).get("status")
+        if (o.get("sampled") or {}).get("ok") is not True:
+            return "FAIL_SAMPLED"
+        if (o.get("probes") or {}).get("ok") is not True and not FAKE:
+            return "FAIL_PROBES"
+        orc = o.get("oracle") or {}
+        if any(orc.get("errors") or []) or any(orc.get("garbage") or []) or vs == "FAIL_HIGH_MARGIN":
+            return "FAIL"
+        if orc.get("complete") is True and vs in CLEAN:
+            return "PASS"
+        return "INCONCLUSIVE"
+
+
+    def flag_map(argv):
+        m, a, i = {}, [str(x) for x in argv], 0
+        while i < len(a):
+            if a[i].startswith("--"):
+                k, v = a[i], True
+                if i + 1 < len(a) and not a[i + 1].startswith("--"):
+                    v = a[i + 1]
+                    i += 1
+                m[k] = v
+            i += 1
+        return m
+
+
+    def config_diff(argv, env, kv_bytes):
+        """Effective flags (last occurrence wins) and env vs RC2's real FP8 boot."""
+        ref, new = flag_map(RC2_FP8["argv_tail"]), flag_map(argv)
+        skip = {"--port", "--served-model-name", "--host"}
+        flags = {k: [ref.get(k), new.get(k)] for k in sorted(set(ref) | set(new)) if k not in skip and ref.get(k) != new.get(k)}
+        keys = set(RC2_FP8["env"]) | {k for k in env if k.startswith(("VLLM_", "NCCL_", "KV_", "P2P", "SCALES", "MERLIN_"))}
+        envd = {k: [RC2_FP8["env"].get(k), env.get(k)] for k in sorted(keys)
+                if k not in ("VLLM_PORT", "MASTER_PORT") and RC2_FP8["env"].get(k) != env.get(k)}
+        return {"flags": flags, "env": envd, "kv_bytes": [RC2_FP8["kv_bytes"], kv_bytes]}
+
+
+    def boot_facts(s, o, name):
+        t = s.log() or ""
+        o["caps"] = server_caps(t, s.argv)
+        o["pool"] = pool_facts(t)
+        o["graphs"] = graph_facts(t)
+        o["nccl"] = nccl_transport(t)
+        o["workers"] = rpc_cache_info(s.port)
+        o["host_after_ready"] = cgroup_snapshot(name + "_after_ready")
+        env = dict((R["setup"].get("merlin_plans") or {}).get(name, {}).get("env_keys") or {})
+        env.update(NB1_ENV.get(name) or {})
+        o["config_diff"] = config_diff(s.argv, env, NB1_KV.get(name))
+        return o
+    save()
+
+
+if not RERUN:
+    # ==================================================================== CELL 7 — E25 NB-S2: B > IDX > S28 > LP > S32 > SPC (capacity levers on DFlash2 D3s), long bands
+    # The modules and the CELL 7 body are lzma + base85, each sha256-checked here (the readable body = nbdf_code_export.py).
+    import importlib, base64, lzma, gzip, types, inspect
+    def _unx(b):
+        return lzma.decompress(base64.b85decode(b)).decode("utf-8")
+    NBDF_LIB_SHA = "b014775162fb55401826fa8c498f7009b5d47ad15cc5cb365ab23e5ed37b1929"                 # nbdf_lib.py (new), nb4t_lib.py (NB4T verbatim), nb4_timeline.py + nb4_ppack.py
+    NBDF_LIB_SRC = _unx("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;y4wcfL#C)Xbna~aS1SFih*j!rfewm_Y?31yz*c2z=V$}+l^xG-uzl5b((ZPWK??z?)iv8fk&mx@s6&hE6En58^Xhm$q9Z~pcI1s&~p8O$jyn*9A+JebnsO&rQ@S7jgsWF3~^5JZNbU>`mZz3s<a-ldzd#G_VhylqdARG<qGj)OPQuQdNY4B|H$E(&<M3}-b(pqENbpwx)JOU6Ekwv`M-XFkGe%LONl4IhqJj@T?*@x<<LYU&Rek!hPN3by=WYlQ$Jdhg&>l1B1I!4uY{KZ8Votjv;N|0C3dvIm)2xH$SdYj5FG*9{1I0|VwwNKu9>tby4QP$%D9DjjGj%D{6_sa&lJnf)@N0i$9g@VvyU9iBomm;Y>W{6E_}^V<iU000l7lhCV3taF3t5S$M9_7^5D`=-T=}E0ax$-&+IQ=50EoD(ikP=^Fr%Jr+W4TpHao)eLkI5$R$x&Z2c4@4I5oc_fd0O98?Iz6UC6kfQ|xhzRplKc=s4JucSxW${=rbtPGxgAaWaPo{jt?i)G_0FZOnqu;_duYeIe-{zfI~*%n`!N)YUzHOT<Ivh9%WHX}{IdWZc^inB8kUov){!%ebcXY%aF2npH6szx9unJErRf0P=h0cOImF(?UR9M0)iS5G`4P<&PH`}(3iP>QDKdGjYMG;2z%*LD4x0K37d^llxHNB{riCGrsEg;%JrbT|RN3_n-Ou@f#>c|G8CBC_+<j@i<C+<$X1V^<n;<+nJ(!Pt{pem$f%!{LrXqTysrM;kvH)+oE!bRtcUf@U_zeV}j@@@aJDL!(rRFvwc0n+H`}u&w5&cQ!Qb<;`ntUK*Sh?wlhccX3es3)dZ=)rW}ZYl%l9l-W1ToTM}2`^+rtKiLh(t~q8ryAg&3q;Q-ikulo%_ku}%rANlE%~U!x=v<|e$PSHYuT~1dYuP9t*WBZE9bNRsx-4+=c26<&aJfJAkSlHYQ9!JyKx7TuYn(@Iu2v2VY60jjeVMd?PtgP{YYYS<3Y#_7m>p8(=Te8qU6($;np=}oI40M}@g2sx(W)UZr#}&o){r*M<<EznqCE;v{x>)4NX3A%|A!mqf<dJ{ymjE;Yx)YA;xQPtQS5L9mqP`jT>Z6P1NJE7t$O~5swAwG_~xN`G_yj1wv3qe3i=a!2ZaCvRgZ2fO2^=~2kmlk(La|s04mOWxpR?JLUj;ycp-Bp+Xn7G`Idqleq1neP!Cp)r*anxU}7!+?s?_E{N3HMW$gME2qRg6Gg<ONmuQJm_9m)ut!Pl3+aOPCq915~m&^=3FX>Y$K(~DpQ%9ATxM>P~kkOUFoDv9Gt*>d__gOBr1J@<sZ9+Au>qan&X2^Mh3Vlz(3g$;>J>>NIw&I>-6Rv)nWrMY1FK1L~m>sUYe*^%G8DVOEgknF!B4zEzF0@*Bc8BTGNp!Vf_HxT>FTK8UgdZx<XMO{QE|mvw`=fiUAj2kjZmDf?a1|lh$fU2H=!a4m{qb;o6tIsWSfvw18%xHfl5PCU+vBGvILUtGgF)w~eHw)jA?Le>3IZpG_r8;P^Uakq_8glVqF=9kx3@=Z_4-05#PL<=QX;7l)&i!WBzG_t{caN83)4yV<}B}3_V|GWjgbyaWg{|LipFd~JgMVwQ`TSCe>$<ZU8yH2S>EhER4;bb^h#!tVzEvo@*5GL3M^m`jWyRZIm~aG|7;@PB3fu*@U*WeVCjmi79bNUU}uWp9nx@UPek@7_^tp)rf4s1X*Um-Av4nj%HeA`(}5Uji$wpS`}0H3>}hj3+UguQ>Fu)1+``yBnn8^`kH!Kdh^Of)e>*Yg-VB~&`J^xns#3TV>c@2tqyS<$dTy|mYSAFeCHvrGs#5*i<h;6nV#wruOZS_*2{#mP3rQEFP>O83-l>6#zXl9%h(V;#ZBU~6*%#b}ho!5c(iu+`+N&nspUrxKm?RC_(q?^!>KqJVvH6Rg$DPYU0(7Y}d(JfSA(@5}DZwRUQz$+nxOGp+>TRiTORtZ2uxE&49m!ab1m@cz`rzpmnZkt7(@_68XsY8JPa-lQ!`A;)2G$7TR(-*!l1xY|ve0V3<7$>XqfGrLp#e@2+Yuc(Pe0Azx!v2Pfzd1@QVTXX6!?^OPo?)_+38VAR)LsBAzgBz46>{@+>KJcdtFts6O&zmmReIl=4La&G$7B=BO-lSN&j#Z^gt`<;oM9a!H6MmQnX-`yHvxn5K<A7LWFv8t5e&m)WbDB94(qEt4Gi(@9oqhs=by0h@Sg?l!e2#He_C>#e2!fjYK5DUB7gQH!52OYlg*GA<#wbL`YV_t848@3C@~+;Dv4&H>-*>i<qUc&Uj9+_IHHhVR!eR^!W{YC%Z>>U~4xN=V}#o-GUHHstcUXdEK2_9OVi}huiG}Q=n`bG|D1S_}CohKT4TBZ5r-VjmrEvc~5iAjg*xQH?4<HtwIH*2kX?~Z^`^n6jCN#eGY~~4C&KMr3)4t1W*iuX!ZVDN6U)=ew);+KHU`}nk$a9Bqwu|%?(Bn9DS%xc8I04%gPl(S@5-Eyp%+G`ku1=tEM~XMJ=Y2>ZT%sIdrO3u{+yo;HZGV0?kQ8XhDa;MPTeXh(o@dF84uT)tGJa)}cbfPsblfJVfb$NH?<>uEP-GH-KDueq-}AOpCW6Q7r`iH*1fy`zI&Ay4$k?bh&yvh%VCTNrE+Y!0ztE4ybs4eOv7A=h3tXrua23PDy)}gR1_u4jgcbR4awi4$$Pwn_;p1mC!ocC?HK(!;gN$&H(pdY%-v?QI)VrI-`%wdS9W7m*rHO3}Sc?F*?|;IGlxn9Quxm{<-^(FEEAdB_j)9;F3~3bTm~@*f^BRP1M}$qn?lHZ7o~z$iM7{ptwmT=r(S-N5;f;jecGK`~U?EYGX8(zb09U^5&!lwd=DPM+WXWy~4$0sa3)_7&l<aI2#;#7ttwsu{TmRyMk&s3Yfkr=Cdt3M`R#SIEA$ZB_JklhZ~W1xsC-jziHPUrM4HZR7eH!o|S$!fOL9s3NkG%XFQ}~V^phk9&&qtW+|}w-?6mGQYhXftW1PL^60L<_aQdeow=&k#!t;9sNwHgzRDT(S__Ag55>GkE9{^YrqL!uE|?lMa2p7eP%TrywF?39a_fXLUn%_HuyGa2)2N+FCsK6qJ@qzdR<V*}=B9IeOD{7Jsiaeo-mq&Kx{R+ReE+Q;CRQ1>dn(&%`X`2KGC6b$#GV{&UDIDQy%w&+rwfwPlRKDH-8MheR6M2URODlcw-8_w-EhZ!O=nBRed5LtXn9k^4XuS_Y!m6KrRMK=7<u-d6yaWRoUa(xZpmUix31)2BA|XHmpOK^!#hu{{9D34Sd{Xqg8o4F$a~YX@IYcz6;hp$?^y|itB*bBe}1LBF6M;t#hm26kCdx@lW=IwHHgdMpDg|MYE7gD0ZFH6yfHTEGQvSDn|eE-*RY8hG|d6RP;LYylI6jT@G4YJuk9Up+Nb7R@HqnW3jnMBXOl(F|3or{QTh(>YtNy07P}ZW|GRSG>66jJk2Zpq3ph28?X1!GJ{JE$3}%%-$y$ynm2$hE9E@MwbWjkl0K@ohbu$ZLnJdQ(z}?XJc<l==#ntu^7mfN#0LyFK7;M#!<u{rs<cJb&*iVb2?iY9R7S2-dG<)B@ZRz3ce)5k-jHZmFM%2?6<TW<CxHLGEC^_LXO1N1uG0$HOlbM}?^&V+kV0p95mg9Pnd&7;s7*cfP8)Wm}?Q|AYZ(_%1%92t{1zvjwLw+f&fwz40X&*or)KtY;!Y4V3$v#^%rclQ!LmqeoNza7iw<<jGMyX9$xztP{+}$>1xWKkbsIa{9?f}wLpmo?KgJ*n&5>yp5X}QQs!sk0I?d}@wdXhxr_x?hd@F1oOS?RY7S-Mui@FeVd$;?IB>cV~!CJ!0+Cg~cDXnoY9{Kc81Y2De)>n0KwL;(cjc<_8D=_4wS?PagWS05sx87=X*P1`;R%y%8Z9d$JfM-_k>&bBLTOgZI^g0;^dY0yP(juj$Mb(h6ozl$y1G~+&QoIm$>7a2>EnupJFVtAR}8#O;)*Lk`YIkV*?&v=?7EhFeNiJmqM&kJu#*Mq7Ubwkkw9iA6w`XfH(Q_ei$L%HDG+B!K2V?Gq2_380f>nqj-d|<H#9o=Onaab-vAhX>dH<}q}>i4KLK9t~w3L#o#qB$uxZVH`o{WGe#B`YI{vo^g<DzjBNIalYXB6DuL{0D|(HR}gqrf$VPKR|I%Y}}m=<qH`u49dm~#37BRrlMI1&CXR^C^I+x`i+c1@%HFjr5RX75$%-8qDul%dG4HXIMOF<^=a$tgiT9<d~YUq;g_V~u>L;tRaE}6hM(4w2@!Wd!aXVH)nPt3ExGdDFm!$?K$E$DUk4po18`A59Zd>enB=`X(rvY2Un50&m&L*c(QJrtvjSi>{E_@+b4%6=OJc556o?@a?YY)C@XbT>*hX<%4GgphQHb{hr3+ec0DQDU@M4MOou1mHAyMR~UL!pp7ZnHeVAvgX+hRoRUJz@*awi`pjW=e{;VL<zu}69|`~ye7ClfzdIstCO-cRE-{-E)sy@Ksq4)C>5HS95X8ktXjz`f_fAh6=eI4!2p3(|K`oj8~+39sEfuDy)COavt-qXZJw{(l_UCS`947PPjaO;cO9$RTMCVwJ{VHkL>8T)o><T?+$=c#0zOrUu#^)_0vT->Nj!%L{X=Z>t|@8O)CzYBoBruFC!-MjcaAHD_Tb?P4~C_S(ZuIVwaRuD{;i?fcSm5D;?2E1+SD()p1FUNACzwQ)Fb0I;tBd0us`2nO1~gBHC{@jvTz``v`Wk~zYNd6l9`dqpeOzA3-lrRCXc63HG;ouwx01*fQp13|WvT8+wq?I<KUCxsIX))pDok`+jIR{5{~&hf}ppmgTcD#*-@i7jeXE|t)!5@AU1aHL`zC8fg5-SgqzVj{yre*Q2q@&?N+_`_M;F$wb?IyYw6hqDVpNlI;7m9`_F^`snfwBWPmdr+VxOY#j0M*z#p=OOURM9}$5^(afjdgd^_R0X>R)rp#&A4nq4<;Z%gINsysB@rPuppFo3Np*0%j;P#3?5gDFQ`oR8^m?As{gXiB%FrK*`Nexf)82O>3lh}Wy#AeD@HH$zQ_;2Mu^lJQQ+lSXfzFcV_6J6TEj<H_^+pvC8Z*+g7F5}n2<}BSx!*?31jhDc%F#$BdZ5v%2t;ROovIw>y;1hh*S<zx)BST<+TX(pV0EZ;l~bs)?bo`SCd1O6UOKEBGS&Gr&)I8@$)$7FF94^j<rXEpgfbAX+=<m4PSUcp35X1ZcSfPp+`!2xebg-M@Ft!MHn^k|>We9xK_NL<4I)g0i!!+oFiheS&AAxOnB?f<qOI|;NO7(TcplCy-~W4j#utPC7#bH#e0JzXzIIxixph3Q$Gq}l&5fb_Y?@cZs7aejfVj2W<EGT)+x)>gNS(-Uo~&HLIgjA112Lmc=h+1g#rAM9BR?-4;R3-o_&pg}1jl_N9s>mjdIgAj7k~Nm6;ky|VBX^nHeiq>XsXvq9D|#v;2es}cu1KY=N6kvKu9G^C2KDIeZD*Vw*w7iR4Sx4ftB}Tb94&ajp6VpPDBoO?$yBHfEIE=&xzNvGf9g}A443^?%;$098;%=nQtKy!?zbTTU-ac5c_8^E-UGIoS}-d)14oR!CVdo?MJ>X7f_kjm-|1={OZ*gPyih#BeW(weG3)JeSdO_>b$kOF4Voff;lczIbIYlkw5%j><+%!ao+De{us3Xy9vCQn`Df^eqHp*p@%MW3|@LHF{{u0+vy=0U(0pn0c^<*Ez+X`R>VwtknO;5jM$1WOLlPVJ}!Dl;25>uZynNxV4<k?{zc(XGY#zGS#O*FORDmXxCGXGc)ncwiH6;7&=GVR{@Wnj{gt5FE_QRR?FIPKD*TE>FLy24k=$iY8c`i4{r$e;EdYq>LWpWs5f%XUx?;9hOI7Eupnf1~&w_;=HH}WCb%QHjUBbn~ZevpKQ#5<4d;hrtNrLK|U=5y0{TCHNN1G$Rk7V#L)FW91#JF8?z7dMki6>29+0lA6m_5(M>cAr{w_COE8>=r}IaCa)r&&zvCf!BwIbC7yRf~kPFOpQ9Bckhy6Sbc6viyADbc;V%;kdnuJU0EQB%@VpzVFb;2#4+oZnfI#`Zl;Ks%?X|l}qupy0kbIii(A;F8*x23D5TATN=>I&V-1I(n5-n1eJ@`=7YwlM`pK|!O(8`(uqEj$ppHy#6QDdcru{E7^j<kvIlm={wo2k|HfCMn_M!<M5WEWR%H$<qF&74*A`ZV7alb4tVt&AYeFi;-fwzCEa*I?A1y@oNy(h3v7^hJmdTRagvXz9w}@Wf+$doGm_ZPji;Bp+gohQd1~1wvy39U|dI}SLLt}v8;2N`^q5M-<(mMTG01a(Mn%DIqe`=+>Bt~{_Tx90@o|AgqfGFm~0(|Iyc4p>#gCcrcRb{*+|6j>6`W(0ugFo9!F_C0lAipFY2ZHYAkl{53grsq~pv9PZ(T?Wqx?4t%&&0_lH@rl>iAl*|5ubNUI!jIy>jdZCzt)McDHsIlB`WE2m0~$=H~<>qTtkwocLpA&-ogtAe)aYEeYN57??x$m*;w{PbBaM}k<s;CM>8~K1gq%Dt!n71008#7<syctKT)v>5%;TVf%^I!#L*ooo!xK&j5m)=Sb1I{OM}iUpXrAyEE-mt2tfJV4qFDBV}gQT{*>!Z*{+n0kZ4k_UL79PrCnUUe}W{Dx#nSF?;$&|<bD|wh+wZpRT(*|LG9ow-MDL}5`K8k<2nH&8ud<)^8<t}asnmg@#c{F-U}x&%mvGsRv~&JttAd`$KfPUjIKg16h?FBv(K&`V6BuH8An?my<^7uFA=cSK-dTmEI(Jf-j~Ghfbv74rTL{DySfQYuV_tIn&yK$MI5@VCx7x<NAQsrSqW_52bJ`k3S10E96PV#Wj0tYcl{--|Kbt|bj_ICtA(JJ&|m)Bz^bv9HB>;{d0?HH6XWn|_HhtIwOK#;;=<X<7whxU8XRu!SKAQt1Wcb1a_0khJ-xDniT>$%K&z-dqgA)i%uhFxn3wsyX>c~^w9_fjSl~ldc0GVDuZ|ri*EU0npiq<sLiWAf_9-sjLqBSs#RU+=fLrkUw)>Pd5~uJl4ct!XVe|~F*rYXgRU_BSKK|Fou4|klXkt2}+hes2J&mJnYxu|5*UALJ+pj<XZiaFba3>sCE5oN_Nr-v}iS|!Fiw!$$?Zw=kJ`Y!*$egD0cmWsn-+6`7<|bunxJ<Tbd_G{0{0U=<L8k&P(-q-&wT9&mBnP<a>^nqvw9<hRu?zk_FQ0vkEj)@KHNdNT4tp%XmFJ<PipRSZ?h5T^tOgHfl=U|7+(Y;Di__j-7W>fc?DJE7AQyRxm@KQaTFaTRpLbOHP_CWSvwNm_P92%}SQp!ok0Icl)7iKAf-j}!Njw$RJTSfuj9BdGj!zO*c3TGKdA7W4=2Vt+47v7^u^E1XRgIMs6<ms>vC{@hV+6c6F<+_`nfz57_Y5BKy3F!)+)^pI{r#VrvNT0Ql-cmRMvJz*b3a!$K)ZdiH{J?-M8r||QJvmAjV-Ep@pTI6ZPO`XosO`af;O-Z5w?;rgK3sDyc@yl%zEcbx@ysyg<LR=&NUyGwn)=!KO<TDlUEsW<4;=8L1ZeHJ62}rqtjuL;sn@@S&f)`HG7a2FW&|g&S}oGXlHag)5H=u<r+fLn&`i4uiT&hk{v!gIEUST9{MU~p+%X8E-Uez)J*Sz17H2faN?T)x#v_eNbO*h5eRS`p;uU~g*f4&An?lYfZ<a#*55lK>qrs>{}t4dZ}?A5l5&uuSGZ_7V9!{m;uJ;~j)rwxX8X10WEu)k3G*w^Zh6set_3-!t4u-dn0N)1)D5AYR?Hyb7y#yy{^X!tS2N#ebZhf-zZsZ*uOsx;SEzBK7I><npMSZZ_9e^mVmS)sEQX-^(=m`#S`A$m?Iv;^U!w)iFB)x29%unE<5>tJ49HwAjfzjEG$`nQ;BxLf1(*>~i#QXfK48u^JkQnyjNc1tAb>XP8NyAr_9lfaTfvbOK8*uj+S65wHEpxIJg4dI5qJpuNukXY?kIO^>kr=vFP}`6S0bPm)uL(eq1iS0KjK1U(D)gWZCKkS9QYf+_a&u{aOioGTFha0RR*-X#O7gwh-qdPIpOO-1T&VRMq~ep49O`cNW`BD^qvNi9Y!~iX@2+1&fuEi+x3fb72mam>v$#xv>FSc%KgKuNP{LdWb->K1Dm(OFk?HD1k;!WdHx%(<~#TlVHU+m!rF9cn9m|H>*k6Pebt>QQKz9PFMJDP9*NQJCB69-qtJrXZjv}D(Mv0GOzcYYu;XsUnah&U)D%{7fT|WWN!Nm@5A=S?`t3tINBwv5Eb^5qHE#NTKViNNga1|d0>YxnyT8<;&%?gyrtqTO4zTuL)HmH<NI%k+dvT8`hPcW9&9H%{%<Z5TLYK_s2c`p-;2|IX7dpvA^Hg{4nB`=FJceY<2b3U>)XmK4)_jbH1Q3Ky4wmzG_aKp3=B59SE`X6KZE<lp$_heeq=9N#ORRiOKG3yqZ`F$JiXvlDjwb{c*@3_=C%slDm2sTwT$OSfIMO00Nw9<M4%(z4pAqz|_ks8a8i*8DWrJ$<Gj-f3vGX0`P0+eFh2hh-5?l~vD69skP{F(AdyE7K?fcq5@V#<j>dzEf>aoq8JkS7%EfPinb-^z%2VJWix!4-s{SgANJ()gO^X7n0lL#&q%YLv{kuIoNQL-57e45AlPVRsDD{A600_TXhqy|k*<^?zKr9c*oK{$a^O?3<U#sIL>eM?r`|45B?zKf9L&M{2uU{QZ^IESR<$Pn*EfV{cLQK>VMj~nz$8NAE9pjPwGfhHP|{O#34#(Sfx#eoEO?tf=GN5iQrqfO+^%gBgnw-7!tWx(@c;`U*bN9=hbrUTu>o}(jJ)Ye5>A&RtZiXiwFQ`(}XN~A9^Fq->)Hm2$UIj`TtxC^9T-oF4~HZA9vziQd$6)#Y?DW|5eS5MbEz?VWTdb12ZP1l4xNC9wWwQt>1vadnE=eG+N$nhojdi36=A~vx{eXQA<h-*153j)x=)~r4tbyY|l&I_i-RqP28dB!Rsk>jsC|A6h;{W+Tk`rNrs(%pxdS9}CjC*>2^O52mtw3S{g9U@X22TFxF*_Xxd%r<{oFbWmcc`CwH{I?zYbTiQM+g6G87#2}+OPXkw(fx^2N$6?8GNO?Y6(73qsnRnxNI{R-kr<(WUBQWCe(RuA#If8az+$iZ^G!3C`)lxP{zJ1I+E*F?Nv7Rgv7W>hDN_=@b5$qhTs8w2<=!D~pB@W@_#9m;ISl;rMBC9-!3-1P)Tcc{{DPuBZ@19`w~8NiwHHdFKc_)&3oDIHWy%+#Z(3o^U;0C}B~gF>y7Os!ooF0NYihHoU0!N#n>U=@jpv$-C{_-s`9x-5luvyVRJ=%30E^h^a};oCNKWPQnn*tJIWPnN3|e36eOHP)h+KLKFwnIH{%gOTbeCw1SM`yU2XL_2b{)Hw(7{;adYSZ994YK`(+ZwNV~&=$qP{H$2B-5Zl@Wfap-@=ZJE2hBGa=M6kiZ*wf74&u(i4YIQm|Dy37i#Y=8q-M-#_O37rYbpY0wIk#1hsOPEoRk`#m*DI;VBamo`Q?fc?CRx2df?D_0BWSoPP3FCx`9bgG;afuNpwaqFhDn=H1x5pT<u?@p{<9tfS+Q6?qXc>o4^nzu35d>US6lJJ!CmEG}4#v<L`lG-x)2lNBnruTTRZRe52{^<hJk@0=4*UtSSWken$O?XaA#}+C2aSvu2^7LZv!|c&k;s%~d6&<frG;qG=AtF9I@Kvf6m?qBPh;~H<$p<o~qABLJs$Sa&<<%x(Pudm-V~<fmo%@vQZy+AYq4_Jj%t@WSN6e2Y5pn^w%M#9@2?C(r<Oz|XtDI&Q<3)^JMgedN!RfmdO3~})MF7i2MIM~$PHv!`zI0d%ai9dF=Bg0%>8GAj$yS6^_RxBX+7+dnOO@_K-p87u1{)Vs%k9%(@0w$GDihbl2L7fbKdhblCgpS&r47zlGEH_!`MGi+zX{`Rs&;_Bpg<Zy{g?q+?m$xYiI#4!JTVY~^;o!orUQQln4s2;4}^q5IywswLJZ@(Y<Qr6Uw~!KC%I7XWO^AT%nx6X%Gl;5{%gb;y@C^wKRfAfrHy`z=~zDV*{)3XVda;fTv;zg9EZcIHT$~`_F;NVDX`HNlpP?sLd04ehfe76)TW%R0^{P_Vv<k&!!@oxXh9H`s8){!JTh&59^ia)uhad)!d=rnUA?X>aOj|2T_(jg{_=)IrU^_BD2<8M1V3C}>CNt7W5QtA87a#yO`w+-_7GgB58-B|M%Ae29`4#sG^--?2L{pU*8IEp5Emwi<JrUs)j|HP7mc%8@{)SKJ%4S~k+_FjU$H$OJh05j;yn6kKZt4e7iVm*53%~xW_ob*;#jmNq7n@lf53961fvy01##_UB&f(Kde1b6V)UbK)7x38X<etLa>y)%VDbMdrJtgWj_@nJ_y`b>svcd2A4?upT`NR_;b8a01+$X7fZEMO5t8))t5!%+_Osa7_-;_p8UPy%MJEj{LeMn<>**#0Vxs5Bmsz~K2S8r96>>;Cn%#@lVM_H{%#UlCyKJL_$%q}$pfB_48&QZi+6dA!G_%KaUU|2c<sd&5)w-fizL4z#vloRVsHGy&5RpW{Es$2Thq4)J85H?N79GV%RY>LIh+=8Stw5A5Fgob>4~Ob%j7vb*ND&B;cG4Y_6oHAPbXo)80&gx2BU?^vJ0Q^U1VTocsh=E<PZlFQP<_5iT`LG(`@SSD@WHTf?`)Ni9i$4jh(6JXr}9UrthuquNN$16tNcYwhDnno&px?Ra#I=nj2QTq7e}PsCY#3TD8hRwMU)rMj3Z8vEPy)NPRXwHuA`RU{MFM#_G*B1FAZ+8>g28g@E<qGA}`!wK@|gGjQRfH;(5clZEu-S?INHVx{F4Ue=s+{kEASCz4U<oQ!|5ECL{Qtsq~Z?Vu#XUJo+tmLKK&R>L+^$+>y2*2vm=U#BCojy*(tq^8iq>{AjL}x0o!j*Zq034n_njhmDAeFU2dRf?EArf{qEF-y5NA*^hKP#EH=J1H`gbZv3_N&r{b!uYill$Xn{I$kUfZ6L-5Tl417SCi=1J4M=*_<&GQ4fr>#{_^7;KQ@;3D^I-PQf-5|Ys<OaVj~hq8`Jne&%=_G#OIxcB95)~Hkq4ji5ms8-Jb@<3aa$`Hx82vH*63Yt1r4AOxe16b#3*#kB5|H*$5h?Wk)xTrB*h3}JPHHaaU{6EMQQLp+AASru>&VS!F<@(-hW{J{DrA5FdVm6ze<=%v+)Jg3%(QSS{gWma0Rq6lcV6J^9<qRBIDuN6Sv+7S&2s0Jcu)uHc$Q3_m(VEWqGO7)Lp<{=NioOFU$g(Q!hKYJ@}3=Zn@*`I+H30!-unv*sb41ZukoD{R{Sw4jnw#YVtA}lJ~$B)C5#2@ufEu)+VnegYZwHFK@jX{feWG^D8AZ!##~W@zbIlyB|PjXO34E-=Q!z2rDn2@UmGuZ1QAp;g$t*l2Scyx$-XN<I7UlZUx1NXg{{!**eRGyU0I|y6uR7725H2JP`oFbTFuJJXHko$Kh0M!x+HN3*rIqM)Qt6QtsB&*&wK#T+Te1pX02WOYbRN2^VKhs!}e8?^dqPbgQdgcoaj)*1mrXqn5PC0+`RwproNGc?Zp<6Td6_GDOmT@fs2NApx#-=FPPab~w>@XAax9@4m-<bpbQIy){0-BL_%I|F}g(sZ6UdIb0+;%~ulr(r6jwNdip@sf*1`^UsUOWoA<T2L27(Zl+*gFTv`ACySZYI@5}i!*rQlpEyen79o2E`7lB_AR-3Gt?~n593QT5{r77ISA=Sdk~xX0La@t!jP<(MLNyInO+*2*MQTR^u@|x2$!!EqsFors){|^~MTs`=Y4m>*_jrpLdxBBUlfXV5bfqfXZ6<~iufo0I(H)>@qeOytr8I%#(nr;OnBE4o^GLsKSowGpg6?8gs~WfX(+2j*E`ZY01&q6Ww$iRnC_nXXKb*o#Dk2m>RD1tUmk)Y$dT$!3)d73AIShMdWv4z1+QO?<qO{vA&%@qDMG$H8sl!}FKYHw1b+~Yii(m3I5jK>Zxdg9p0?>eXGs*J(<ztGQMk>LBz5}7H#UNEcsL$^{FeIS#&Cs3lX8RcC4(g321QQC6u^(b~O}00Tu~pq9p*-Q5=EZ02KD?+vd`iz3aK3614}p+uG%k_!{Zr*WpYOv78$2Nz9dFTLO0;uIJUOX|G5p9cm0}-66VI88{5^&=O4=t4w!=0A!;dvZb+`L*<!>Zks8JWL@m#27DBvu$;;CycEtnhws|jEevG-HLh(1jRwlwu49_Y%algXP$Mlj|;rucTA2<A<ouM$=jFc|-kj{yTrHFZ+%&#f$|h@0RF##U?bhm)YgnyFvz>))(d=)QPe{-<FYcPouf7gZLbXy%^B_f=~&Cdb99-&$0xvL@P{OVbtWj%@qs@P_kMyY-6M`g^mYTyL{J_`Kkek@K~nZnEq(Pj^ts(So6!7``H%HbxnSJY1De&h^qvSsHg=Tfm#;GUVRDH??fl#*YIV2Hdw7$vFVn?V;h-mERWTBYs^?91woT!`KDjt&IhA|0)X2UYu(RZF*L2qvAhfPq1?UCt=CJ**5R+e+W|3VkZ$G%{C8gw!zAqT0k)6=+U$w<?MMZ5ANu9T2Fc|_G&P!gnW%O`hQhHZC#LxZQ5VrTU10NZ*A;k@TQwL6eLcw&2|N-0QX!x>pBK#iGkNtU+XdrM4|EQLhTLXfR6_?A!f5-^W}(pwMDgx>q}ScN*QwjgBAl*!%;Li0EfI0;AFz<Rvi5!OCRX&{mAqkLF|ApuoIs{8`LlC`5asSHyf~gO2d4r_zJG6$tOFyP@g;rM2Rg~+}H04@?n65w=|)rv~8i+bipM{Z~cJ<u?&>j*XGpzrz^4VLJD_oNS46Ipt`h_-k2~%Zk}~v0_+jJux5e!h8o&1{#b>-Y`NLGS?fNh=LwF&fmF7kcR$4Oj~YzP8>9h|h$!C0f=w~UYH?1kL0LKygfQ1%W3X9BO>i6U>P`XOsMbb&N=P)$z8<Ruq)ZKBYhrEdA##pjU<%2u1f7L_5>@U&um0)Uq@{xrO<SzOfh~)~qkx)Y_bd~8z&4pI-&u(<w{T3RHIC5t>-h?%BE;g9H5bw%6bN?+=Lg(ffE&)CMTq(o%B|vhJ7hh79ep1M)GG=SAIOrm;VOtj8xb31sX$hPajAA%g+ESxaI2{2($oy$aYP%h)VY>6!tf+V9^lWWV|rDF5rb+<qnC}e)BDfKA%E)5qfMwVnh`XtyP8UJx6qj;o+lSdkOrXNKgmW#O4=sIk+Lb)a=aps@C1F4XHKk13UEC1T0F>N21UKi2}G*olxc;tK~0+qTPNA(!2hUvdd3@2la?+&JB~w2{U(c*X}R?zFXPo$uX6#9;RPP4b`MSM5tp#ztH|^FVT&mi*zIBLH9s?>-unHMq)_mN?zGpR)^xo|MrGnlrR}^T4olzhz+%e7UfPL9Mh9Cxbd|<-Kpo@ADSaCQp@9>T2Xl!PIx6D9b#K2{2$V3{ZIX}XGzL9#hQ;GvCa!LTXGAKzE{(bmi_a3eE5~T}lz3>VwOJ0*ytc77D2$|jF3xy1KX^D@Yb}vhM}|htPau*+;ZiyN!tvsOHGU{_P;>dxL_vsins1r8!Kd}lG?eJ{bM;y4=d#e4)RrV@z|1k@8TG6B%!+$5c4%Zh8h<KqRV=hHIQrMtVku}Be3Q*WGgnW7cK)T<AL;c%qL}7$#)`RIAgzMvH&Eu157J*ysCVwmis1)qpzw}ucCF6d@b4mU`(gUL3sX`EzG--sA;Bo*OCZAb*9=^9n7fVI8!PTkg?kVp6_s5>qJY0;c&Gy$9TtiGtqOhtqslvcN8@iPhk6PJM}!1XX6x$m7*M+5N@&!x4klwhE;<u(X(&xOWS!TD*5E7vb1d{7T7#nTBEeSB$IIExu`HdJ5~a5Lb&qYaH6>%MO}qTg+cq$Q%*}=65U95*%AGtEo42Mfat8+6XNPpk$5YH?GvC3D6ocBt1M=&9zy&g({~1fmvO1t@6&Y$KAdfou(B!(daC8qqZ1zJji8q;p3`&`;<Xgn+L38>;LtfZ{HrOv=X^9=OBW#L2-#@ZVMqFkv5^^RytlIIR`e0o*hB4t<CEqTgie;-i-1kqBi&o1t=Pr6{nt3lCdRtynL?e6ozsq_+ZX6LZ{!RdyG%~&6uBBkTGM5)R?$zNhN=oR&{z+)+LZQ$T=>P}iokQ_{517R^#z4iuh5vxZIn^LO!kHu_%F_m%f=^?41|jaEFn1O^lQPw)e*U^Itv*QM?m8S?RCE-3zxnbBPk56=Fh5@i<`Dp9M;DDsp$ep*c@BDfUmE+huym(tGvXu!5_#sKsFew$b)lk!+X$h=ctBZz1aP}^U+Put<fe>xC<xbVm5_I8z$LYe4_b>R3lk4c)%AnK*}7IC<+Cd2l!Nf;d({uFQ^DU(3^zXJ5JG%)=yOqyG9OCCR7y#gMzbTgo6CN5X=}4wc~l%WNbPfrCHVM?c89iG)~vXDPA$|2to5Pj$jwz~T!f}PcCT8&p}<WWYIjMr)zQKn-Vkg?`~s0A^)@6PtE|H+$Z(r<GBaf*Ht#m5_F=CyX+lhbRtx5aQvye~-e`!AdLHQU*VI-a1Z_N1xwL|M_}uiy-6zQiA;QH+;1}h@A**cPHEGaM-%(pi-XP$B9f=EkIK}?t;`aFR6A^Qrw{rhPpd(KVuEo5#fu_fKQngBNSWfqsiWf!R8|jIeEJ9(GsU=3h6<BE7DpXDkiD4pD|L=XRG%2``yUw3ry(Zl=upWAIc*7WIzv-*+BQe+o$8CEhfECB18=z9VLqmK)24FaC88!C`JAMXkJ1)tDMQ3`8@#$24E(H*vzAIUJ4S#Z<b)<Rq0_62~=Ubs<qL3XEgqzt<1wd)cq38ysDZt|i!)Ya4L5BZ1C*%v+EELea4hKB$$rXAcHKOr4dgJD0SKariI)H~XV4|)_d7WN3Ld?;RaX^^@{AO{6@?)wY|J>8}D(KF$6qh*HToHZQUC)99c)QP1GbvYENT?2L;L~Y%DQNY-Q&D%2=NQUEjQ8ua5ohW`NFQ;~tC%5Q7;1Ms$57%@4+uBEr)<{>0<a5xBFmY(o>`HG&|3nq`RZ4A>()@j=t>KHQTVStS3A&e;j#*a(!tSdUqU3+z7f050rtf|{`rjWT?32sUp77~?@hFXKNd=gJdU3$BZA{~P{}EZG{!a?JPlNhorKP(a5EX;DJ`fUk)EfZb@Jd~%xe3!Gh?Hz2J6I;pO|dsa}}((NL;wC>qra#jCB?mOged?5?dH6SueqL?k@p{-Tg{Unz$cmBLE-W(HdzHpkCIQ@lOq3-1atP^*GEpfv$Xulk7T-O17CQRujONO_A{d>gI3ahQ2D+w)y@&GM|<IV$e{lA(Om{bxX3z_6P)-4|*VgxTnoQ3aKz$p(=jK4cr0N6kVI%Ak^ZCN>-dWu$%}10T;J7YMR*3T2D->k2RN+<EWo0fB}-^`_@lpAU`fmXp>v(Y|>+sBzX}?=eZH1mx=yiD`&i^NWgkIn1bQq|FuTrtH+?$@vQIsLsTVbL$YblQXtVVJlM;Vbn1=}Fm(?MS-b&ug4M4r+(4D{(x~$$?oz<w=Uk1i3>|jS!H!*S>|t&qTsd61(Qu}fx_L-06K)TjtYcd&tEa!V+TXN9?}AfZZyzMq8ujx3A&GVO!NDe9F+@1hKG3wvqsK}r=_R(G-J#8TjU51}??Y9gh4P9%on+(5p7YK!aAT?K@Dj$0%S>wn)09f+5sDx6DF-a42o&`2!ARff>+uTRCyJXNg|23~>x_Aw9EX}zJd@ez{s<qw;(V+U(_T(Tsvzrbx`qI;2G&PNTISkhfEcWK>G;j2r3#@ydIle+_xUj$V)ONR(qwk(>uu=ZuJHG0b3kspvYF&7E>%#nf_`#`F_W(MegDethY47!Thhh%2UTO@-uHF)@6rQ~L*k>%fZGj=3iYqMfzGuUMCQM;EOQ$rZL`nAC%9Uk9_)Q^XIqwW0qt~Z=k0IF1uKfXkg&f@4n({De{2a9O_OOx_C?5ira)=9eIhL~SDm7VwC9;kVV4?RAxtY<4jT673u+CN0<$6>v#YxTZdVAhFCD2Rl@&o0V*?M-S_*qbSR&VQ=W$|zz^NA|syrG<Hb?erd5>sH4upJnfTBOE@8^;D+X2RSAbCNwn6gt6>qn(l!g9(;dA@+Op}gE5t|oBBj?WBlh0CX4`tmBMw*ZxsRDE_*ui&jW&ozabSFMiv;p2r7Q5rarguh%}&jvyVlJ1vZb-{n(1!(sLsWxnG019bnG>`D?L*?^+MS;3+eo*!NJzbWR!=;R;484}B%}B5m=I%;&KunWO48!{oyLFbw6vhY=!!&jMew)u{&rr8e_k-jiDDOQ<6i5gWO~9JhB3`m6O`zRFM*Yf#Pv5ukGU|x)N_fZbXn^aYpdI;SA9Hv8y5BCr_n;2RuD;b}GatV2)$HK2b?lEn{}*>bg0F)2_+0%w(SQ8xqjYBHsuKuYMq^qBsO+h@#xS)QiNYUtY_Dr)(#0Y|@0@c+saD|+)gv#SQ+3?YHojZg_g(-+!$*0&TxT&79K)}taw}4{I1ncuQH{x0e>H=dXat#%_u$sW%@NGr(}3Wv#wg1KsCn5ckc3<nCxJgWITJRRe`_2&GET76a4(!-rEau)RX>CODuoRcA*EDFF$p)qKB>vAxizNo)R2K>YF{2Vk_aI?#d364V|ck&ua0(&C$z_m01Kq@m$iPcPdM}yNM)oqgTm8`;ZsRe-Z5Wc<S1j4{zESc|DG)*DLXX;u5i0CRQv=Abe&!mf9&w*+L8UMCxvml%%h0n#f2wY=jH{23Ld_EK7yW2>OnT@t%sau;fkqep6Y7AUd-vVUq4<=j6D@Wtcn&JitCi!OeJ<xVm2=xcjIOSC&qpr)>4k<Q@g^4qXp!dny*4tERu`I+k@Vn>P!1!e_?d)RP$Wqaj{5H%C0H=$UJ^QMvsivC%4x*gm{X#<S1VusNhAK*&U#?<b34(LzIb2mE82$%@N4qogQY;2r_~MeoZqDvPQ|TFR}&T^pF!;IA@*CfqWzZYL>*B_eN)`g4^al0`9=Y#QV?joTD|vbe9R;#xcHwZQn{HORGlT=Gq3_Z}0DbAAXFrsT(s_1TW+*TfDos@Z`&HBT|-ecr5oXci5$)=GVXyZ9SZ_x2_?6DtDKrawQND)=O8a3hbQMA6tZQ3kkr1jp@>%{a^eDxDl4L6k^ZVJuSMyi&b|Xb2{<HTlzkjEq!07hP>W<lv{&D+&5e=uD4Vxr|#vB)E}|FZsdUYw}NOcMzR7Y6vT<v&fMU(zPrFL9%0Z-_%v?U51ro+q=G-@xisL8n*CNogS?kWD@YpGpaEwvD#qOzqKJ>>!VO~mnS~HR&YmktA|Xb>)bgaMAu5Ev7EH6H$QBT7*}N#sk9ptG?H$QlVv8F^4rSjj_xA}k(<Z~x*@XcWPBXO8tH+9K{zMmC>gT9%xRt>wCm#!UY)!vBh|kX#Sx-LfzKA@+CQExx`v@R#*HpvRvTMcH@)E!#U}Pa)X`|%8F$b|5nlX33MbW_$C7~718a2^xl(zw7dOhR+9C>0T9SdNX-g=W<!vlg3AIC52rKZ*|XEPm;cpL_vPZsQM>vTE@;QN1yS%Qc_Gs(EzoMyJ9hC<KdrJ7a@BR8gt_a1OcWO-IOQ`XN=93_Fdvc+NAE+vmeh?JemhxvgYnwtslBNp(+sVzi$kZ3$=nokESOL7XHP&d=r^CDxJeiq|La=POKpU%!bc<!CU2QpHMRtwwLz}LOR;#innaqrT~*LC{Q#TNlgZh_alKTfQ$q^J>>asZn3XszRlWzxBu05&QGtf6>6n4!A!)|!J35zC<QJ%2-doi;EaS>I$i`;8yp3tqu0G`BeO<^K(FKTT+%ua%)J?oPEjhTAr)AKgP$b9H@ZDUrPSZMVzZPd9dl8J*UdO*P)py2oV2zSYJ2m*w^>o70sqq#Y8}Kc8oaT?1@m>t%;(J3NuOY?mhU=fyrKDn>PJHP@soX@Ks4l*{}`Kmo5&E7iV8%b^GVQ9q>CAt1#b51v#>)c>r<ZXW^(0CO4f-JV}@2ia#>KcrmmuK;y(F`mhh7qKpsxUEwWJGQiEx4tuwbSxQ9aN3^s9DB?~z9EJEj>v1np846Ds8Ni~-E4s!SsSfz8xS~UWY1C)TvuF44(5Gd-rqJ7iHCJI(;S}j^Sz03Z##hIp(<0<RTuf>xk3HR1WJu856B^@@%i-iQtKZ~(%JWz@wFLfN+Qzm@9Pw?_z90#bnv3dEw=ShB>Y}5&dwq+XfO&4=-Xig_RfWa35p;MY42GR&w27T1C7O`Lw;TZP#McY<M#maZ1RfO&NXS;LhX3jzXYdaTcp8K=^xl7g#uX*|I*#cAc;=(#sF=@D#j+OnIGHZsapi=%g&^crFCvD>*dE>uRVGlIP2C714xjo3dz3t-IP%6JIoGs1<U>4tLE4yE<nX4!7Pg`WGUcOy@p8--8;3|Zxwpf(nG=$=b+}!!_Z{H+PUDno8Ah?W<`$=o9d>#%bQ$d)6r!m^yLQ*=upaQxR*D^^vZrx(j<%QH4i1Cf(@Q0qw`~T7#AQIHE2s^G^Ro~k*q6^=t@|HF}+2qi;(E3AJ6p{2&*`^uv%KE84kZFBg5b5kpvX=hmBl7RuSO(M6zRhB)*gSjr5c7RxvGC;6mC0?#(-Nd_F<SUmewf(59Lr%XEVz8e;Wq&KD&NIDMFU3zUv-P!sSefzqaq*Gx*GSAAf`hWEc?5~`HeEVA&m5nL7NAjAqwl#8@A@`pp?2@D4q-}o%*>6Gig3`cJd&tuU8Ci|+AdTx-h3DMqX=%LBy_%3)uD<#)>#IA`iEXhOyg@ki}OCcv`%dyi?!V=5e@4WvqKJ_i)Jr^MEi_IFlBKz#mJt1Qiz%EPWo$f)Yl0SYBDOyuvIk1HEEUF;05=LJsgUHwSaq(|}>e=Sd34r&;j(+FyplJY(x*i|cc3h%6^*Crr+=$a0UI_`cq|Pw3ZU}FSs?P3(yeh2J<fm)2U}o%!Ed49U>hvr&1HjPY804N3tLB-^4#C~oA?>r_*Wm_ashosOpG~2EU^$kpSHOXRlO2T*6H;&ctsw)HY5~}x894xnrz}Z{EPdf&V2+(J`R=5t#;UK<h6ObWA#Bq5u|X<AYt7m;EA#`|&BXFzEBXR%U9`xgaug#zS3N(wFcZ73cLGS08^9=k0HkP*h+xj+0HapaEpc?Y{5ZL4vbS0GtcWGabX2Oq@>@UA0mRJl){aj2fZ7*!rGT(Z2)M9wBwQoZVJ2e6wQLZsxWKRY!To->E=HGgJViCnT>cA+Eh_G5G?$fAl8vWXha@xppS<<R(Fxo{$sRTFfN?U#)4$Svq8sjqqkge;0&-lXn5bmZ8&tmVOnG^BYf4jG*YTCKBd}Tam%Fr2kR+p!6+km+N^s$XTZhGBHm^sxMt;^OJ*#3*0O1QHdfOo3nDvjR-tx?3`cpttbqH9yh>-B~E|Y=XsytA%*nLi-iV+4<b^D72E^@L8xu?#*#|rbBDe6kQp0tAHOUp5cvvE69XpES3bm4$(c7N#mQptltmBylc=Z}TH);=<Fr8@j|OTdP_hBPRGRz2ob3|h&J^CurlZMaaAVP2_M4Oo(TnA4y`V??cI0*1sK_Z?)Yc=rkYBXE+HYH}dXbAlq_(}nwV-$h{2HR<D^@B7eH0c)l?z>xzY-}B$w082BkV4T`1fM6L)8%;#o3eYRKw?*Fu?jtyp0(#+Y0``7cS~W%(izpr<&sp2j7fCXI%C^KHqfgle7Q@u4^7+oU;?s`4lsazlIazJFZ5SPP;NnJl-2bIJT9yYgGE;{y+=%MBLNxC=%p~)l9WB6Fp`nb~uI|442avIy-w&;LJzWx(S7um$e4=bx!Aa$f_powA#sHEr<uycT?%xmFsdGWYRPinzLl7coO7gvlq3nNVv*Ras76j9OWPwPG3*X4AY}tJe;(dD_*&5|uOmfC*K;xE5k=9(%X7DTa8FP1<|E-MvSO4zz2@cQvW}(m-ux#juebev9RK&HL`C^@-G;5xHs{40G(^Kli5a*Rza<lt{GF!%W7u%nFOQ=Fl2vL-Mlk5Baq-?-7h+pTri<seHBA^i}Z=IWSLOpFldLu)#VzRP`T=vJ~yq#+jo1HU?Eb2hXw756B#nRXRD&2b-Ha;`;IUooVXd#bh3T{FxF!ykNk#Qp&?>%dPe;@evY9L_-r(wxD0#WSyq|d&1N~LbVNX9m00{6#&P85?`oyD!<;SDyVEmDRQI>b{FO}#%uy6InbT;{EgyffvOx?ggBGjIlpqXFO*|DNUiWdZdF%|_j@mYcityY)CiW=sKlPw`zBDW=X1MU0XtH3FV%l%;jfga1$Fi1j6h>L?2L$1^umvmrZ}h8${jAfw);?OfN-M}7D@x@diNL@vKTUDUy}vzQwf3YUX2dxH*JF7owEQWs$C^xWZwv*#v!1s~P)Z2Aej6f0}KkehjDMWEq7wO@$(Ic*1$D0Q2)#>?Z^$GLjkC$BVD3M<Q*(E){y)bjHQ<a7A#Z7Q^?zp2gC!whhtc@k3y4dmm#>6Jh35(;tbjH6_6qmyi!iS*A1lnA?6ymq+b{2}cN?I_K&LZk7byiJ_((Colmk~PX3C?chjG35DHULq$PXPUthcPfzXtSal)W%$CB7h1;klb|a%;V&<bL&D<No)^8(8t4=4ykIF{<o`*it~2%^F@2Ld!%b}4j=X#DBC_e-)_-Jmex412YU6oBA#PFgiFmvig#tokO$#kKD{5Vu2{j&=@!8ymoEK@wd7j0qe`l^|V-*Tl<b9_5m==$aSmmB|MNgRgSAt(Nv9<aV+0uYwpN#)YMI~u68CS|BSfX92JQa#kA6a54f4q?HhGy@T8&CV0RUGZ`P|BZm*Q3LvRWC=ur|ABhkt1~dl@5T2Q!o_gT9w>R|BuA$N2M{?Eb3YpZq3mrNEZUBCgvT&i4e=JyvuY8VZ^n(JO^LYrzY^6t$Kf)3A~;hN>+0ikzxVEECaS$-TiKbg!F{_D1mfbAFnkZ%->!+Bui(zWE_-aS9^>%pmQ87yM53S1l%c0AbI_kCUbF7e`n9IwB*1g^hz84`7N0hKSA2YMmu5Q=CpSfcaFQ9D!kh%=h&fWA+h$?X8#+$AIV&+j*Ti>8Ards<q@ENTb{wI<1pC6HOub&HIJnu4bR=yeMHrMkJqt$=0Z(gKw73EV^s@297JQ_Ce5pr{Yr&+(^9s>^(r?<oQ!L9s-Wt9C^nKz`WjS5@<`6sp=gm6Y^$dtdOP%#@8tm|3EaU{`wM=r*z}_bOkIs;jGU!_7pD%5I4X-gG{!vRRy6alXufWQ!I|HJ)O+PkrX|Ua(7A$s{r<#g(7ovF*>Y2y-?qor7R1Wa3W!K+F8Og8r(QmS>bcAL*J9^rs!(G9<~Z(M_tC)mx~Jw7b2ucqQ%rZf$Wsj9(de#?eg3y{HzA#47pAal@Ss5WTV3P*wnb{~3$vC{ct=!fW;aIkkO*?jXxy9vI7{)E;W-oPx?@cWabLOEi<7~*vT4D0D6OrSlJU<dlmvKDeYmU_Xj?2gt(i;wVzK{E>tq#I6-;|%j^jBYhZsC=P#*5p#cOMCSyze;hlrYXV~afVLfQPlfNz41E%6Y&GU613j(ExQTUzJ-U>qaf;l2wZ9|(5h5-1Xbv9&muc@o8ez(G_bZqE$CT{)1LmVWoI5n8BRg0T)FQgSZeCf{}VQlV%a!FFZ(P9?S1RN*m>>+IS0R3}_yn)E5T;c$<So#&Bn7?JT}tXwoWk$0<~AeRrXDN!_w!*mLk{wb?u8C}#+uNTZWT{2!8h3$G<#oqWev04ksw%pOaP6f1C!=S3xH<&6VvQc$ez4lT*5(;r|QS4?zks7lZS2{$W($a5|n2(tGlnBs!^$Ji9my?f6AoVIM6(Vge36Tlox#xqcIA&yH%^G45Qp60(<s@_q10YWBRLX>W+*_Vh5+QcZ4LoNhazSh$4;q>d5fXYk5Te%L({0elHq|pT=}Jx}=faryC1s3JmKDq$r<B~m+NU#a@>09gmTM~PKeh^Gl4>kOn~cvFG)YRm0S#El5Pp4f(MI^CtjL1(lj1m@KgOffn0c7PPC|W3K&vpEH;;2<DFN%^C*U)cvCk_5(wXwp6{hYfPnIhhb6806ZTGG0QIOH&%QEXk!6)^%g|qpB$QvG5vQNqi2uSMv>J?=D<83bf-h7JTViz3<Ss21!&ZrEkUpC7b%!;r81>p9?(Ng9=09AIGF`MR>gC9LFL(3W<=c@ELPhGIrGstG<-J}-iO7{7bK?886N=Tx;ZB&v)F2)w}mfD3+$s4wQ;WOrq)KNxiD{i!dC>$-A*z;M=P<7ki5@kTl5|tMzfOBw!LTzOi1hm&XQXVpQJ++#7CgFAXgLNixq>+I3VG(Em+1zEm*c*>IKf!+B`PXb{=B2&kSUYU+c4@Mz@?jxml--r&@e83Y3}FI1(v40<>}_8{&biI_FHV*e6jzt1Lx{$*>LGoQEcTco+(=U38NzsciQ*Ku<gK}a3K#897(Tz=HwBf7DeHvTaq+T!0~X=>zZ^(yo;KK_LamY++@B*XR&r>dy-yBO9Mv6!@H{p_i&iA7UvMF@io>Sr9c7*1OPl=a!WYtdhj&}$^s?(lAgZ!u)R(l@BFbaum&+__?R}jhe3Dki6%TM1-^`5Ql9mJX<$XmcyYJAHV9_&^7_P{1oRzup(9b1vSLFy$|2L1J_3j$iGSrf-6ksn9&faz<%ZYqkNa!x&+TWHM@yC}1#Cc?OxH?HL#BxAyiuy?nr=iVBC7o1LBaFtVm2HDz7#)LfGEyza$_Wb%>h<Z$FS&tddpG<qUq(jYpiEs?(Q<SBO(*#{Bx?@D7x&d3uJ3KBLuAN=>rJM=64Oj``K@lx2ABDwnJ?1t?Ncw(NetVv3-n1_J&%r-jf5DEIzgP<f|GXDvg3v!dV@a=J*zGD{>5D*Tpuh!!ZuKgvD>hyqbq43vm*4+T}_(+VB~0N7bVUrf<Tu66q-+QzGJ#@l6c=7tcd)mp!NW83se_xqEC(U_y}!ZdCtLU%;(a_i)Nslm{z(ja@qyFOzvjdc7ig{XGV;0_6@jS-uK&<`lPO$#=Ctuq+KrnWk!CsjQ14E-GO?l!t`ztyixc7M0%VV=#MqhRaKw?-rKF2zl%r!)<vAX8Bv`BQI<@QBw$KGcu+;I?acED>W!dU!sQuLj@F|#JnOXuaF`rHKCVNMkeSDnh6$GVcfLC?O<6uLZ)Z}|K;~5@fcne+BN@hv*2dwXVE-RoD_KI*V{Of))v!&I#>H{6k2XI@rJ^HIcPrM7|HNoMpkR0sm*8(l6v>C;1XAHY6VjrWI$#=ap5KMycb<PU&e2V?msT$PlB)s`gN8!Er|`>vpNPA1u23My33tz@9Oiy;Ogb=xKWQtUBAmjg^Wj~+DHC5ekVsi@Kr<#&ipdwtuQ-a9`6BO3Wr$y?)$>HK#H{6(a}oi_k|>UFfYU~NrTi}xjnTA=4D4bhMEJ^${z)lNVGxXyKmnOgqqG;^_wv>`t@5cab{%x}{}71W0TO(k%lis#=)_!@I|^Se6<;w1`4}~0wQ=YJ??&`up)<X+U9Hy8eOlhjeXyGrW+EL_LW&!_`r$j+75cGLj`Dy6Wi`-nK4Bukbon(c$pK9jANkN_-L9l7wYY1j%XVvp4vBT2&~%`*85EUaO!AxdV!tg!sckn#w{)aIpqbQ4AuF;jRQj->T&0L`b?TGHkJW48W^v&ZbSh_PsoP6B%PwaW{30p&B*cBAQihS$L5QdmztfAht9;7R{9~7)2Rt(|wq<~;eYJd;MPI60byDesH?>krqrj#ZR5eX;<gqu!_(3*G{~fv=T%evIC&7J<Wi2G5y!FXieJEmV99im{A;skfF4JrD9~D+;E<By4k({_SMis0KUPyQ`R3s5q!`&xO`UV#7yaAA<cE=78UbH8-ok-|!-bI2JAn04Sa<N*r^r+6v3F0nNtSEe^2%cLx-bc5S_2c?cl{yTUmN)iJgy3{oA|DHB;*^BT;(hG$nV&L+ZH&`xJS4f#La?(az3ip#TgV^xUHY+hPv{z3i*+1_Z*;rn<=h3zM80mznQo9okaV}F?6-;QMak^2;U1w+5Yshy3~d9!$~kkyr@<L2`7WRY^}n80GOaF^4}m-^QO6=Kfso<U$hZZCZj(o#!$}_L=9XZ&oqW0Y8x&lC+{w;mqUzMm1`ka^EIXoKMM*|9jQ8vb7w$(q(+ngq3aOD=Y$U!z2|pVl>{6-T^TV&$sdH$q<Uw17(ot<ag7PgA>RAv>P>}X6BqA4;o3&=va_amMvarAoIQ`ZdzJqI05obpNc*6>A<WO?(Zg=S&9TDQ%oV!t*wPcn467Sh>UovlIBW}&(-SRYIWk{qUaoxA4V%o@(OW-tD<~WGtf)hr1o5=`mr(rzG7ih)HB%0Mb?T*9u3nsi>CBEN}<<*Cm1@;l{Xr7nE0QRFrR&0OaqWuCp^r-6U8{+nNi=ea8`4}zEP7hTSw(caC)=}<MD2~v|(O&PDM-ser;nfV>>p(+Kw0e!Z$@!jOEnkAe3r6kJ;}pfUQG-*PC&QxY!Aw&TIXDw1a+Y{h_Z`KLw_{^EX1+w(soib!=I^bMFwW%;xJ|Hg$F;31-soyUM4Wg4){i_{GYlDAm|#|;>K}^bg0+F-1_hd@*u`$kwEITKByeB%v%7dg(YT0bfB?rPfQiok?xsJ8am(FWI=iE`e#7;|0f^~eN>t<eBE_q`H6Wk<cZ2yRp;lDhA<+XYX}m}R>wLG0ZB3;@K+-bn=*@Zv;WvIy1-RSgDzsz*LOl5ew^BSn-LelajoB?`-Ag9$jMdTEO5`A;I3&5@Ue>{N1nZd#YyCEh7=>^2PJ7j>Az(aga#S_>rcAz3t;(;gm~NAc6>&Q0q!CH~?_`J4w)GjS<I@e8)(u+ye@z4L9}s7F9ePMCWdMlGL}o;ge=L8N7hn+U@_j8uFqkG3dG|cBN-1*w_SRLFtp48r03Beiz~hQhYB-Y47C9ag_~k00ysm+w?~py!vk}1uCg@C!kC_)y8+Ojzzk;1+@*$#%iT1!v1Gx;)H}((+3cPiVx{?@X+O4Q0PFrBC)ZkRD`#<$jCIVby<&Cs?HC=T35jMK`2U`V6^Id*83J$t1AoQvc(LRM25hP{u2V}L6AgL0(RK|r)M5eWmi1lN+EhOy2WI-QYQ9|q`rH@`!7(_5N9R1;)uTA%y<~XYU+y(mrUS@EG0$kJ+4MC`avmMtF*Dz?Qs6^IYX|YYA;*sYMlP`E}6_PIv&1-;k-XNQaLsDOir7gf1Hs;Xz_TYcm1{2(Q<FSU2A<%F_JXWnaSraYqfrZfccqMg=be2JjH<g-d;#wzVQ}cX~n3a5C@m+%@z{fxnjo614?_~Ytf;QoS80?_A)Vkg5!~bpo3e5WuY|6hvm=O=RUf`j0hr{>*w{nW$;AwvsBLuM9aXkSH$f%*a?j5qu>R2%*y9AZ*u&Fi_YV!EKcz}@`U~2RzNoaGOp<%SFYXa4y$Qg-VNUjmCXh<wZ<WHrx>XY=c)pU1bx>^oRZ*Tz?7&Spgfve<11hX_{-6^|H<cH_#9JR(y+W5!|b`2Ywf@@R&%$<nlQcKuTHNnA}N8a8nesI0%bqmnq{nx!8i{(Crpc-0=9XB8jH7cxi;Yl>50DT^~nBTQzl}E9ypG>|J7VH!CfXY+~cZJG)i4PM5R)z$vZ8QM=yF8ql4lE+RnRt}@9xP74k*hxKxEmu(Cn}Z)z`W`VKsHr(3q-f1RlMi*aVc#h?qEjc)oeJ75zi1)X_}IJ+aeh0g|#h>f|IUGl^qfODSRttxR@K}*}3}riI1x15|Cep;U9lT8KZeVv<QIF^F;<P)-!H9MMHO08^h03EBWzGXi18Y<O^;vI7zRp7uVH!;+`)@+S>KT2~5b>JEEoe8keYo<8=*%nWpZyaZT+MT0LDMAM?$p&5Fj@{IibM2?ntSO+L^kuZDw)L|c}RLsoS@D?6t*To#^tZS<iwwT*<KP7a^!<{Vf%RIR~tIlr<6y4d6qtY(WSvwO8jqax8*v3&&CaE$?aM6xCRP}9Vdc00V*6Ea0dWjLvfBr<ge^%1Z5_zcp4)uE!NM7;mn(DxtB0v{TxS^3K7?;J2aeO~f0H_G2c0YFBDD#E^Lugq%BK3QB%N^oVn#G)240|F598KVkILF8<-$XFmTZdpi`w|GVaTQ^z3$3vmzmt4YZ*A_?7p<*6%`8Nr}GhRRraN%cKjBDfJnD7BeX=PtI1P!Hto9f{duaxFbyVpAfr_&r?7_apAivH&l(aNn^gZ}vkK6P+^>2|31rwv^hWH3gztGK;vkW|o8V7+e%lrO~{Xwd$11XA?*<VY9ClY;ah3<77Vk`z+v_%xnWL-?<}LtJ0RU$Xh}2;&`v>7aM7gplI{gvfA_wr+{3IGY2Od9?B&|8RD~L29j9@bwaEiv01kvaOCLhHWq*Rd6yyQUVnN0I-$twu}y>BigZsYfJ!=sus$}l?`fcG`yS2OQit9E^)txnd=#xjBw@~`c_4erT>Zm9R5E+9%=l8(K^8NPnAQ%HC)CdmLY|<;Iv*dCvuMl{gZKLhI0{|f~0tGL{~!WjwE33WFt#U-gMTmJi)XcM9%XS{(hY<iH0&T@?Oi#rNd%<&lp@P4(?|tTfK9~8Ww2nbV69I7^suHL2M~tUU_)sTR9Osux)h?5Yqn9TPdEs-D&<K)0TIjUKB?uV+zn8f|~Oi(#vq*N$umRqz70UwdTj$sm78n{&{BN>$>$L^1ZcA`5t33^DMdUGgV)Y)efb;8O$d3gXKS*Y*bs^QnI%+1;+z%jF)Hie5Al=y(Xm&iGP}eXUYAJJnB!|Eru(VV9FVJCt>v_|DyDklbpoNy!)eNYi$G{Emm(2;eA&&k%0*!ShYI<!jR}8Fvc%(<1Q)+%$zGC70K3G@F+>64Sp_gNQ-=#7Hy27<!XCnY3UoX?wY({R>6g$fX{<)spVImdi@z;de&M&A;RI@)&DM%8RJ;^!*TB8(a}7w{73b^C1H0E?Be|9Zf<{^x<kIleuc#~bASDHSNMmFrLuPLxvz!Y{WqZt&EN9o!WrDg!Vq+l$7TbmPDEuS`;b36kl9?ZLoy{n?)hYb`|4L&8($#3O`j#1lYXws6WHRNH;z~U$m37xtL!GwUTNmuA!xbrz)MLs5<#9l%ER^>TiWudOjga;vR3kq`E11Kx-#?1oxf8xJ_Ak%DATVs4s+rOl*wM_Ig2whk_Sev3i-2QVFb)zOGEPfr12j1A$K5bzy{~K_y>9yCye(}f$qdRO9rq~#pZV{p#BkUYBGjAblt2T{9MI`VQy#Mp8OJ5Q8O*6#xU+orl|lTZ`T!C&aS=I%TCbBh3Q|T+%PL)aT@LHOgJE!5@JHIWo*q_qg2^g2>YenzE+E7v+pRZZlvnJC~FVpi)O5m9p=!K?-m7maVQ*IEo|9e;JCP!d+l?fe<MCl7|kXt_b+gdtKjPa_1b;Q3J0aN*p3oW+#1>7a4%T6dg5jf>%@*!u~j<r4t3}q047h;*h<O58z!I~NdE?hnY-cJ1!gR6u_BUystc~nZj5%E#L6~^wS2?tSX%e4I#pf&ejusBI|{@(DLcK*G%a<3M?<34B4d9Vn=T*4zXo8pM_{BA^ur5vHj+my6MePJgv$7~KTh+Q3v%b4THDUXaE@d=+=l<FiY)gMLBpet*98hu$2p4^ybNPLw1Yafg<!G)QU0!S6QP4z%^Do;qlIimhvZ5UQ6=hPRwS;sF>rtt*K9WLaOg-n*2P84*7@*svMa;J_hr$FWzBU68V0k&?>uLy)H0>*DGrke7(H$s+O3Xu4E@H`Aydc_*KQ?(wKvkvxmfoNoW=BhmVkSK(xkyH(8J1Ns4$c2@Eo?!6re03!c6=TxptskIhA~%=ayC%tg4t7MpD6T6+|fV4RF6Y2ch(Qubrt!>GOsM&4)>Gl-P&M&#roBb{1DMj7QlLvio2@`ED6)_iQ4XC1s&-00-+CqzEy*3KXC5n_e%tU=ffc&%vD^u@!g{gXIM9OiT_h34-EUlTfAIDv}6`oQg6K{YkoCAdc8m4O^OOlJ1$AXz?GAtfgUFWlK7L@*@wh^x6uMgpA;C;A$v5)8`uxW<*1q;MN^459*VQcwymaLF_wvMTYJALT{tpSEc&Dxuz;|`?G4B;Ie`D!g68XXJr<MQ|B2J!{u|up~T7B9>Nc0I86HGH(p?V4qcx%EAs|tMA^_tS9=LlK<^vk>X!Dva;1_TG!j{B-||=u;K$vvgOUg_g><FWo9d{rgM6)_LPBQue*Sp;-3AU}V16HLL@Gz9<d7zFzpFMp1c)F&C%Rn&EeC4CD(dJ?bkP6n>2Vt!oovYHh*B=FbVc0p&4gv5bbm>^ntiHKz_IR4GkkWJwTIJ1L+iph)+}@{?jO7igFf29Ls@r-7{%ww*>HI7Q+~0P<eV%5KcxLBqiQrXBg_lr+ay@2m6b>`<URaBmR<ff8hZ%Rv4xyF2hPdHUA%6^yf7Y4gqtX9eQri??M_n7mmS=<#^q92E%yWi6J3YLUN_jg!VV}MZ%V_Z_Hm_)>N`3RpOrcEuL|lZ8{?l+_uMVrn3rxC6=X6)p-vk&-ms#mre~DqiU7*il>pP}=BOWXmkEiG6lih}uW0q^MyZ-=@7K@`TE232?FNF%?<axTAx_$|CqxO(iLKQ0SOISB7V*-)0=_^)pA6uN%@g`MXUwtIN^Sd*iqSX4krmih#qN6b=E8?zp!pXJj0cs<M&%f<j?!`;g;i(r`AUVia(TFy$JN#>Sz9DK)RIgVpz1K8K=npA6*MBBpIKQRL-<T+vc=v=xNblZyF+Kn@AqS3%8g*qk>$jUGULh<IvH?pEHr3O?;c!M*u7+vk%6Kf1Js&YP`ZvNHecAG86|h6`|t5DSqdI>Q&v{FKTL*+$fIAxnJvZ%Hi--`9c)b7#hKt9ib@0iD(tGDyc$)q*G7-XkTtv>wS^91+*tiM%7-cBOQ6TEba)S|U+s$|h1#x+^|7y_0YhXd)t-3;re4m4D?!-$9zl#?^0ezmVGzJ*U&a**LFd<9#xEGDDd%`j&yt};SHT!&k@LoYY?+&Fx3>9j3(5RoD+*E<2e2U!$$Orp(J<bk<GUH1J=3UVccYH>oLm_rI*&Uj{LQa@;%MDV>&Kzu)xAO1u4W(9R6lemw?zf63{g)zR~(!}p0dkBOXe#O0*NXdkf^(OId6LgDis~|=N_N=pR47fkU&Jr>%CwZn!JXeuakjRT-<-oaD`na(VO4>GIoq&85`kUO4YJrf&^w`$`oG1l;hmgErv}b6{#b%g46U$m!dUsHhm4PYB$o=Z_cWK&&E`}Ge)1fKfxl-?`&l9{&`=a^VaiFc`7HY0O-3XtT56kNULO>Avv0zo1YT=0Bhf$r@&JI^y83h=N*#EHxPpY*!S)kTR!5j4#d7o(A^1I>>QI>xfSYvt>aV!tZ>5)vaCpAF*r(nlOKGZIL~;m+sC<t*7M5Xf#uccdn2HBbKADi$>;%ARft&ZSwS$=1goxPuJb1dUpyp1wO%yN5u^{<C>1~Wj#$x={t7X{bie$0Hg*2+2B~_k5_35?-hy_HSq#D)vs`9111{zJ8vhNnRX*}d5nkMXfP{iGY=BcLZ&c%`!qOis#z9&1($gHzC$iU2-6jChn`Eeq@Uo@h_SWNBLZ04fkI~vIw&K4JQr~|l<e$Xz2-uP-G~Zr#SqrxWsq;I_=5}KNSu3}4*@1)5V;ejO&1esbBm@dN2#YYB=jlcY0|D_`PHaqvq@V+<--jX;@dt4MDCVZYsuShw*;sWhuF>7?2nkDQ3gd6Z-@NT_5rk9DOu>VIO;%FZDKtE0ay$N`e(64eaW71e^khYpXTf(HCp=S2tC-;_<llpiTHED>PZDZMds{Or?_6}2f!;-H2#Mty$;ll+$h^M&q)hj{(h3P7oJ-{3BAMoj660+ag3zdjq0^G9Brjs^rm{aiC#5&=@82%08lR%gPp}U{$?}o2=UC)gD`vBuD)RBDR^Hm$Dqk%a!$=av2@PM-$RDKHnhPbe>Ga7uD*wt?IgREZN6Qc`5QXA%f+9V~T>7T3Vg0Et=OW>r)WBqi*Xt$myxR#F@|VCJb>@sbT9UQ%jvH}CHC?tE<_CebvckNs=51^!$Wj$}XC2D(@*wFV6LSyMqb#SP;dB$$Qn+g+AConH*Z%*YS<|3+d6llC!E)nYxTP49W!of6%M$iZDoD5MpQ*cNZkgIMpgBR(@2svLeacc`Z~#>9MI%4j=YGpr(HwELtg<Pe;_4gzRS=7?6+;&ja3cfCqsb$z;|1oSP26JDGr1#EAEl<-Q=t@PEJ<G*5mG5LR3QwEm&)9BNRr1d&}P&(yk7OfYnOCDKW~GtF52Y0NLn)zhb|@u0d;vN$l{i^^bORb`H!YH?ZB7KU4iPCUvI{0=(hoF=#qEkfzAqK*IQ~&Qo6P&gP)Pv9-gAUt@*?L77pfZ`2%j#R+T{evb{<B!I0%i?x*0JQHhPisoC+cyCdM)xrl%mO|eJ$E|`KxVP=C?cYvpd*Iz<XnS|$&{R~A`1wvtBtSe*CHt3JXB3<T<%OEeZG^BGsv_7Dh#$`_*&^e1Pqn+7Ju5kI~BZ+9*(hAN)GFwyA7qJV`Q$%-RwWw>SQA+D<Qq7GG-3Kdry4s8hX&^1k*I=KsXH8OFVRn)@C95j*xn+9;)`93jnnLZ1q+#diU2v?_RRTr^&n)_TJ%)9w%ccGire?7S`vrBlz2D+S9nB4cjQ6??1{@QBDF=K-k2>1q=KDIN27u{}@E~nsuD`>1f5v)(<SFs7Ycd=9$qm@-raKR>JG^KGAsSmQx3pdJ6l}uzL`lL0I?qUX%rT#|^HyQ^`Hc_}%^T(m`A@`DMeuz*sPSIfIl*S)tBJ{+8x<%S*k{dU5(!v9#XMfHy`wu6A{Z5)SlTm{3NDv0XQ`Li5{pD5(sc|Tn!>YDmxZ#?6bVYE=3BC3u@8fLdhudlE19fxdGO%**JxAq6KX|j32)3zdQ?L$(R!tHMHW74iJ+pdU1#HZY?EJCbW>TM*)*In9}c~#dAC#YMD&I^)A3!;<I*WSfbt(LK8e&WQ{R6~uLy|J3DKb@ub^Lc+Y5oiPNXW;8CdZA3n~~6kqxy7#w9*1TA9pLHX00c6WXSOqR7nqUyFS!@#w6FqOdXwYQYLSaI`T|e!PC7$Hh7Dw2DKCT_ftMjk^oz-dJ&sjyr%Xk|&)oBcDhK@+cXVJ2R$f5HVfupvIA5n|769cV*c9#NK|BW|V|vmSv(Ew5L{@=H}r4=nscxvUWb1#-P>ZEL@9`uZPiv#U8CuTv6RkKHK-Td_ZTM9JCG8EkKx4a#}z)_A1yIuk8BMfEK#gMX9^ayJvJs+U9=;UpxtFZK@nHRRA>V%nt*QSNw$P^KdLD@`{z>$D;L2Y6trUNH4Dy8)}{^3#eZj6HIiHiMm?sD%oW)HEEHWXcksRD56MJrq}V;SwPC4CkdbA!u<7c$Ia5JOYjK)k-NdWx{3f<)J4i0jcuZ`+!4mYudQs;(mI6mJqx$*569iI@BuX_Zw}>+x<KI(W5Z`pVGas=WJ*zhVOy=x#@SWRA)JdLX@T`_abmlq`VQA0>DSJvOQcno3=P6SShtB$Dn)@!k`ohe^UHTj-PlJMuF8l$7G`7cQqqZ)&d4GL2&}LPe&(~wxhzHlWH#G>8j)FyDTjm@T%<_;Lhr@TQMq`N?(V+@M;sw06BMsEs4}?NPb9ZiJi}T*W6Y!P(;f9^r6~fy`iPe}IYqr&ykE=;BJ$bY1KrMFOTXi<rfil~(!b<^LdsJkSwzsLdc^NX67!%y1Az_-sq(_@MgvY0CnS9hJ3!t}7^;1&ZR3xgeEh3BWj{~&Dr%$zOVfK7spI5yIStj;-6)0>{;m)8(c<AT^$9J&^T+|37g7=>&E3wHz8u3s8>l6#?w>-@qLda)w6zW)Zng2Ek}u=e@l1Ry5eqIKw9t(yL}x21q|HtyAq<t?z4C-)%&jRT2j>YINxz`zD0tQ!90r$9A<eJ%@6t+M*1^6`YuO8#*U6@}H+WC|<&D2D^B}eGAL2)<9K8hVUW4;akq3$XWPeAx#;!a+j94)tKz=i<Sj<?B(#-AKaf)kpz{rDfZpT6N0UVzqARCptnkr>FY<Ygf$V+r_jYk{7{(qRJN;`Z#-}W^lb7eL5{}W5jaD|;lt#LRek9+UH5IAqCTm3|=Jz%L9@6zb1l&H10*V0P->rjXo<yJm~@IN3;#Dxx0BIr8ug84;Fz7v9qyT9Tvqxb1b^rD*+=y|=9l<<_(#8ZHY2TGX_Da;U2(`QM7|4T*jkj;1`GBU$yu-Fw*sX-zs6E$}?ruYTxo<m<!eNe|(7P)wW6PP*K=6M&JLr+(UuO)_s$nGY`;u}Hj=qouXz4@n5IXN2qyQ2_b&rlHJB7sxR=8B6P+wyY|j6MeUf{Cg9v|K2g)eSF`rrSaQhI}rFgwo0ZsgYFUYEEVmR|j?e=_ciS-EkAZ#ikc;F|>USFoPb1_W0ADN63Q~`WpcH<wqThPH8cX2$VYCFEvtRcDWnT?sV5{P(hG=w~<#l-vOhjw?^UK$mG}}vp9IX?}PI3x+a&~TM#h2M&zv_#2x?gT+rotjZ-k5-1?skE+ZuFrun*%sc2333%3vH>eCQFiINwg1FG<;z~k)U0TNf69JaZ0B{p<;(j1^<9Q+?jyf>XT-HbgO2Q+^aa(Y+=dFuUOCsYT6O2FL71d{x%PGQmaZK>l+uEHe=rY8>U*3_Q2Mv3dhe_Q7^;fh@ypGz`hY~iN&ME0bTxM)3Jna#X)-(JzPtjRNVMaI!9arM@po^9+W&#?g^l53kuA~w6ZH8qR>3x0$NZQR)Z9fpmy9%IgvchA*(UuxZXL!Jg=B8-T7E?RMFn$|yP_7pX|5D|n_q<G1?V31*1Cw9=FLKMMbPC$dVsizd=M3Oe848e_FWDNTSSBH`vulp4ue&pa<r6UH9@Q1i6d)+EoA|j56J1^<;4cez-MNzl+M2FElWS4daD{qQir~cR+;Bp*2EHDqi@t(rTiL9)h9JTYBn1VdE87+~ig(FNr{2~CZpEuGV{>i#=w<-_P&lKUXaA_++s9h+7+OQ?KUQ4zopH|J8`8I3aML-J_`s%_Prt@^Q!=Ao3A36n2(d!utpt^O|4P|PE4x8hQPM^h9;ER?~?PWlAy>)!*BAb}_+U^Nuio;h6r;V8Rw1@{!oEq*8*T}5`q5&7DC`M4JInAC0$Dk{8r$PucPztL;ciYzW+XXbC^!2^zjMR8}cuI<zK_rQ2|1#|X;k<3`w}Cis(=oBE`Ahe83El8!h~+AWpRVU`Z!E%Kv-9F!c1zq*GS0;v7>U>HogSG9-_=aNCKF7Em`k0EGey8~qlOoW0a$6^pUHP%sNK-ZN#-8C^J&X?j!2Nu)s0N}?yB-M>bshOu|R^$3d7>nwo;Ndq<U@ak4R*3<F#b?4-v&-Zg+X_O1oH48affmvqawxbnqtw7WkdGL*U6_Tm8A8h9d`b|836s=utv-904KZhCaKVla)DVbY^v~LZG`Ln<W~%wi;4ec58OKrp~|Fy9(u%ke=(1j)9&(ux&jg>BDqWL0wCOJ&N0ly52jUq0#r|dl{}LL59a>X~pI&wR##F<OzD}`_WGAUWD+04$RC_RpbouaL+U1c%`ICng_rpRRZlgIIcAq^r2rPC%p8>1*Aju1V;!{T=+9N&s|{~jKp{E;)aZRo;R@RflBb{hTr!v?qG9cu&&)U$gwb*|5VYO>o5FIcaGKP%E%1G4IreQ^|zGB^mWN^v)*r)jk3SLQs!p$2;v7}mlE0!fJ<k_n3Xbq{!4+T4;l5UE-evik^nHI_&0KlD}m6KZBJ^fRe81(+Lzz)9hMHHEp}O%z$8vn>(uzkqu8)Qt%<)^HG&uGGi;5K)J8wd1rLbUAOym24t;}s!!@{9RPeKp6b90TV!o8U+2VH*vWg!%UFUu$E%q!5C~6<u&8a7p4<wDe$WKAl!;<Z@mJ=i!i_1wHaXjH2j6x#dotfrDU)Cz5rhHr%Gepf_yIT878Nfm}7jW`?sLXv;f2O<Xoa)u%YSl<8EH?#iE<Dy<?Oz}m`qPpS0(CZPLTc<&!rF~&T!bGjvc5{sv%WY61o09Jo2dDwXA7CTPYyE}<)lRr@~bFLwWHyWDjT2(uTcOYEA&zF+&>O~w)N{^J0pKyC;xe&u#KNyGl*{j`O<c#bp+H8OEG4~MSBpM8+1sloSqxP6#0;qewtxV6k-+El6#F_2D49AqE1*w{$f}3!>tPt^MqXG7;60lr>_a<NVkz4dCfbufP`!^*s0cvOKI8mVx#NHuPhj~Qb<qi4gPQb(^NzjU#|q{53P;ZLU${-e875JnT!2DG0jyfPfg#O*8i?kr8B}2`2li_`px0qQf5HxkBS;Fzq%HQ8QbP9?=T-OL23Fr{mTsSb}!EfZi{4T(AXsrI3okMaR;&=vCm(C-WeO<uja;IK-OKa0ySH`tX;yEGKlB>4nSEy7+EbuW9BsDk1M?!=T>f;fTwsYHKWtI_h1S5{4amS-;d3l#A5GKxDT9*9`|-bVHOa{ROU90YCkQRS=k>jV0gn{ie?^k=Q1CeA}v9xq`<Tk_3#mOpyp~<>5mjKp-&+Qx-yb&U88QVwi-iOwz4*$Ic;#}oQPgTuqiTYz-~!o0EcCQpHU`WB*+%#emSbJl1JxZ0OLLlc?XhL)eUAUfJwMp?E#nHP<iX<7_<LcBA5+GefDs0U-d08{m3+o(0FDLEE(A3$Ljd^A0n?)r`{;)l}`a$X>kL^&%#Bw|CUJI?J>OQztHp(IKs-~b7xedbL_;*df=6?J6y!q>><qn()=qdF!8`lL;l9^y$cXtDp$d#V`;)FDokRmEylja3518e%@f@7nt!Z2(eL#x@3A>19C&=gg$PSVbJZpr%48HEr&9Igd<eszHv$PSVYirV$g}%eK_kBdHZ)i%Y&c4A?eGRvsY(ztXwkIrj)-xcX?3Cicq0Y5>I!lvBBQy@Y?Ww5^hMs9<Lgt2T(7p&I1(gMkpM?TiC({=SOdvd3#7)xx<QT-2@UpFk0>A9mo|~WNzcU70|bAo($YlXM=I7=YBmq^h%&kv1@jkM+HPbU;9b@j3XfKR+nWL;#D|c0ij)$g*eu_#mX%hVi}l{quKFT9yr~qLX1<UGNUE7HkqiVGD#c;`br^Pb6!Ya9yEh2YN3#xN3=Qv(vn_o@F>dc)RkxRhm-590LvQZg5|sB0_*MSeD^(5op8y2_|G~qeYw-A<(JFTR8n)9E1`h6cXU?k0SmT`GVxPK%ZL{mDmZxVbd>=MAtX@@ekJ`<^PTy<c0R9yE*iP5a^KxbIl;mEMlZn@{OgPrVRC*{4;$TBmglnb^>>fEUo-XDQdqPe{pp2L>FW}Xua;3BXxxGp2QZvb>e0wEKWiLrJww$Wgk@gduT-?&!<-lJXL0+gUDufi=ewaa%PrwnzJ00yPkLZWb$qDZ`3L&7IQj=J^@7Ze7!p;gwp^tom1{~)cd`hlyNc>YjTUjqt1#<20KZD`^9k_w~zeQ!i6}!=+k8GwE-crg89y=iX(-tiax=0A?X&vSW;*YD%k=O*dP6@L}3`d7BjCR2=>JQ7PSxA_WZ6?p4b}W&F{1P+W??AKnU<8(nj(vH~p_Lv5KjbAE82ro`Jg%!fp+8SJypYNxN;uVB5V?SoDsZ;3QcU|q6eW4VS?^lV4ltCPAE`#zX9X0D1MTU%scZH!udYczt?=0fn)~GRn?gKtbM64R_hZlt-(_j}y(ijZd1RFS{g<)t(5->^OM9b7C>F|R)usCJ^2Jft#TF%l|C8+jhj^n*MHI+De7bn4_%=?}`&Dyg)I5leWZCt^I=AAuY*||5QW39Y4K|QNa37EDj+^OR-|0?*NRSqwMh{~42+ylDj<c_HGmjGkbT_=8yQh~Ad$ad0B6<MlhOotp6|=jU`hUhVesLF=5YT?gq`u}wPXhHe>*(}NmjqZiZb%XuywQu6>=~(vXrT0e>xJd;ym!r*X8DSN1Rz!3K*1xPfvyVZ9O>+=ysaW5kHgo=29yo^Kgwb^uBxslEts#Y3X=&8rpz`Y*X<DIYt#>?hb(AuN8|ha=5I(eGNi|O_^<p-N@U(efw;Z1C-y@Q)C<s@4=Jp6ftFITLKATJ8~Yn8eBy1pxmg<x=5qgOxEFw=lpc|56W1#A(m1!v<rwFVhTgj8iQO`0hF`LVZ0bsbM45%|PTMDtB-#l$W@9IgxAT6fZO-hl;&2Sn4#}$3fCL5Ks4v7%%CGQC0*;?SZ5wCYRaaQ2Vo5>}or^WW)T(#%1jX1`fsg!Y;;wBbppn#%VkuszKx3Fs^zD4EJYv^niP)6Q0JPm&V`AM3AuHI$FXP$Nc?>4Ee_uP>y(^k}lkmSrL~R>lGDqqd>`qvKa|w3vDwA?bV}|>H@OwxF?I-e^G3M}1-zPJM6E<1>P<xigTLe7grg>c@q%k^)V=>9;H`F|Z^Knqbd{M>|6fLB3u)Wv*-k*hI%0iH9+Ix9zP=XzQvpYz_v;4dJ0hXmX+>oXVD7c2D6Gl7}Y@zlAkg7B>x%QHq3J*hTK5@!u7ZYke!Lf@Ms@EvJSr*^ZozRLvBCkc~()`z3ay$vgJ#2|dz;F1gv9Di9DSEJH!`N~CNd(dKy=SV&<)pDtc)$uay8yuT`69qj7n)05_@w@$wO-B>B}1G^H3sbTmPL^XwR>6X5)woMzlq`fjT8}Z*ffsnIKp{W47cb{8WWb6pP=ZcHOJg8xIIHTj1mBN$EXDh!_RNg_=ZS*m^hJKpr<$)6gw~%^;RjOttUzZNfWDFrxu#T()PK7u?cX=kZ~P?qXtTEtIx2O3DebShtERCdy@tlNet2IHTYR7Wv=Q`A|;C6^{}6_pu}4~ULjDjp8-Luf$Aob5<SDdcSgU_*S~zBBB5*Iws%!u*tC`~UgYt#gIa!6vY>Vx;$*vrN_zrbyLpC=q#L~hN|jWGVtLqzH^sutaVAmvv}3@zf@6H=Jxgd&>A@&(f?;w5ENFQUrS}dmix0;XrW3Q*djIJP7_(dl>s+(NH;LHnej7BGSrHZ}x?M=6QH}g3Qz26P*USxY0N5$`vuX|bj~sfq?bW1i#%g{HY}v`-H`XnP%QIpktx3_YASgfl#@dQIZ^>HoJ{bXq6YD|Y8>XIE^c|}D8JVaG{Mgy(!J=ae(-p%XFK3Lw?a2v3?p^m)a<EMMlGh8vBIuoJWsI#o4`jj78L&hYm`u?w`b#T2gFxfZqWmSm8UMWRa3puRyU$(?WQGCIt9uvdW3WQI_+!6zu2U9ytcjG~&fnibsX=Boltan4K1y*RQInr0k{->r$f=J%r;91r_3h0mEqhZD%s*Xquc94oiM~ophLJ$+fz+{z?pMt^G}ZZK@4UT1V7JOpfKC+2<{Bc&4)d=c|Muh9ufunwZLk5Vb~{p=dFu<JR20Qw4)x$6D;)~k<>Y}P>?jt7neC>k^A(8<ajF_lUJP~@o~SkL*_r<Z5qdYtK<dBH4|uLz7@AYOd!U2&JowM?+yD^=2{s?6+~j>wMk^JyT;~Zd|9rl#Df9FxT{L}~iK>9PtTo0sdqEQIgVFNzm4o9)u`5y%Ki#=bge8(SDGMMmrUo)Qy?g4*XCZHDEQWmuep|D}-duhLY@!mY*X&W<?O*Vgj)ZP((9_ZuUk*)mce_{2X{#;YrUll!M~!6$iG+lCGGk8z2X3!&iYKdI3x6>guCGvICz{cNuNibM%R2mHEs(WllbZ-Ao!^y|4OI2BNrF<`p0zRue7GL}j9ROrbh%DnRk7)z&o#`0woomoc=+N1rx1Vsps7ZGO5s1&ztX+tZ(Fu`r<{UXB+$Y$j18kyl}>HWS<6}~uSJp@6;HiH7x8951vnXd_(P*QocAcMlVVbvWHXrTkLxKR-Ff&5BW>TT<F`3uO}VppB$kB20g?CkVRf;fUU`^9ICFk+*8Q+#(=P0q2%r$erb2&N8>=HCUpH8D5u8UMci}3{8@0)D?S^fZt&XAb{^@_55g?b>`8MRnsR<78%wIou>{_Dytjnv*XZJ_{;{gFix~tt_=WhMfDEu87{3ZFm{ibZhi`RJ|cA5+tNLe$w2@hW&U~Y(KeS>H^_&Nik5scl}y1U*-N?BJ*Mt(nH?z}Xd^@H!9fezYPw@I>n9h+iq@>OL}54FYPocrqn>)&`ZJyCYcUzDJ~=G1%_e@@rr#Wzq5e-L;ySN7TKBqp&}M)^bR{<Gkq>c~{=*vsrVQqxurV8_rjkk+X7L(FhrS1lk$rt3Pf9`5$_O5#bleW6!D*Iz%YJtg%k3iCvp$ff%(k!YIlXrWV%RYtPPS=oz}9*O~V5dOr|npln%dXC}`ZIZV3B_289Oo=;6>@6c&1EGdI6{mdQ3VuQ6F%F>l(n#e%^S#yss1Cb;d^BpRLHAA7LDh}!FCa8!-N{!kH$J)F|1mn}mCz_wpBYVq>$MnD*<jlpR90H<LUeXnHFFeNUlt)G_UX$GuIHHihZ^LPiEY9!#iOnd9KrGWCL14YOk6TC?Tw%dJ>N81+JH736D<@~kKvMXoxg@S|7amqodwJ=>n!f~nA>5d_`ep%%crrH$oBUseN<n9ePdlIt`Iv;mm;8MR?dwzMmlffzV68I>Tn5mS!3(X68P^vBH{_K2G|=E9kiF~tqfeDu`U6Py=NZqWM267S;lr#to9_Wp`qS{*A=T9aALiw=9e5^)q<{tZ6a^KUi~ll{=3;>MzNCgnjyUJ3<e;MdPCPv8C;!Wvzn-R0^8ZBy%~~6X6ZA>Zj}6_gfO~zxSs+R5L4Y?izYKX#_in3|6Yg|VtBbZT+3l8=DK~2eS%oanWIxyk+W!yz%BvA5c;JDoORXbrW{@WuXluM2%Lh+Jhm*=ox0uPiK4ZhAQA-yfAo3E7mpapYH==(bpP)mcYBkCpueW_`h&?SEbco2WDR1jqD-K7x!3>p!oZRgjs~^(>TJC5&H6b4iR+XBj;eztqpBBTEj%c870bl*CRziN1U<DfFMwx45C>HZSopr~6bw)}?w5<=?&4P{zyT{VbF}i=o>Eh_P!Yqul<v3My^kIhD9D+yB?I$|qYx-DWpI_W_p`7Maq4hQS4~1sDX=f??b#bo-I16yC1fy){c-EO;99D7%-xZ35nS9p`n+JDJ`7YN4f`r)(e*}XFA9l;ItCbd<CokdwTD!5OI{}!55PPlhP|BkoaX}}`JQ_mp`<YBBZli|ipUzUK{~I?GylktAsJ^H*Fo_P^jdquCYTFW_cr1M0d>kF$e@U9-<@JMJm);%5SrSS(NDZ#SD6tzoRj_7^f3)g5s8-_w5i#!wyHACx{Aj#&u6E!hEp5Df?E}Hip&n=EQBh`GA@Ts<)e|@d}T5bwASnl@{#qgs%F!NQ4aSO7x%qSXZdKcPX<dSFn-;M?<CF1ZlX6R`1$}3Q<yEYu`;MduA8)5tmnN-os?f~?$~sMkV&aW@qqUr?82BG=QWC4CIXq}TBdx{h%&KBZWI*`oK)0~n<G-ru0xEg{#k36JE9)QJtMnEKXrqn2Jl3)4QS=m2WoIV-<l>fT$v>#LzRjR4ZepWwoZ%+0K)yL>o80|JcGdP?^GAL=i1f@z*G8Z0BWQ1r9bGaYst;5KWbpW;4-ba6nUl$P^9KIG_A?D1{_qmJ#+Q_h!8ImIwjQj1{M5(o~32Se&=W{iBks&LiORwvhfSdl4m#T#W}H195j{|h$?Qi0Soyf|Bqa>v%mfr{ij?0Oa@4eUhG5+fhnD(3SDf|bn$^WaO}gpu}h#S^Fh-euQ<WSZsY|A|6%v_X?MsjPKT%xNuqEaV39`M^!LPM=#W$K)35X0*E7(U2n{p1(ojBodl0^h(Ivc&U&=8r4U(hIH%=$7gELtz4F6+%&}qhlaX;4gcVQpHnSqSTDC?lpPt`x7x58cbC38fTsBU;a$09yD;og)F4^^Vxq3{J9_b<r<>(_#)<Vll$(%2oXIC!<#;PHM?5gZy*Hm%jjTEo1)dklS=Z>4O{JR+NZDUeRMe@P7QnTM;sJ=d(+9Wa3i?dqh&10XxL!`%AA`mGG}|G!C1#R+Q;dRAlfFxH4njiDZQF)FGxddl+Czc@Tn%-FT$*QH7FuYZQ&4~%sVBoP~fB>>Jxbf}#u_Tsp6Bg$+dIuY<S6WE!Mq1Fip2BB)YMaj@CNk2NV!UhTq-#!-j1cUI|Gj3kQPse@F-<kAK;u9hg>jH5q7D^JkNE%Itnhw#QH8f}i=UT%VbS4^&z+pdcMl&)sJ|>i8-vn+&eQXy;GVz;tkV)63WwBN*N4;S`Ty*~$0ltze?D`5+WnLPOW?74wB<Rw`zb{e@>xTtN=GN8G$7og6It2>uXlRW!-MI$UoCw{&>%7-l;3%#Y1+<o7!o~O{ew?7#Hp0?`QnI10#or2><`ZTB@|6~0YR8h>+Mt@rBAB|zaf?A6?uXJpzXOG>w3@FmzK?-Hvj?7_BFiC8;30M|12VvHtc3p)3LnPcXmrg`%&;Dwi_AVkxBYh4c=m}``uaOy@w|#UTk!_}ymwSQ+Z&}nVn@MY+Hr61`T)Diql#QM=J3qe2$-U^p{(d*a`wK4fDM?2OY$iqMZc!65)5}_$b3hUh%+k6zLMULS761bke4Rb_N_lrt<&b$#NSv*@AWc%E_EHd-I5|C*SFBPHbAllg7rCWld#UTIzmW!{5JW0ikZNX`8tvqa@#RHa%9`OWC_3JHKJCCUB`Y6c@rpT^<@(d-MPw&rtuoY!S?En?uCL)Ar^+87sa0D*&mxiZVg<2wtgJ`Sf+e)58|ZYjhgv=C~iBN6Oc+ATaKUd?q+DHF5!4OP&)u2iNHHs<hyGbTdUyr$h20!z?rs;W(7lBFs-!jCM@BU(r9%lV&_kgOSjmv8^JKcFpXCT#S00;{J?L4%a25VSw+RoaE`E))Mk*7Nc^O@nZpz1j2qNB0>4ytuQEZ1BMz+$#Y4O@h~AcMioJ6n*jm;@8KR1qvCVe~AY97Wwr6GUzpDH4g{v!L<d<`IHkif2P!E^}O$WD~3Bww8ejDr3NNsaz`lLmz2dCDvrR~H>O#Z@q%?m9$1L)!gvmZnQ&?;)K+^U7BvS85^PzXVDrC&1i&lrh`zp(FV)GwW-3R=4qXrACl4C;jX%ujSFb=bSV8xKsHR5=lqAFq~H-+!H6-a<;TvAH_q-G3dyt!_(v-L{lPPI`(9hXO7t_*-C>tWd^=>6LAP`G8+NrRrUfe)I(*PptPeArV5gpH>bQO&BTPdr(v1swCd`MYJ>lSh`VVL;9aq%##*OdosbYv(d{g@ruwwlBVq9Y#_y)#$hv{>SBFjm2YTtRq<X+80|)q_!u>~*W$&~;zsnGn$qk$H64cx__CONzI0W;*z=$vcO?lIxPQdaksadK8fZ8X5?1eFBm7&4%_K@%?(7SWzHumFew;2Rb>8N_&R{gCC7|73Tu_kra!cH*UtB_8$nD_I@((IsQ!A=hae-Uqi*;f$l!0`l`Ms#O_(l?`wD-6~H<Lg(-^w8N`S!7j=|p;o&Y=wW^|S0-CD=k4n*&?XPam0v8LhR==uqp8hbF#N1atq#`Bj!ks`8j~1I}H^ba$fi-}wRpv!Z8chQtC^axrsAdD^bahPHFXL=TW8QTNuM&eH9X^~ztfvKpF5fCeJ+I2yPmj8ek7wd1t%mrd&s0}FOZOL(un=DsIsM}Uz$`Ai;4-IF|bcVoZUX+|mPBSU8~F<8iytW{Wp&qHK5c+Sy7+d>u$(f~Han~dWbR|~-*Ts{`KjQ=!_$^wigpNc!*Lwgs_=5gjVwJRC9E58<QW+=i^Rj6^+=|p=ZTzCL%)ami0_??ZO9B+_B4T;Stm7A51AXOKLs-*rKE<HxQ7sG5vD~6_#c0J5LD<ZYZ)2|x+)5(R)dqP|-PhNQ}h*?7VKE>M@WV^o+gre%yw44SDstF`H0!8Em_Vo6R2Js#)F+<ooBWg_<UJJY2$=QUQM!X30oR32>`?4rhg<Yc2VI{<m2I$;9AM>%R?lNUqlffCzjI`)nR|((V+BQZ`pjXKQsE?&-UlgeM0$4K`oxWwDu6sXp<N)e0YNee5hU+@^q=vL15(xLgN9|R*=SR4aLYpXz#+4A=ET(UgE}P=E!Ptg1geg7vyihU#o&G+G$DdA61K~hk1DbG(wxP^*L-MaDiTa_=WbJ?ch<-<fkgFl|1Cg*FvzfT~4Yjss_(<vA!}HvO>T3pAdn^&HM`{SoiHSuP^dR?jq%~@`8medQ0<T_`*#xdi53nTp8f6BqF+B}hb)2@B57Wl#o&y&i|0x>3pvHWoEmsq?&rt-~`^$ce_;*8u_JZD@^rBVm^1t<#XU??5{gw*cjYK*tN-=@?g)>)Q#&kJ)xGKBM0x%P9M6DcD0-;NjHCC5@_wmi7??r#&ii;<oC0#`H**K5S*=H$sXG$}B!>?p@o-qELA48|Ay{P<As=Rk7J83LLQ!@kGOF2;f6fXVN9$vxCr_=rd`T#e`UT{P*YtjA0DhHLX{WnaGMl%SxEn>^&YC>~<Im@xgN9%5N#A{V<8xm-zv{zTfPxM&>`N3Q3Zdc)ITfvu%IlCR$U#}9&hu>3rHe!}&=jMl9Enbm6vDZ35RL;Ar>!dmY{2U#_w3>)%)dk6s&uXj{;o<d{M32)lO(nvY#FNFE5fb~f(<?tC05v;dq*zhVdD)Mn@e8Y?wdVt2ZO#56QBa%?8H98}O)1)RGhOE?TKz!7s3`}<HL`2gX5?c%fX<T=;+9gjpbZmc;&|J!MD4(>%+NEbeKmwe^4Dd4xs3sGY`8&44mo6c@rd3a1aCzj0<SFHmeZi<gT}{VD?HXe0c8g#`3G0q*wO7_7MG!ED1qq|=5P{#mVzAUkOw${tM?1mATJrP+`E=>CGg{s&2A$+UgzmU068GAfE>s!e&S!1hl;rDur-{iIseI>JuPC6=|@vJH@zY|9*1;*+icO6WS~RgalLr`c9h|ARrDx#vG*B71vDa7j0zL9zTA>YYO&tQ48%2ZwFfQROZ%kniMerm=xB~q4yin$rrxp?JY{Vg&C(=g3H1ML6DzQcg#gy6?w=#Bb;)wCkqmbk{bdyP9e_7K|0wyZt?NkVSbE@0@HFO1<5)3YC>w@2(s55Cd6Op8H98y&*1$v7*N0~(wR3l5!@Ch4qyHk(U3iu74eCJ;Pt2k&FoIa_5hmu7d+>fE^{Rbu0rAJd5d=8sfc*iJff`Yz2v$8V@_a~n2|3Su2QU&&U!H~=o<m(S9E!s}X#F>P0VO0Zs0K)HDc<I#luw2y6DB_XJJM>3AR$bVnB+VQ0_60|>XbW!i9~3&s%Z1dhs&S~(ArzLw2IUlB2=Q;dZ_mp>qYrghZ8gR<8K^P*rI@g)^zycAeoKyn@Lv_LSP~|e<}SdjPk~%Jv-2u+PQlNzy|Vyj7ecdZ+7EEW7eo5OaJB~T7oB=_>Yrf54zPecQe-k`5x;pRRE+F)m@#%8at<i?(x;$=`@{pxVQ<w0KALmTgJ}MDLI?z-YJ2}=#0FTqq>`7B)zpfJ!rK+asQ=cjX2w|uv>J(Jd<7KV$5Qfff!lhP#|yP-P3F^v@NcfGRN=6Kt;^4nDGt}lIA$xZ=635HT^tUq+Ea`W0IJ03yY5`lXEk1XD)!5uN8c&ecdNRsJ|E6!MPiQ;Qp@2ag~Bwz72)zrO%oFEQV)Y@3$=Zw~(d1Yi$)$)nV!sU4bn$raGR+s+6SZ;qARJkaW6o*mK?(f6p6(x%%Q>Xu&_2K*kywaO)W=)-_(V$i{E@m3Quf`7xYR=4OPA2yzqgU>KOzJVF`F50JmU%JS-!0y9Opl^Kd;u*8P;lL&O}--u-6peRD>wy7Mz(qVUWKQ)r=>nQuIqsZtBu6|hZjluCz7Ygq#P|<NVwkb}M<Ra@xr-cddBHWi!kdv3WuK+}nm`mE?EaSHZJk&`KuC4b#T+h$Ig`cbUg8tXfqsM;_dyeDzWsE43*SKIDp(SNncr6xQj+8KqLGf|!fjND$x)~*-@0ku9%ip~CA~^BSqwDx#%C(K7*+r5twr>_^;FJRyQDSQ|RgJeN*@W7n2){Q)Y1r6T8I+xE#`gVt3_xlf8!a|`Bvk0eR0{36e@u0$(Z_9^@rkaAyu4<u%z~j6H@Gz3iF}i+Ju~>9`xS^d#;V?O!;<TL(o=wXEOiI)!@$`x)SvC}KKf-MDs!)}m~Muo$&UaF#g>Xx)XH{o4HAH^rM0R@9CG9p@zZFy@!H_EAPHe@5ewg6Qbqidz8=67-u9qv3v6JZFf&qcrsVn!3>9?{W_9)txFAY0WaCu7)RDR^Si*4#1zfUbg3U3gpbm{wiC{I7IKQKEmT`jcHk;KbcsJG3V|xeY$(L^D>EX<-<B0zYo&L%aFWU)f#Skf3imfviPFFurCJua)Qw~9z&i|+{=mC^D&sx{;HJfIsUX6^7v0~|EOw0|;k3fpWFs8iX_tV^;bL5NN_24>5@yPw4CLvc1!wXg=<xnBTKP6`!@71qI2Da+L3uVBV@T`xdfBmBk4X6HxL}OPcI={d9GnIs%9klNGo)^@rHmlS=1zEGZD`VvfWo^IzG%b6s@XzWYY`Bhan1tsthtpG2>^Bw#hV*AX9bN@ZvzUDIR!y$%=&Lu)qvi&R8Q2xYE14j6Fx2g#ZCG?U+jd1eZ*q(If`JnnQ4v~t@*Zs7TD39V=zQr?7!(LV+|0FbwIy4-sYWI?W-&*FH{)6%bR<^T7AHWr@!~M>A4CRKHl_z%?xe#<XB`yInFQa;<_zU>Soz~u{^>Vz84csk+G?p6t!Vk*=j;-&1uK%|C!fQ!6Q=kqhnJSV(Yth7DF7SM$F498>RG}H<D$rPK@y<x$?7n7K<cQ&r?%@bl)NtVsqqielPDsZK5YxCu6uM>5D=weCYXIY`?W?oO;4u#(8Uf6-R0|3$2^I#fPT?aPgBFd!rg^jR3tE0(xNBA8>Mq?ga*h{vuKtocDa>B$}~FxfO@Py;ebfa+N86qV8Ijwp#CX69}&IY7*?sxKIN&+#^J#{p*vH^JAkLjjtJ+4D<MM{vA1zK!X|3<Gf(vqz5Dv{>zNUju6kvvW%|QzTOEzoleFA@Iztlfc?Adf4;fmQsFA5&Y42*ON=*Ve{QBf^)N-t3gYHa5NU~mMK}Nsb0;ZB!U*rKr>Rgi?<NgqjaKJCWJQq)kYEs<WvV%sU_q#kW@FxJTxoxzZIi<{i7U9$*hOrb_t;cy51R=YO4tiO@ExKEs3XJx&i|;2X-;&(#*9ZqvL7);=x$Cbwcjc|J+wH!deVBpCW*<OQXZ(<WUhei4K504xz6J`(e1L5NrVn)Ta5@3FRV@_}!%%JQsiTT0Paa%^`#74ee+<K3jPN=8j10|~$<&T7O2S4@)cQCVdY{@d{ir=?Qj08ywFPbG68Y_mCmfziH96JJHjrtKhsDAP?DET<@E|RpT@tB${vxwshi9WjV^G8eVqeLG(wA(_aO{|fp;dh|xW`Zh|MM^GX1pqZ4IjP&Oe(Ik`@hH5nzE%>vSM8Ebcy~-@c5O*v;YNYtVj6g*z^W#;xSgg{Gqj`w6K?;oa9d2;0eWtI8(p*vdY@Qm%27l3_w!F`?QMh8#4K9S$iIn6iTod_RsM6FlA0FiP5`?KrZI8*uDvb3<fICX4KdKc`JVN5`}$Vw4RiZa5HXAo><&cgj1mYVY(~Jfh>l%bSG{BCuL!BsHJ5Bhs_<CK{OmpXX!;DMYAS2fyTRjl$!6+EPMglEJOUr%{nu1Wv&W&Xs#28fd+?D_O+nyH>Ooe9L}1>Kns*s?a+~Y>-Jca=VEYMowECmXYcPp{Z^mfDyze}CB#QGmbVAUI#GYnaPu+&jtR>&lT%5zrtJ;}y#1+V-QZfbQdn#dT2Vrnw3_CbEpW4Y8A}0K*dTJ2Xp3y#k?X|-R6A`%AidMdmMjEs2BNJzgr$<X3r%;8M>S}KC{{Fby4qp;`|*K{2pS1aEGp0aGE<)@=P7;clwoui9-Da0AJxE&ukX<}u<<0L7<{7%0oLrb!shh0F{trl`LTy6!l6!ZrtY6iep7#6>MoxqipL^72&=NQ&-81m5;BGKUi7?o`mxQIREMUJm@g|$?dN}&rRi1<x~7kML{3%ML)}=7J1-`R<2SCr<c!h0nFIc29#?g*SvIzHs&HUlQ}?YSG_)cKC+wqT1nd)8!dy-xN7~YB$$6hBPoxC15Z=WNtzvEy)4y92VL$Sk6e_e#y|(?SOs)n#x$O&3YT|pF51~NF@8PhXN?T8)XGwHa`J5#3%kWLQOsr=(h#@`5tYx=t9?<<rqQ482Jz}WSLm_rMs-DeJ25M{&=~Xdbj=^zk{2-^mItHqyWicnOQ@qzma8gdqIDDe$Qo;1!?T1$Q_=stkvSbm`AYSC22btswJ$|g<j$Q9eic8y((xswBa8<wp+M=1lp%^1-{j8{$OKfMkr{F9&N{l7PpW-`Y`P~#zNj5|U_Fsd*kpymL<GS8R%z>TO+#8!4+OcTKA4j*>AVd53R%y72D(1-REKw%TkVUy(wd-n35uqPhE|`<P{=a9(dS%OzJt}vIJ(Stf+t!{h%$jRkuDy06D7wRGY~;JXzAhegyLnct>sGPM1yrku0Udt+SOS&5ksUCIwer`-z-KkyXRVCUQYT|;KTiPzo14#Wxgq_tM-LNUrqj#9vd@#|^yP;!L+N8o&1>XdY{iLMEn^!EGg4#=VJQmA7qp+Neou>X<aIMxuMznQW~C+p`RwIL3QD$@BaUYSFjU<R%1{Jctr8Gi3uN9H-Rooy<#uI75!c@IS-sF_h))|kSVNOc@rjCqGHHY2^J@m@uDRBr7y&ZR${e3Z5&yQm`YH!P5>46kakU3Sl7G0Q-;e?Bfq^QT)fZ%;l8^wWW#8WZ=oDvt$&OLce7b#dFi$KZyT+a<Opan50&sTmxSx<Mt#?Tpyz<LyMYMfvrGH?r*m`M&jR@*?r}w%KaE;UnT*-S?16)BM+P-W`<==K}glK`zZtx=UZ(H{<T*SWlBw=+)ed6lwuSd(mLfXfu3!7h-Yx!i8PpNDIExTP3yt<{uX52Y?l!n&ZI=#@lbY8`l2ffbo^fTY9E4!kaNa_YAdRPq$VYOHni}bgV72Gm9TAY{DwL~7+hPGi7FPhJ(h{PXSOC66l3t*dsEUcB$)fUesGc;<E43f#$0db97u*AX~-dlDk<s++~_=+g|SSdHcaex$S@~=>n)gT}F-9X&o`8xQR`551B;&wqOnFgK;q`0|kRpMXyejEk1YGmYr(p>^~2IDNZ;dxy{`{<rnMq~aGWxT;n($!uzI)$#v=t<^t?aBptqr(s>K1~Gab-Gvdu%*=oMkPVUKPC#>L<s+9Nn5;8TObEUR_hvo+{&B2abwhn1{AE-FDU_dZ}e^0P#gC@f*E&QWNya6)7=H(;#J5Lh?8;CCCv05J)ZbI@$)6whK62X9B^<%o2}2Sx>r6)(HrO_-Wr;lBlm|bPhPHBYn1GyZX&HVx$%Tn-%UUGdfS#?MmyupxUh(`E^JaR@pX&fbkRCwCN#3!T9$Y7%+gNiCzD87pLzz^=6OQ}eZpR)*d>wSMsQhy8BY8Y@cWh#9@T>2;oldH4LJH5(&z2GaRy>NXwuE~ny{5#W15zXEy#ov@4FFfxIj%nt)`_>^BIe|7HE+;MaNh$jaG>~CNXAFXYWooyW|^D;=?XEAN-p)SI{$l#IRwQ$_t^KuEsRJ)xyvFmH{pq;6&WimoOXEw8jr6q0^43P5Q!BY=y*4f>8?L%Jw`q$F9KSG1Kntq2Vi-W861DVYsiQcOe;w1k43@Bub*P6%-3eF~Vt9_)ByMix|+f`=1xSVF`Qc)DajE_--6%^Zge)EtEZ6N#d9j`dd6#`kz5i5gW1M4aXw32;*W7LF=5m$?)8@<r`q*T8MtW+r5;0$e7Wm&4BpwJ3Y2{(M8D^(EzK!mCSk{Biz@LmBbMh^sGW7gf3v!ANTVg;|r3w8#Hd27?HpA?`6U)8-}gvp#jkokS`0-3e=5d0&?bi)tB1STq}t|4KG9}vI@?NxIKLkd<(f9G+)vClfE=15BNLOcAFB5#~)8Ejb8SPQ!BjTD68>sUnQ8Qm>!zg+-XJs#anv7yLy#z%V{qqPlWPJPun44rsNNU?xZSBPN)B^Y{84Lj3q~(jVg!%_aI(M*7^vKDkE)WBx!ML&UuRk>gze|Tj5nDqxd{el7u(Nh;KB~sJ#;%sT5d$T2!vkJFO5O%`T7SHGWM9lNRYd#F%oW{PgikjQK$cKk;k`LZ@dr1T_uDsIq{WspOST|4z}+t&H@?Q#FhUzb2b!EVIUX$6<j@x(U_<?I)e9F6{JFn7Bxtc0Ps-;k1<Y&qD}lYJP*-ei{S;3+Ur?5qXqzgIE43YXnNuOoisax`>Qw3QM5C5X!nQ(ANN8fK4~sb?;X^E^?jbcac^Bf~97M8k=TCK4{Nh@9w3WMt8BvOp5mfGA9CGe{c!amfb3$TT_8s0X~r{onxA$?FYJ6S7#*cae!m}p%}>*fSYFnkekP#6S2!4K9|;keiNVGe$NvR*EbJ5%_BYzfEI8`8?;#(&ii)DITFM@%PC1NNLxv5MyfZgi>A2TM~R}g(e<2S>NT4Zv@k?}@$b^JgZ>4mc8nNHB8~_L>|hT}Q%ZpmBTKqK7gp$y0zHaYki`lnl%}>E+O48<KCqEeFRj{KFPw`uq?*w8=KOKg<FK6q{L{wyORtUc(4Wy}L5&uY4sZrAvvL73hOi@bO>;g|=XH7!tt2?upZ(edJ}71zu?Pg=6<@;b(5qG_m-R8S!;#;zBE@b}Wc8B6N~wc}XQ0&MZ%ZqS-VCnbq5%!Vk>&rTCvY_F3XK6*>6df{-b+Siz=u6wTl`E7_kd6G5On9|WyT_Xk@Fe*eE|{}jqcj_{+eCH8vM17%gtCd(mF4a-f^$@B+dH?h!>2>7ZR-j*-JCx2-s7+i#&?3UwqX%zHckFf9H)ixdD-bjcG;wq{9f~WhRxJ;twAG677HMYMj)M-Ar9=91yN9@!(miHN{!;hd<~p2u=kk)FxCTED=$4+$qXn+mM86p8Y9+<(v}w%}>GRASjyc_oLS=FFx+5w1P}b>%gT&te<gzeRg}S%{D=#wU(3$te(WoumC8AyE`S3+uS^4O-Kb3xP(KnFrIUI9m*v;^&8~bLk>ZKxS(8rLrM7UimXPPEG$JIW@*xyg=M|wbd*l1{bW10AM?N<HZyYxa7c*qrFxxryDShb>HzkmhQH1Mz1e<-9^54P%>hLpSA2ik2Z93BE5%B-+wxS9ySUHsG#0L?s5fZluGtoggDUS~iF;wNC*f%t5Wk5e+5ibl29P*GE>SGjC~Uq_$?`?8yUKI30TQWSI>nIH1d%x~nIuaN?^*B&ob66D^C*p%Xb#N(g-I{JrAxt|po!m4Ay8@;e3Fj7dWT@MW4Q$`u(Ajm_SX9>EleyPnwfH8S3iYO8O{s&(UfFXmzF(5!^{Q825rWlto*|NO-2pQQz+OAyt&>Juj=5`T7RR-y_kS7AilYYo>&nrvl&LRK;(K_7A2(s7Oe)ftH%GAGpWkLBA}(H3_qOh)52AGEu&fOvHa?Fv4z2a_~W?{j&c$SCHR&qBKTzMa1_@~I!CfZ=Hy7YJ;`C;CCAeCy|Mw7HWr;1jhk-H%gG>WFlQSR-&@9gzaQ51{KDNEB6+jWmmZ!sg$P_I(@IEqrBT<P3NU~KqBmma7WM{D3a4_XMh%udCZhVEq+~C`wQ&GX0yHmBfM_jSJ9BUUN*qPk6?$4@@=`78+xS%s(Vk@D@kTJ8TPt^`@|^S!u8{s2uMy^F!^Fg50%=7p1}s-0)O0#1M*|__-G*k<HruPufHKLk48g#ALuJeP>2%rG!l*fm4~1x1=k@iJ|Gg=YZ;UoU{0?bnibj6;{Y<aH7o`~OSDc-==LCF5yKjF0<7J&$7g=kf@*EjQH0CIUO4OU%e{v9X(7xzR^zyemMO)*)&MfekxLy0%E}4#(Ab25Q{Ud8Bo(;Nv_o!-wn#KZ@+oAiCI_tJ3dJ0E6@W6I5*0M0&k=jw_oa|0IxKynOwfaZz2;f0rZ%a*_i7A`t8rrJ2#El<^Jvc!Vxylh~*s+!cqMJ#FyAV##E%#QZPhByoUiAQvV5~u*IKrOevfklZ?)OBi&F;vCM87~6bEG(mR1p@r{-9|meo$|9wdIq0hku-9XTsp&JuBle;lQBXU7->X-eWKZS4&h6{zX12`P30Hv1inEY{HSnu;vrTh*X?8z1?Wd4kxc1M%sF+ktd6c9wNXII$ty@XJav7;m)HY-VgIr3LF@~o^6v>EBG4bnjc`Vg}8k)dq4VVYdzL8bvm^pJy_bq4a41Df9$Q*TuAWKWnto2TXh-icC3+RqgoZ|1wulDIJ*DSMKjaF{G#-8NR4ncf`|vD3@=Ncg1*k<Hc%x8-`3HSq^Lff53_{yOeZvXg4|Ns0@8Iq(2DjWG5S~-yVJ@#aPPm+jm*kOD{J|{-1mECbJF}m_w(G4jruUACy?kz4qzlw!a1L%Q+k|l**y|}3LRJ?sMRYV-U*J)_K~cagpmfpI35Xga;@vg9v6?ziUYOwMzJ;6+%Y~dV_Z{ZkC!QuQ0phQ;V!h43>U`iEF4nhe8h+}-~>Y1Z4VX$z<hK7c3PPa=nrG(gFE}qS||r<WVWkItA07G@q$vwn6$+l0#1Ao%@#YxrIG8EJgpy*L+819?4&42&r2ri2coIWv{OPSdII3WP9%?H$;6f*uG}FkwDGW--`4O%UKcbE0-Zja!M%bvj~>%EI`WrGG96tt0)=w2JxYP_i<@98MeBy(Jw|t>1Dh&U2V@6=M@Y9)iTBcjA8WY*_!RS7jvM`VhOr9!coJw)`<H;nPwDnS3<7(`<LI=Yew@=VE}q_QD9cL%?`L~o87}1#gVTJj4rw0pcu&ZH*Gk;HL~w$+T2;uIlj)Y}qiJc@1$tx%n=&Kk$_cUVIuO+9=4xliz((0taP#5zm>+8Qp82CwYeaykXaKypC-n41f$0Kzq^qGW=>`j2d*_f9q988we&Fz$LWTZms0uD`d~}U;L-FCqGFuD;xxSbFp%?MqI`6D{Av4XcM9AGM!RLO&wM-9=iH^~rgy05R#6mvgW(bnduxTzQZNM3@mkO}ON7wb;g%6b;DA|-}MKApIZHOHvK^Tg~Qsq*u;#9Ijm6@p{Z4-16qPsV%jweM?w57j44PAhCq2EpKff|TJYn6U=d+O%Laeq7Yy_!b>Hzu1@W~=(gdU_hU_=IC8Jve?*RAOjtP$V0B4?FY^oguB%ga4~8&v_^o{F_u%-8Gy7z1425PN@au=waz@#6-QkzM8sW1AL@<C*JIAB?O7CqiOv~MYVu%kuM4-USYvZ4LHAv(q?n*y*12cud?R+zfsnppV_u+))Hjn!_ia}qfL&;>@;J8e6zG-1IHZu0=XnAW46JDF2&q0vsE_0{gITdq?XzXQ$v%i@>Y)ejuu06hNDf2e-aE|mNG-#5NE*ibV=KsjSYYA+J5EP^f1o7Ys*ZnA3NZMAIDeWdAaJgF>sKJOCvzbw3Uvli8j)-yq&Ssd!%`LTNxFSkly|m^qpBM4iVg&xog-WRr^F?U9D#p)H6NSIg=@rs7S#Z&ED&jDh-dYz|{;-9`%76-H=?@^A$}YcgpUMDZ@p3*;Zglsi^fpvKVQNGHEtisq8`Hk{1f|`ad*8uNCe)d+F*qhjWPB@7%+zd6e(s#an)uJFn<;g2{{6=#K?hS1<!L3a5M2Os-EaZhra|ZaGmZ>LNl;S!n`Y?SJjHflPR*T>>9SMa5eYoC17MBg-{d^+6vjrPR=_N(vqs4%P=zfvwHCKF1p!XpyJ4JYd;tb|aJTR&&zGLkzHv_5NLyPv&|Nh9;4b0jSL2BxXLY*@vy8u`d9e5t{<+7`zAnlWVjk5Kqb3cgbk+_aYB3YJF&tjWhdqGYa4TxKM(1<QECo=pT<$I_qZ_K==QWHkiyo<4U|?)VHXH7H^r1x495tMbC&LVI-T>nCF3cQA>o6z2=A)nH2jwy5m0=_-ZF-gJYA}ckE4Dw5sp?>UmL29pK@q9*F?E=Mw(ow*6l<B359(;2VyO0h`Lqr&OaG;|;Geicl2`YdR1CfSu5a9)cj6SK34H%&U`oX$|Of++Sr$q7%1x%aqVExGE_$S4uNXk`+ozp;CEYlCb)^D8O@+3`oL|`yr?2e*AT!*Tt!4AML@(9&{DW2X>XYQV|lV>yGc2NI+e61gSz@3+kY(cuM}z0d`WN!SU);VE>uv<A<<4@97F0@WpwNCc27dUPY-GxwO9pBh}BmN)f)R>|R0;*@R|Nwl0a?;Y+f^o2Zalmu{K}RT&fX+#~D}PRA^|phKKjI{A)ueRFsSZuYDn#80|!{(qluED_alq7bGrecvL=to1Kcu4~?8_FQNWRX{cInpHef)aeH%J9XBuF>+uA7x#z&q(aZ0DT-W`00ErA0+#Ry$fk5OvBYQl0ssI200dcD")           # (= NB4T's), dflash_seam.py (parallel agent)
+    NB4T_LIB_SHA = "11e39802758b5e9472c9d341f8a909f4d170f23d4fb8e756ae2751c914c2365e"
+    NB4T_LIB_SRC = _unx("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;Q!o7xm^GeXbna~Q3)_)cIa3Kp?M;PJ(ZR*<5La|qw_8nPfyP3YG$7PpFQdSZl_Ml^LvHSz0R>wp_-LI1fh(4;d12YR;dgxrTN8U3zVcp?Z>nKj8wErrO1{EE#9W~;hKu)Z63@`Y4Qk=S<)fwpk4YSGVWVcQ}}21jgx{<S^;drckxG9rU$>zvCi<;Hh>MWwW5=F$^h}>@)VkT8_f{NqVW6DBmeNX=-qU^3^Qtib^F2V6`*u6TD@9KWCX95dcGjZ_zmT6s+zj-8Answnt;Xf{N%KRj02e!3^Yi|xhLm!@PnC5V$oB2;lzv2_DVn=SGL3))huV9?@i|c!xIA_3mokW(`6MMhPkGMe~O3Ct)tIb(g!iI)|eW66bRge2(-?yWKM{iMbWpb=#UPc@EmJHh>B2KrZ}hxC$74{s8>+M25P++BU6w<m?SEJbF&B`r>h=F8DTo;^NwfI`o+Fkyvg)Zw1RYuSyZ{EC$-X>-zC!SLW}!8=5eY97;VRf#v{?UNlMpY@9VHA4oW?<(`ZLO@`q)wKO`$o9@%nHtQUO;68;G7V1$$|3=hhi#*oho?UevIZO6G6;_u(srE2J{?tX*SO3Ru%+4q&EnDtb2#M11diD$ocdnTfk53{UWY`R|5dLR@5AXcD4Vk*DPjwU0kngXY}ckHIYy=mu?m1~FhzTZoS_&iI0<h4^`@XlNA{{5>?g~oe2eY$TAr>%~v!c6bvE0pcy{h7kb+&*dlLU^3~;_lCsJ)ftEx(Qn$q<#;<qStuB-wtEGboo2=lfq@(nzcbw?=Pb3S{<sj;082$ERLXj$j@X?<-Avg+3pxpO1sply!LTPw+wdb`!9^1WsGW-!<uSECHn==ag1_MBu&E*gw<RGtS4N1V|hW@9pO$efJeol0fB}e;6td#e=<D(jKhV*@&!v6=|L0)@uuo$B%}s<kLX%sJzlg&mq58%ps|EL_f9OFNlyBRK91u(gc3%v4kj_XS7d-VfcyKQft_~T1|yE3$*DoVJ!BNXl&7rl4|Tab$7ReH{z}rds^~6f;&WU*w5cM*<xfosPRuDb`_KTob)F#2wmX?_Awo3=0f;G`z9~(~;7eK(M`@!wGWDkQds#|*hZ!=pLV&Ycc;?EN3&27}eBu*2=?&uXYUI3qqnqNfeJvvmcR3NgNqD(4msR-=XZVaTx2++p2re4}kFiBu`iofAre^R#`J;!G>C>Kz3$HzKWzYXAMA6y<6T<K<_Trk~Kq9uvNWy(3liJ|DNVlS}*IapVN>WjO0B%s<7q8JielS?~WNR<WsEuj+?4+>SB28flppT4MyC}$s<m<F|ybO`+B-lY8E~#tv4+^rmq%ZXIq(M-IpcWazv*T*RJ#5cX1#C)v%1xnqX!&Tbo%?RT9jBf|4p-;8a0mh_r=OXY0VzwI4|lwo!&o+*7-!^aGOFB34Xw9VKoTJ-*@}z0bPcZ-TJ|0F5-I+$d4n-0!iaWh65<aC*!9F_y&G2Cy^;W&8A09K>y=YTi@V){`)wd9S6|d=G1lp@+U#WbyH=|PvPRIDc#lRSZ_I>_vIYN(pd5@^-O!GgK<2<g&NRJO`OvH->7ck;V4Y4E80=QF%Ck{*mB%b{c<qlotS-Dx2#=}`=x(&rUGHJ5Y;uBL+Cn8P%d56lqeKX#aKR#fV8R;jWl5ox=(YG!lOVB)+!}E>{!9?q>z}-*2D2`Q8$0Jk#ohyxig@ME)Gh{TkjNHKZc^2x0YZRxoBvatS&aTe^vKG^0HJ8XNJ9LKz}?H<s1O54T?ee$dF|tANT{?Gx4D1kN~(Pjr@_QU^x=yK=Lob@_xA<7wv&idBW!)q^IW9yB#PUMYI=EIWFLAAdm{(Yf}i)mAMIry+0M}K7FDg+no6FFA9gUab@m3L?ra_lt+x3iGdLf0InC{E`txo+_nai)2MAVA&N(8{cg*f*X3(n`@TZhluSsY<g=scJqTtzq#o43xZGB30cY#z&T(7?@EUX$5Hm$j4X2~bT2Q~p$Fyc$|mMkR=kku_wIlQiT1;@yiPnHiKO%gFd+h8fe*w&Y<e3r2bU}z%a{%5zG;!lD@97g!+&B$(v3@eSmDl0B3O~mx8j^PI*RO)5<$%kO@;dkd^r!jqwvn6Htul*R}JwY4$i1ndJ@<xLgPt{z^njzA=w4!sSCd`phJR@}C`tf}260l=wFiTeBI}w(J#>R2rBoL!Tskq+%A9WxVMHa1`s!{ID8Y?LXGyl6~&|X%oB3=Zxnx^vxL7ns{!$|_$ZSZdbZD&kJ-js1mw!exY9|lGXLGt_@=&}!q=iz-Ah9uy}OalE-hO5o~hyDX>bpxg5FL9a0IJ%+o`OBu<l()r2xmBEy=Mx>-xUqKxUmg0?v`!11-b2oU<ex{rD-kZ1u&^g$OWE@#smu+k9RW@NZmnueT4tu14^V!^lnawdwOLH!6|K?;l06;J5|Lt5?tEo57LKYD0tDXE4E&RbRw%`vQG|D@fe4Js@|fkaN3Q=Mdukc(1b2^_V%XQrfbv*EVW)m!q*hnC5O`?$d9Hswcxvj(R+RP6i~<1*fmctpO(c7wx-V~B80;e~DG>N2v%0i*yQ|AVW{cv(;rjxr>p%CrJifl#1!rNyH7%3X64b{<)<00!s%FIp*1X-LuiZe1=5h+%4A&F&w9EEP--BSIfz^Ul@|T!R54CM?-DmyA{=!hLgk%$Ak%OYu-F(F%7AA)I>W-h(0Ak&Jz@KDv_QGN<(V0OP78`Q3mvU&`GX5b4%K{#ptn0<;qFZeW@(5a*&!LmjPcI%u&AoE_%y42dDP(<Nz>FPBhJi${8>Ig@p7osUxzNuA;fYk;KHyM~fP4yjp90LqY^Y>U^5X$u)sB@|LPza3?i`bzJ?~JpZ7-74fye#x<C(rirrKMZ8IJT0$ntX#<kh)1@qT89#0aaBrKF5gEhB^!Tya==WD8yn=B6F6K$xxJ@bgD--JR|joqdr;%VZ}7t)AyJ-HO|t=FO~S&ny`7RHe7P*K8ep2e!rU7c8idP-fsZ@MCP^+ZioldKud~G1Ofm3{3Od;{NZxfDv;_*A73}cEQOoN7O|T)eR79zkKOiQi~r@z-?$p%xo4FPk536xfFwfR#XG}he8AS`ztTzRqg>2K%;(?BYeC;5T<=t%zyc<ls3j1Zy-15uMD~QFJfI!e#pNwmh2A(Cf=x!ub->Hr*LhMcuSRT`lprm^%0-2R{f`efUR@hetQsljIm!Gp06)!g)x3-MJ)Av^nLc;lFEPBid|{`=OW#=Qvg=b`Rav=z3%EhZ9MRwA=yY}oImvtWa31S2;lsJ`V5%B-UP=)I3k+<7UKd#VQ&&D=XP<XcXBCZ^{+1A62GV(%@-hXP`Ef+nvj2m^l!KLO!c&}s!Z3t-1kq(?GpU6t1D}6G;TV)p>7gdT;I{7&%eTtv%X>>ddm$NB**H%9rl#ggcVLVaReBR)@k*F0<Fd>0hE-RH&Nh%Y%M3`h1w7jm&;yfL!g4lFgoj<le4XXX$`b9f$7lL5H(BHceHgwojroh25Qw&ZM$&crsB@D5Oq&QoP1{{A{+ELFRUjpIDw*|5Am=yStoT8WLz!Kjn!JnC#DE^PiEmKe8i~uk$vwyj-rv5+MJR}>la1!Z6L)rx0`Y+xq2%96!tG~QjOl9vNY&TGz~}-xM@oQCtCWlgu1~R7Dh8oo<aN21!M&DI-NojM5CM~ZM?oy1iQSJBwfP^s2v1&=(AQ+h<C(vB=6>hOaO6n%mp-zb;5D5m^imoLcbZQnbfrHNsiPml~wRMQNNR$O6aBP$2<orU@}9^|GzbFSb$GUEbXWi!2rc;i3d@qYd5D0tok0K@eo7TB9zq{KM{0pxW0HHY=4|%LBu&kIJtedc1f%2(PT82p`=&3Ov-K6CYsr+fIK`|XPGs6YrQ+n1N{tU-+Q#|Za{}fdeLasO0mvcZa}Ci)Nlk%J(13jw5{5FB7;;WupJ+_W`WTo{s?yma=>6-=vZ^WPxeBBU8wx7f*TdS6viB!U=!OMJ=2gzm1WPd4ZFBMt#Jv21Mcu-ZScN#SFKj0@pq?cz))l-h=A--cKl2b!7Y6<^(sP(#tdfSejB&sBF+>6(Mr|$IfVB*;U?HHg@}@`zcV9qRo4BI)}8^bt~g65&RQk5=JWLLf#cJ2H+>7+S;TxBf1*vkn0PKKF26MG2WBYyF{(V&<@fHnFGxncNy$7Xs(xog;5lNU$n2s}#Io<ND20QSl|~-6R{pR~dqkZL85E*)dV8P^x4v~ufEBqQI8N>%y?A7OufAy<k#@Hhz%7NCKH2a=soT(oNkF+(kObrA{E_ij;0g)IG?^i0>h|k%{6jABG*f$WTd`Kyj6cD2bX7+fM>mxjJ(4ZR@aPZD4F`=#4=7+ozH-Rld3+E4-39M8z))$H!daJ+6^3Z4T4`~Cd%jZC{U`p&R`PfTG3cZ=;sjpYdu&a#9s_5{1Fxk_r=<9g%kNd3bw__@`o$y!S#dKhqT1V7@5ZyRR@9q(53th@dLH}IjKk7t4(CwvuXT%k?k0UA`-p-Fwu{rX?C8gWF}DVQE&<9zr}<F>TPb2`hwFPq;7z`_GHqY)GkTb)IF2D(r*o=5GJIrvS6ys5M{ZfoVQv+wg~2n%`ee@xC=QfTo@__KBg7dCmU*K>r*uC8v18v<V`d06cPlwQJ2k=3jVoYib5tQk-mw&<mhVD4VmhnveQ%-&I7rmaWW*>xJ@_<3e*|h7rW}wAII}`8A|SX+EV)ISjvPYc)vgFch?uCkx}1&gW>gO{z$qsX@?0Eem_?Rwl~ewG3Lwq*i<TAV4K(z2<$4Fk&IqZM1w%Sg28ktN6FJ*6vHUg5maN?g8MGKTRMgm-KF2R7?$|h+!V^<LKDO&w4ATthr>?fI$r5J|QiYQirsx+l21`m4_|E#P7tnQ)7ydfw$6b{MyB_T-)zP5{gdJrMj(`wZ8>KQjCt}8er6YzN9jh|emQ>w<0E{FKTs1t%m}mnoMxX9Jpf$?nzN_;tTMpqu+PR`Y?YO?%CrL2YFTzBy$wnU^vch-(_R!wb`R8!-=X4cIn7y?W<7s5QsH9p=s;;>wYtXC;!1J6`hc65!27{pp?I<-*-Mww^4xmYvin0Z3aCfr5RfI!TNkj|-2;+sZpDx5WsS$r75LJF588++<4xWj79hmLneQog)AP?~STgnpGAc}4o(>x_W6xs?TcRg>(HCNmz0?(|D8ovWhaJEgRJ_mY_<W*-X>D7a-7E;Cnlc5JPcL)1|(f8b6fix_=51g>czHp7c5o^$2JS(yji9)9r_J_%QhWzwA>kriCMVhLtbr^;8DdE=J8e5I0sKY0-<Gn#(c{=hY<$}@6%L@k)+VIa93Nf5wVg%G-igkHifT+@pYKbXatZ!&ZRflYsxxb=Cb1sf4d^4x7BB|gT{5N#a*!fk(m1Xl|#2uG`X#{6#qY&m$XrZP)<^!+l{1=1<b!Kb|NcPNHNk>Zn)$$7{<(qx~d;o|GZ|*sGVeYJot%SZYzKSL#gECtWL^e^?fw<ukrcMeEb1P<9htC5M=M4+7IW`7n@Rqmv=t|j$36$s4s#{v|IWZMGn0F@R!wAT58gL=%Pf|htR)(?vrAx8SJl}fI4M9Z0oohQR=|;{H-P3&2nU6|@ftxxI=T9iOdV!smP&`H+U-V4GMqz(b{Zu*cEhNfUa$!i|!=lJzEiYKXbAmz!gSjq8xr#jPe{%zJwa7`V_&;6WSCf>$36Onddy^2dCQig(VcoL%DX>r#bAp$C1l>|T{5<ZGO_{83is9Y#Ly*siA<(BxVk7>?mG)6%3x!{zrR>+$ieA2h1$zmDoivE%W@yGh_4v>te#4)KnEj;0uvw@&+LPF13x>^dD4<`!(Jx&g|Km&Q=tObLahzpH;6h!~M0Z1LMPd+-P<{$jza@_G>-bd{z|l5PCtY0wc#$VWv|>i@MMh@}VOY-)MZ8Od96bD__JL>y-lxqQra5-|Co^DUO+pdAyr@Qchl42GSLfmXQU!IXL3!7Vz#g#V5w0C#5$<9h?O{_~f?>3GK(8a$gW}~2T>*t~8P3V4iYHtgeXuXgG?baucf>oYOgs#0Rr57&!7UZ-Zz+;i+m^_uzpFwF>@e+ICv#Yh!7zuDH_;WYXk<m4D<rov`;mk)<b8RQHu1%ej110MDYx91Sz$L#y*pg~9fD}H2>u+iJZAK0B<sD10$KfVFYi`${r+GUY`A9x)8o<vyO0$)TIN9Kmq|M-Py)o5$wf#NE7be-@akQBeS<0%2O<)G8iSrW1Zd;IRAkM$FCT9YY{dVMdIdIBffbwL0_ZupZ=e$41mQ%_jcmD)0x+B@npYI^H?}PqQ2FoP^e3IcZ)G=j*fmHgp6PB+v5bwJH1zr@)(pi$pLg^k5)tRrC2EC!_v2&_tz46_qZThpuB;4pg(iQz_eEz-f`SD;8SgY?ooE)0qb<FnG8giS`-r>|;gK5+TcMrudG4y3#iD1=Wxxcqa-B<^4XIuZPbmkc$wUYbBn2uJ;&SAeJz#SWR`e*K<9-*zQEXQXDz^BpY+_y|eahGm=Qr<(x2@g79>yE-(9T8X!WT*<TN%R<-YGrSMhl?_p#e$X46PIzumk2m48rNY3x>m=P~%6=JaEfW7E`GnQOsUM405K`d3+Rm;k$|}AshaZQhQ}GTXMjk)&EXtnDaPZ7QM)*)|>8$u0f!^I{~+)#_^xwSV!Dtncz%h`@f42r1}}P2>qEEEhAX1xu$OVt&1cxjl=W6_ypAZCagzuf#~5>iicVCDN=l8B)oc-ogDMjCyrFGZ}Ubo0+~N+4JxFyC&;!9`2Neh@eV*rrO-$|e@Kkye1t^$ZL_T^GGC5v?ix0R0h4tuu!%x2PVEQ(b%GizL)B5X?d`v;QxS}hLtoCku;2Kv*Hk-3!MoTz=9ZqaN8pKDVJTY!Wg|`ffI8@f!EUX5^7<nHUq~jx&5h%PbR|=TG>0-S;@`m3D)yKmfW2)bX*O=^T9;Wu3|N~WMU+I_s6f$8qxni7v!1L_(%wT!YUBXrhz+yK_7kfXvWydm>`+N?DM8?QN0^wMxr;ygkwjnHA6XJj>X9k~UYI&k1IiH>U&`+V`fDEv?-4?dYCb4sOz!lUTe6d(=-uy$UUOJO@*9pNw$O}w-LbuN<Q)uxlavba7-MfO+i^q&%|1uX`?H6@Ye=;oQGyg6J5G!C*-=?6K(Nz<O3G{w;mwhu!~jrg2NrlPt!4R}TYa(%DIcO;f>iTJj$w4k0OgdKzYT)C0}hWe6<^*r3I}|nx<){LY9ykD66ibxN$uZVe2j~D25k@-JO?rwF7~ICBKK|vM=X0Y!oz+{_-7of3SvJ4n=?;fVfy>zux0aGk06ldqAJBPS@^P>2cmgH*|R%q?!F0&9fqKrhQq+kTd~iE8K&lo4C|@AQ>zjW58;=r{11=eWNtTQjzk$rPuV$c%iOUQ91#*?J7IoBZ6CBj4;!&jYU1L9_XI~Uh^nCN%0#35W0&+5tFMJRR6tW!>2hOV8Unp8LR-q!W{8X6L$(-0vr%@XE^_KVqOx{Q64yR~)GEjUM*^+N7b+pW@?dK*Ra5haF`ZToe7`;_T@FZtUe}Sn%e4MSyFTs_p%$HWxYG!Qg5z_tQD)HsN|FQh1DgJgT-y2qSW(7qh#=Zvx=8=bW!sr+;Kh-iT0*ot&!DIr+6Zjr-nzGTn|SjNb611t5peo)F*YU*2TV)Zq~Q=WZ@RmG?SIX)A^&)I^AiB+9%eN@8Oc*!b-0C=G=EE3DgPlNiNzaT^F}#{^3AUPY*Rjwbe0RcRs)N6>9v#&A>$w`sV8$u0cO5z`fDpu)G2QQ>GwJn&QM0z@c3g}t`Iq7N+|)>8HML-oD@!C7<Edc_da%MI^g8~-!KEUIelOOQwt}?{Sb}NCR26;XvQ+T)R~?B1YzZ)WnKX4%QvIp`B>W=(z)+Xg36vYRh*z#IlVk!`ZN(Xr~yGB$cOK2SK-xA2*kHI=pKFqnNPa3e9Pq8g?brc7>yD2J{t)ni*Z!hbc`~0MF#Ii4wz`NoZ+4Z6NLiBPU-GX>a+=a&^A)kbiYpTYzPVu;aGx`QvU#X8VQlFaXhUkHzAe})9mcbiM`W+-4V~Za1xuF>*FRxP?vXX0xIaXoNT%6mb2Jn_!uLa28<)ek?{9`Eema)N^y5J_+a6M#Zlw&_unM0`Hrd4qTflk_|eRKY4_)ly{vr<^H-oae#It*{~VI|Un*i%<$_$YCLAZ*>9Vdc9(>ZjAei^NvwJ4(i*VPbqX0>30~$^BUB!GoSrz0AO>^lsP|Jg3fhG24j{j-1pcgec-B{0uXo78n3WFj<LNZE7LoeTBU$gyb)mxmsS$OW9P82};{2SZyOyRIph)VcCO;s;VP0-L~I|<E1D8Xji<&8;M?i-i!ym1PFqx;33@v^ADI{|C#encraX6D$aRB8+lOh}{@D?abc!YA{Y1m+2Hp!%l|*OnCOsAM&ozL&r5eQO4I9G1Mxn{a>%uak}SS77jo=z)osCI<N+$VF;qX3pNYJ<iIO{DboTF3vS=n~NAed91hR^YnSdBQ#9ygADuBzeDPPZW^qA$EU&}XYrO464A~1)IxF-{m%B2Y0kG9(SI(WRe<wkQ_Vq+%X9Y6aGjol84$7K?(5W>mZNx*uEnkuZNoAw%~pLLfPO1^orIY9gcg_`XcM+H*tE7ZkLho{OT!ThOUW90xI@ro{P6|P-q!I5TrXX|r|Yb|n`0^$<13i5{&Ef<l$XZa2=AMymVziPzpEQjjN=8f2>LTymz3GAezw!*CIt_!;-6iRxRx$NizjN<7NeMuFLD2$GWF1AY*Vr0%?u1$HG}l~u@xLjufM3x9CPNZI2CTT4-d+U(w69v0uTWz*_HL2`bC`E%Tr6>WvS<$BP_1jib{iwxYmMc1+;^xtAna@iP3!COVj*B_+e*IzULL%DzXr2k*3%>aM8h6a*QJ0)Yzy)h^#t4nT}M{iY3?&0>e)WBY*V60K#*7&1iC~3IIl<;;?glhT3xSgEYGIN+l0ihGAld|4gyx;t<L6h1cP+8}wT)akk0zsC0A;6x-oR=Te?JPYk`O**e{OIvz-;0%5;2YMKDX2KA0c)HHMzawgqx5tVVR%mt7%u!%eomtPzv`^9Ac{_B*+a<@&P?Q^BSUB0&k5eU=#U!3Q)&nko~HvDkQGU|ZQU|kQ=nGJF{^Pvu4`YmAU!Ppga;UPak$JBY-k!8$xIBi=;JJ=h^OiYaLH?@Ma`rsbnfI}I=&OI5R1y)Luc*cd!^egHUF0Ra1ftWYNI4Zuy%`})^H_A83DZ~MCX?h4-lOV;0sh+4Q@4A{m|9@q*+aI=FNz)>|XouU*YV&2IU$v|syaj<0JFva=5ylXC0_;;xWk0MU>u?n#)OpiAIRSH@dr`-FVzj~LbSnQBn3ynck_x|-n9b2g!`9;|(7}^e0;F=2wP#X=;<^#0-3f_Eavd`gjcCdO<Wj^Gr1-Wks}rUV`gCDGeOSH-5~JfYgK(+ngYs!k6(!l+Itd4rLM%(%5RU@_^dF+ZhCozul#;A>m+jLa3Ui*3Zle}v2G41OtVDt7#4{B2Y5o6};XDjN-6VNkp?@wH*<yFk?t77G3^PqMm<`FJ9W>Sa{8LefE<0{RL`^RLu-hPN>+KeF7y*VqdWvq}q_|q2b4TtU!Xvw}oYT#2`ya}(RC)l6BBOJ0{##$r@B<!jxJRNcju4#H!NVlt;o$NJS-`D#bPy2|p68!<_`HX+cnK;MBmA%*W0yRWLVB)tv*ZIzHL0V`#%i5tFYX6Pw~fp9B9^aafABh7_(R6A5E5$c@R!e3$>t%za{3udt(DcXuzltI4JQHnC2G6gu$S6P(N98i2zvu`0%?u%UjuM=fLN|FP4t#pR%9ftqAj%s#7~gc`f15U*nKrov>41c0<08;0ak|=!ixoW3a8U5p=cb<O42eGN7i!A;>x1IGS+qtBf|w=Yw|k_qk^97Kh+sVBfj(|nI|m-^2j6=|EPe1r^%VQzsGIS5w9)36dh~n46L+Pag2b1d74J1ndRHsr7QV?V1Uv5@v|mrBeg6yP2D%zngKyQ;wxb(HRPIRhzR>^FNV4LvAs_w91dr^i6eUgwBLLCkPR_dhNQUqkEFz#p{24i1JoyX@I=rnGjuygRueM>+W)Ra{w6uG-JeWXtw?jbpvgva)&w}jIKLQTnV<ArnT2F#(i5Z4(A;wD!lZ*ol0nw$EB<>truEks6`s{j_E+($Vhe3N5jVWn0EwbxcaIhcA;pdhKH?m%B&oan2l$4-!!*RC+b~d(YOj@rCDKm*1|U;qb}#x$yiIeJwQ*ZCm>c_e?V8;Nl}R5?gdI~c6huUx(@O)ZTapOj;v8J65cYbVHJT_(C*IUjM=`gHXuUar{wNp3OL%0x8>R!i){V#MZjXSp*M^&uk@z%*jXUXQ4>Q>qXB_*qucoCm%u>@yi&fIYlI070`q-nBSykG$6q0ynWpuTEb`qNhG#8WL4eyiy(cRnQkX=b4`?4sOl{Xm%RD9^<1E~XO=5v3r07QNOxqtF+ngFxW9taemmyE^AutUK=)Dl&Lz=eTq?p}{3qRyKqnMoloS<9693}N_jy6%g65DE6YKA&a*^#pV?soO;fW+X;bAH9b_7&jF&L~9bR{Che@oA@ncz?I$EO*(=WsKDy5SzfB`fDKbyj?Yy=ADOFXr?!%@aGaUhWN>QtQ4aw9-nqTrGhYZ;jU0kfC2`d7asKVn6+l3^lcNu`M;^=IE0f!$crh9Z<s2Q+Y@sKzCt}Q-Mn;qKBkaXOm+bOlVuWPD-=YIIKv&yBA3|Vbfnsy;vytH@OzCtP!!!hW>a>KkZBn40Diuz_ZzbNYExhjQR_%o;YdM{kj%4CC<@2VF6CMEK&h_tnq%e9}nYJ0o{JxUyVzsaQbV?vJn%jvbR^fPxQPS+#U@n(lTCSpM<>s!+Q8YwxJ~FdBQAI8vE*|QJY#qoynH!y3*$hPZFP^;ea*;w9GRbxsAj=N?3Dm9|STTn+GdLLRO^czLBqJqHHv1~4;4EnLHz{MtSH@!D_>R(C;+w5NVz9xaN1q>!o$x=oOhnSeOrif2i_RRe)<s%Ef}Ya>C96c0w?+wM9W$FX1Wqx=kXNE6JD)!FKD^~z?cCK!<@j){xx4o6B55)zb+8t!Kn?M%|7ZEF&EH|Ln!aBxp81qq>`<d3?VB|8Z-Rc9+xNSE9F4{n*n+XbNRwN{6hnrKYZ`Nn-VN<CY5anE(pt>xSwOIde6gvedf`@%xQu#CLeamoO4cM#fhZl^8jmri6eBEHn$Josi}S6uuCOtBp?Z={g0IfND!mJt21YYlVz;~~jC3eB_HNfq71z^+0jSwbf=~DFP`;Dn6`46>XjVCzZv|c&=3#v6WW>t@eihqcx6I>(vW;gHK>$WYg?D;6_kWe+mP*)<2sulT3XU=^KAtj;!~J$T;n)$p77`Kz*M}M9Qbkkg8x_Xc!*1uez9C9olw$iKM;1`TUdRa)#T$1a?WxWGjF@&cKbMjmaknqH@1~$7>LE7e&4_{T(ZyY%Uh_Ox=)LH6GZt0w^#qY5OhdcTOw4ckMQT15om$rp*NV5?N4|qw6FAQ>M2_#LBL{h1+_K+W9|W1pXZ4YWhnB)wgIKCy{k|5+mkpU7^e^5KaT9yT6Or_gZVCC2g%gMoL3=ZqK#UKIifm}#KhJMkT(@_3nfENV{1(M9-;bq2_8Ec8VzZ%2H2erz#mqHIF_nT|7|ab}6$sgKvS*!gRv52rHyKRK1FOm;Tn$O$pvf!c@|LE1q}c}`GC&=cX#=*YaL|~VAC><P>7bIjfi?i=r0DCR>J{2+-G@*>2mT%3G8XpEQ2;YQWI*_}hAQM0&X}Quguji%yY7v=M0`T&Ec^@D<Hq&uH3Af@%*z@W<67iZ{)n4MFngu2U5+-oM-J?RB|lAR*0;4?yGaHqY$EJdBL8TrytV1EW3HwU#|3TbgYQu{V|jSbNgyG>d~7GIR=BRf4X*B`TG%F!w%aLt?;(?B7Ee6U4+pslpm0Nf4?%@<FFqRm9vkU2x8sk#3<RnTQzOko;LZ?uC~|CTYWy-y!}nFjJE&hB;xIrVDS~yc1H1f|3AaOA9dD-IX3Q_V4)PJW1vE*9mx|+S^c5g2Hl#i2zH(@V^~p>aCFPbRD6P1hgdE~zf<Ya%z(^Q5bk53E?E^>~L5lXePK%j0AfP=_2qGx<!1QyhH<BdGoDqw$`D186T-+;bZklZ1@;Rq<Y{}Oey&r)2+0RK%z+|}fv5bi_W&9ZB%ApsA3G#}oujtYjiL-z*%Joqbn;}$6mGCw?QUmWvgNh+JPzxL~?=m;f-+2v4kQ^($tE^QRBa=a+COmn{u<~(|VM^7J@SPW;vj~DutaPV1=d>+jAWD`3R)l^^Qiuw>X}Dv>cwNWPPYyC_c29sfvGzsxv^$S2pA{CwX7zxUTY*!SFS^^^bAjO$@bA-NP7rDDpDj?P?3FUHbLy{3nj`T{)xZK~3xoa_)4GDAWC8vTmg>oJ@M2H!@Y^=c-TM7dG2V19jOyBaWmIY%$_5)m3Rhc^z0&Uspw=E0PL{lIzZP=2YQ3)Yqr?tQ)U(gRzg8{lLUWa!sw~;h6%-fq2uI@UnXSvi_0F_Ky9|71S|LlF?^ZFAjK(cjA%GXMT0Ra(p_v&#O!pv)+d|<vkf4!Cew5-c+Y98N2uFo8ZL*!_B>B74OHcWeUg%pO#z&%DX%7RkC=r6pGU0?ywGh8BU<kpYiBKcLsKq|j<8gRbxSJlEwQay!>|1o>0n%n--bH#h)cx@SnH5kzZ@RQvEjABq$CZu<i#J=7TXRNK<m`F+j!1Ts+|&9HId<cg<Mw#i0i5@1fbGzG*1mvrzFt57)yA(CmAO$pBN`{#&LlZ|q>RpGd2`TbSL2&a%{nxd4pHq&65vRY&VSut92DketfF=ZNalnYJ9o7Wd_zmN$7Lo|QTi_WHwKqclVUv2;DgR(Ms#$u6m`wV8AcXC)JO10^YoRz<ki<HOkQoBwwN(I$zQ@uP~PY!Pu4|`MK0d;J9>uO_-k{lUnc_by{Lkg2{kgx;{Sa`mo)CgD^jA&FIrmA@>HVjZoN3xP?z`&PX8sZ8y=Yy?o!tVm4tny86$<4gAKVk_f|>YoCb5tx&6(7c<g?-cIOOPzs{z9G%pp;+$|h1!d}f(-I8g28MC}1!jEBrFj5c9+E0P)bR68Y4>d7UMgtx7pqr_d%>oj-bfxY9hmN;aMtftx;}|VgPZQ)m{>xJ~|ERyNvLG7P*QRD(aaFO=dV@9yqi++!Oq?t0s-*o=Pj9flWVMD3I8%FBsP+=ey0iiSxis;9+$W*Js#s}MokR+t$pEjITYzK806Bb|7`S$Y1ZY;A|GGGKR_6!bf}W_E-gT{pE1n)d#F+>-0%7b(s8kO12k!i<^ju_RaAPylpGCuWduX$UhO>`8JdKrl9bnVP{82Ue7EvnpBs}J!KajCsivOo3!T(Q8BW}gK%-*|h7!#?!Y`V}j7NlayXuQCQ-|`P$U-`_IXTax{)577o+xLz%xYqjnJNkIEOFFI&*p-?M6X-wunED4$I&2g!yyY$l(S&)|9cAXYRP#nZ)U6&>%@{_ssDU!d3O_BUX%OwTG?S^S>&<_=nL~7@;-zi~O^w#Iz?zKZOpg>`<g3?^i=TSpoy_u*A_XkdmWvxmFKXA>seIhRPpSNAtb!sxn>BhuvBe)#6;=_)W8gd2v_1&Fjr5X2;`d&F9m2_GY`cp_X3^Uz{eEflBAP$(`(d7e*fEAU+}RrCYP&?*&rFBu{iJ_zu?n7&`&Z-J&7uIgU_1hHoaG`1=_(+fue!dxbRK0pw1**L=SrxU_aQl(MNyBi%vCHCp~=%3E<N-MFFj!xhBNRI+09aWJLvkTc%YjHF<`C<hFpAPs(CU0oUbX&d<DlW*@hW*uA*N*#Rn)*iS{jvdjs0oF#XUjW`DrO-n~*o<D_E|bSzZo`?edA!H+9a(@^15=>C4*j1t!+M1bi4bJ;FvK5PcA8wO=Ow&hTh+wLBv-!=PFcc?_rAW!I(LIIOD@DVY3Kb!TOYpJJlY=C9{`04Bmg5y$to@2(LKJdGx;ezr~k60D`0IpR$>NWTuc>G9Q??%Qgha~y{*d0gs_vm^3D&WT@CwD$~J(agAxS-BMQfoUt);xfI<Fz&%oCefg7d|f32p^>!^cI}$O;o!yowA}8vWL^d=fC$Yz%tf80xrg!Me?aT?y4l|I3xFmc_661X)<=m>=@JCbY+ISnsM2zZI(}#i*-%sD|;dlr(8YSsZyqZ*Zy`{n^W?U%4DnpJcj@-*kjjdw}Y?*sgs6;sZQZhK#0#beV;~g`vd)U3<49Gr6QupJ}Fv6cFjs=EwFL)F)cN}Tb74Mt9?w7|Euiy*8;#mvlaBSBB$IG`(h=m^8%33^kaa-E1R2<XKiZxrDKof%o;6+(@3u{Z^BNz|31&#5X1(v+pBTK+V4qQTc2sOz0rZZ#(Zg64RF)k%1LcThluGgq)1RiBG+fn8f4;sLI0V`7Bje_rnNeXuCPOfN7mdGwp1~e|4ja4yp_1rD}HRoaleRQob;E`OTHoE+58eayf*U`_g|XYQL^8n@lp6jmhV<Ypp6?Ya&xL0rC=SdGUdl~^}jX$+^Nhl<@Zfk*uQlTFNfr#N-JlzAKIf6dJCP^v`gP-N2yMP0yztS<po;u+i_S|fc<EO(FKf*^nxGr!qM6i)j6p>pP25v5)R@XqE^=!e8$@rN9o_lB|GB`6f8m>JAslOM^tSSRhGIAl^E_`Wt-Q}#B#&&YAIQsLeQJ*-%{|9`%(YhZt&Dc8e%)Jm;ABiWlK4nGR<j1D@;p974`augT5MVSR0-%S1iioorV5+1u~;qtyzarHYmZqw0(7dY1gGwS}qIcQ`!_#G*i8EPtyU=tP4jL85kQprZEhgV)^iaCTOQGy9B3AT4f1$O5c3}Vs>Cg?`JiBp%Mj|7e5Ouj8wCV3)s&m2-eUO#~!Hn9sbNR)k;MVzMuZ;Nq^ax@jB~S)FisjQa)jFMa47KbA7_IX~U4gin$cu_LCsis&Ld6wMF`qX%fBPI0QI&+T(d6tilb{cmAma!FJ1t0vi<~DswA_GvZ0W3}<KLKJR|*qM$on6)BTN;x7JdzKom*O>Kzm<@hhTZ9?<+e1$ZUrB$W309>oVjzbG;h?9j2X#?XPA-`xDJA4B`Dvi@{!Y^zg6^PoySe}KyNdNh-$L#oP;s9^boLxdDUXDfK`(TOsXN-KW)OG20sJ2e`a$#VLLV2wqVn6yG2up>Dpw7)D`D0r+fF$d0u2TO_qX*XMxlKrWiq5OT``g126Q=FptC%>z#2Q3dh`QI$ooqc$g8_zdnidbA(@<|occd5>jLHb8C1iFHH3C0vN!7~-?~T7TGV^d;08~%%_YZEc6aEVbrk^Fxe8+a?QQ8p4UXcXxdmOc;(XYTJ0QH;8B|8%=;{B8`dAXT(yDKd67O{l+RCDYM<Cvk-DZaRm4dAuASpLWNZ3&q|`wBqD%9xSn|41!}L@4jVt&KYES;X{%E1GjVeZdgdCRVJTrhR1hs4$5$=L(VGa_JySbM<wuk0aw>qw6)V%bj|~rc1+ZAVx}nyEOjDVzr3RGBMYE>b&@U!bLS1VTsAQw0`-fI5AS;@6BlZ?gY?8g(dr~Fc-4w=Ee`7a4U9F+hDp<1-f6IskoMdju*zr2Q@j&+Li3%i{K6hV+7tf8asK0k$Xa9mOV-}QRa#WcoHHLH?X`;+QO}Z4}O`sCOE>|c+nyY6}Y?Kyl5~?hoHO?PMbtrP)A+V#p(dSk&$y|5;#l|*^!DZC5>@2%$8IN=Zl2)7<*DTA4W17@%81x$YEvYbzDru>Lo|HG6LY~RGEZ+&J}p9NTU2ONio(K@qiYo*FV`JzUY)Fw#A9Ym70u-e@n>Pw7(_qT^9dzyF6Oa`vPSNMG9tRC(}3)k);K;jP0XVRn}Q~FB7lxdcFxP-&tp`<g{b+&NV*Pe~Z5yD~_RdH{_&s@>rQt7266Rxekq}yFlxsB9}=^ZFoN=!igTbmCCS7MNO`;mf&E8Bc>q_Y6uf(%kpzJ&b@%&jzH4Zjnp_9VmF0|LX_H>FhrOuT8WvRwihu*3TLP)@VBspOA;A%_y=hc?5N>zeXj{zARt6+1;5IsofsF2UTX9X^S@=MW(kIsBC2&wQL@3ySt?1c<6Udr6YKc^41JJWznOezV#AC7KeIoB;Oe=U)jd=ju6)|tJipiLlAkPG%cLcA7CRoL)TE#BLqO^{KB**dQwalHjFP`2uUT^}av(g-jAOAX?zwkWm(HL)&YH|LGxayvr}W|8RPyK`U-KNw$G~O{T0RVn=ip}jtK)l&X*USdVm8dWGs3pxh*i>i1lPf}?TCIErsj+_wJR2Yr#0PzKTTl3sUhXNjQbf`m_*C1hVMrb-C<Ge=D?KSk4i5o<{;?j-w}2|1LtF7&n~8l{yRDOlN7kxcp9vG|DOZ*Q0uBHrPxCzM)t8fM#qI^zNT_hGPsC7|3C|3WUShbc1fYA2?d)Ed24Mb?xR&cPiC22+_PI-y(K0N36881q*`kPWXBju5toqzvE3((dl57X07Oo=j1@w1a1@Zp);_)fd(EF}(D^f7*9m^vegO%Av%4d?Iu1=BVS^O`41X24$-<fdtYnVb`jzRMe$VCqRQdlk3PtcKNSgr)4&4q;z#P-4QJ#^RvGkqF-(cuQt{^&Bo5tsbZ;fGT`wnk9M}aOUonlK78-h;*Ea63lS>Coj2>H;anoHYGK%c9ow~WOX3`x{_$cVIleF|0RGCO%53ELl<gDL1~u>D$<QfOELBDC7fDoO6uZ-S3sz=yeB@=Eqr<!d0%zskBh96G<p$f=4yC5*K&oT{=d^FA#>`X_|$7$0Z&k8$3%0FIxfsUxOt@wsC5y1f~|<ZsQKABF|2DMXZ-7{5J{RnW2q7nQayu!<Cdwhj6g<`J=A!Ee(~zd;>LC`zR4F!aulfK!Yf4U1H?Hn2#nb{l0RV#kb~18%AOv(L8qF+O^18JE)RXdTNn1FCJ>h;skr6fVOubh{?Wan88ACOgQ7|05v+@LJG&OS2=<p1Dj;DN*-{f0+Vy-c;4|0RN<~>T?I|Oj*P-sjZk4IUhwoC^WSH#$waS9{zgl$FckDYwn^~6#HZ2Vn+W+6Dwtw)%F~i=3>C0^%FN1fGOcASmhNyW3|M)Zb$XMTlvC1Gc7fb)5Je!E9*eg<Vki>#o+)&EK}UK`xD7_FX1%hvQ`$V7jt%@z%DqAOhFKqMXx8{au-Ty<=lF!+(jH_58`EO4?xz)UX|AIUYL(D*YIxIZMl&M9nDeG?g<ba>e8}4`N6ySnhbaCb{t`y<?F|93SUM=`Y8lFbeZ#6joR*+=9ngjC&h+F{7c8VaT}ec=3k_t2wlUV<MIc%5yg?$wB5zk7azmdC-|qQoc<Fy-XFe1pGu%i9SW<^Cmx+EyN$ERHeZ!j!0MEqVFbn1xO^a~<+t|B@B377BUbK^UIW!M$R6`}e8_B!OxHr>CU-LnX7HryrbKY61$KXy2T!FsNco(DwUAXT6v;IOUO9s~`?B~<TwM)P8p%WkEpy+BDMVUA5&JOyn`&Cl#ztaCCit7DfR3lWs;2Q<`%s7N%{3ulm2)4rE^H{lwC5vQm?qiT46!SINVBQN{K#O8sr1_aTqiq%?aC!cI}jvP+E>7@zhcwG($owPWZ#euCP7n5iZ)`-RmpVM+Pt%nF34$!iD4l$B?rp9U?f9s?btV(Ijfn8J`u*ZK+Hq-MhLhegl}h9U2<}YA#co~+xXP$v^>S)N05klW5c9U16vbuhiZZ!Wb`gjI#ZMhV?P1)fgR!s8d+K7OW12N7tQrJR{WeH<L*h`CH{9s#s(QtJ0PiV%PfT*E%bL@$J^}=8@*qSS&bN5baM9Sh+w<tB(w6#85mC``Ih*UlxaP}%$2VwC*45uD>!ZFdqDK%F7PKe7pVjoe<~y^4{#V%^x#gt@leH4uSA8I{*o;kaErfFy8Js4o&#Rk;T*qjQBJ0w=&MM-(=4@?AobEM2!9Aq$a$1XnhJEERP5T>@Ai5|6GDwn$MSpDi1%pSvXEjXW=!}F!%>G9dk+SF1*3(?5kmXaPs`?&l>h%@SB$vjK<WP`11R;X<YCUf-AfRjlF`Oj#k{_*X^vChJ2TZZi1UM|BB4}SDtg{K*+ex<08}iB%AG*|T^|llSuYOBnV8v*Rr{SBAgz0iImsJeBU^RXVpgv*F&;s~&i95)A*TSj?ui52FT%D)Wn$jPu0KSkW}WTosmyVj9GXv;94I{4AUXKi3g~DW?Fe|rzHMs|`y>FfrpVg-0Mzy`Ji3-6nKqk-v&O)m{U=4wSbS>>MLfO9JLU1IMgPdznohiRruhQJ)mev({{aV?F@5co|3TThiDf{k{e(~;064#&ooJr9A@zYG);v5t7&!4X`tXuT>wzD0+yllT<>)cAy-$L$<RR@jr_4{t@P2W4C_7E)HrJ-;#x;P4?MsYgU%CWqyV9xn+c`Gq(L6FS05*Bh4^DnKF=B`dB2Y2@k!phH^gx3}s_QoxE2LiwoqG)_)o$DJ&qB(}AYz2~iGZ8-e&fM?lIlb1V`a*YbB_GQNG>{cR<Ne7`%SPq=m?7CY#a!w#7vyy3}|bt3*#vM&7?SDIHRl^wOms$B|R+eyeAcJv@JUNmNCqomhr5*VH0AVMdZBpgTj>zJ6@dh7T=UvPKwkG{bFMNUm7OM*TRX-v6li+|Di!0`IPZjzo^#2V|UNnZR|(T(~|UyNv~ZTSJ^>!^eLb=F7Iortm7#BL~8Ym%^1$z%O-Q2)3ynZc^5*D#<l4q+}V8?>c==}$;$;Z$5Pv)93Bi1E*r_PyTdC0n=-kex-O@qm7~(5G{#)EunE4k5|JCv)Y?VKAO&u@e<(rSVI%|bKvr3&${n!UEJjdb7Vs}Kg`oML$X-C-yQ=gEOfGB~;c`dXux};rX37^EJq2XjJ{gIv1<EQkuuhMBv;Q!`(0U5o&_a5%3)oLdd(Q`ea&!v6g2q=9ohEOu8stJ-jI@|7$3-%vthS_4ei)9KFVHOCop~h-rc6JT_of&fmIG>7!g@|X5L1kE`wuRq6Dmj3w2@nZDQIphvx!M`QQ_ki?Yt{1dDF6cjFDAjtxY01s=Bq&r3)G4b(~v)3~GN^m3sK2phFT-R$67z*aFK(=4A;~0RBFK-41vDFc{!t5Z0t$%NUlp(fPpB+Hh}qconvqWvBF<#?@8{s-=r#gN5~2^)%P$o)%-;AkfjEQJo`p2^9!u?REj*{GP|Dyp#o3@+O#>APx4e|BAS#=(%T6nnN)*de#(dj=DvNfYzf3`I}#LdvFmmISAQS*OC@r58yZQnaRu+F_8JFfAC!sw4rEKBlj(&=d5ga&TA&E3hLk-2*C&$HdJC3i$I4D)3%qbMp0`uFZ^I5J;NaJ=V7BllG^B+`;jOxquis90ZCB=4kt9>^?lR8v$F$Vp(#ICjlY#+lR`UDsMeF<ks87QKJOaPyNO~m=omZpjrQFZ&JF9Cvya5plD=je>F`B<|MT%pGzr#LDUqClD#vba6{VDN%z`Xb00^3ef?KdN=q=sOA0y#M8rRm?r953PN603?sH*$Rypy=093&Q9QetR+8IMI}|8I)&b+?TFxtGb~uj3X;D18`oOx_c+ex1J|8ohqo;P4)0^4UTIq;j4p1puq<9H!(;X|@WY^ZX@Wh+C5JH{qMD1<SUNn$=N%*(|+LOEVE~RYSvKOND4oebwP|vPEh#gTX`e&Xls7Q}+n9V={2&uko~9iu|dOG2hI>VZD!)_YJxV;UN^RTxUK()EV!!Q#pbZ3OFVA9Nn2{IgMdpo~QATT~LIqr}jI6u<ma?%#JdAk!`*D(9Pk9<iB|!vp4HWh@9~+fq3*DVtl~JrJyPEwZktM<Hil;lBP9rq&LL~`gmxc7w$)HQ@Z~G9D+9Hr)94zJ@8okH{}7hkF4Fj1HZ0v-z7cFGV-09JiN&P=aO*uyDUc-;hCt3KE0^3GhC0A76odQ5mbc(m{EBVK<h`L`>H2m<2gEY?R|<q+Iy!{!9tgH-F%|s&mLZKDe=+^`RS0#E;^RsJte~l0_+bnHn&>ZX6oI{o}XbvnA`Z3t%u3qXBqW8$YqpEgF^p2J=E7=^C1n9XS@>qxe@x8#?mrdQM;6ekCg)g5#%FI<F3*F=Acvd_+g5}5)ZC&^i{d!Cr3G3&}(vLAi85f$R7x*CtRRTAOvNVPQBp%5@Kl_hT>bIdM{V>@IdB9{)t%mg!m^nm4<1IAlDgpZG$@{0B!R%82^J-UB5-)SlZNar5}5>&mxN-V6x7)vbir77wofZ#>-m_IeC{k_YdHD1tAMFO?0)g5gcRP0o?C}pWJ|rork?K(;q3Lp(#QRg0JJliPVofIsW~@Ia80<rWYA0knjbjPkFwBliQ&sc1DtGsYI*Vkhb(3xmIlIA%*Z3Vg-05KWug3KjvUi!OcYFQ``JVfy(L2B4V?5Xz$C`e7@$`7tC~0l@@PnQ86n79Q1T-<olx{bVM_q-yh4wd+p<PD}X6Fd*rsy*iy=EwnWW8gq+E&ia2^|oi$EP3sghT98fH)T{i;ByE>cUinP7=43lG5+ol7^$7kgshG7*ZoC{<9K7&<bW&^@CV93&=2s7!ThW>-_ZVBSf0>_CR=`MSp7IueK%3Yx?(AH8fAOg?M8sA3k)uYL_ELF$HT9ebezG=1gG&2~r6uoSCpa)Jxj7{opc^X2zff&$+%`zQAT>ItDNsRD4kE(TW>1h&rYDSN?$kxOm%KMfTU2R2fd$xwpfcNk>XJzT!60<U7iBsPhr#r{T2q`GRLMG-bggLchF`+w_Iux+PYi{=_MeIw%y@AELj(rC*1}dF&NE(f5){dRTDR^*{&0#A+6G2eZ(C?$CWHZ{DTTG6R{LQ;?s+aX#e1@eMZh*P0PiCx@-V9ZdfDzoXCxqQ#5+Y4XX6PlK54Mg`tZvn`a(wdZ!fgvJOJP`2+H7FzV_qzVBy_T6I`y162^LvF;@#T$0_iS}`275(t4xXxYMM<qoo5yPGLIYrf&W&X+CZlz&kKC35CsJ<vp*gG;N-erfQY*`TtW%?f>iKx3WT&O3*<$66+@a@r2aVn_)bZ%^8?$3ZiHGE;L&Q}0iBf49n?wk*ME~kpUF+rnX|TQxfv)+bA6>}{>$6bL!*hl*(D<YfZyavlx4qoQo>CJiVULV0vdmst_WLrw|>7Fw$^%sf+2~P%$@H5dLYDvLIuAu?aOZwkFpv%m32Tt5v*pe58FVu?!GSuLK?hLY2INKR2E~3tMh_5(Ck)D+Qx-I*?+fCg$WR@P2I-ToDG7Z8<H>;q57Qi``+zcdN{Es@6|fN`;Iy^Zd^W_*Nz}fLp2Z+t4fQ+823$y=PRLjNVLGL8Gi#w$`5I0Aqe`S=DrcuDdwSnD<3>H{=ZXkCYC(4<5O|M(KcIBTFiRVMn}pjJyi=tif6?T3j4W|b6_JQukPvTH)?4B+vKC9s-UcySn!_aY^{42<@I4ehz7{>Ow`MW;rjq7pF7RNqKmF*qxnegg~UN1fj$T3*-C{MHLS`f6K59D@aHW>tP2a#iixBInGvSkm!S4O)qlCqXye(NJI41xnVSS;>*EJKI`vlFFxbvFmHgi0LSp>ZY9u#PXKF%%(;$LD#X%4VWO}{2v(9Ko`Rw81;obo`F62T~PhQpRb^@<)AX_q*&Y3XU3o5Hh<z=?xrm3@CLq|fxPKAM76sQRx{4bfMoh^Z)pCC9C;Yqin7E$6ZurmcHq;~+jhy`X*vx?xWe*v#YNpwz{YjLjs(~i9#%;pE7CYqljScvfHintQ$!HM6uQ>IqkJ1`BkAXYhTF;TLyQw6tS%`_&EV~{|mYm3)vfVb%wVWn1<EAUl-&3sdRFo7(wlDUM|rObel&u?7vrk->fRciWqVDx6RAlq5~Q9XE2ay`V`ij4;RN(uRh8_UI>T{{O*H`R5x%~f1@$Ie+iU{@t{DWX*2z$!cd6^4wI$59*N=3QRTHbhp>$s2`Jxg4K4>6pI)Vrhnc<b&7-4zjES=DWeK7KNFoJC#?7EmEo6Dd`WwLORELb4`2(O!UijcPAAiv9k>)6k>L_pL>^~k(j=g7Msi*6vV`B(5{nvZ;u>xTd8AFe;)!%zEqmMGGnBOypMpbe!yk6{s-0K!7g0?6grK{|Drz9W5Oo$=HK~BpNqlwT8}*yB^&|<7Ack29Pksq&;O~-)j(m5q-Xea?VwE|x(Oey*-r8p%4`6*zE%%)xQ&H6YhN+f)apyU=cuCOx@=`bpC{b~*V0iojV_-7r(2&|T|G9dMXF0D%w6sX%<{}0yi!CGCj)DQQO#~^sYA>7I0tSiR{IJ=PP^q6CJT`K*<&<SnQ$4-90&DUSII8V>9{%EAtfpQ5nB2N{Zu#cl{bhA(DvkU#72vHf;)x>nBe}KM*utUV@f$9FC!TI$!*f8Dr6OiON5LxJQ7KWED4OXM>`@oo9?-e-L~R!aK^-jYUXl*ON;rIllDf}Za$zJltJXxitTo<qy_xv8_rIa+9_vKqF3LC-69RH0#7}RxCoq(Bl**BwM@qTv*tNuo7C)ikhH9J_mokrdS^U3vN~=Mx~}v#v>4uZ4YqKV>k%3Go3Q+oy}*V}fPP?LJk~Q65jr8oCQ|@)$*);p8IG+GL4%t^Vl`vWVYI{tg8YR<QS_lUq_7QOgj`}k{ay+H2>SX#Yt9CVF3%OF4(}}DmdnQ+y(T|#cMGn%fR;=`R&0J0;TP0jJZ3eO+z2IhebmxOm|sz=I8rEB0f~|<#P=M^!eQW>(#{^7_ewr^_}sYV#f+`I3pnU5i22p|-*xGTAvj_)Dl;ti9XnP0caQ@8fkU_!shi94Q{OE9ZL8ZJ48mrMdxC{>mE0noaBvjzjN)DJkJHbd`4Xi5ZCH)*u~?cOmVqbH6h!;HDT+e(l5x!<1^*z~gPW)Tx>-`tTdcx*7yUwnDFUUFXtz1%zA~Hc3(_ejivAv6pPW-VBG(XW4b5N(i*6AIi-!*fQE^?t!T<TL_yRYFIpyNqf}K6(w#+dE#&``SAc$D%2xx2PdjZ`+<bKJYcG5kb1gj=d^U9|T@1X&1cZyxTHHpceHXOu!6AlKM$gQpqIgl{w2Hx=yNQbH?g(M~Tws^5Tw)342qiXnv@wQn~Sy`KaK7_&Jhm%{&lqn&K8NEV&nF178m_YuRh@<zv8UxI4oyhrJ7h$2VUP<x?T36bbN?%PWz{G5rD+V()n~?{vc|3lDl^rP^#%4w15ZeOQ9WjAXm2XLHgoM$uF~UW&hY%d)Ab_5{rq$*DbS6@Z@(&5}Rf?iR7hrqzmq*EVp9=8@3vPM+`4?FRvpEnsD$J91H?yTc$_(#B-|4+=?=L9DB+lYl87y3xlwlrJC7KOI<sS2^-78r@$ppSA$|u^@>PreYpdWiI_@|^n{T2d8oQXi#lk=r;=qOd>RyRg?ANUq_;wO04ODKQ=5yt;>RP{J2gpr+pH0z7ipu#PWptY`{#P5*#moOSlbXV9G4t>~nJfQ`~F~K3^Q-y2yV>Nq)+m@E!kBB;*RCb0PTv&^BG@$Q73GGZ?j-zBzlpuP5O(a5onUZEWav+1(`|%|q?Q6Dyt8tHraof#U%|sWTdw&LwHSaARYixQ;?Q^!@nz=b6J6n%te%8i7ml9JJnvc^2vBn^P(9vkfps%QS4b~&M45X&+Tf-2WGK~kl4l2L|ijnq_Ai>h0r=eTFw^2+eE<1nsKmA*m_B^(*Djs!aLJI$r?9XR;j6q^M_|+AtE^vdXKkGt^$1ue7*qL%oNE!p>^ax0s6totQrLZ4dC650uL|uE0KSev1L*_o6w03QnzEhH=fNY7$C1_k*uo`1|;EJVjUgQb8`S|x*KTU#D!S=57Y%YDC*$r_#y|3(wZ6Bmsq_f1P>R`LZ3gMB5<c|V_+|YLZ*{n!^d9w<GNYE-Lb5641x4sR5hdRoG@<w20jb2G}%6{HEZssCo!f!5Xm(+M5kO0SD?AHI!D6#+ZK>n-oj|vhCe5m38b#>7Oe<HQ#Ii7OS0O&?6OWd1W!~s_`Op}ctM|Th@0A~=Yyf_zKx|1eP78Fn`Y$(+U?gdFz=#R_L13ULH^MjcQr<%|vqvZ}A0TB_CaBXS;00000+#uIDUG*Vj00GsL0p0%tPiep)vBYQl0ssI200dcD")
+    TL_SHA = "43a0848def257e70565285b6e172566a0480dc523c76eab100ed536a5a575f5e"
+    TL_SRC = _unx("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;L}7rW?cXgXb*@(Krx}@rwH#q5Z`i_CznSd^pXjSWOYFQmMUNN`jlIeV2877X=c8K;UqF8@YR(mmmH!Xg3EJKlBDZ#shV5nX^7d{pA4*qx|RM}h4mj5C=335>JCqM9W8sP7P<BO=MHW5`v7(2C-y-ZQXFcRJI={NrbV{hhg@C%c^MOV(XQm-)VK*q78cC2WD9zLrjlXI+hhr@q>w_9mj^UexyLaJ=$jfCb7!+zA~)W+y*yE}@cO9Qvkv6i&KyvFS}@jHzvO4eFP#)H3oFCO#_emaxdK0NM6{JrIyT3r<vz`ets9E1=&NeLQ=n$tX9-O=)^YzD>_iJV#dKcaCwtR0b5W01IY?>jeN#bAbX_8)!TJeyj+^B^l>5PE*|~fM&DCVsnDPeCZQc9K&=3p}3^3eltd$SIR=a20mM;`seceC71W=pC17CW<FLRIpS?H7um84cvklb(T;e>CeU$K=oAc~D{3P5a1&kQXbvnNiKxmt`YwMqgiB!PJ^FnHtl7cehvKv6bM&$S;bJ5(k!nL4D*MtPe`7DTi57ZNed^02{G{W1#mHFp(H6-zRrEB?11tF_QURqFM1@DywpiwR@S(FgfW$08E439N#A@<9FH4h#KigY?GwJazzGkLrFnCh)W+A3g{^O9i|w-IzwZC^B{N>k*nX!}C8*+d`cwFDq2s3YZDo-S7U`MxL82GDj{)+-I#HE~NYY9K#4B%B<bP)}~(1iJB|ZL-{1wnVyz;`|v<aZp_!8nnm2M+}k*BdCAt4imUT3X57ylwxQKpX%jZ{-$UA}@6`^^1Ngg~le#wO9tzCx7%j%&)X1({+<=RNp+3B=qoq$YtX4`NrKmYNgJG)MJx4aEy~AE3X;caK;`%-FZi_GyP%@F-81cn{xC?{uNWyg3_97)7-GZpIT}zG`2Y3Q~?K|_P;<|KiIdzz%)j^29!28>n$Q3--dj4J?0z5r~{D+E_Ft5`lG|81Q?d!Ci3xoH8`_*i5(>5@JGxjrYYW#O4Z>_F_xezSv2giD^8G)h(AS77SWKeVd+EVvGPB8t~P9)!?u?diT@|}_*&Cex!CxkZtn2ORTwaHTkKcVQmV^Qm`ps$+Zj?A7(XL+>RPW=PIJg0lJOU7qydH&KByV0jGXP36sZ-9>q)9d_Ir$oC!WrDs>+#+N9C<kKvtulk)M?_^|LpT{pUeNMR>_w6Zi6gq_ypKV5!I5B9Yt&G(X8^9DuQ7KIq-0#!etlN@e^GaGD~h*FDioJ3YLi+}5xVYk11^I)V|9f@RiNJ~G_}DV4$G{-`ogyw`MRo;a%z=kU`tqmq7POM)lu0Luun=Dt&<ZAoe)H;oj`EopZCYPm7fJisuZEcRAr=YoG6fx4Gd_13UBy0P^$*xeRzv|e%ao68!aj$YehwIW^KN)-DKB>R6I*TDCV#BpgB=*KDy;CcF*xSE5cceiXiG1ard-HC2)W<He2Xcx{lt66u-76$EH4;22yF}3#G^f)5z&abkiWW^H)0&5z`#&sGRYc!D;_J7>q*PlGfInXbCfHP6L=y;y3^~)9A6RK<RZAJlSk^s~I>f^qhLCY~u>nM~i#l`EuH_tv$<2QYI!5_F&cT({yuBiXV%q!Dp;s6Hcd$pqn=u24n{!^|G_teX{{?{K5f=D!!?}E5IW3h1|9kT$Uu0LH>-#M<rqZ{N?NywdergESZQ+b=?f3<?8#=K_lhPM}|t>HtmN5)yBy)A}IJRqT|wE`0o91aP^EN=+3^$bUn(j=HaQSP%FQ36t4$1?cT;pq^Szc3~fE>?tE3&8#Kgq1wmBeJ3>jp9?)>mF>*-VD`+E_Iy32mv}eKYDM&F86ct^tH{f+_j66dBWY|GF`H9l<quK^of75Duau-_eRHyJkMQ`v0w*J-q_H?;E9}FnqCkwkfuS-resoy^g6=<}bmV3(HcyL{7*Bk#(_TWBjLX`&O^=uNUhebuPnAU7Ir~a05pLvy-UsElZ5$$)G#hD~B$jk2B%e<JZhAw6uWNc-5sb*u#OpUCVuk7igGg!BF-y=R&oU6icunf80pl)s@JIsOxWzChP<DGspq$}vC|CzPY7ZGul`#_)5=E2IF5Hk9n-rTY5b|vQ;)b3mYzGisrf~Ybyau<mu>rl56d{?#=dwOOI`@3z3+-A2&uy3?zV}<pGIS*>!)Gf(fMMt&f^0?fm0#%kNyLS;;=RFc~-_IO=<cVV#HhWM=<~mve^cSND*i0)jLv*yl0&zA8jW*g;Xa3>P$vx7MgS^k)f&XH`Iz0io^`$c;_6B&-hLR!4ID77WuGasVLCb$3!m_k99@alm6AM&ryeaS9Hk?G2F4aFF7S80~II0G#JUm>4>=FeCr`k<FOd>-(zxIt_oThGSb(0B-V}sEX5GcOx85AL2jw`GwOSwXZoTF~Ivsr@M7rf;*kK+38AZ_d1$8GlhNFcZ$EzZgR8LonXd#{@qA^-;N-Fz3xnDWgyys0*f9dya=lraIH8O)wAaRK)_t7gO%g^!fAA2QQcJs~zSW1^$i1jn`~(*1lIhJl(3V+XJ>Yk(K!i@^2ErP^ie8sE!jrQ4)jvAxBS=@YidazoZ+1L@2|aULsMS)kSC*zKw$RY`1QnU!@CVfm%ZWIjo|Q7thy0xOvK*C%g=p1h5FTfM+qcGR(Ih8BL`L&<xgbig}<B6VY@^~53JOCGuHa;o>%^vfTN0sJ>aP%!1Fofm}@{U4UOFB)aL+>~jxNthZ`QFlc5@d*K16bDf%mW2aqs*eHtu~(%7?z~ybgX&2{<<=B8Eb#HwHV=jcyYs<`ddQmmR44_UPKKQ+5^z*=lUor>8Xkbr<a{pAOr!ytR}zo^rHb+BFp)O}4V?Nkq(!4PLagm>54DkiVkaUf9QlHeBuTeg6Dlv%3crQfcXHkrU(;;;ajNq%yYYAoK!As$RikAyKTllgaa32Oz9WaTV*@`F5B3q!$>B?e9!?4=aT5)s00S=@#hBs*$2(mU%HH8hf4DwkF%G8NK`>fa;dm}SIZLJk`>w{{Gppn;k+sKzdi)JXm6SpgW`HNR+sgO{TD^GXY_Y|XA?aKfs#!aTD3dG$g6pT^u>yB`d~2~_rpv+(*Mn0FjbZ;|7)TCh>_zB%)6SHyWLGo9La!VXLB!i=6Dd%X+_ZP&ROUyc&0NW88?&=OGB{0b90xW%SQx8yWkyGRU;md(*OHg$M!PpW)CuZ0*5~=##l2E~M2`?k&9KA<8q6Io)h1%i!7}^xl$E#C3Ldr%CC~^BZvil*S0(^C2n($2l?bexh{dK@|Mc-z8(@JiR+5}zlk2`&9fS|cj#uOF&t>gGYyr^6f+-ud;YL@@1_;UXe?0HxdN9(y^cEWkZP&tdB#?rsb2mtvmR0@FyP%<#-8Hu!V1fsmaxMt(P7Hd(pW$;m$*|!aX~MGI9_uGklDGdI%cM}lp#^<N1fsc~!Gmz;<x-UA0x&u!_j|XjGoj0S$t3ep!0bU%v)OdVLwT#Z0W3aUY~+79-sXk!Q8+<h90FFoa^+-YQL!qWZ6ms4d9UG%eV|xsIP`vPrX9_m>?~bVQ6S&IWjmxs{~CWwEU0d%pV7%-^qm(|^Q2_JW3No6(W<%jgKX{l_HyPvE_i*%aq<_|qE{3wgwCq#z%(Tm`uiD0jrhVo^kcy_an+@aYl{}VpkWSs_Y1tEq0dG0Yztb&Fz=W7E<(^iKtxWLNKU_EEMJ%B|5#0R?Tc0ZC4*VM-L}*#eX#7(JoQ%TcqbG9&7zSVw9fdiEWf2*Y<{qyWed_3o=E~`V;anL_Mo*lqdGqY#FM^=+N+UV0BANo9`cYKgK!>TT1!91cXKvFAF-?`H4rJUjoor@Mt<;BpXbp|1x+bnI`FJLy-zV|t=J>$G!0p!xm*bTk6OO%gqe02-*2>}zcpxid0UJT;h+q5jV20Su4d;MvHU~!L7d_Cw~S^aQ4X{E-p@ey9yw4R`WEScDg!-oFn%9$=vWtySD%T$ESf`UewAYr6#|a37+lz>LE5v}R#aBcUGoR-w4ZsU)&q34_dxOtY5r|X<&PeJ|AZlT5h=DFXdPz8!*=4VrROM4;{P><WiFb(w|jUI{SPoEyDD(~QQB7~-c%dwdly4p1b6{R|G&P_dHwtz$r3e#U#sQ&wMFY)?_UE|f=)c=DhX{#E;V1fKX44^f%3Nq$+8swnj#^pJq|rTNg;Zg=3s=t4WUI`8cAY3evX>j+QB_-D)iGC3MKkZm=SQ4+U&*m+Wp?h;Y%eCSJo0D*4PRQoweU3kl~uN_kaChn|3bbok!ns7f6Qj;Hw@T0AWwvvlAelBo%@;9QvW`Vqb@lUI&iOA3=sDY~WqTaJ=#`=0T;v)AFge<XkuqYTn7=dbZ%#FxqZ+vlNH(t`~8PCwh391TTqcMMU<WtrcV#uX5bE$3~-xE53?NgHuD$_`lKwP+mD&SDd>Lb4#mVp1im`TSy-0FIqWGwyG6%%vPAUNG8k-%?$HqMWsoFTh~P{LBC{kV~A=j;{g>B+=k&D{r(N6nWbAnrPX22UJ5lfe9g%3AlxHcvr{zVgsgXn?}!6;e_|XON9^-dOB-g0`9RG3O>)E4U^kCtpGLtwAQceXLQ8M)Ayle5^o%0K&MA(I=aD{l;GAz!kJ9zP$8JP@hoeY={fzd@Nc<_7(a4)(Bg~3PH)7s;3+RoTDv%%7{v6;Us*r3vYv6AgS~3Ep{05*0CINZdzyJQ>{k{$kDmIP`KyB_58Zu8;_`m>HXr-Y-ECcy|NYzdK2Iwh)yq02?Vz)I7A#zTacV53>_#ywP`^rq$gx{%iCZ`3!p^6w&{fSI7p<gBQ#E9u<TsU4uW*EKFm_bKyO#^xQM!1b3Mv)vLSfLknEf}hFUSA~;6t{Sk7%65J!3~;VV<xkXC48!xi~8xG7-7JMy+8AU90M>^!uEX@*S>BM7U`8e!>u}q-IPbVYolJ<ghc*SsLk!G5P?cWID#AYQ3GTS)%Pg)NS`Lal1(av6A)oO<c?Pw6F=;3jw(X^8$8(=s)BAE+h|l>3CR0$=+VMcwxGPJZ#K;?3)49^imfA}WU8eVD5jfMXf7mMjoX-#Q1bcHCX=Or*d?lfGVVHr=)3X^kOp2kHUT_67u{*v!OK=P+!SfP#|Cr)ZZ!t_gs%7RhFCrgNutcpm^2*Z8i5uL+#^YVse*o1gD*Iz5S^<5vlp2`ok2Y9%VUJ5!}7lpx3K<=p}Er{z)$r0D|Igxc`)SwPhC&?%1#~dhIqOQy>Gh2{swKPu#)9eAoh0u&+W0@c8OL5I7~4~sEC(*FQSgL!?4x0$l+(dn7@7aZ;dwu@>(jFq2(d%*#U27m3v`ZiW-P&;Z3ox_Si~&n`&P<3ZyoBSF6^8-$33iW`vqL6Nj0Ab-!%Dm#p>5NI#btDwc}7D9Rs??qXswCm{R+2ese_SJX&-A3wK1yAR^@y)0HK_5g_NP7xM9+u#RVqYl`sRDRKTPNrI!Lt~Ei{hpF`_RqLlW?SA0;&RhX!VbpWyIomY@k4j->2((9`CuZj90Y(EFe=H${$>pNvp9Nj)bhh6vcybxUn{^C{c$|SSAl`L!^>v8PM@k_J&y&)%(=${8!_7I&j^yg@UsR$zZ_~`qvj^~cWPDWcL+xKYxQC)bpftt`Dxc+QR9i1P&?K-LBE!?n;3-Gv?Y&v02hh2hG`OrXx6r^xW<je+6cbBwN4XF63^2??AA<s0ksq96vOKx6i!5re1r@`j8W@~T0%%=h!}Jhk|-rc6YAf~U{2JLb@sT=a)`M%LaJsya5)cAcowoyTX_1%tXp$I%r?ujTzS=K`Tdi>UQ-v_@JV1Uihp8;>BU~`9#=-2DMprQnk{PvBb|!7F#(Pc5$53L?Sz1*5}pr~QM3YV%%?RlPh=Rk;JGV6ay&j8SzisYdAE1`lC1`Q4)PdsusE%Is%?pyr!UH;3u*&%UpE)`)c5Ek^mZ)7y1UfA-tg9R8)G*1kD5twX~I}rr)g->XZN&<(%Xh6zndGuux;Wj{XACgci?s@Zu}71kJvSdba_fvd-<Bk4t;=CbO9Ao1rdNo=llFWLk^_i(fPW2so}G|e{*{z<SOkehuoV|q_j=nG2mj3CWF_qjq=Ufxbg;F&lc7<uYWChf-Jf?ypF*pMzA@o9_`1X#N^gMgTEJwZyv3UwWX};y-{V8$*_s$91eSZqbLj}a2RQ3G3tJj2IlY22yk1fg?9Pzz`mB~gydIy%qjEiLLR}cy`7jLXyDWi7`YnJlwewul*SE&z9K9;A0tboE&2=2;MJkR3z|s<@p$-V_Kg9y8)~%4oTl0teOkV<>!NzF8A7;GYoXl!O=lbbJ{OP?Ujj#$?xFxL?%m$q21Uq<d9Wz6g%iCNLKRy61-ZTFIfyD}TCU*0n^F^u@l?*xr-E7KIbMILcs0e7E2t%P^>nC@Jatm;BjYm->x_}gzRa_tgo!))t5cF-rRL_(jpDv6MQ9Y*QAA*_6%)KA9=IC88Ru*y9JZr@ep=FDI6${t^}KFCL#j;{e04QxaYtWGt{I-X2-7PUPRwAHfGvfaiz*JlF)qW#6u>2}cDkk5wv2^FdltGVuY1y$lPd`<F1W#b!Uq*zmxC!JMU5b_n!L{aY-z!t$-_B+y?H*U@%~P2*N(kI%b<mtKeW<l9WH02ye3*}^_p5R=2@?8+5Q4*b|lM($i%4k6H~))-7e?B31=d*n}ON1O;U}XxV%~qy!-~N9+AY+Zc+(Ee%&dg;nf^}#^c3Zl>v!QULE1k7&-{}{wdiK!vt8f6eFdNui!?KB}UZ$c~z-k1af3;2VGre2U3`uKjJKf-n>Xp<*vJen(jN{hlb*0Nw%CQ#04`f;drXD!fnt-Z|A9E`9psAy;vo8IxNt0MjYdFmZ!y9LFUfDow;^9iIuSk-Qbo5q{^PVg2wy~b3_z5ieCm>u8EaA!$nY2bW|qoHMHX~CrbBYNS8AW>YBr0C^#`!#U%PF^*0?7FGt|8d;2rt#Wk^Uwm_cWa+*@SkYFRgA)$Ui8hyKlH?JXyAz^>99S?k3Nw)`>ZSz*YqBQ3sE-kW;GP3v*_pq8>fM3Zr8!`Y?C_dt$7y3Y}B3X1Q({u8^DECiux{~5eC#VZ_b4E22fMb=X4j(mfg>{2#z~1^nC!nQxXGZKx+;Hh9c6+NCiQkJ=;>H+_u9#CQDv(D>xls*Y^3UY#RS(9PVVv@sxlf$PMmCibrRXD+10u0=s9~_oc65qGCe=vLr^yJhYUZoK0nWhQS6;YSW5jkj1a%V4(>_6xKYQy&C(qv5h3xO30fi_1BXcx~W(cpo7P`8c0ZUSB^<LYsnX!**KQ~8(310p_3fHxMKkz7!WLY1zCDsrm!3Ypgd7v>F?+s{c+Am3!ES|izl0AH<QK3g>_6YAcj?Wr)d(=CIxxEM*O*dX}z;gK>_9VVyqv&KB<kD^#^KK(D67_YdBjWW(7@WM(pJt#$1og0GZ}Fri0xy5TIc3br(vl%-^k_%n*gj`85*ChW!zq&!eXe_R_=fpp(Pk?ymAfoYT#FP;6#3tYRNSy0F=4UB$TV6zEce&E`gm8glDKQ^=a=-p@U-XHDh}&}I;+x?&KX;VCJ>9rLTC5Jl&b)vuc<=Ues_nL6Q8V9oN4MNW}_tpG4-PBXW7X+MDJwj6(@;Dhl+e~bKtCr<HAY%U3D0wrYOR^!dV#ICZ<k1C;j~QKTUh->C!4fVZTY=;*8v3wcE%5R5`@$94oEy{tTQ3AWAnA>B%AYnXdg{n{xSC(9!UTjOQ%tP9aTFHT=^cEDB9^c=BF3PzEO52!EP}!qLotw$RzvBbM>-$HiwLFvV=g&e!m@!pNbA6}^AWX)=ZL^nhfJ-i+`3O0Rs299Wmg(9hHO$m4E{rJ7RG?&Ns;PMXg|(X%?E9;f4?up&w1lWuN#!B;yxRV&A`?B`a1PadhigHb=IW>8%_azJvGR{_6>G0;78r>XTY4O+Bfib^RD17f9QJvy94mW;s&U3^XX>j#iW`u|;#JDDH@aGO#Y`A}LUb*h&P{O2<}KASSsS(m>k6*`2rLz~yx+kBqto)qL+PHOXhGpUC<gO!KxPLJQ9u4Yq6WIMv9@!sxMgHr@1;^7KKX~Ib|uL|*Kis5|VHelN=0|}iAUx4oEB5W-VQ{1ioq16L_)lN>Owo&Ndgg%2n^(h6wE%FccZ<-Qg@gRSpMAm1^`6PxIKLVMw+}=Hk_EWNMXbD>Owc(&N=`h@DX`mYetKRn2qTg<^r!ECnd4m&_J@1&sR6@{zL2&=0d{V8rF7jub57QbwFw)dmb0143GEWyo?2!lz0%Wl%`eYnmQbZqzRxF3KZu!}tOU;RIkGa2w?>ctkx|_4dp{?;%7$e~Sz!D5g3)@N{)AB5Ge6ic65M?ZsL({EVJ}{1HmJ{^%Iz4q^y^&xR|D&U+K;av}z+o|qn_##ZZci-~_Riv`U{`Bzh7Z}XD&_L4I+OSnUjDkp;PXE7fe2j;HxcFQx8tv6X6@D;JDIeETTL5y8El}XO(_P2$1!7aA}EdmY}akr1E0M&o>S5cL@=ehq5AD{ab=DpQJi8p2kx?JgJh4k1Jtq+rSVDxVg)BMth^!}H=}Sa_2A@~BxW{_yXTCz?a1KA^q^kSU{yth!HY;qg2s;odgE+n?UakN-0(dFoIYstSg#%-&wCI%D!MJPi;0T3-r)J4$AFYv*s*(o=Zis%7DD}PqnA6z`VY30c;E&{@Prt1*}T2%ug981rO^&L2izVU`MpUlj;^*4;JmL-&HeU4JUz^y<+ThYX}Mt=5Vqv5WSmE}oW9|zen+Ou4LMpW1%d6xK)$#Ks;DzZ!$$(bkYnaD6?c}hKclN=u5NruD*C;SW9BvgGtf%4EyWxFl?N}w9M3EQK$ws%7N^9^N|owgxTU`}S=UbrL-k`<GwSSi%=s3GE=mflM(c0U9Ae+w`{M_+uPW7uW7H3LAwwXVquuTI@3rjfeTxaq0F=TJ`Xycns+|B0c%IWUU;H4TIX?eIY8m1#UV`3I5E{uQ*dSYWUlDON1QNX)ZEOx4LGjmQUK3tm=HhCau2(~XhxTzsU`A=F*z!wiS*k1s9J@1k?{W`a3P3@bfk#q?u00Y7jP~3cIKO_fknp^gqyv^@m6_l)P<?EA48tMMXv;%heVm|`Mv^kQmhpErsZcGJT|$omt7f50B4~lq9nq^R91e#51k18u76EM9QY<4~Jg5^N^QMZ?u>h`r=cK;)<jL&7?8}r_YI87ikux<&(&#A>@ms{CJBw&I^2b7;qA^>L#hDu*xeUzZTnxH8O=V2A^7L(|JBjk3PFo4N3UIo7W@oCGi70N|W#m}OV+9!{WrdaGHhw*Io9!>rVPJykLN>tXAr~~??mYGP*RFnzTI~dMwAb^f9yN$;Tft~Zffu=&*>9@dfcpV{1gpicT-xS;j#Y|oc6BFvHk|vf!ECO7$$^2rYuP!WIuVccTpfHGGBkttYy)}nIrH4qjer82hiB3Q?J=<-SYU-JA0@Itp~qX%2)c4N5;lH{#$bkAE7sqaqDM*PEW(qzAfUF|k!oPq8H2Ey(3{F1l`L=t7Tky4kLUeD)o@dJsFxX|N!iQ!--Jw5NbtA&ijzgx=V`We26<{{+GZ|m;O}O7YhN>ijw#9xlX|se>qf*_7XH=+Xdk>o&013U{34rjb*dj;nA@BHMvpoo?;dB_Anou%+h=svwvH=r6rT`dWE&>S*^d%>p2KgO@D&u~-9D8g-)N&)d<%V@(cJ_HO>1(7c!sr+Mw@k>WueDQQ3!gp#9_4P&BvOG!P|@@LG|<iw``4XZde_O=Yig2G5wqtM2K5$tZTE>U!;wzFQ=0@a0&}@(L7?8IUbyag*Z7sewNlzS!YbuMb|g|%!NR*s8k=|_IlS<awY#GS(ruiS!WXkXuQj?C_srenaqp&O)ALKi7iH4#}Rg=1!r-j17m|vj_f@MDcb;TFL}vtEsahB9xd32*`6Mex0RM4&7!QCUg)&o&-w4X&6zYI!v)dxZ#12+GC=7ulb_yNrcnRwS^sJcszr42E$sg0zyRs4?3n>XUhQP*u_76)K>5d#YWs~f>3`SuMe^$@CJ6s~Nfl#N$rQb|xv#*?v+|><cgMr)3@R7q$xoJAYohBV&u~_07I533dcw=%gqs1}Vo<)sIASBk^t>&}S@)Gvr43-6rnFfE7jm-VS*KT2&-V1}tM9nmVF<6T$rVxbNYI9Gx2}NvUa`7Ul>{kY%2$Zwjn+G6nC8G75;GK=$8+zPc_vw&XD;{S=8y)}g~&SY0}qfRO_XB_Qee(Gt`s-YdP&0Na9)y}A`!ut&TsvqJHEY<*TH{2SR<r#+WJRXJ8BMK3q3eA{F{KegI!ZO5~i)OAd;CAbDSOG-;!kP7prMJU8hsIljhpswuc@{*4YlYy>IK~t6#v}b#RHl34a@}phLjYDP6OF`i)t2#>mgrMZRP!Wn<DF0HNCb9N*Np&7|}Y{1RLm;^k6jd@`N_VoYgb&j8I}=VU=n9bTuaa0j1MYy7I4Z3-uZ>S`hl;1pmBFXevz2X|ghyc|q$mD#~(f)FO=K9J3zBI5fo>m({<6QtzJC^F-7+~jOpM~YFvCd`juG3W3G{IxR=QDuI}AI8##H)avZ7_>jI&l$|?0iD&Z>;o(t^=0H56_7+a8v7#mbFp1HKkc<)FTY4ZdvSnRbc*G?pHDbuU!w3i5(Zx0H8ij6Gd!hC{D<0cMumxvIiNUtv2L(Fs3mZXY@_P($|MVAwo5nEKRbVgD055Er2O2`KdP-6SU>o@{V0+Y)kSK_)XYbh1waGVigmTVlR-HkPI3oXg=e4C6}8FeZ}D~dh2Og0Y-<ZP&%qej$|qW(=ftJXcl721sG|ZKsyNg(7`4#h{`f85PXN95@lZ;078CH8>RC)*GjpkI?u?X0m5;XdU-7bHb75w%ort|Yyq}bAKxbtj$YnQEdkSvMbNx_tvk0Z`mo0a(o_)t)B^pyB&pkeg!i7Ee>7D4OkR|i{A(>{`5aq-IenHoEv&gBy$$K&5MbPQh7S7#*+vB48Y?frrfm2Qe4rpbrCO0=Hu}7#NU^zB|O{Umb?8<_PkO)gLb*Clj8YdnRY>Oh}gK8z3*&m<>;3((3OirRCKoP>eoC%W#WvdyX_hO5NInelPncFTDP+Q}7IF-Ww;tZ@LcU|xz+*%!ilp)<1z-3+CVrPSF!G-#6OkhQ}#F<8;pSjbl;iMr(&p9Xt`zIl2=rykGUF5ne(o`XkzQ4!mjz!_OwGYZ0STIJ=_`<r?x7_2d0-?#r5rYN;)K=HT;t=?nf+Mj4Z@RK>+vdDA3F=C{YZ#PfMxasLmo70imSyf&VTBqSKf#RY`gED~*$g2zGX<|d-Ayc66$gqDF9S-$p|R7&7cVmO$JeJgF3iP_3LcF4)5rsK`cqA)n}p?Q6!u3-Y-_WFGuF)kuO!eX+1}Gp?=0RT`BmHm=Xo>99rp18XnoGh%))gyshX^bj--u1!EiH=;@<*l>xv(@QCXEtU$j1I<JmZq&JxXV7nWF;$Mg|W6R$%>?aq1JQ+r1W%YrB`Yb7&R6zM4iVH3)n<|o}oTEGt{oL1s#J|K{A6~Rc^eP%m2s+%{Lnv8tV0?NBvz0Ia9uWiT!_de0$#AP;Yw(nx?BicAfwdFCK;d*Y?&MJgRt`F*ypq%&9aoDAmpD#Br685-(hw@dZWJAf+-ZrQ2`=@0q@d%AI%xkgk#?;2=ggqP7bZNo{LXvk>t}DS2{ew!CU%5SO8Z;h#NzGstLv+kHLW&_u{43TnJeoUd*HmFe8Xs1$)3mxhCw^PA;21!#_!+YoIm%iSjZMbNC%p2w=y2!Pzo;UP7FgB{TP`P58{5kNhR$@A|0V9S_LJxQA&I_dN-|2iuH|^iKMpbKwFvGJP2;`bpr0^*7x#6U&1r}EE>6rrUuM3K@>+ID9{LTkhfOJXOm*su;G-T3$U<d|xw<eZwpc_VCN759+<MK+I`3*7bp7`WNBCti(q1-^i1av&G+jJOe)IY*+<+Ro!Tm7i3NrZqil~=n#<8x-Xa}@Hxpza+ASL*~AYB|#Co99>hCsos0j&^WPdnQ9xY;3*epMEk%mp%|apy%dA6B1^2~bJ#x{d7+Mrd<&sAv`_dW6s2s*4SIKZxmtu)fF#xcBro<z9E4@J>>hNK$hL5~pqbZraiGSq%y**{%;@6&w6pzz!gk&4+2rPMY3{g@yP0vWe`iz_-A<VK+2pl#zG20ph<99OLBR%K6xt=|E=4bdy`Ov}=I@N6`Y4Fcq@#vfp|ymh$QtL#uZL<WfgqbcHih@$RHpA{MztyJgCZ$O9XCUN~zakjstl_oL_TVvwINn3{;o)kU@AKKt=6j^rk%bWkyN#R=N4S93s5QAIZFv1DlhNd7X#NO|+myDgj-pDb!RBTF<HBH?_-UOgn3R?%fFlnD%C%I`;##&E&f&x=%Z;ul3g^CLgGK2>`F?E|R`!=iJRJA*oJP*1oXSr<4v^+sX;ZTZ71r=3rLL=e67b`>hYv&w|b>F>*6NCfZ=*V2uZsJ^hr<hn9qR7V^%TV=gGeE0=o6<5KH)c8iufK7%X7HBK*fPFC&tAuTj>KuMv23YaSp(=l5+3_|z>v$k)Ir{r{NFjBW{p5|w`1Q1gEh{5oyt3WIPS={Jcc<E@^qX5%EasDu>o$I-w8PUxz(#^K3XV2lC7;GryGQu`WRt_zv;8#}?*iFmil3~U8o18>6Y@S5Xv;9T^%jP}wi$}iBf<~I9lf0Dp&HRGMi?|3Usu!ngsIaSPQ`>KR`H<{*qo(1&;{Scr^3=;5%;~5o~S#lyy+FbsS!mlykpPctZS|--LhU$0Q=+-KJSE{84yoa!y`+>FKy%PTDCn!kyb${?iF#1Z31Mmay>0=cLaeCZ`8{*IxB-$VmLNi`Ezf2_Gn)&7>c=GU;Q5_?g2P!*OO{B;-VY#K5G%QJKo^OJX+T&GJ&;sK;S=;RtkkX{({|*4Vc||X_sQbPo{oAH}2}hw=F5ikLz3D54sjt8$q<;^acWaaR5H?)66-9!1vhw5Zdtl%O|be@*#?W2jQbV*{084l~1MBq%yxL&T^~gi-><PWcKU+W-Mj!w%6GcjN#0ZeYcTpTIn%uQvcwY^g=O!djj%w-x`Hwz2rLRCo@-%UOrfFJ2Nl|wjRjc6zB!BCfUkn?6@q4LPfy0rH~5ej&=veT1=Vy1Rz|Ig*xPox2N7Z*{?0jQ>6KJ*i}W1y&bcnNE$`~fp47z$~a@0gdRVFu1&@vohLgf`jpCr$au9tno1`Vkj)f|0{M@$MKzbnAwtFs#MBvf2=XJQRQMjC{LM;*86F2Z{x3yRC>p-9SE>Z8$%IIGuT=Db?<DOxYdNK#iPC@eF;`y2A)25tQ<dr&3;@E@x0hn={dlBuYFI`i1d7Np=--$|OB;5=OIyG#f$!^FXWCgfO08><OV<Ncv%OBr3D~9?K1lsuX<#`0;%G}QX6G_iRK?pQ^V91CXw1)i+bw|Xekbk0rkRk0+~H->w<~Ng$o1tsU7+|L(kZ{4i=;faOqyZg?WLOtpAc+^jfL()KhFQ0l7uI0hzhVwcr||!>E|8BUozWTjBF|4^jNP0U#Wc}rAk~%_<X^4`oo=BdyOiae)HAp*&R@tFor;|??3|uoU4ksUA1p5FCRplG!AUXG5@7&z@b)j<t>b~dz;bMk4A*$HCF%!ZH{}t%wE-aR@dOx3IOwygGnu`_@d}0%g~S;jRb$eZ`cLDFL`!C5T6%-wMkItS#B{rRz;*-DD!f6g;}N}LjHUG0)lMC-#_sRQmu$1zL($F`i1|TbeJ{?G!b`}E8Fkbw*n^bZ_oD1uiOy<$tBoit-1-RP;=^Z`Q#M(kkIM1@ocMbAA6`x6Vvo<*9fv99IWJTdp7)auCbM_;v-1J`eT()qx*&^`z@BY`AtZk4x=D)-glk22%N!jk6-IG#*idPyZ^xc7|V`pG1N|ywu%PZcpjjIR&R~oe;0;Fzc|nK^{E%}7>j}s6JXRv|3G7q;h4l)LH+zJr~ya5Q>g!@s1*z#^YN6xPz1|(4&=G*LOK3AcvWc<f<sv;;1w3H&4n=&TKwU!sgShA+f#yp*IDRW-0Ey#uPD&v=07<;q+84{E<u2Dc66|AzSWyW=*+rW{8aHz2i>4s4u&%C7u7^=&f=4jA%!7gbGD}@xKQa0N01XwXA}dT!T}Tb{Y@$~D7n2m+T^M@CpRXaFH5TqqKF@w{@3K>7qZNjCS*v@yjIoie#j*)o*E2mvb6iVPA2{hT=wGkd`gI)_;ZeLaW196_{ft9u;_=mtGgZN{rSX7!35^$X!l+$8SuO|oQ$F<B{T$ec`#AEQai!oGgF9EpQr1;3u=bY1@#)s{fiILcw~{Ieb#XQ!x3@wH5uztc-rt!oDi0bKN|uLE55uZ{#78<_StG$ZSifEfzVNSfFTUdxS94}*-X<upg^6K%oUIVh-pRORD}HM&v+IY*F^Q7LI8cDwziE$ll;U&mVmJ!J;W?9x<i~kkC-Hxf4O$~L0a^WGK*^l5`||MDgzSj35NWkYd<McF-wKmiDa1`(}5AIDdXCllyl@1o^tbz44Z((@y*R^uHdUoJCh2!%8X7CLf_(Q2fPe?E?h(491w1}>D$K-T8WZi{-b|fVZ6`OYk2bhA^fH&BOK?Z1$gHbrMS&8>s-h#9oK<Y!keEwifEvVwumIHL!!yIAJ6*P#8pp}xOO6P03h=93P$uUI8(iKgHqwDFpO|e>GaHCh>11873L{2RdFf)ciEFmhuvH<TJa8S^hT+d9Y!d$9>dwq|B&b031tX`e;kJeeM&8i?K?(piwi_RL?(cEJw<N?a&c)+&W5EejMIFce48%)7JW}$xVzQug-A?iD1g;2tO8KK*<|Q%y1z?5hS0UTS??;X5`mxgN4@k}0S?3b_Ex7KMsnDy)_rA);vTCS=VVL+imL6A{IQ8kv^$Zr9s67Y;AMUP8MlCW2~O~O#t<sNxv0O)B@rctohz8~u&voP(n$;F3=*m07oD0-8R530Sp2F!Bm{Me9K9y7phQ<Q2^$gby|eiUa=kp-0pljmg72(E_Fa*_^kYD-Jdq$2amFm>f|b}^!im};YN}j&6Sna`I0&uUp$>e*>X@30sl)b0?>O*|UX|IAY5?wA+88^koaOSRkIhIU>)ipI*+%+8y*q4?x%ZXAOAV*V-WqiMU(})`^<RB!=qd~CQ^VcNF!y;^TeF}<=C|h`wKEngtog4JM4BtyHITIyXKqA+%t5oUNsrrLqs!gllH*(j15zH1wypVu?p9XwFflR`HeDuK+6^k{$I@PlYT|FEFbF{vM0k<bvSv2kVBG-OfK}4RkY1C<g`n@sQVh(B9U+O(_-rZH-?@LxQ{c)x&C{cbIK7yBgw?kUF$@dx?oP5j_)cypjQy*hm!8*&)#%*Z^-&Ejte*wx1%DqHYBoD6Xf4DrGJji&%^L9|%ctxF4%R;8c@&Y45pgjr$jxcE%3~#5F3$x<y^xA#{LQZZJ-4`Z5K(|n%)+$hJN|*-{rSj@TBKsTd--OH0W*4klmNe&MF0$LLkrm=ai=k8s_V1dO>a%w^lVw<HPY?h@Ljf&^+G*B6*BSjx$FE7fhQ>}7rqJr>wDD+ptI6T*?h?OB-?DkfitPmGJQfySD(aX7EyUksS3E0<#a6~{b<_dwbCI4^({K#7a|PM!-2dL+Khr7DDW#~_dyejg?GC9wAZR!4j9$NH?ypx+hNoK=qUKxYYQpv*O4p>FXJ^zAGn%EOm>E0zE>w<S?%?j_4;O^hUY=9TdsqHg8}R}w^88WFE}$9XF{~Jys+}{vr2~N&oN9fsPkP*2gNDXmYTjPp{y$#O*k&y+R|X9OFlX=G%f8$1#PtX6t&$7nDY(v;|^iMX4g93&UWq2+v3{oySGp}5Gc{Ik(HDbACh*;Y5~YSQ2X|8;7X$Utd;^00MzyQk<zqLS9L>ybM*Tla?8AyiX24rX#%^3@ScFG%kx}q^@Mh<5?hv>oBU{W1vgksfwfFk4R>A1U4lHfZbzGD!fTbcw$f%$4jerH6}~JbL3{Lyo9g7}*=0#v!?KuRfPk0hdUI4~v&Xdxl+5mJJ9>j%9tC9q3D*$o09w!`#3@axPXsgM>Yy2HM^8(B7lE3_ArX+qGXDhbfISQ=W297u{w*knV$8QCMFztD^H_CR-fZf<zoEtMrPMqS=BJ`K6PkWoOzj#SH&fsA&6Bvfd)ri7^dowa+#s-eWjf_&^-L(S&Yude7@0_JHtIko0^O}<14h-4=7}wmu^^VXLhYnIxo7(x`X$cdIQ3HDW<|^&WHg^S=J^K{JgI2eHWe??K@{rL)dhv?Q&>r1P3_OuCBRUoD{KK!@WjL-_Z;E|kNKNu``_{Z489tC^%tZIpNf>s0(oyl+=j8#V0aCf6v7D?QeP#2<@^gY<4d?{j=Z%Z=eiW1_aKB1v_Iayf&TL~$v9pU1$tPnFG_szR4p8uwj4NhZr3fNDh~JiYp+~f+P1II&hy`$L{FE>Vflf-f<T{=TC#o&&jS3gY@K_P03}y$;P%hOa!$ux;k`l3X4jBywNqMB4aV{4cA21NT5?JT2dtj!@UXK&iY>u0$|a#cV~2r6L4svsBLm`sP9DxkKcAyyFJ}-2mzike6kTCcJ!k|#Rx&zUl>DD^Dk2!`>vaWdV^BN+fs!-My`CA>&t)8j>L$=PtPbADHTCtFh~5y{E6tOzYtRKjsQ$H;T_6t|GdboYvEKZ<{`IN=T^-Y@qt41RBR=?QjbITGik?31+-H{D_y?VS1IvWJ4)MZ)b^~@VL_CxcAagAd+EUTXcOP$x%~XRtE;eVr<JCU;05_#boxRd7!(3nhbUnDY76;0jBUJ~odQD?Y(57KG#5cES4X;L*FbnDAd<Z9fnp|ex^Db6qvAFA%6rX6Hx<>fNV^S=M2S!D0!*8r5GH3y3)<5ueTh$TvlYi<d7)zZ=8v=KywU|w!*PNkZHNG42^YfpZqt|!@90P*184{0^QJ!<n$_jam(x)JRiwb-RMq#7JJuU9w-Jg-LN7q+O>QIn0T#-ooZTZ|`fssGoDmbOGQgKoux*Rq(4+tiDlE#KPRMBqa3GhGLF>JkC2_V2*$>4DQ^D%@__Oea?tnQ>16Zk9SJb~u@!{J53H<VbN)D8(gWQ>hiKh8xn5Rkg_5k1jzo7N-HfWkWVxU#LDB#uo0>l4g9!N146mkOwP{p({8`~{id36p_bCVWLzo>UxUa%j#9Nrbo#WlYPqbUp^NaFP!#7<5$o8!MO81K=Q91`JI3>kV+_Vt23ZM+Au}%7{1P*by&rY4S>F_|z?NMvFT*YJSUc@xH@QG94<Yx)5~$!ALfge%Lw3Du`6@?WMnl3#-3(+yg;o<u<jr=1H&nH3<B>5=pZUC%{s4<qd{W**8ole3fQ&sIEne&a9v=Ba{goc2x%6juEO6|IuUzgA@)3zdcH)t7QLj$Q5n1<;>LFKY!}Ho{1P{U$3+Pu8KD=-g=q4-+uIBA?e8&BxaYUzz`MrJ>gmVn=pr@p#__l>?h*{9?h-$1F$tjP}iiq5EbU=Gn6StIEs9p4_Ri(4+dd?nC6GL1C%Mu;~*?cXC*<9l2Xj9ik(_9);dq{O3&COT%_9sMeCKS=3>>=@tRJIq~ZUQm;Aommn+VzL_!pmJ*=OI{&;k(XxJ=nJCpjZ53`tvlIl?RCB!JO#K|R6_~G9hp@Q%hd<3+taLMU}NBGA`X;}+dEuz3L*p-ux?ksKj+#fAfc43#mm{NjV8k@$NNA-gjq_m+(kA4dJ)hcw*hpRAZudz6cGosZd%o6K<%{0*KF@7=MX{z}H>S06gsS(pwE2z*nYzB_jdsAWVKHH+h;hCS9v+o2_!i6-PNBTK+XhdcJ260s@R^>#$qf5|S&8jd<7{Vv<Vsm<#6uL7t&Er5TGJ>cYLuei9ZX4|rXZ>^HO$UBvh0j>X1oPL7oFLQIu)^0i<ll1h$M^7CNEHYQmL=+3YBj_h=#))J*$}q3B8|{!?FVqlQNZ6=TaC+R(`XJst!5Az95nT|e0-oku+lnx*-pGPm>P_Op9sP|Uyd5kiET<SbChl^{d_W!N6){yX69BRKKhv@6<48r)~4kD&6_$UdS`g(U#g0iFBFm?7Wr6K>fPF~{M{&n61#Y?^j06^E`v*nuu2ms^HcY2jQ^^NPeStYwJI3Ic)hX8Gf~|}6uIx9;4aPtAXv9Ct_N7Hf*Yf3+Bzv<w(kkcJKky$njNRDfXHgS8B^WpvkV$F85)a~vPG4cI}s14Z;9go9i(9QYBhtrf)%abQ+sOVHir&XquS?41}qLm2%ogDQVwVRea>(ha@x@W7x20m2XQ?q&AqJDWM>uQo_J`l?Be4Wpo>P{x_%!n+V2c*ad2#Qf^DQweP1bd$b_`YhZflJ*sGG`BlDvdYXV3b2zV5E;V@XjHnQB63t@fLJUA|)b1naK;&3*Dx*3)E=USv0NLm!z><cbY%Y#*dLMuU-$Y3&y`0dto^p8lEJy~mk#GC8w&5q=wS@4PC`i6Ssi_lSaFX5iO9;R+f)O(Bv>hTFC1%<sIbX>-@5`H7KKb=eS3wQ|fSwU(lBa-WGn<BZV&?9{uo~J`|ZT7z^!g9==uu<zq1$Q1nDa5br%|5l+92wyfLu+`SzAKk=cPJ^20eb>u^%a+Qo0)LEilB4?TqBGEExJHXm!Og5S@tubToL5WJEO*ywG=?J+>}LA(EC6~GY_?tr#IXCh^LGCNOer1o2Ob{EVnjZ@!=-jRkrR!wuo{^W%M}G<8yuQn%LJZV=O^?I~QTWYPP#%6v9;&=WYiS0X4d$EZg}2%6KFGP0+<nr6+uCL!C(1(tM9LN!Ms0<!{F_XIs@tT98RjQ=s}?TLd^@kc-Ph=D>+UVG*UNc!!@$hRK8~k)b&!={Zib_tW4_dpS}fc6Qg>ypF^z%xEQ+MGuWx4nF8BY}y`yn|trz%Fh{VD7Gqy82p^;k*0vFC(E~Fv<=VX1Wx||>1MFaxTPacFKW{Up%+XSwgb)<FNQVhA|gYXpG^JGKI(NQUBY7^sh?<Y1N>nm7p%7%;RHXn^wR{tX1Igp5)Q6{ETf7qn<4b<x+^L7K_U4M5oaee@0gC~6*2Yxm0z}EE7SfAfmfR)AOk1H9KRa=mo$TI%NT=WnS@^bTgG{MGwIUw3aR%$373;Ud|~+IV_ft>M^gvOp+LyIwSpx&G%9yqRKa2RH<?WEUmtg4>q*zZ@vg&Rg{~ZIlQw!n&Pl-Wh1!WU$MC#Az@Y3=M0k0{G8NAX1Kr&LZrC;3ZZ3PPa`J3?m#D89AYuVlgUY>}J@uiIaNgaT;3G(6l~M`+{_7A8`0!@P!II|$J_ggzE_*R#XmWN&t{QVtm*G_zDDd%Owo!4l<<!dHs7QOxoRyptBOKQvxDk%zBz@-q17^Vo`%GbOVXl<+0TCVYzWcl8th_~oXTB7`jw9Rv#Ai&>n`q1k>a;n;<#BE@5LwTSNY8iPX}R{T#1%L1s4LDNFrvj^*Uo1Ok$T=P0^R(OR`HD)h_4*<+p4Fd&Es&8o+z#9_HJp9bGk^NarG1VaPa+%ex92h_siW(6tcj5AS<=)I!h(d)NT<cz#|PmlXejJNSq8s=^@M#jpckW@Dt3cn8KRj)0g#6M|74KtQ$8$nM8%N3s3wWn^i}E&@lOUd^PzqlvK^Lq-gsmVnGbycn%=j$Zl69!~!Bv1|xM7>|45ss@scb)(Bxn2@a`#EaWeCNi)RtTj#J;SwI7WDovi*!Cv^2Bj@&fh|${8D@sm&p4>*Wj&B2|#=Al4&;S4c3N?YXpLCTo00Dw|#ij!Qm5-#;vBYQl0ssI200dcD")
+    PPACK_SHA = "8dadf0763d43d22966603745198ad327ed6ed36001cc60a79925ea18818f2dea"
+    PPACK_SRC = _unx("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;Gv-`@?8KCXbna~Q3)_)cEP3KbfXE9&SXJMV<=hB6!@)dJk{Re`aCPtYX_C1!aYh_9-NXG4tLHXzLaOnCEN-uVY6*S1s_8BBdD;N<8>(E`kZR(i(1>Kcfij0^X~`&9tJ{S9<6D7pZ4W{bxa-QKQA8vpyYtc<dI5OO?OMj-&)Pc7^!#mRhmRW_r&Wcg_Wrv`toa1_q5hRBg|;VNV!4%C8K`aW#{6vLMQNRHBft2DFF-0*xk<hak(>dTT9YBqDDu{`nLrJCFfvSGB^SnIhVV)?3JUXzi4oI$>`$`hS@dQYOOTpyK*=1Ug`let)V0#eYpDSYOC^=0ua}uio0ZSNAsFrol+O2@W04i^K91gRKB~}Ari2_ThU3}Mpi$l)wL&FZ6)*hIrclU3g+tKfCtCU9d2eK&A7~qYpu_{Pi?i8BYU;jYPT4Wpv;5~{gvOFINWN$UYEm?lI#@AzU-m=L=2n9cJ{aDZXwMl<-1U?-1{Ti9EWI3)g&$5y<<XzlMdbQ)Rzi<NM8ERF>iA=FeF?JifFuBR|8HfXDqMuak)@zg3R2&GJm`dtEgmlu{E<l3&c3iIXu@_(inSCzpZ8=x}yyY2eZ+yoAtuN(Uc_m58|*(TQ<W83hqwvJvjj-nW`T|a?f-15SjRhi6h%UK)C>TViKD*ZBVlG1D|N^Ndgy0@*ak_oh>{Ax)0k@f3pQB2NdGMPVrk^3SVb?dxR#|?y9;T_Cj(VrXg@R3gJy(crCGYA5S|Px~dKH0a2K|W`R?w=`b9rnVJ$r`$`3d3SPbFO?A>%*AsX*21p8;o8*(-fp;H7Paz3M4l`ZvgT3{6gu+%`^ySB{s{<A;&?38A1GZA=h1tjX@dmBUmkFbYPnO;P7a450wS70z4@-k#Ex^=a%cvO~pbBMjXyE2z#I1OL%ggL$wITdXh??Q&{n{{Uzjv|vsOA!gIznu%e$)R|EV)MO6~i;dpjL<VcrldQ!a6PCR<t+N*4j#QBDrR9l~+!cj%X!iKt>pC?t84gvodU5-v!j+=QRa02%9YefFcH-TRye><3%9L3D2(tF?Ud?Llp#Z3+vu;qt2oa(B!WNF2=7L>;TI@rEq_6enXO|-$&&OmVa#~5K5aR|4E{gY=CVvf!^potv1z+Qaw0%f_P;3(gl_LiB8{18o-uYri6a$1>M(2u1tpHIy{$3!`Qkde$v)Z-3c4ylV0NOay~6{oSgxp5i?<!d8@Pq)CUR&U6x>X5?hml{%nVuZ0a3ss5Hxs$=-<`H;OozhV#eZ#Y47^HW+I8Z_P7pMLVo+FhM47Tb|vfrq}@^{EQfNLRlTL;O6uB`o;*?M`DXKVEZMN-bQYH1KAU2vmkHCfjS5EQGb&8P||f0WiEQR_f{l=+{GF6Y8Wtdst8-%?6<^!Jma~syXtBDBsb^3qMYyG7?()fHkB<e7_h7==bnpGHK%TR%^EOX=y<I`3gZW}En8O}Tr<K-5yQWC`-=OXOMYsjM4Er@e~Z(~RlLd4RJPmGDU{AM8hG)Qn4x^mTPUqZepc)}I16387dS5m5)v9E*44U(>bBEjjr*xWu(vC?u<Rp!q)1ISm-cA3%(JDHK?Xuvyp9FfN-F!IU|4Eh<98wMEbV`5tv=(eBh=BCUKw{p?3<<feVzFK)}QF)7;WjnBMG5lIiKV+)>QwTPt*;;fK|MkN7uDJ^)7_BA>zwx+d*{MA}*3WFs((dXR(n2H{z8qya3!5GiAUeFv5^fz=5MpXo*(0BLUct&?b61SO19oNci}xRYZTm_9-4Os>7!y6yvUoidLYgHRJH1?~$oRh>PzgEBHg2Y~W>G?Yq`gIjwQwZQHM;4EBiq9>apGun@V*dGkpgjo7{}vwuM7fl)Sfk_m#l+@7_lJx<hgpD@F*<PbIk8UfIK=M;a>GuS5bV}zb;SYMoy*gag*`Bc(a+At;2D@=4+&bK}dQ8+4oDrxINqwk`NLcfhrcWV6cifpZ8W?C+h#F4;zZGnKnbt`(L?XGX&rD)k?oTxv9TZbn=MUMAC+0C?1W@p`;xdY@HR1rQ9JL;cPY{xN>tnlR4<mIk2WtPkr$7c7}v8w|BS=)awTb_R9dt4>}AbJHn7rZ$NT!T|A*8knL6;N#~7T38}ANj?(^PLT5cM^C-_TYhlQc@*Ut#Jg85obBA94C!rg+UEVX+7DquN0%B24se)7~A$btj4tIWQ^ZPo3Kcgi)*s%YmsaxEhS3-*3~Up<C4!GLDdR=i5Liw{=_2DAI*zykv!OiXMn25;UP|0lO0nHnqF<X;$acM9v^3-<;&-YUSFfSSN*R3nPKt&`)-_RK~Zo8hG|CI_X@5O#@LBgLq9X?;-3$&z#3+E>0C?{lRv8wCJDJ6*!=a}*gaz)F&=ct+`$8_)kVlxU?;a(!oC_}mpcWzyR7Lcg=G4m=1X_ftgr5CK$M=5E6$Y4cjikb2$3mP;tH4}TghN}tj*?j`c|o=Fz8fQ)a7sPHCG84VfuHhw;6_gLH=vF{@m<)_ohOfflLc$%0nVye8+pgVTCl+!-ZDbFt*(A>;N0WxNzHaMp)%Ibek#gYF)CbN5`Kh*hMJho7fva>FKKikV$uIwv2s(N_w^gY5Q|S8H}vYjLBpCbC{e8L;kCKD>SVP0Bv~XCZo4CXrDanr=0Ju3@&8{JpU8a^RQlsO8K;!Eq@h)`870BI|oJv6c_cS`UR4Vam6opTK>bX7fyQ4Cb@f^PB*34928wNHJpY3hPj!9`)QZteSwjjHUt8Se>vVyAxC1%cvem2ch!BQU*oSEb4I*+ha;xx^2?NRaVR3=V-vZx49;)9J;5@MW})HDzcG6C7!iMaK9l${(?7FSE65~-U2uW*NfTpVN9tz5QCvVVp6Ooq+(l2!50>X7c|>buTZU3p8<t!g4@StNqFkQCoD#~n|CS#tUSu<@r<}mu40^-|u2q{Olyg3oy{j3!zF*%8r{6+kO#pX$2@CFN{jhN!nnu&zT1u;sLqswmm?x}^VvxH0lb0L|S+Os26it|~D_Fr5Q|;SmVqj>}928Jsy^nutFK{gi*=Hnc0t4(IC&Me!;`^!W;JCIjI8<{;eMuA%xLFP$YoZ)GJ9N%cqpl<v{zl=SsqVC4d(+=hLu_>T6@^vJ(Xx`_PPO+~(}vdg;|dwTu%+zZ`N}KC)hDG%E<I=MiGwqea@pLmn9D_C6617|AJKmouGRH&qEAH;YL-|gK($wctJ}!K*>RLL5v<RBYsyX+=q>X6kU;?u!P*q%+q8W;RCC^x?J5iGYNomwAcY3E;gy91M&@^dGNC$xB-Fv_s<g8)-&>o{<xvYCMPhf3n);yTR}9zpG7!L7-&xc---jnqXA7rn7~t#Z4EJ@Hes&e({@VQ@k>tp6gswTY=5kN^9rH(6-vZWc1(&AedYy&d<;#%~QzUCN8Q6ijrTz9Q4gk26pm#x#?>GLyXzJH)gCt-`?P^B{2HW2JX9sN+g6`h_AdtA~!Ji5pR`o7U!c<fTYT}i-aftw8HptPzFv@SHPa_$!$2}O~3_(y_@I=Ky{>PkgQCme_@#J;-2Lfp}Fx@>A9MA{l#6)on?fpDOg5}WBws!g<MKSpfq#K&I3BT&!DxW(94<C!C?V%@G-E^C+X>g56{&60uptm$_SjUB;$6>wICtf(nv-}IBf{tIC5iHE#-sE?p4m&1>%ot;C<~yhwNPAk-to)q80f8;Y{)<VVc`t3N#ZI<r1UKe2jRM!XR&>r&;?SOqV@#qP*{z79vcx?Hcjk`9q`zLd_XuPcbX_$-mn*DMC7zf+IKb9H02ZVak+ST=>T^8HYfVzrEa8%Uk@qKGjb%fNz{rW?OX&F4yX%nK!;pC6fWu*~s4z>k!yF7&R4mPOdEu67Di`nEdT1<Yqy31B81%g|O~r$d2u_?zOv655iJ9@hUkn}wpDb1egD`LZ15_B-GfzTW=(Y)Gy@8mVCkrx{Mvr)t&k38y<@;~gm9|~0PR?vj!iH{sDC~32u+IF78R!r%S>;#e(3+CwU*2+u`TsG2v<_|A=B|CwQ$pSAKRoE+Vq0il-iXpQ26zQ;=#gE;060S}X_f62v_brzWDV7-r@xg{;YzGnS?5h>q;+s|Dv%pPI;QWc!@E|2w|K5BGDvpwhkn33?Jn_iW^OTHwlqhugm54o`$S=ydU&Gy+wCcStGJRNc{E(CcTUBmvqS{s6)#pteD|Bt{zMBSdE_uF-;OUJSa2-D!;w!nYKU(mu-a?&iWxM3Azqj!_S8|G*oBb-z%VgM4S3HbN0M5+^Ixib5>SI9CQbRnxlu<U(ttMdQ%U_<nf7~yU*8t*i=H8i8r>8(mL|+W+qI5Y7r{bF^9ttPXe6E*EoSL)=$JLy&&p_$YPNLNHuth$KtC0^MW>XmE&O9_;LS7JQ?j*Z$#=ccd1Pq@+qr7(hN4w`wjkCmhwG1`QY07ZX*Wp6Th6`v=S3P?K+3!7cV9bpDg1_Bg8Lh9+nuM{r1HyROZ<fG=3e^Y8!E%4=y?DWvimv8#_X7~@FLuFK{W>sXn0z#V2{du6++S&V2hU{^1_&1Wo!)Ryf=s3>%)4O*AiShIi~{^cynFi+5@E4UB7Whh1(XmzzkM-%`X_lDsuzZ_;mv}kc922oeW>89aF^NDSXv=XS4H;C9h&M2OGqh!b|H9f#q#}O`St11Ls=W_NbjQH8AT8d+0&f=W{?cG%Z3_2m~=&>f^T-QhDOzP<LeH@2lV^!~-xDq1!CdEt4%nj5oZN!(BJQ?6{MTI%){Lw_vYyF!IRpWzeW6N9@)0pv%pz+Y4mlr{m>x7^fNDIJ4ts<aG3Rm4`dJt?{=?&Es8HmB}ZH>vxXPK0Bzg07_re6w6`PZaIX2oCv$bvn?N;H5UOWOKya?v66;NiDg|w?9^Y;wd0YxG>by}ucNj6f7du`Ey*ga=V*~GHE~FomEJpqQ=U868i}(o&j+B~%K4qIDtd9^N%E|Pr~>8uqEgyPh?1WvBY|sz?+TlULF;dC<6@`4omLq-rbXdOrPm55?N~3U&1HR}AJJ)E7G}iDlmq6E;zIxgO=E$cfVN2iLj~pSm%a-}1lm?lIO&pwhlX;udTEoeufwn;GA`<||Jb6RI{R^bliy}0wmUTKg8LdZyyn1^DqkjHh{SbBch%vvfOJmJ6P2CUz|X|MvVO{gE5!kDcBm>Qn!nEsqqK@B=p$j3^s5@PuyWyuv^E4jhULY0Yq+nb-ndDfJ1=99yFst*UK74qLlcYLFoS{kq)<#;vx6clh`z{qhwux{AQ3V6@~pONjF6!1Un|}O%B&&h)t;zuwrJ{yw1}pzoH*SbqQ#EN8D>|KWpqikYRY93>_dfTEt7{uPx6Cubz)frKrw9oP!}cG^xTjipktwQ-ZH@w{*&@vnp$<Xo_+O716fK{?uydira+7=1EOYNGtlhi8s%H7p%dF8EwQs5^K-G|g`wh7D|#^2BdO79ZYkQ%3Hhsc#)a9cPfJbb;Zv$r2*t1=5L#jd+6HUEr7L&9`f1@`l~T6r`(e&zcVfa3lnV6s@$3aTEN~Ts=M41b6@}B^B=s`8o;nyydu`yoxLNA6huhF4xuKR%;K>04A-0WlpMjJ3`e6_^By=B4k3YX@uAZ2SA7b=v;7kto<3s-ICqzk@6%>rtySB@o9GR)fGu#InidmSndbb9Z@VTv{f4s*A0AO^7%5NAK_C^3?x~47y0K9i0?!+|fnZ>Jle5aW8Q#tGa7hDqXYb=m%{)1Y{j{kHxNaZXXZfLNEiTgowi1MiR7KfULY*XkO%^E~$s*E2eI2~7)t?#Rb`Fv~=OCZl|QZbZs=*@IJYPGUcxZf-@$$pAi#So!?^0&xU5=2HFSNqx|@(O`X$a{v^oo_UrN@pd!@XtpcO!=-Uw#e=Zm2)ACYy6vfd}#!}5InwM7B+;saw_Xp=Dn12+_|`r6B8xr*qu(=X}59?=>>oC;|*E%-*@lQj`8<`ZPCGf==WKIx8|7_R`n03A1qpx!e-dmugQZ3N#oroXE(s@nHiEkuXa|;oOoeNZV$`y=#QY86O9|+>rj?Z$LP4|S82_s*hS<W$A=JOi>uW76aZSnbK;Yze|lWgi_G>(p97=X_JkT~D5SBP$J)n+q6l1y-tm!+YV@z@c_Du8bKpx!>8BuMn=Na50{3mC+`1dkR;qdCVOv}A(WjzCPbz)T;N;BhuTbTo1s35vH@b>uCgm;#LI+c{^K&4vePGymyxikOkcZH<4dW*pAYmE`mPocL6FY@A@Wnb>z&{AFur2`o`z^Z`Y74<gdT*a~l_>Q-2=<a{aZY-`Mg`_=l^PnUAFv8g_tnjS7Sde!5>F8w7;74Xsp7BmfjSzui^XF_>7~wSxbia$DN-g(+#&S*FHi{>*~xNTT0}!|yS6y8;h|L1K4RfuhqH~Gl^zH+I}dH%hm}l%G3gRt8aO7I<b$fc@V8q7&B8*$Ucv<aYx?fM3AHvBJw*g#e2lZW*wp2Hp$dE)(oV@88tCsre8*-vhM$vuUsb<n<<r`P>u*tuqnkHA$K>N=LN<P(^SFO#KBNbz`w8`ub122&P2f=O4I^bA7=`ea$vi5hv^3*AemO@CCT+w|6QuLXv&B)Tk}W5#c!Z?r=%QOznfHB)LftHUSIK5L?Oe9UHV|QN?e~+j)t-!kg^OIAydmBJvJm>GC?H_CXpN|{lJoNAcrOI-o5Z9h=c{iMEZhx;^cZs{%ufS5r~{GsFCVK@weMMz6h+XJkCWC8)0^Iiojq@aofJ#nl(PW9giMU|!?Dr%qIRQm4#<t-0m)dCeFK3m6vaM^Dy%)8O866c%Z^3cF;a<bDzL^Bd*SUkkph+N8rI8LOB7>8HR$2y&`NT0_ejIYjES9l9LG6c-~^`*dZ$G75!OL-u$m0Ed=Wpb{Jtt{vjcYIC#I-rUdkE7Xeu556VF?98dH*pIy%;n{k2nSrqs9LH_Df52JI-$+B$aV?}Shs274^=OZGN+YR3zWBXGKP&cYumkihXppxw}w+o|vUw%S(KBJW;h2bf8ysZ^xzA{I99$qpTPbbksPF4v(x?n79DA(m=nQ3-_#kUa+r!uSR&#1F1+9F}?;EOsrh<;7-14vSFk&_jw+*Er5|dRN~b-oRY2gi*)sHM<Dxkoqs6kXNj&i;6DY6YQZ|fs9_j3Hx18tj0|urQ}Mq*Q{<rQ=47Fw56nCR|3Pv*e5%u0dsy|u*VC63zgcycI}5vTfR?8%u$?Fu~Od(^e3Sf6Z`7srI<bDbY1(eJ5eK%$-)J>T*^jAnpzz2o;bK3PXoNtt0J;7xSD66yL1->y4<w50CzQd(g@3|6rvHJecf(-cjd3%dy1n)t36a%Al*8-#BtsUM{i+~D_jIXN0wOJRs#7+fH^gE0AacxD>jqIxuza0Qfu?n4L_A~&izC+5Tb82*$TB2!z2^`PUvmYpXHB|q~ewJYMzO@$tt$ku~AtX*A-f}t*5kgFqSJj;)MhI%YDe<6GY+{k7Vm69pJ12BJh`WhWI)WI{c680)k-!aOL|r^;024u<ZefTV9IMu!_}l@|H%$doXPio19Y>@r6)@h;XhPs%T9S%w}bo-+i-nW3tlta9{yHy#h~^&A6e`E48O9&Jf{I?D~WufmOXud2n&5pe;lU!9HqX0bOAV6edskK-(mtZ{P$9Pob-WeJ5}@=dD%wGuo3je#qG}`1;@Fi<p8L8lr;FK{YUk8kgiM)qpqvnlBPpmyCR@A_O1A%+q~lZ$G)a3PX6iZb~IqJr$UNE;B%C#s}l~q<ceu4O|HYxY%3~=kTk*6ztPWeFnjq${;!4VL}t~hEvn<vW@nYPdgna0&v&*%eH{Q9Kg**ONZUy^e5MTjxrx{KG!%_=AhLV?*ezk^u&;Aj18zoIcQcN$pWCC=PRZf&O8$TTF^}aO*1J3HivKH1N5;{IFPU5(@-O)ik?Pt>{0iO!h&)GP2K~h^1{?MuDpvkFlW=5<_a41=Is>s<HUu?H3?Do9UGo-m}OP^V~J8{ay8!LX19$E#r$wF6@#ZB(Biib!pdL(leQxBgZLkQyAQ<)x5Zi=#mu8^%Eg}m1Aze$^nAuk9HcnklVZ8&%tuPUnRRw{maJq!3R}#{o#b!Jmte287>3iOSMnK*ObGR%T#-%|ougpr)Ai2wQsj0``8S#^YXt?@<wwa+WFDe{tU_bem*o7Yks7h|*ZPAnqgFGeUGCwPN<CH>CRNl1|8mLCnvc|0=#E@e*e7$LY{t!f66tzfTo_XsaR~?&mBhsJaS;Z;idYs@f?mVk=7c}!D;Ar??WxGCh!zgjW$8A;(?Vn+;>Wz>X%QosTTEi!W-sIZfO-?HJkpWKkTSF&?7uBGlCRx=URzLWMtR6R*SYnLgun!T<HVPvOm~b&h3D?HWlQ_I1ZjFM{czEGl*~*+g4c-16D6@=2s)icQIW1IyehLmK1J7h71qLuJW3M&hMun<DCe@IM-EI~3NPol0)_G<mMI2=4|W`qufT!J!?TlF9fQ$1&|G*~TJ!`Lf|Aw?qe=dzUI6x(uQa({hr;p$8NmKR3$rIUqQ0iC#2hO_iaBa$u+|li(AQ(C5EyPI&-o9uIR~AuK5_n2|B$0wv@}DH<#2a352>S}wu5gLu(vpQ!ZhM!=^r3XI_pG;aP+2HHX_Lq>h9NIRi}1%06+0gsvo-0(GS@vGVCeaix_tl?)#C|km?nZ?PgvTh?gO@a=jC(PAF;QP>!-&3o+_<^#UJbc_|^uLNEwD&gu|+bn-<)O@xkEa*66*o+)E9%w>i!lkypMo0D5TT~EJ!zwf4A>K|k|_5S$ZwrN??(SOn&9v-aXC1aTzt8&B3aY9GglL0u!PL8QTu5X?2TJt!!$@#pFZO^~s+vA=Mp4~6swAdqz!sY(bZ5gy(qx=_~ouxn|z9(%Vl*`@s*5r?r26~uc^_|f~oNJd$8#E_!40ff3%i;GjQKuk0o`8KiThTG8Nue_><rKB@n|#q>nuKM>Ds@sgKD#y`<?TAVaRX)Imh+!Sj#hTBqRm<`5umep6DfB9P)Q*~`zuthalq|V0jYYg*x*kgW31`!#d>!QIKd#@iwzPlCuI;yZwjjNA@8%0#Px5k1m`9aAu}IjF<7(;oz!4f*zl8S-H4+U&m0*tXEQ_!>qPm$dMqTo7=W&f(1sRj8a+6XyvV^<^XSX>Z~fozYr>eD562uUn~!<a(+IPDb;b<t^__Ilp$na3NL!BdOAi_{yA-g@c=}ruJl<I|XtU*eI_9+0EcC`%k=#{8pR%o$jlZ-o09wy?unItH(0TKn93`=`m^1mIx+1_WCqpR#wf7%Z$UTH@qoL!7O#ThorWDS<|EXg7cs$(~z8JR$y7~0bw><@5fs%GY6F-&-2T$shsHs(p&0;%e{{fYV047TnGKKj_cf29G`hI`>s6RPkvRa0W_Y)Gfk*9-nnpgkL^6B^t91&g1kggNmcoajQ*Qxfm1nCO#vEZyJ%Lga25{s{f_gH31tsx6ZJ_wTucX8X@j<R7`370a!s?v^uT+n)j!t4{UXs-e_R#12otI0$EJe?(@NiQwm+E^@-@YJ{N`qc`qd6(zeu6fcQ<fr-(V&HpL%oVMF7@kE$+n}F1<f-2VS284S7jwV4Z-H*DMxbu43oFja2NvAwaFA!Jb;rzkZd2|eK>T8+>L=E^qQhEv&5s)A6IO9vo|Z9YpK*d(OxG!~rAR=cx?=_lKt0UkSc2VI7|YWN_qbps;PU$5RYe}%WmpiXmXr}UZ@zBnbTV*Yc-=^ZyW#DtX?|mV17DhHi#N9qai8a=e-zn<&J#abi1PWEchw3RSg3RbJDsTJVBxYqtY}5hJz5c(3!CO6K{+M_J_72>lt0w%mJPQ|!}0WEAHM)s3W?|5t3^nU3liFxQEo@5^wpkmeWw}}%|DCkR;QVmEX2m8S(-;9<_zRx3*;o8qvA<X-K~||w_y5|c`F#iiE)8;T^8axo9&cp3|v-p$|T4S02!><SnUflw%G|Ibh*=yMewlQYoisdy`hMf#0SA5dXBLcz_-+5UEA_tWs6c!9yk~Xp_eqw0XXW6b1oKTn>CO#{xU9Q9<}A8_c8-&IpyqKo|TG#e36$g!NvVQIj^qsFJbS-_^?XR*+nGSHusG_=)6#`3wFrQ@kh_SzSRZuN-lFBtfP}51I#a5yoj$EoV;Z{$EgSp!d%R9Jfmqmww7kHSFky?Oe%hP1_wLS8gn3^ex)&<WVfPn`k4t{bjRU9>EcIy`Yx{x^=M5Uax@o%+`~d7RTaK~VHoh5?peDUG;aN&TjXDuY<)w9z#`2uo%N7a>iV5d=nCc>*1I@5;fHI2hOVT=&Pkox%s_}G!(^UTDmsbG^6+;px|t8WldXOT^Emt$J@qOpSJEZF`(P2Ls#n<9kio<*=erZ9aeg+QH(G-Rg%7B2V6O9N-=a6g1iRjffi{7f%G61>ht85tJJXGNx!d;LfJM;$6u%18143K0583k&u$4kL^`iCgLYi&%xS{u2<t}RSu)2NX0TJ(|#a<J~LihA+(us*et;#}+3p2o09g-<geS*f3nZtqzm0;O9d2%v>L1dSf(DKFCY%K4OLYahYWhM~SVl|S@3*;<+;#&xH#wy9<K?VWrX0K?{K5wWrK1DB_(Z`QC#(<7rpgjW2zaXe#pJh0F30v>)4Vj{k4$()sdnqqPcB^+Hlw91lGjO)ZH45r+$_|Ke!Qe{|;z_V&4&Z){$olt9qRD_Bld8^MMPFd6Nt~=}{I^p(2j>TS{8eBR9l?;YUMbx86f2V&mV{Z$F^Px&`a*3%Z+ay6zU@sEZbKDQjWhzWrAkDrM)bX2&>;xETZ`g#w6tZsVDJ?Ys>8sV^ey;{ihn&(F*R9cp)Wi+AiRhQgElj$l$qtxWy$w8Fc{(+@P+}jC=!z7`^Z=$4>&*nDc%IXl$33LHgBo$(Bo;THzMpolafx2deKW_!Vg|Zj0b0LFd^Gr{{5VL?nf`JL4UcH^Jy<nVCqS@Kk^8H-)(tG(gWsi-$z{0B^w=tt78r1*7YoR+2MX{n!^`4NDFo}B*VPJLf>7wUNZBVb>}2i0?veX8!ExDHDlK-44})JBUICd_<$?*tOIp)%A~b6n?v<@;+($w-P#yDi%J?u{wPPbE(fFRvcuwmRK?~D3^Lh<m7to|IuxuCv!to<xmWfV<lfBZzMn-VkK1u6HE2$QV`d*FQUwu?-4f79)H~z;lbn$%qc(N%|9c*WQY3<C#p_FE)XPS@VYnjujIY7q3K6;MqEDNP;tlJ_^C`mmJEd^pQ8_jv_&L?~WJ5zohzTX7xT0lK6roQvMGGMb(l84>`AwXlIp8>G*-V;bO+C2%vs10qcAs5J-r~r{kSDVV-}OM3HvY$(GY-Wn_X!-bypz)YXatlIPKN~)^TqmfP}yB}!|@fGnf@93I5oELNK<kt5QitTxgs--e`ivZ_pyWl@R+x2G-||tgyTSs9K9wz!rL%d?X^`O2T&I>4T;dHpxp_k79n+83acB$0RQXeT$zQh@k0m{*_L1P+$Y3%N=&fwNiE5=Szf6}K^~7e;qP2`Z>6x5hWQ#B8F>ctcb?A`k)sv=vsXk#n}%>&_id#^hV)|XzYdj}6#$V%2`Lgomt<Ie=hr6|SC&6>t+73h!Sh8bdgG;oTwyC$P&%w<4D&e`29?H$e?OGi61m&GdJk}={O%io&kTOlPVp`K)h9%sf$EE>YtszmfO`&K_ughl;D<vq#c%W|dv(u&m&Q|HQ>nw5FU6O|h-}YXx0yx5p9F|W?q~9tRQ51mp|4W1bQpSMXaNxbMc+3j-=b2Sm~bS&*x=RwOo=0)tO=-VCP(oaEWH2F`jnUKCNrn0i&vpE)!?_UmUSY|{y4}ksPSTPEGbkOj9lUzl-p6ScfRD`MxmR?n^Taxk8{^K|K&|937K9k@+)4UE0m_bI@;!Top7`TKeecH&Q&mEKOVRT(sPWuYS6!}&p0Mj4*a2xg4s#<P%0{%jZCTye*oE-%w-8#f)b)SdEGkZ(hVoC{GXrQ;VegzJRX`CoLxZ^J9xwa;xMqqSkQwuOJ19?*TQBaf#cJmZ$N_vO!5To*m;gC9F~x1J?Z$?7|8+}35;&`{)nPFhOOvv;*%h>>y})nu^3@|vxiGEZpe!(bdZX_PG`u`U^s6l&XGy|BK7>C%xzWl125~740iw-dV`HZZ(1vM(wh>9<Z1aGpz?&&D^Qmw-Z}Mw)9*&r-tZF+1Ui=XfO;OumwA)GtP>VDHIqpW*W0zQ5ArGRB`P`68=T?FA)$)Rik!tDt-50xz$bCdj7v2NYpGJF>s2V3#gWSf4$^Qv$H^xV@{eQXHw@CsnBBE|KW$lT>y!b<SkCNWTJEz$SW}!UtfACS?^@6*ozBm@W-{Dk=b5$D_%aLd-7+5mfv?@h#fuUKxHP$?XDHC0C@|wl=Zr=ZfM%4w>QyMmgka<RX?eo0P<HJ)@7+d4VfXw<>2ZKgV4%$MrE8^kRkd^-S&_>A`Z7{ddTJUQA3mK>C628+B-LZ~Y7hj!&G24`>zxY36hMe4+yfVhfY_+n-)0i>sr-iwww(3sN1Hop5o&lpwH&PBqi_7#==@Rj%NcAx>a%}dIG39)aAgq~ns>>HdY0uK55Wl8nBbTIc&Y4XEt513@EV9S0Yp~ykxWRYxAe9{fvy(y)S$s&9lI*RnzqH+GK1$<`x{~iU%o7Tixbh*t5v#nuouQ)(xs+Mqci*<@+%DMrF6WLu-w2vlM@+HECEJ*9t%zooe6o(8v~BgqQ(ZhCi~o<T6iIgPl&z4@pRq9{Bho|9wHkdFnQ)@>&aWHihS0C%=C(~Zf!*tAB5W4N8E|~0?e_X8ix;4Xd65sAki!N;@kNTE!%*7;2NCP+gS{`^2*Hx^MzABeddwew!%%P0D0s4FON9m)M#IMx8L%YD!yk8Bibo`khq#p2tKbt?}{^yJy(A{@gt*jE$CWgX%3;maM%Ew(LzBVA{5KBQ38Fe0!$#^PdKM|sNB*L`FJ7fL3+nLia}`MfGK{y;|-x>btuS0Z@EkpVQzrX0zTF_)Ke6UZ((TLYPJLHDBekz5FMvz9A^59#e83p1U#3nmBmj2a5p87s)JV#wT*YtX`f_u;x=nrPkx~&77iIp%&4={Y}RzcJ4vRW#VWrh;0k<L%Ee<zQ*jwcN~=9+iv60Hu7E=9*7kd>FRRhKwkt#@q*>6DEv2q401|bKD>FLsWk#N&i}Rv{KQqe1BEFaIdOIyG?d<Q7>^fO$)vL_tq^RQAG1@X$!n73FcPU^44~GmKw?Btis-m8eQM8Br#<wwOveAY%UTO~t9Cl1)*1`D8s*lTZDo^a3oj&jRRhfr%I-3fxrg$Z|^RoU$XkJC0DMwf#-Pg`mK#+6Jug-u&q2R?2_@>~a%@^hD1L`0!)E<{0U~EU6#q;B=8fMr5vq9w2pS;+fw+A*d)bbzlrVX35DwlKAp79QSh-J_FyqFSuB&&hup{#XQj{Tzly1*_1G%E7lkXAW)yLTmY=KtB&upp5&4UY*@a6;Qgt6sE70BV*TzU~HkN&>Y#i*WrDR+1)cxsHCD0H@hp{w5ATwuOs3CtLjqj<KH_n*SYy-B=aVU<alvB*v+TPpa9~WCPlU{R93o1@BP7YNsb=e!hh*7oZ3^R=6B+*e#uu>W<oidDq}*x;?~LA7PCg6j14*dF87jB2bSD<*Dl2!1X@P(i_PixCZc^WmzCZMw=Zcj9o!-ZK&G)G0O^i3)`~L3OBeURIi5YA4=EYem3<odyiJbXO(2zyic{pLWWOwi=rp2X}Dc;aLslN^e<J{6#_xoJY+t+)`XU#8Vpf{$E~=Gj22BiTy{6OjCQ`|mce?7-go<vP@iYc*G!W-s192q;=k^4nE_e>??m(iDbEsHm>D&A_D1a%nwjxqDf90QKe2J`I=DBVWWX=ViQF#9y~gC$e?hS!;Oy_blo#-@YGz1>kCX3D5!s}W5d(CI@_c|i7;X9OTYhBEwgdGZH9nYWK3xEov1jbLS*8VXwD|h~XK!Id0jG8~duxjqjez+9<*uv-v+~hZ)nr}lfu#-_GX#?x>8}AKrTStCT!SgZf<z@)q%vzkQp**bS=sAlo!hH+c+@@2v$b&`>2tjxu}88w3L94cVxgCKYNi`SdES@Ojb3uczbC;&Z2eo5AKQ@RMFK4(dDA!2l~UWXYk43d0^NpPY<V>*Q1RynN16{}_Y^^BlLM`RuC$D7&gjOsuf}WQ?75ANoeOyS67RY{NuFU0^2uDpTgEJ(>g+mKUDyAVyxVNa1)|~1(<kt#nAMsi`ltGaJh@wHdwrVt1Nhy<0IX{Q%%(*TIX_pV_K32Z!MbzVVSPFtSLK+Zrbk^MOj<`{pHoh97FTbWM@-<_`;A24VE)817ktUfdf@^sX}VYn5FHB7_?c4O`QH&WaHnz1=4Nesz_VS}0nIN8e~aqJbwzh^K+LdhL=9N$uQ||gb87(6CDdJi_uIE`!%JcMa^5+;y03bV_a&39NH`H_4o=jx&}YVX6n({9vmHO}&uK25qx6t~7^??S9!q4}V-ok3Z$4@L<tKU)<*aX|VA7jw6B1q^w@MtAoJBL+ZWI7(ol3H#qfbzgCfHFKXtr6N1O~Vya*;1Gm=0*mO56s$FeEi#^?eCb1C5a)!-tqf?@1ndiiX1Y7PBTh2p>M<#Hrf6MS>y)_p9Ud6@S)<X7Gkp?Huyee3}Q2eKYRDBJ_}MJQy?+;l|XfK)75REB8!V;BaTU00000A1WprmBwmp00E9#qQe3J3hnXJvBYQl0ssI200dcD")
+    SEAM_SHA = "341d859be5b2cc619247ff7b645304b9473d09f07995358ead2ee02be116c60b"                    # "" = the builder had no dflash_seam.py (every D arm NOT_INTEGRATED)
+    SEAM_SRC = _unx("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;baV7qg?<IXbna~aR~z}<^`mct^RE%jBwK?GV_~~IXTx@e<)InE4i$BWQ1so@0$Up72S8|1Y<?~at4{w9!}R6eQqkHnsUOAwkJc6^_i~VL&mUg`sk>^GQ0u0`?`w6hTY$$)22m-oV9F0eh7c}e7)fNE*i&&(V`ZpIHB)tQIVR7hkE#+^k&=eTBNS6FM$$0R&F>;^A?i1cw>g{%bGrS^TDv5JHIjCK#OuzIijuAcr!K!X0%|xtrU(GrUx75?Kev4?bZh5Fzxog4tpJgen+tGWb-avl~zr?g}gc<>UHMv?OCL~NMs*ivYGU|J#6!h*Bqt4#kHje#|bO(+3uHzE%TYpsG*ie3?#^4ti)-(Gh|lS$nZWX;{hQ}dj=U+G&olKumYM%2e*}R%ZVTQVL(QX_W9Y$6?y@wvCGFQ!mHf^pYG5+$F*sG+^xo|MAsREwJ}NOQ7MNot3jgfYiW?axu07!{Aw>q<QAVjrw&AP!%Xf^<ZU5%%^jCY!gd&_u8qSG2QaheaxaEDhvp?FewgHm?nQ$6oxG_-IOwSqR!|!<Wn#eBzJ^{G!QWi$c|4%yL1(;p4)?v|5lc^|9O|BC#nrUhW~E_F$~Cm}fm&i)q`jijCg0D`=Kg#95&uT6MuRn5eYIWNvI56Jq_&?QYetSGt!e_?E_2F}1Ghq;Pt;FHT^E?UDLzVZPfg*Kz!Lv}EXuKx>au?tBLzN>N?jlps-IVt_|)ZXvE1dpk^pp*i`4G;Njh_WL4#?F?+#?P+Kh8L)s)LlpvtOGD52-ow>KyReQG;Bw{Y-Pw#reaxwd8acVa`V`YI_yvm`Y2t!OU!82qa4Bc#_i-%><CEBQyeS3yUA_qUr`-Esk^5NZxU3-dfoZ*R@{`bcQiegV!T_>E?5<1%LIO=ybLaV7jlg~9Gl&T!O-{fz92e%#uaZhzDgl&)I4nJiZE@~A`@V1_){XgYJ5&TKua(4fFE<uLc;rvC^3nkwbI^aea=*87ncS4ToX{Druv621{QLm4#dj4ZcSm+38z!r7vD^S&k_x5l)ca=6L!L+J$si39GH1Z>{<d3h0E1VKIMSWUOYtQ2BZEN<ezj=GdLhlFX*wA*NzlBO6w&(sP!SvE`aI1G;!dS~jKStEIFB@LX=h=Dp}c-^h}0ezvfgU~B5&OG=|37^Bc1oN432+a8!BnK3byYsAYc)%RiekbQG^l+Yjg6{hi9PW2tVX0_{JD|~#hCt8!QCkW)Fx{{O1pIHg$0=&m$$%=FlI{W@|JLE^IGpT2vb2av{3846jRDEUjP`}1W|JuSW|WHhxLsTc*<VMJ*`T%Uz~Ps#_+0k;6L_kpfM)p(9-6he{A*dGU>EqEpcOo|Jn5AJ&34>aCQ&Xie;BWpS!`%GO@(e455{GDf(GLoX?20VwIP9^u>i3n>ntjljj%|`J&+<A5L`ZS4Yt;svaKlsJ)VWhgt@6aObaw9T9G`CQQ7z&DCN$>ufoQPBlgp)u5$@*t#+pCaN8sCXq5sJ0Vp?##EFBV`#b;|2fy;+L%Ca?@9&j877FQDNQHxowH8<%=2Wnab-SM=;1rVb?dTL^0r_@@!sG2CE9<wp5Rs#Z7%<D81{&7Yp^?hag2HSt)d&rB2iOVRU9dS=nLT3t4D78uY`$O#WK`<pJ`X6nqK@FjL$1S)Zs?dd1|lM4(+<S)@1R-!X`d-KVU583Gwd|iEL}Y>LiLiy`$8RN(XC*TazUjAcPgORrb2qjSzgPWB6fdhG5U#4-nJKtkt5PXz5dx<zIc-V;?M^Sqj~m++mzld50%3SOwH4ENejL3t}>_$?H!9LuwYPELvTzSZu@_?%8!k7vQ^+E(<lsPKDwm02l0t41Rt32zZXf(jN_K^*is~D1lQ`xg9Maygx^zCAXP2FyOphmeAv}v4NJ}&_0n7QbK8$xU9UcHRZ-Ig;Q@WY_Yd(X`!ooQx=Zq;@mf`KG7TL3)S4n}Q}N5kEVccMk%Su5$=k@(qBb#(eI3_{r;$*10zi}dFpo%I&^PwQTe(T7LlGa3aj*G&SZ2g^^NF^bQ&TY(zO&yz<I0+~^tb?xDvZsQH4?iO;bB5k44hT?83W*_;6=Ci3Y%6V1FjFK(X|@4p?Pjx5Y3*f%+diT)e~mp?jxDfzUdJ&I<PHECFmI#RqV<;y>@;&I&FvU>#EDG6efUL(0ZyI`ncx?iJyei!WoNx#Sqhl2v6o}-+M<2NH_}V@J&~<D!r;6isK@vy@%ytv)5W<2}0F1PF6nw;2tlmQL&I@C(V^5>+=`glvgCxo9BNe;X02<d7(<A!4VR%#-w|@^@<z}cIx@_cZqb&^(+puo_>rl1{>@^=beR?@c%l>5=Zp`CQ&}bpb%b_NHtm#P|?wqw*{$XIlHW6!rK(x437Ru)*`_q)9BOiclq;b@>H7}<_-Sb4oknBT{*-4ttRX3&D=|}chjGvY!cNsogy5b*EX2t)^yhveAjcVWFlYFVJ&S=k%@4LQ|BT$zyP>h5J_>Lh@aRt3P<3<-J`VL2J|(5|IlJw_B&ILz8B(F`QD~Sl73|M_P`VwzWLA?dAXw;QR&onFKm7wJ1K@7HsP{-g1&MEW(o7;zN4cR*&96{ESuoKo%Cv<ofEh?(}F^S)><X(N?pWCWb|@n=}GAeWvpkeeiaMiq%{~meA?NyeI3y2+S-OOSTN_kjne1n0La%X)+o~VqfsS1VJ)v~#UWvsM9OmqFDKskL_%v8vTlDcYz%469)*Z~AMA1He(sGW_p69+AftsWy}C(^c>y<k-T(_8$9Z4u94pL{&|as<k{FKKDWOIF0~~Fo6z<(qy?X>}j;sL<mF;bwoly=($)2KZLjjiGaHgo|D2QD}ISkmOthC4BR4l=yC7d4NNjPQL1l};znMWWdrY2DCfg+LmxdKBho`hy>y-brpNw*lfMbNGv=1H;$g~jp;Z=2W+taRuwc>F(kPfmuEM81N?J9zJ=aF?E1y<Ao&412BWq!t_ZM_XbDR!Lz*@B>|?yu>dBUb`#K5WqUv4*Vbb$y(wB_*#5f`o-=SgFf}c#v2L>N*8O&o5t)2zC=4~gw;swS8RfwOIwP<#YWnzHj(B6dY#S2N(ad(tFBnS>X-1w4@W<OM@bg<_21u!Wung(8T~nBu~2X;g;ahoB43Q|3++gEf(|ODJ-Ds0cqy^S#Ji0>3;*I`O$rp;?C|c&1~#U<qb758(jvR1hDrk7DASImf~Boz`SjK1XtR$U))_8LYq|H6ZOF!bGLN~7*SZK;!hL)PR-pPx#W=?(s;qnCL;5AdYQmrYA00gLe<avwQ4GA2TSS8HWoaq3xM99;VTX>Hwj~o)J9<~w2H-Xk&yG&9u*>D!XXf=3yk`Llgu}yJBA|>20yVA-QYvn_pa?DfV(F3-Lgux*`R1909^`Ri%9WVx%Nxa$Oi|i{Gg)BZEb8#G>8+=m^GGr7N!{$XM-NTKMQ{Ftu)*)m*64pz!>O6Sllz4$y8D~LiQxFA<xqQnXY6ksT_Aj&8o1r4t7M}1=DFFFyu6%8M@Q23&KX9fZTU)*l73VQZgW-(w$mjRv}d)jj<}%}58sdwfr39Dt(okeKkVy`0Pn?2x0f_+BofzA?>pRF{97VA9u=zYgG5{}S;eY}2NayZYuHOr!F@H0*Vun+LaN=vaA=GCS#mAbml~v`-&Jkd$lcAN=r*^^#ydlB@=+-e-*TEn5AlI&(&7W6$RWl|oTqjye{1DwqFpG%X0pWwm-&$$BRQt5xfE+ZcvU-e<LJMA_^u1f+q#vT=r9k51#5Ad`*Za;iM<l@#KrY7n;a>ucHFgB*}2r4z!{s%n`Ma*PtPr7%gEi`>fq1cP7Okx;LDt76McXH^G-rbzZ_k>e01#P80I9Lw@Pa934uVcYc-YH3*j#bZF}|{$3$%phy<j!w3q3f%hUk&7mLV9?9djuL?`NegrQ};{lLDXbk7zMZdRxB)AcR*$?osmqswv(*!yRaK8rKNiH3|v^^9P3ON}~}gJV??)GuH~kc@Y<(m%>|($sNJbnE_7Hc4MQHa1%wqmT`>8IW#lSrR5V!Vu}7uUn>S7L79FlhPW*R{OjNg|lK!1Oj6cR_1F_ze2y`#aXX<v|Gn1pY(Vu!Bal4H65ptaVK7|cgE{iN%&PdymfmUsJ!anwqYs!55EvFG}pI59a*)_2`>kAQ_}LR?fAVyQYKyM`cuF4#4ZZzGZq%~sy?sz#~q)&6T}Gb_IVG1^PS)!Cp**9ullt{Yobz+KBY_+o<miR2*Y_0%>{*LevU>D3pBqI_cDLC=5r{7#%X{YS&S=(5|f$VMH|;o=8x`qL@gEa&L!5$ZIp-8=X6KoW}iKgl`?gK&@<B79CR6t=?h*K=4Vv*Mh9xnIA=`wS}o=oB@PgJ9Y*Oy={AS<YlFcgbQ}^zAvTSp^pAqwkZ5#s2E+uO7A%jF#biZRDg<`wCCU1<yH}CPf>6>8&RDMrQCr6a^>IJ!Qn$YX!c;M^Ztyr5XZU=#;sVCTqkCDpW!GL;HtpiU#)=cUP7-x@ssM$;!00|U`?h>ABU&r@9#qr+9jN=GwKihM5*q`au=lMYBQcD0Yg8xO6xLd;vH{J&fpyh>O_KEN6lYbj-&L~cJx1m;fcU$L0Uj&*y6n{;l|fO+k-s;@jsA+U!$8X~2Y<i8B=U;rD$2`=(G%-9>J5W<xkeGM7j3OK_S9BX&qEosV~Uog9hKgIvGG{OpL?#jD22zp>7410@xGv?0VT9BAe)zd2;ci^&_O6{Ds*)P0Sp}je(qWUe3HeF(treTp?S$}+xSoNJ$pN9=_ms-j=ejK_{!$!uGB&5UiG}C<4&i}uav)fYiQd!EMKu=>*gA8uUkdQ^Pe2?5p5U>_@leI<+tXXdTOBw{*-|Z^Q)CO3)J*medv(VJF(nV4|YNpW=*8)Y({s2c7F7;T?Su@!DE?*0k4`HkaIKVL3<B|5O(W_;dZ^PhLg6V)+zf&T%CvQ$VFUBl<v_HPrt{XT4?ra=kRKayuYU9lYvNV1sKz6ho*CJjHv$~#vphO#2<yidq3*lCE_2}*u``~XuO?S1MRkNS*ar{jU>X3E_de-C4#ouqXS6p*8Dt<8Q5#<!QkQLnLA3-qSH+;2g)1&G?5$HtR+1o@`1jFP`n2(l0Qc>4Q#Waxrf4|bh*B@1xbIMv$FhDe5h4)Yx)~83b8$ePFF>zayF`5+ls8f{5<>1vB6I^dFRcm8EQVJB0pTIKthz1Dl{X?D8xwS2ePnao>uoTD$7>{B9!h?#8xIX0NKs7pY4tq&YGnhe8itnIpz3N6v(KcsVP_v?TMIyefuf=Ps<D`Iz*IP?fY4WV}$sarI^Yw{jl4{0Wm*zVE+6{knw^S1_1YEzSMd>@nH&r0KZFswsR`IOYtdp3*Of@##RETOCFn{iO?X%{FL(K$gj@|-f_vEtbhN%O|}uPnnp&!;mS>Z82!Q%P#^rXY@+j2Hggj2gRzJU`^bkp_g%p@#+%6YF^)9Ea8ca_9&u`Q5ZvGlIDue$d**{tdc~CG$p9OwSsq%=0lcR*(vhBQB@O95jU`Nrcm=F~Snx^C#`|tp*M#@2{&`G;;jJga?fAIdwm-_t7eg+Ovcs!gG6Lzzxrdfz*}rA+mk54A<XD8k1H2*WRU{C-#IdlgSkT8eV;?-r#a6y^GLp`Fnlgyq?lWG@DNK<*wW0q+eAaU(AYxOWHE@RKvqOUd61NAmD5nlN!AA;UMRz<&U5lu$@8#`j5#!}{W#EeB0w$D%UXy}Al!p!yn=tKu0z>Um+6Lc_+M5J43%m1nhKI?9p&G|aI5Fn%{-Sdc`w53mUoNqI>Q>OmCP;>q2x*Kg5(fC^#O7+=;E9N~<Icg1^o`TPW+@N4jXnZwJpzlQyz&l{%jjT{ZM9Q9qIT6Ho7t4T-YcA-<P*0$Id&ZS1t3f3Et^*ato|n<4_plY@XMORE}Y(dEBpGhV?bRHt^#_ZX1<nzQ{b?yBn+r}okQ@r1^DJ<m5%K(KI`%O>TTbwjgEK&lJA=cTqT7!{?_F^ce*zYPdFg}(ZO!aDa1<lkF@W>HGxn}lb$U3+<{{Af4Q$TX9xv07p{H@wdge|H*ka~q->*U1j4FgjmUFY3im6^F)A3+!fQmazQ7Yx$hYoDT~DJi{=6CbIB>-4lEZXqQJ*3RUL(}O8UJN>@s~@iGjPhQL}4V*=$3WRn^)_Da3#gCVz>(-I#h1{h}0hke7I$m8Dh<$xp^i5k0(aXN%CFIz0NF%382Jky;<=V)zY>_9R`S*(s-Rd7Ftto7`#)$d>=#WnU<^~Nd+y%KP(qOhGw4_$c9+4c?Az?5v1B}YeIVgQtBq;KrM%l9^0{a?-}ibGrAE|1@y7wxh>uYevd&`{B7+8*3eys%O%1iL;(`(6=tpy=L5@lBdU;AthL8tPSSC;89$4K)qhZ(+Pa;+XJ#jVU^$en#)PgF-6JdK_UMLV(ByLYhfoylNwEjMwJ36%QexlPk0;^vB?n%l){Ds}H4V9Oz#kroW25@XOcS|Sl>h#ZtUmnK7T*~YNd+wt=JW2IRUtI>SNg%k8gnc5KePJv3!_scl!~K+6(OP6qiRx9p6|EK&20xSf#<JubZf$2LO4|nTtHAA6zEaQxv{&Odvu8?b_)2y-_$G}?|}8-=#3tBB<dt9+d@40p8=DVrUOeb)w194J4q{i>!uVfl(!GKO>(`n```YX_cUl9u6Fh7_^BhIHw`@40l)<F=V0P3%h^vp#IHc?>>0prQt;1AjxQa7kFT}SKOLBN2G7B!dYdh9O5Gbs%D%ozt=kDtohzSu8Q>c4Ri3104h-%VT6hEzVJvjFP$Sw2G}_tSF-3#Dy2#aJ8M%e3JxUwx<6Hi8shxH=aFHSt1IZLKGW?Z~pU|i%$qvr@(p6XI`-rNMrN@tpWV~+^>d0SP6qonx+Z{Uutb!HcHkHvIX>=q$6%Le=W7!uN<v?-u_RRI+MaCt*nUkmfoCgOOk)&heqcaA$R%zvp2P3m<dyZKB##*k_C*yj3qI{!5BdIiKnXY+~nt2AFLu{9xu|ztyc~u_I`?-af_^3j7HveFR2JtpTLl4X!<~;uxN`L9?n$umSZ>^*0<LalGW_^;!gU;K(2z`LD=rWFtXX&9LSL~6O?xaVOus<&alt1J@1J|?=g#XZ!xZUI-(35+E-W6nS%{={t4zFnoOq1IJd8LMY>Cm<kv>Bz)ocP4Y^>&Adejyf`X0o(Hv1+CBp|aG{#oDhFm)EDgCxL0-YihT@|B=Nbu<ooNby(Tl7NhXbj6_6%FnA11`8O_DdMY!K{7ag9FapJvYIQJYPA0rr;;+J?XioBLE>XZ3_bIX;@18}nx9~9%XcZsSWZ%nhVG~Sun6pfzcqQKHtsF>67LzY5w}9Lo+(zCrh@_*GQuehB+k2<0&|>EJ-!Iwl#vgx9pO(IU2dVJ6XvdTjxjn({JVx-_d^{-}v&nbQ`foL~v$Ewv0s0!>z>B^rlrX=sGbbQWf8L?WIRQ_R1!)NwqO)ITC^R8P%$aeb$>C8M!P&44hrt#qJ9_Fqggs6fLijzrenO9)3l^@8Jfk&RfFqwYDdJgIaN3Dc+a{|6>#YjnlFL?D7)T<^@C+V@7~a}x$lY57o)lMQuP!$-*!j1h!z#pm)C7fytUOwr+6_?vOtZjliDFE{vGEW0boa!;25%)p&io&nfsTqC)GP5tjjZ<#pQyLFF2H@3s0nwVS6hdorwV&@6yfgO2i~gp6vFb$B^wuQf_P!aQ<%-R7-aEsPfa#bj`bi%<+Bj$c(HLXIm9O4#J2oJtQA=-lNL@^{;Jxv&eJHZ{}k+!1#O`S3v)J}H4_CNHUd)e)>MQh^f*=Z{cp~NJdQ?zyAPPa5VddIu22Q98vt**L7;uLL7nBgOLUv6+)&lk?0oN~x<JFfW{xlxtTVv&wsj{t>6DPvDN@63=$6~8B&lmagJUcT$Mt4Cap~5KS!vzwaVa-kdYB;?ba}`p@ag#@)~c*p4<xz}b*;}kUjr?it%~+Q6<%3;EU&twVl2kY1%O4bhSRIb$@$&L$Qto$rgSKKW-8dCs82xjWFUh5gpUn$a2~^)yYW2owUQza_(skAe;}pmc_`qbpAMk2v0tYFDkjTCDhZg&^*vH|SOS#hI&h=|5n(Rd5_l?>ql5J01CmJ8s|X{QZlW5!VL`#2#w&Gk)_L(sf?P7FQ)v9cBjcp}Da{Ef!XxAk#nS?4ai7oR(u;(=wl}BbLw;4F3H2mh(i<ub(}!~)g-SKU*e^CB%g?2KmYU(O(&AJ;@B7Lu+Tbsa`_=*lQ^9>EfG10Z2HL)7LFinVNK^?*^LjExP`QZa+G0NlQEVOCQ3~C23efAl-qFuCK4&W)U3vUJMc`#4*2tx-;GGI7&ZicbEcb;WY9;1jc~HGb*ePn^TU_e6jPc^hl4|OP$tP2d*Etf)^kTn&8(pSyd?DpK2s=|OrYc>?c6V!zVTSGi{);Y6%-2xbCi0DP_zWoAhQw0}EF}Elid<{Mo<6}Ge!uG<T>=(YGmsu9>y0yT)5piztQMY>B5MRfuvOA`2HQ>*4RmKG<U5LTXS{|#5>$5j)!uB*TO7ZTACm4{x#A<C$v{PI`@rfU`*PL^`*o4hWVcxt+<zHxsX;zxT!(Ug01sHk_tl9`N3Lp{JKj$dT6w-LoRe=@H3R=J9vyg+!~^l-co=B`LVG%So{0kJ^t{;Rj8vF@9}}t3-Rfm@V`zO7llWYx<YaaS5hq1QWd$L4itH(c;6@kpI<t|-(}^*nbOmt5_$V0C_jd<F7X0`}xLzoX5RWD@WV%=2OBp115PwCyYndj<9lmvG=dt}CcFkoWfeh}6dD|;*wfcr*k!wP$#(Nx>Abk?5_2(9Rd*&$0x!>vF%4Z$0j>ivhfk8t%1|k$9QXEE?+q&N}LqGw!i8B9Oi=T{|bju#QQ{$u2r&BnKYaO;k&U+Ea*kOBr-*8AP<*z9il}EqQ70d*fn+2v;PPwJnnSG?MWU^#fmR;`^FExv6ujC0>C?Gr+4tUNH6IxM}G@jci{KDjv_Kr~>%)r(F#T<%}VnsJl#xu)6%fXih4`?K>+H!)Y*4&riH6-GgdmqurpfAI36iuH0LAFGHrz~F>*J-OfyA^{YQtWPlcXC~&oI(zSR_&0UlQP}c)^frvhyb;801@{JV<WqrcNnnuwYfH^2q+`SAW^5Jloa*c6r6R&kpb@NF&QK<4OTdqNgK2m_PfXn4cwIcd}?8Y^UEC04_VBD_It1oD3dZ?&CW&D?M>OH`U-1$t>ZaDI2oW7s<++R(kE!!<o%WXzN>npS(<l%%kY2rxt!4wR5=v=B%bOmBJMz{O9J(v<F}KeOt-j~fZ9c}n)>p>Rx%K;C1IG*N78}NqiiYLG&46P1+Wo_^-N616lQOkSvJYlT9O4LrtU=3Eq8sEW@HQ~jx<{xOe0y;$1L6ht!YeTM5?voxSh_vCO^6XPmT-7s#2ee12{Xn829c72QtL<;1JrXkjKr57+vz1IPRNkpY6nmsoqSb4AL`~mk5l|b+V4FD<(*p8=gOmtYr^xbuku7YD*b{U!=sK2A&UzG(x1@%o|m;g2T~a=J<O(y|`!hNj(E{)S&QwdQOMT7eA%QG2Loo_=3z&of0<120%{W^b4D5_LvH7?8=kB+CdF-RZX@)maxWvl@#FwAUEF!STVIu>`S$zlNB`scARazssS-MAH%!en<M;bi(BQ>(snXVi3_)nJYU3oF&-UchA6!_p6y1p(yQ1YyGMVd3#3y;232equ#5!64g&ViH|a`iM;1Vn2b1jR3f=ut#dfA~_9%V^pwrO|w~*s(m)dYY_a=@?UBS%5l1~f$RJ~$b!=&u-libFq76CC|6bKPF*Q=K`I8l=9;|9HbT#%jG<8fosL-h{L@9y4ds0SEfVbvzdoN<K%xRK=~XkrPwyfp7=@myS_{*Oi8n@^Q=cqgsiW#Qc_qP99K1fjHT+aFTCw1&l~o7aI<k+$pwV6`}AMcu0ubmC2U3ae>XMooJ$62%IpvB^ElL+7u`S!dAkprZ%R^Z62mg~u+tQ1?4jj?7D|{VCoxY3$J**2?vs<u0VyoEMAI*j#3QthGaBT|<l(@^YdN93|)}jdap@$`&yunWwedOFdM&Vgz+oPP}hS+aA$TKtuq#zgw$I@Uhy6s5_Xz&q!gs7IGtTEUiB3!Ag+-{jDFI@d##CcL(Fc0IgNHUJ?)V8@{w^ds$~&kKP|K2Aj$wEvyc|g|OEF1%b9k!9=_Mh>LI(0rw`cC|{ovZC5#k>@N&JCtLTzI$tRf==7u|?1DzM!bRFa+ZRmSvXT*-zHy%fJ%85lCN;BMw6d^sqOtw>6)Q_Jw=5~ZyKH}T%FLs_b0C>EkOw~JD=&v+NKI@2L*>WE%=sGS#mxv+!%)#iA;)E`u$^Iu7yZtPwO=POarhM{NFU8P(D;15T`L9gZ*S0s5@K5mo|ME#S?U4h4G=s3@2089XC$C04~v3`p4W{M*`mNMOG626mng`nYJRD;!b-*?MgPkht3dMaWOMXcfsTN>v?M1B?Nk?uZ3E;fqG;&nSp`HEks9O36mp01*LueDO`Xu!?&1AFIyGgPLGD=`p8rkh+3@Ozfbs~84`1Uu81(5=FFe$kHNRrEm%-AJ+Zm?1KDMYy62{bUZOeI4HD4BbgTZIp_6MNN=Z~ucga$I6yVn#WsF$2)21Ub-99(Ng>G%!;RoG7i5X&#Knz2^$ud7+73nT2`T8XcY^oQPE;F0xYK!34Zok;A`lR6PsQUtkE)5R<gIWP}G!!A~*@X4##r2ippTxk2|8K5=k%>(Nq`6@H_IraojV3aSfl>EmDNd!G!X<cNZ#A^l5K*V^@IEHEAfq~n5R_(FN@GQjY*XFe^7tmY1;nQc|rDZ8)H0r5C!Bl9g<?nDRJIkm0qr#}61(XMMGXbp#!wg&z(GfDB<1g%;nu#!V<G%qlPb}cj7NRE9mYqoUqX|2@kK0@eL;N};4NWq~OPtBfFFaokvp{&z8r0=J$f0Px&fPs%y+YsJERD;GFtqNT<;$Z%L@U*aK`!*AC?nOVjW0VZ`NSVePLQ1TCr-(x`jj)f`CTZt>8iYf)|i?lirrH$FyXt^iCiq(rcO&*Lh1%-B%813_7vDsYA#>qqZ1CwYl=Gzw1*&WtSLXQ=^4@?u61L$^w==@kEK2{3&X9{a3?5<QfqgBh`X&dlP-Pk(`O~b=X_m6Z9_OJ#UcbW)B2ss$6<UW=@Y&w7;z>yyU&up?(Z)3B2Wua<=`k{91}0m?Apce9>~zSzxCv)Vh;Qbp5kf>h^kDXX5J4koN9rl8ubM{iL!xCP!{!YK~IqJtH2VJ_5E+K`l$cBB(5t0mjwC)eSFIN_Y|ZxK)@sb#eJxs%)y}|mhevf2Nv{YzoifZE&e(Bek9fddzYpr0KNF5B*5u2LuYtzvdK}IfGWAVaRna6S%0#G)7gend+Qgn&St2Ww3sT2b;)1S!aBG73DQwz73V@65vn%0tu4tFdjZTEw0@%T0@Nt&oasmHsIZ&Ae}JT^bOpZ)NST1}n4b>I^9ktcb?9qNXRa3BORc4htO26f3g47N0C2!yYUD3Phm&pCv)O2NoJQ})RVj$PzB2*rwSsoE9dA(CpWNFUWKy6=-`wbpV1uB2Jb^xA$%x2~L^C=n<%+d-anPsFSXVaoc0tl{-hSRvzd4hC`4ot97t9hIca=y;Df!(anIM_}8AxugEJXy4l+8ir2X?zO7GVyqkNVx6+v_7Aipkk)P3S3RVkRaGtZU`&#2tP!Xe!JQJ3UJ7Gl=4en6u_2_KIi@uSE>({W<H?hl9M#b?(W)K5`E182S_Ou9bxDFlVXjg2IrrvEfOtZzM_fA%pC0S2$T{@_N&tP=sIKBj|KhVVtd*J~O8?VN%v^(e8qPsMI{Mz%YN##VKae3&bvlX}R$i51OZmM4p_Z{O=B!c=vcMYE~6tcGw*(wvgotQwq^K=|`mfECit73VtoK4T9g^lec&jD$s?cq04>JSOcD$N7i8QOXQ*!MY&a^{+|I11#TsVkyYwNT4699!TYua&R&o)_*`a4qCA4IWy)a-Q)(4#fRcepX0P`29rPGC7cDw!^$y4XMc{eod%mbs(YlYOUE&@V$927e$>3^&F<ZY^q&l#uG8y&!z$*JgrHpFJv=-3on`}+oRYJ<{Qp$KFJ+g><QmKw9FahD$s3%r_3B-Xh^C{NvXr##v2)Gnz>oA}JrwiX5LQqjmIk$Hh(Bu6jJEw7K-%X~i>23PkekyjkVH>x?MaW{eU~IG>5b?}1J-&yKPjwF2@<iH?8t*gicwwzpUy=ybVxX><CaSfOhLi_2&BX^C&Tr8HES9Qwg$G|AK&Ey2?_mO-|DcWS)~aELwid_dY;T_)-97n;sVNYs@1}0&De6hIBZ0Qyrgk()Sv=K4rUcU##gL?uEV-J$Y6%ud^o{P^C#W~r`u8kURFPdDLv)X&Mid=m)sl?Rk2O8J06F~vM5IU{$9X5`I_2(~P%ly@I()aR<BAhrzXIB*jvpKR7nSx@QMMJ!S&W1x^Wxa&_lkN7j9cJu1|K}!7y0MzGMJbq837hh1|ZPxzdl<cX+D`&Nl+x!n$k~FD$B3H3~eW%DzC8XtStn$F-T(1!jU~qVQY2_%qg431sP9Zzw;f99~#R2a?76NEBkZlsJoo|O+<1Zc8O0l3;8aL_nO#3`Ew0o0~x$$MXoHXWT;-B<_MAf1W%?RpoQfKRunHT2E#e(X{kdKnCT6;_vlSBqV7-@pnmX%Qln5w{appJ+1PV1r-f!dY+2MD=LW*klA2!WwnYS*=g?_o&=5Gp2$^6QL`2?wb0>A{=%dEHDrJ*Pb2J-cjN~7C#a)CoDQVw1+O}kyu*ZZ80G^`o%GO-$3H88Y_q8wASoI*J{4+|ACsE*JEUwmXd*K~iGCb(GOc$-4&~~-22}6I++3&Y6Sd%}rla5fRU8W&5#aS}Wh13nJsdJ7gVy_nPB%Q@0*r-?R+=#i7C=f(^p8k>`=7IoTW^HthCQ5|2NQ(-2eI}e0>aC6l7qL6TtU2Np)2^ZeYlZ9`!^d>C5*SgTS|4{U@VnP@Pk2`<wSSeN{XL@?awoKq^Uu8N0ZDU#;k7I`9(c*Fnt$G>WUDXa1g=ODneJiB01YS0-JUObnP08ip*umgZyY5lL*ayG3RNN;dfEZtYGYLsL?Dr{x^;VTm&^2{!i21*5hVV+TpZK<TxcjHZO8VYy%#;b27;&iXj<sWYRIi6z*%+xj&`S;-$3{UJyg4qfB=?~6Uj+CXQf)OxLnTu_$oHq4YnZ9q~I#;?*eEx;q2e_9N_PcECfuz_y{BN8wm-l*MboqqW&vj2Qy9{cDqFGc3xLJ|9v}Wa{xyyy1cE7VI1+g>QgiCgQqh1rwp~V{P7&KSn;AUH{v{`{<~lswkg@%rTSrp<tYnrY@;`Szk3`@#5XU*uyrzUlUbbZk>ifmJs%XEsLd%Q@hl1^+$Q${L2TIkIk@=ce^FEtS!=gnpYxs&)ORM<2*sPA;Z)3I-YM=8Xh&KmgOf}rlAlb~7Ca<Ux4zK-s>uW=Yf!=ja%#@7s5C#@TQ3gxMJ&(G*Otg%^&~(i$yX{L=~R%`v(BanPi2(861{(OE5XzQ_D`bPy`u~8g3~jdjFzBqBzFc{cW1KWO|Ga#JgqI91AQ*kNcH$54(WI2oF*y;sgAm8x}D(1X2OhLUsS{Iz@sSJ4xYuPAv_LtoFVooq&X&=aheOLuNRj!Mq(;TcdKruUTe-|$vcAd7QrP;qHG5L54{L$Q?Grd@2=amKO3Gn)~%buuUhi_JPjw^naz6;KlaPbj2$cR5LRALc8SNnQ1tzL_Nrn18Q|4Vg)paSrQ$@Ax!(LzDw}Hr8S9E&)fn)oiY<?FTz4bJOymoDG4R!7$=hY6h4rAuMev5K<+Z3$8yJ#dg)eatE1S+?gRo_?<I(6&a+z3i(-DG)#EVn!So51g#UK#k!7!>+Gq@qr<pTbGvI7EZ*3bvu|A#D!YoO3+6qN0ze4!4Z1<>E83yexpyF6IFzhm`KlnNmUNkuQvf(&Xq>r9oF6dPJTxlKI-_+}bZt8}U4He?}^fiwv;a+;sS@8H0Wny&wDEY_3YWitD}@lFjj9zm<Hbw~3hXzBHdPsfbPT5TY7rF}d%q)_kDA^y5AA})4BssYyrrzBk@YERnCpu$X;_D5h7^S_kT*GQhy-iY9l^_KyO_kh!Ia0c`+mmV07TzqHJZ1*;9%h&!wV|nF<J@nDuY67j`T@F-hL1f=Rw{F@^|AY)3dAn)8Iek?MQw)=~=Pa&^uL}IIe)s^ME?!yl+hI5s6&Uw8X%(4dX#8CGLdgtT#F%59v;eYev5Ei?#wV*x@1>LpExi+*)*c$T)kH<6R6FO;wG#N0lsZ$e4IRK%T?GJ4&M|vu5MuCXei*7q7ETI$g2VCYef~5ZyhVHz4I$sjSlWvYNkJqx1osccxC3rV_aszbgn+ZTY9Ow#ug?k)c23{-lohdb&)fMbT)Zibye$qfNRrcdj}?$~po^A=;IIj2&c%Thsmy*r)`!grbJwGV09n)av{Zd5jWNDS`spF8G=Bp|XxtX9qDhyGi1K0?0@g6hfc>f`irX-3#ut4unLprfLRn64N-R~$JSTz{vS$1`7x8x#TqtgShiwRuU_TvkaP2jkg9I*#dAed+rYpgZEYIqXBAYx(i8xm${9bs7Nu(9%(;tROXU4-M7|*6-u_Z;w3{;8cXmW-s5#)13o90zXrk|A}LPTUBZOr=M-h~x5qAUnS1BoC$5|k#<cwK749j=4;r@Q?Mvb<MZI#Nh(y;iB7aLg+$!xMG<r#HV%R+rGj+a`;rFP0Ei5;5+|nB1oy>j}X%l)qj*=ngHft_N_{?FXZQKHGgzkFndAOHiFqXXp#SW1gM%I?>9ZCclZzsf8R0Q{XuBfR9Z<I{)#I&5*ZiOD>P>-H+K<;#rGg5rBQkC@MQfvW6FeX_kCszbh*bR6R^Kh%ABoHA!+}SXsi0L_MDut=}Z#i3}pSSDee$9uO67t`CAZsr9^71hp8-C%}Uj7t=tj<p?T}oDk%lQBq?Co<y&>Gu~bK`91#t6nkMI|NZHUvP^nbAb;_d!%t+kdU1UDJGh+j)I-e*At%0><f7DnheYB{!!~eVf`X-kC!104oLiNL(QRk_-?|0uEJmLe^265?9ekAx&QJ#HNa4vm@Yif`m<aNqNnHAO>8J8PJf0a+hNf-kZsgE@x{^;m5Bm^R&#oZ2C%v`gD@$?Wb0#c#Iux^u8ns{SktMim>4^3Bi^vu7wB=jmh~A9sfFtRq8C50+^;2?i?(4Ql`b<CW5<mmI($7N^XbygZpHAX^dqh$G8x@EYr!Sq-?dNoREZ8RiQtihSc#_gr&;ftT_!4kw%)n`LvKB^?unN^ksw{_5DKf>b7^sWbW&NxCk!N1EeITC=pn&5@94)#<3BRY62ET9gG3%a%pwCBM3_$~{YB1fGh3A+lF9hY(AzvW<Di{BMU0OmWk6#Ml9%MtCvcp^I<=~_t_KkIrNzyfbd_d3-G_i<~N#R8p?f*7n4Ov#g%se{bYT|!MHO1wG1jQK7%eAGzw@L&zMme-kZy{FDM;Z~+E;TqJ;T>4HhF|oAyu8>f-GL7jO+anwg@TsEE#UGX*`@VKC^;rhOu*H3qp6EVapt$bI0d}bqb)y4R$wD^m+xX#0Pv;VLv&b_G#(y=BOxbPz)StU8(3imQY3Gpn-k59p*7g;@`1Vr*4iG`PSb|Tk)rYYeKseQ{^ioM@02a88xHE>T0DmNt}6y->j2wV&<?bu!*VD(V&oLVr>5qUO%}Ja%YY}_E*>lFnk)}l?zKiw%n?O$9NcHep)qJPD@oX~QJ?3`?_=CGc>CPIe+8$ic0Yhyu@-TJJezLhwB(B=3jL_evKw<J4mbSzCtSf9W74>~ocfwds^r;lXu&k=OmJp;b21fz95v~IUg`E)o%Wen1?{vSd$kZ#Y8sq?BDM~KQ$T`R1IDw7!qeICXo&m^iq=FiUF8XT1N51F7@uy|rlb8|;Hw>o%>IMSRVy@JIm;3LJds_sXCqPx<!2%Q>xbl=T7EI*`E#L~TKNDkWBY`dq~Dk*n`|a59iIY3a7*Da?-#YIzbKBL?9w-J6f4`o7gbR|d~aS$lei}QVlqeJwf_)Jh`a~lz?tNo2P3SoPe1qV{Xy1EaRBQm(}sd%wB7hOFiS%8kc3FRBd@^@Jsy&(GX;ZOGGL5*6Hnq+j2J2+39SqGR7_Q7&Jp-rl$|j5hn66Q<%-(}9yOq`%tfkQHgAdUx6(TsuadxdTqI+4;xJEMcDyI6PF7?6xOOZ>pgUY0!W_Ff@@!#%OZUqgHKT2Z8<EJ-UWNfuUEOV{wB|hhkT)_|REBKL_5MCDXm?+FUb_b8W+MlGvGn1LtZBF1Cxtq4MZLV(MToVw>fYWXVIO|3lfvL)FmqW>Q1+F)iTPFfo{o3A-0il2#7Ph)UqL_Zs8*X|e+%(=gozj5OZUynxxxztRChs)l?<hNH>#!MZ?4knDVP#O^yFPXYhGy8K)a(dO(mtn20-me*BS~&3WAHyZlFP%_5!%z5BvJc-1vneWCf-EH1o6p!%1YxWo;df?}#>3D)6E$rJ8c7+n3mEPV@e(^tzN(1yuf1g;Y*f&76UrZ%5<krfAnFfm$*@x3dt0AIG?bB3E&fR%5HsyIP%{?3!UfP3|v&;bqV1WoHD-*zu*1SPHU)EAg0{{sdVg&|kb|;(|~c{P-tN*Bb~8?&&c$lW^6d3@<Z@q?;HB`A1GfFywg3{@7=vEcwVs%f?@T9a!ShHFD7^9YIpM_u)ewav=e79WNAsoMgbMhw*Um_j}qkZkn(Er=!USrwwR`4F9V)T0A9=CZXsrFHbN%X8NlPa_ZL&hr32Ho3W&wHe+l}F9gDicZ51GE-PLJsOV)6L?(3b{p=BL=~Nz-S8BLz;1g!T>TSv|vv@GjPB5=apYKzy4A|e>^i&}}B*!2l7?Qf|_N>A3Bg%TU3Lk?83r?(G*umU-xTYKFikp&ml(}isG$!~K;sc@#)R>S=a+M?hf>JekC>KlIFoE)?S#k5gkS#ErvS-HlHaV!je<3x>Fw%ZUb%DLOEo`2R1mZ(WiIfTT(#Po4I|Ipq8LB(nkl`%-o`N48VkvA91TnV(t8nFB2))U}C}zN|{wZ}WOYBM^fBpGn3d;F;FyRF{oS)E<B@SOJp`VrVG^GU-^wzp!6TL=O%-;(JWg@+6^}6%yyW>l*0CW+no^&F--l{*@m3uL9<fs4B(?BEJK(|c1Uc$0^uK<p`QhZ<pp|m)7WW;vS_x{}>awq>`*h$*vTB;h3^!zh@aWES4l2K-tR&!GgVyBp(OeCk)vFr$4xGmO)u3$^T*`^UvK7B3cElRRse4I!)rf`Aiw7Sb66DAM?$<8C66*2F@ZF5qgYYFbq+!^U*Ik~J<CYN(u<SW^@csp>#{tCTE^d0u22Se<0W$RFApnF@2et=oc%|aoOhVzwUiyEH(T^sNpB#W$vl&byG)D&nF4D?HfgZDomoy~dHc-oD@4?gpVAiGOm5(xlrZ$tz$Q{GaT`^SmEfCdvjaK;9joJZn3SlnI8#lCQ}*8pqo+@7d0XIwc&f?{lS-|RvqziqB-MS6@8<?3%Nk>%ycbMBbm_2`LYuAarnPvB;;=o}7FRf6e%IGp6K<1oA&bFl_U#|0kfdxRfzb2MM=SC^T)Z0Zr)j`=~Fp9r_CW|+3_;Lg_0m9<2PC+i6W+F10^%sW=myG_752qIrdpKyva&`vhZzOdd8l@~RT`9>4z|0Be$a0i9)=f%l-H2FUpw50bOWFHeKy&L)$$TeA1GhINWSowomHZ@-5Df%AYm8~Jn2$_vxpt7Nh>`QD?goZx*$h&$yZ5Et}2=#*cm@N66Yyg{zJ+D}eN^#>1{HYoSdMs1qCDV=vbCfO@8&N~&z3AVbz`ki~>eFH>#I+aP{fTkL1n{>Wh9(woA*gc?tTUioV+ES}6u?L_GK|G7Q6G{jd5_&}a>sqW4PK5=v`?`-kYw)~I^+l2$he~tyU=9sE2K2Th>=m2!&EDZBs-!w+3?W3o$Do=P1p!I-8Q+u2lnVj&_{ekwou!AX(wgltfX81-N|qBM*l`~ZM*$!>@9CR-Qb3bP>1ER18I0We)U(YMZ|IoHk3nW9`3}hCHu;r{YsjpXcpJ+(99SFJ~TR6>IhYqfdDk*53z&x>O*}^DOnKrTD6TG+IAK;>6agihUPy&mJspBF;DgET8%o|dimz1Jo};EDS|a4172GHPJSAGGd%t42B!vLX&wRn-bZ)3Qmt=Lz8yY%7_Jt8^mKI70h>Eh=MsE9WNiypbZT*b?smw%I*M*c9vbBq{sdh=$?Q+RY1cBGCRh!gdrb2slo=0~lL6V;E8Smw4&u<XxR%YG<eqT_zgrFcqs&0<OjkI3hh~?b@PKjRdrx0fiz^a806&2U6DO5mnC#Ca*fQ9M!sF=zJeFxkJ`#oCEi@APl{@`ySf@R6_UsmJVASNbRNl`6gU#=hS~yqFgrsBdGN1x|eT;#+KeuZDuMf#6ZlJ%+syEVBO(V?gyMN_i(}(M=p(iT~zKTPB(dB-<C9QwpUqaj)rN>W5>W6fAQCi&lfBX%<?vv%&cdVtPyGtwY>YLyFa%C3pW?p7-@+j+5601S6hHc%4Z#Rf<Ab+P3U-yFXls1O~J{Ln&J-Tl5f!)~$a@`ypX%O&`RIY<Tqr<$W4zX^Uzj=jzZ5<6}!<nZ2{_DGF1eLekgo3O9MLhS<i=C55Rk&dG=%41}P+p!af*uQ9ZZ>|JR81YDk)uh-%RwoCDLo0Wy8D9U+g8Wej_xFcBruEhanz$EbVrUu2SjIu_3=1&_r$!AXa!+clR|R}D_kn@PM@^6G|0sxlXh9p=fvD(B(%$TbJhOU3xY$N2NL>d=<=mvT57sKK7A*zVDRT<WCa%+Nf?cQLbIsyj}+#0p|uDQ4b~pYzO;gm360tCgMx1ELg0g6EJpg0jZ{KZIlI?KPf0io78HZUvTR8jN#d^E{We3-ZXWcZc=W{*l*!c^w!yiQp+L>RO6*ZDpcd@DZ;r?v=&=8mP4z#D-Dr!B^W>vvmM66Uil=8K1Q{L2WRtDEHl>%OHf0^wqC`Em#DAimds>R(h*wF0c*B_@B2de$rP<j{16sZjf#%PBkuGC?j}*`pL78mMGek{xWK*dVpt6#Weo~(QeUg{{ZF%M%(&}b-%BD6VnE>r&ioK8a8OewrBj8ycChqz0uFJc~az2C&3ITPKj60qZ3<svPR_oNxchEv$y)qFUHxQ3O1sxeRDqiu&H%rGA?BXn|qc|lHD=u(SK|4}&ix%Y>TKhWjSAHD5KP|_HX~g|E4#E3+Ho2LQ#X&C@0O{uns$TF6z}QV!9YV5gbLgImFrMUa<qi1^=#wF;4MNkJ{@=eF?sag~ZU!CUD=Xfuf*IF<d*E6Cz>k8lsO+i$IXzgRMxoYte~3kU?`k>G#LlZ7F&nah4kA-1@Prlo*9lt`!m+d^Lyte(=Yq|gfH);s&TpYIq5sZ?$s^r_@@WzpqRjL#L=_-4&t}*;*sp=rpCwLMAV7yre2YcRiBO}w`fF!sK!IC~F(0-7<LRcyfRDqQD&MPAT0-#ih>*~eOa5hxczM)iRS)H#cGk#DSGHw)p+x@5-S%WElZn*2;O|;x)<6RYb#{vH)%RP>`NLV6g~{+rCAyBF0H%|Eh(kBj^U;DzbanmYHVe^j<?(~0&16?GZ_3SJ*2+;9;E8-M?SM-Lk%;*HjgpB#x&bP6*0I*S1-ejp5sNdGcw=-4KYwB0FX`d%wTKIh)^j|CoQ7q_cK*O)!agDj0UJ>6P^%XAV)cxcI2DQuviX6pF+<U9Y4Sq@W^8x2Y7&@nI@vl(bgHOErfGD|5rmh<DCrNrBki{)Xp~|Hu>5(T*>sjG6<+J%ORkc_I)I6}%CnDfHT_`61@$cnJmHgg=C4EV+ISF51Pu4kzguA<+<S=-%%!zDbmV1JDwI8?gw#{=fD$p2kqrS8{&r}i4?|YE@^{tjz0}QX>&#*rTU@=$skY8_7bfY))I$Ej$29@^7)l`N2)6g8J<Kr}*@%AkH-Sp5GNGYLL7MBaK<+mYE5x=uYqF~H?wLbp^Itwk=IONQOKc{?W$s~z7a9UuXGl1eQ9jxpp+oNN*d$)8Ac)|fzW-`>U*<4~8h=K}#B&+8)-W&R+dSvYcvgtWlpeq9PD1F3wm=mW&U{Wp7@@i=WOvrL9;cJ9h4)5C#v{<%g2jR?w$W*UA_J+DV7-tvo`jq|>R#i8DVPHzj6}F)bk586`RL4hi|}N-Df%Eh139?0mES;DAt{t$iFdNAQ&?+V!q{rRiC8d?x7m^UUo7xp8vUm{0$bx>0RRGd`KFzFEfRZ@8Cf=mx&QlPgI8?BA82Nw@H#;Sk0cMWU@KublbBbrw;Z^9%wLLc>XjfCM~m>ynJXBX4ke_~%Cm?_)mOr&pIBTuFcVCg*+^RrKcq@0Rj6k^@uDu#-2C<SGEanm9-?J*>r2QYatW9+7KV=xneWXNhGW7VGf>i=<~nLENg1uUa0h%ITacOw-KT}De>%Qp&qhv&mQ_J8!71cxN;)gkJh6#i@s7KRs6b)ewxg;L^I(@3ZS%n;&=rgrsgbiVJ7m@_ZYh)!#pl_twgxwCBH7YP`QLfZZ`Xv_ZrmEFzl@Y(K$Q=zot|Pzmanzj>9tlg>q#FzZ0E_7s;)V=q&sK2b`={wE_&=65f0CmluOB|*mDCmmn{>9#e7uvIjksXc_dLL!jGi3JJ-}!H8E&QErBg=`JPYQZvYHT{QP|SQxgchhj98dzldp~=^}V|s{{WXa1XVFW)R3XoB{@@=9w%f*JW?e@9nq&ub-#;Xf73__5kzxK6*4^{`MrR_a;ypwPx|D89Pk9&_3=*@8C^;|32VDzY8s2A`oV#!KXBP5fK2+me}MjWrh9uS9bB-)|iQh`)r`7FMh7h{jV}AJYR9nD&;;CqB*kfp2KN7@|3{R0%Xl$e%S&0g`68TY!c!UjmAE2*7I@Z-w(qzh0kENk`S<$sXT1g3cW^EPJ$9U7B(q?$21KU0$5~mj_v7z8Pol(Xzp>-idoo#v8x?)$1r3uugd*N-M19hdXC`HB`hvB9}vAJv!d)fpbMpE@-vIhy&jn)fp>dW8v%@tE?gFsz23sA0Y(gzp0h7IUt9W9QkE3(Y6(8PZb^c5acaMxE&7t(B=DV;d{<YKg__x8KRqGvX9x$~z!2>WqfeSCE<9pqvXGv43I7nqjX@<#e=nV@k)Z)82}Y7$6}i_C744N9llQq19)qEodan1R1BR@2CVgS#%E{E<N^Pg5)8c;{wy=eCkuDlL1gkB4mdn%TovC1W7J>zq>*_(`<4Y0I4;GOnccw|R|7v6%7%FQl?5Z_g4iq-t%lJ#DI~5-nCNv$Xp3$E3_!jy4yx>+;v1~)m@z9*(-8#xMneC=5r5TS^JN1*Wp4SZypCMa_!u>bDR(W7Il$!flr<iwoh7r)DwTT_1Yc`+gK7->N3P`g%3Vq&?Ci^#ep9XaKrY#RDnz2M3`k_ya8s(84KCvX`Q&9jsC5NUC8ie`FtTjw)=nPO&)-0jeF3lIEygZZtcHn`%N<oWV9uG2RbZlE%n`)Jm1=UZlR1Z%_Qi935BxRY8*$rZ0n#t!&R<!6)P;3A=4XCmtjOK?W7z;2<f4Qjh4EBciok`@*TVwq&>3O+rURu!6_5}k{sS81szy1<xdj+hbosu=YA33NWr|rObXb037{)~PAMfdA~zElqRRdcx%D}^QeQ_?iPqd7$n?PCQRX<nDOg9gQ^Ju+{cr(zsJ9E#qGS)e&dYi)y1AIT{eHI)*#b_rc7K2y5SpXSs+RrF&jaQBLB3Hs0TG_KDyM7%YIo_=4C<*pd9E%QQO7@HYF3<&3r7<U$d1b3m;p$%+PHWNmht;-QSUrShwcOvN_oBt~<`e)msMH>8O`O0Kbyhyx0rc2f`LBinWa*&|@y<R4YoU??WD)F|$U{<nBS03&UtxV%y2>2$GOB!?O!#yHjm~FnIg2hgoD^?2K5C^1RHb)7XRnB7<n&28fs7A2c?xNa=1!SOa-epxI<*J6UdVIG;r#ef-jSy2rI-xXhL=8L9<ALE8G*#w5rVn)>+QJ?nb7;#IKgU>p>KR&NC<Xm<7>UrTLo>&gVM7fb)r0kx1Nb<TO&72QDF-KsG;$dwzB=Fo%&pATW&;z69%thY$*IbT;oJlV(Ic5JbrEf}*@j1%en}}BX*IfyIt@K>k}0oda{F`SYWk*I@`ZP7nH#Dp5}q=lAb`aqr{()BA+r&DR_ENYjDkAiX8LUCUfjqQy{{t@?B63Zrz)zNT`OE_|FC34EHHvo4Azhu%6P~)%b5DRhVw>JhJN3Ehi!}T3iQ@h>grnY%@S%|%T;=1xbVn;H$$@!4^GFnjYe}?mkiC_xo*7W1jFm*GN$rY17D`<*lEW*VXz<9@Zy2Lsv@npx5yZV61EteW;UHPTK2mnR}%eV)bXQKOTY;SNYrpESYU_V(M)+hiy?{O#?#X%9|cyiFwK36S$_Qp=cgm_OBw6S@-2PA<$a$j(r{Q#>TtX`UilOWVWmZn@}qlu6)R4sSvw3ZA2h<&z2t%u86Sl!7&8e{UwHX0MghENIkV5_Ah8>;xM0<-ahgP0?$L6KUm|{XHAihogDq>7?Y%5gvmQE3R22Lt86--+`_d1+H#+Q@#o3HZ@()ac2>PM^c~!iUJ!3quY$X?mgD{}UH_@bXU7fKYZ&Y$-_R`!LPqa6`L;@D(Frnla`N9JHgkawy$?mD=hxObwRM4v0>Un3%7zc(;X0Bdw;xXnxVEdN1_^9t9&f*D>?!m{Dd}ZGbf~ZbAU|}5^m7$Z;9PI2SyX$<Ox7Bt6N=4rEd(^dzf*y9n5|ruWgxKEMapF9@PnfEWR=-@a)T^(aAOj{?Gpg1J;2>J-$=>b!j6C#{QZ!+@Y;EdLVwhO&{R#`~>57T`#oJ~gsR4Jl^j-a=NVc$?(LXh{O`q<VUBaDJ!MYy}w3Ix<{PcUpG<NGlwzds%C6<1$Nrk#Ttk?mJ#fp#1QXS;StcON*{!SCVe(x?lCBl%xaaX_vWZskAxS(Fq$npd^r9Cq3L~7N7vcM%zvUOaj=V>m1aIn|8al0s;q8C+23#b|(0V<lQ?X<|DRywzs4(B|2?CJB(6i5Uytaj@^nEn-HAY^Z5VZtOq{F-9FzZ$2sC3JQ}xBUwzk7&&#_f9v!7!mJb7O+VL0+vZ7QH_{YZ}H{>PhtelRRg)cWG1<46H2-(6Egzo=Ce@lwjxNrlnAc*IvG~kGMfi&kK^$m-5ba~%&zlaT|F}HY*;2{e(dnZ^}Iu`8nRh5-b@3m9l3u$GjfPY$O(axSIVjM57rI=X(hn<SO*gFB8B2^c6mQc5sT|`7>xAr=eSw!holziqpp4LbvUVskVPmgPXPS)mzwpBO#w&#JDFqmAod$0()Tbt^0*iNEcCQAgVSs7T4{gZhtu0UU|niIj^^9*_xNGztx^h;rzcVrzD)>1{{UCb-|cN%!(ynIwFlR1cz1LZU^WEr_B!(WMM|Tv*%lO80`K$#6@_!W#31FtL^?OU?r0oPybj|7A$MY@Pes{-kKFy{Er}EL%@pS%igHar)c$EGGj6r#n9A8~Vt75Z$Yj%4#X`;-^*l~pAXkG(mgF7W@G?w5qIs1dBYe3##p&xfC|B(O*>z_Q$B#^zHacy>B5g4MQlZIyq)YQ_w`)_Rxt(e|Vj3km8ELIiF)ZbAWhRO>y_#RC65L8=Ak5E|!Z3^2y$j}8%nk1*#Lm)}+*;vi|J-w_7-O+)-s*FjV=-JSPQxUB4yLxw2Cw^gbPK$?^OV1^t0R_<D8A+=AUt+C2bsQx?z11ys>Rk;Qej(WIkpnvL6czkAo|<{S!hz&pu6B+#q?s#unD;@9mG-ifw1FI)J`KYs#fEc6X(*ug6d@d9&Z&tE}L5;w^?3r0u%qSKl%|lzSFzP8K!_l!+zLFq)i86<zSePAyg!?u0G_LW*t2)zRI+lYHAd6{)0V*iHe|RB7OCkRupVUgz6wK(Bbw-m_<ul$}$jrg{&X?<hDT%w{wn6q;gYX1mEMIs^EgUfJ+uUUt)k^Yqe7Or37bE1&$va(wiEcN(9BHD!#b<q8w>S?TFrs;1}`OmUTFf+v4t)x%V393Xf}mR~!AaW2QS(vThsAg!-sG_g338I3nNETm0CT#plcicr+sT*IZwCphyi#dK0k!VdVN5K1zorkb^Cv?+9b&kIVN^6P)|3Lb$At6r*d<oqWh=b|7xwY1<Yz-~Q7vuh^Wi@k1wyjuK6;mhfX*JX+#tPapey=ENmKVCYcdC@(8d4M2R2LG>bWQ}JNB639v@KHH(;5vBW_G&t6daPD7Sw7YwBx2r`rKUv|wmKY1iztl$aS5e!sE6bO0J>?<oIP;*0_<bvveFFb<d#ctxY|`?^Bob^a+MT;2|C!cjd<T&SGNiH%K!lH7#!ej7O1r#mlE_J7yNedv6oQBmA~&z<SGL4EoU{U%J3f%qFq-a@m$^XT*dS6PRg6^g)suq`nB=2!j#qe<SdIs_L2+B*UdupE@pziF>xVyi|8~Pzs%;J)U-A)cDyZncjVAl9t%ikwE!C5vdSDv_1uXkcLN{b)eZLbxl}jIty}eu)`%?OP)RH%ZK?01DHwWD|@i5K>iKSr2IMm8S?WZ-}_b5OzR`FK>;x)rJiiAa;0rX(RZV@q)wsqVIq@Q4o*&+%wvtm-ahu`RZCt%o++h4z?JI&vMe9ABeP2t^APJqCe7i4qXz_}~RjPa^x8!T7x2TB6^81+}FeQbfz7o))3rtd0<!IV=oMM*~T&XZeI==RBtosnAj%H9g<)7lBSWdi$t!J!!wCj9~K+!fUz9n$U20c!+Ur<2ZorTcjlD8|!M2TrX5CS%Wo=7w^(m(&*(Zhc0i#bJS_Yf+Tt-4_2bXgBgsW9-(%5(6a9a3_TCDg0zwy?BTlR0`T0iiduHTxa#a#Jb6-T!)q!zNzit2{=L`{LbXL)R3bG*RCQGv^>ZMtF**-rl>&5w@ORHx8!pU{kl!spnsV6a_~?PSEGhRFQW^Y<N4$<fQc$)LMml>iR*+zaq&*;#e-VlZ^k?p-ss~KoirOE3FvWs8+j5|%&uK0{BI4<%+G%i7||fW8;RODJKPH2C|Eps7~YRi(HfM5ADC?SyP;QJwq%<Ki;s!>12W*0GEhaNp6imI<ekj=G47D4KyKc+WC8ky%F*n`(cx=^f7RE+>|Rkpo3!Og`?+B)goE<()4D%B0^8Tc{N?&|Qa7Evh>r0mIqM|#=qm2yE9!A2DpU6Do4{a-a8!p9v<5z8qZI(W%@UuJ5boQnQts8%Y(*d$#mwd|@#2Bf4r;B{T8pq;O>7uy+FEf{skParP6#pqhO0X04E~4R3&3tMYJ>_kfd6;kyn%^J&RKcHd<Gsy*r-Q1!91I35Dr6%R3ctZ4QRy_Rig7!kef1eLl|Ezb?36+{qm_%M#Z5Wc`7;^&mxS^1=ZZDP%K(2ia<j^mz@^Ha4O$D{$w<NAe*!fRI7i@ds@z*!B6v`x7lY>MJUu=&xTW{$Kx}?Y2+NRbivG0cH=8JG{<#9`#a(Rfcxp5#A~($0^}g#w+-YVk{xox1LQ=Wrgj?01}B5f039mxJ%SUf)k|?QS2}n)=;JTBmX$$1i2mraRi_`Z*;&Y_yC{2O0<4Sal-(VlXNILz%<K~2Q~TlzFJ%mHG!*64mHHpdaywluqHWE*s1+l#eUcWWxg`5?#UsCUS(e;XBb{RF@7hG|G@JABsTcPE8s(yawQau4<}4LjIf)mjlqye`2{ojO`;Y&u3;~UL6U#QTbo_ZZ>!qoo0;{6FKYoN_caKCz)2y*q12|jpu2bUBCA1KClelZSmOZ~=5kJum&isglp66C1AnVZqtQ1iLq#N)UaDG7QMg<Ub;frX91Z`0da>Vm!9QE_ZynewmJXrJ^XRVVzR1{k)K6Li{Tx6UKBQ$z&jyW^-NzX(>uP&hXD?Cmn^E&pwAIs7D^{Qh=4bsMlTXXfP*Si1IZNzYAH$s*L^%an{zo?bo17(>_R1c`%#r6=B$qC8QXUxBK&rst{HzKwq;>5j19V&eO1|1_xZ&0}uaBAYalOKKrU{1QV4TP7V_H#*_$cnpAvYD@yJ_s3<y*v~0wlfi}_^UTY_mAC3eFHlwWKR^1OYGgePxrUur-7~9com!h@EH+`<lr?z^y%|wV&NJ@-j##$Q`>vthi;=)pJq<nImdsW!S*;>zCy^wM7d6~nCt|bzOJ(|9p_sT-@76O7w<LTN&}u$v*!*Yn+UR$FFly-O<kj(rzi<f;@F=gT28iOI%n+l1$NQt+>P=soGZwv6j~!qrHL)bn=7myKx(~T5|NiETws?|`du<@hXLM8TI!%0s&}@~3iqtVXj#V9Vx+~ggOVEj71w*@V%yBt0lQ_kuyFTUt`Eb#c^co-SYQuCG2Vpo_a5h7i^`crT>kT|mQp(vYlqb1lWI<g$GQHYf>D%^xeO0Stw>#vVo@Kt>@*Kg(mj`~#c>$Qn%-{h$HQ+Bi0?35hUCyCj#`eeCRd5>8o_dMpA7{9;1aXb7(opXb~WxjBvhiQqpJ^Vr@rn#K&XAb%vsfOlAGhl5`7E@<!s(nZeK!agBKhajR&7!=+4+u=>b}*7C%}F+!v?q)21-`l54YKxrKM~v{YPseFNW`B+1}t=uevW<g>4WyjRVmNG3oPh3iKAT6=*DUBD@-Lak(qev&tARPqtfsWyIjqo(PXgLlRkNuC7e{S{~l@(MCo`bv3B+U@58<#lj3tbB{h7Lg9pM!>01uK2nwCDvyrJnpwg-KmbsT;D{0<ohzB3|yFL?PI-7V#iKM(vpY1erIyXMV<;oNii(<_silz;2+$}exBOt-Z3A>F}aKRIu-11waO-ViWmuL&%=2be_Ry}$3l0iDUZ_O&M8)Z)b6#Nf|H|;WLt;F_4QUbZkh9pD@p%WeevC2y}B6+57G%0I?P1}q)lS+%`5^ZCmuEZs)Ollq||=gZJYLlLTqv?$vNyTw-F40jKGmb;g(}3xO+kTDOeM#oFd$m&dIb^V$*Rz(T>vmgO`&34Er4IB|{*{Y<&hG;-*TXux(Qo;nZ@#U(h5Ixzmma%R5q33}YCk0Lc3NOhP7v+TZF=z-w5qrtEB0O5$~;%*6xA5Mm!1agD3Y(c+jC`4hmiDx~SELs&sZL~(%UdkyFsRT&{Hz}fLr(?!=GP|ysb&)Cd?0qs6D`hrXyf%*?CT?<;Sgt)xEN+m_RqgAWYvcm8l(-MGlFs!>E;^d#!&xV$#zCBoxA01M^+^^-M`Qp27#tRC_KqfB25si)`H@1C+n)J(}wTx~p20jH3yb9SY30P=Yv!|GEf_;zLRIWhhU+*Eseru<8*R+8*xl*1f(XP#*e*o+}9TbhGA-81Kc8xdp=5rnV&#)WdOd2?mL<$^bet+#v%BUHY#2#2*#Dr8X8C&R(T~Z`&jmS#7;QMl}al+<+46Mrr|LBfh(M?*5Sf>91qw7d0n3Arv=^y#a4ha*bNT&_Bp<WLcKGlMt{h#yzZWMz7CUiRJ0ezC^rdv~6xpv$VNeFg)@7I7-K~z>C2;j$+^4mVK$&!Zq>AJ9EP?iLP6sED0`j>wmafxYSsZg$#Imc@CDvB}Dupg5lFzZkse$wk1^H@2Vh8{nzH*1F?{GsD5&n7BFg6acgpqA_09IkPbpzQy!ojvM`W3g|ky}>^;&>*LlZCLC9W68WPp|2I$E|?@y%vg6K=aCb4&v$+1N)KKsEoS-o>d%Lur&bS02a~%a@kQz>+u=%|j?p|0B`SMBIi1WIiyp1eKB;c2mRX#1aMUJjTrL1teIZ>@<Xrc8$XSq8KNK4B1>C_}&J(=@i_-Z!K<dw|gatihsKQInN!4icvT`&OGv|#L%50~>X}~y<?R=90kKse~RlM>o|EdIMB3)uS9@%ZG=4%YwF+R#mwpb9TGO*a0%Y+);REvGk`=ayo!ZedMU)@=c6yq43(h@TAi=~YRL=6166WotwZBGML!3hd>uYCouDXu;t3Y#@L8DZq`Tl(w+^=$M#GGU{chFQ%)AH?dJJVa&vR&!Nw{Jqgp<cWJOPO{qLZ$}%L;f-}=zn4PmGcTov5p!E}0v=xE8v6HGAq!eR;TNmD=JM#lqxl23fP3eD<X)n%1*ZZ!3qZxzO`jgS`4E|T5rA#x_Kc=Hn&(_Fdp%V2j?q+)<cN_xudh?!7w8jrr-RJXd*o4~+NoL-T9b6sZO0OcdS=~<ka%9r&)n^QOk^N$xl3zCb?Bzld_|Sm-ik1JABv>Li=<t5hSf<qrNYa480XWig(HIyGwdHF*>O&vz<_frMbvImm=iQu3`9bTTKAW|kGOwSC<-u6)z+m}NLSDsp`epaux#F6Ht~Bb`~#d2i`-4bAak>&=&C=yzj^+3(M1ntqGC>YW8tdd0gpype?+zNZ9a^CBMQ5>&pD<<4rd=K38wWskL^`DIV+UU%6M8_0gmzHk6=&paVvtnco=N+lafSy_Ss7Znw3>H)JrakzBq#u{;)uhQElb<P>C5aMh&rn-fx8BI}&(7NLIJ1tyW37VYt_M`S980Y_cy1NNvx~;y*2m1j|i^=b$;*R;|>EdSeXOifCR?fyE*48oCxyd(ubA$EhkYnSE-=90TA!5K@W%+Adunt(^#{Fpl1$sm_|l^V9S6>Er{oIVj}8sn?F8GzhzQs{77>&0d$p9MC)`%{pGCsW$W;+l&ItbFg{jx7v>ZB6Qw;re)h>{HQ;THsuh3abl5}PZOi5B_MHvVVC7YEaP5Z$9+)#Y00~0hf|oxhV#+<!K3sXiUg*868f-IYN>Pmb7F@wZTy+I#E<_OZ_<zc6@^JcC1KdpP)?RH5BuzO!+lMEoW-Az)d;&YmhDacW=?xnu(X6S&+gVr#?4{Nu#;$;s@XfZ2EaIef9>FJB^etT4KW}dAeXaMqAW-=b?zrg-2L)MxS7X<2_x5i!9kU|_$Ss4RvyPZc;pBb;ts6nz0_%Wx7wq@2sJIW%;i#=*&OnSt`?jsmn!dhs&OqmTk6)?sa<Ayb(DpEnUP>&i*%KQu$e0RSqfsp%z-&TbAZ|cXzbkrBb%{HiYiX>^J^wPP_N*sp{)B3-zrb-m9Q<5&h{S5Tq?c}f-WXvnu86NW;tq)i@dL-hyn1{zZ-WA?#MW>UvN5gj**8{v@Qc~%aoQQr2u8Rm|UXSr}TjYWLP5|`)m(stOik0gfL-G7i!&C#{#ywvDH(zh<8=R#|xDiOG1V+=BDD>KCrpbvEXTUmskZ=&R6Uv2pk?a>&j7?D&xE@A0w?2i!9G(;?$?umqm-H-OCW{W;XKYCWJW;R=5JB)m3r(k?yKXgY0{K0a1F%|2=^<*~gB@agjJkJQR<;09J)S2Ndb(woF|GjT{6OA-c7a`OuuE)UdcO64GLc{O<jBdi($Wfj4EzQ+z0c+RoUmf8XtEVIzxvVSM`c4W07EPR;P55V$#${r9Y%eNfp{;U{V!V?xCnX~dg%$Zaj|5ldJ8WeQOExG{pLDY?iNpz4WgU<5+I6k@li&_6IFRFJEaPM?LS(`Zk93E{M=KaBMz`b0w}T58I1+YsHj(a*+XurHPW`Up650)lT<uKv`qY46s_J|PN&=REHSkd%|Ut#aZg&0B>iEMgf%1zl!$JXU00{zwQ&3iLG!1kzkEX{7u~i+<K<Fu2XPAhP}3UR&?Q4n(EU59`s7q28^R8E_X{2dM;YE?<)#y&SUVK!W3V!O5Fc&+M&h-kvP4nAON%RQybAQnLc%atkPN&$}k|*?fS9l3lK1+>^k2l?vmZ3JyuTkGX<F4cE0j+aBEdSA!2cr`MVl5F-=TZX1IWwb^RnA7DU8cHExB-5rwkI^ruvam->teEv)b47DwxH$<Sh4IHW)%e|aU(p#55f4QlT)rjkpR5vKwj9XbC+^7OgkNduhEd*l#@lE=&@t??k<-@L6-+2LDyMm3znOZf**=Q~wwShR@QV;rj7%~i-UXbb<6WJ#%J5bJ9fM99z&pN3z9GfjE7JY@6Hp->a^b`3EuF_Oatqy`-?Ozoi(Rf8jXWcMNxlJ#8Z#gXs6~p~&X+VzP-F0a_l|Vgh2SB%F>ALC~!Yur}n21_J?QE=E1T3E92H$Uxh1X4G1xp0_pON(FT--KvpLagpVEscXeq=O7JTU!mO6bU2FR@hbL59D}B>Qj*Kk|rdkVDqNK>_q%ekAoPh21WV4B;fk1i4<iUt>Fj4ws}{2DM&vUUQI=68qe7JO!=7OxML3u(Wz5!=Xt@E%c?p-2%HdBiMySGr&!w&1ThUA$ui}tmH`7H59nI%L@L1fZ=+QLsIj4Hp(fmLRRutLy;xKgkZR!Lf~h9c3Cn{aVwWa5*Nt;K|i*tg`k4fOSaE}snbGuGVkwn$GZz?8xo5F6LE6b4GQvvFP6UY2!cAmEcj;HuW>H^aqr<b@FrV1M$_o_2QcI-E(}+vpm4@bb3R}@AozRojcQ2i<B1N;4M(a2sHE8(HKV4@av^rcX`Hervl#V=!%b_;n|k<<ljt{uZcl8mDC<63QWM2;wbYCNu0Bc_K*Kb^k%Hmzkz3vNYN08{il**OkVdU848@_yyKLHB=l9S$W&LtMK>HQ^U+5!dNo^#acX!6Rwh&{IJk5pkmzc6Shqq|OZYYmcK{Yn9Pp(tgk6_Z)7s@e1)Yn00HjChQlBQ@vs|jFgORIV6z1qzs;3)e$-BU$(_PaA&8xu}TO{D=ODoN>$=<BXX=vsa0Q0yV!`uqhbqs}FQ-Kmq)3V%9k<9=Txb8KLv{slyJ*yV&o2Jzad`(u!2BFI3|)sq=s=RQ|KJHFp`AUh?fR#Bparui3!B$Sve-iWQoe_kEcO`5cfG@q|D$%9VVKE+TX(s7GdZf82uKTjEnqE7PPIBp0rYSHx!9(u40yf8K^$G!kG9PuxkJO2z7vZrGPt|D6Z<)n|3Vi_UYh2?MaFzmLvvSyDC@5Bt4_pTI57y4YN*08Cjz3H4_<Ehap3`AEn`Od|IR1bZ0S$B9+xt^c{!;@p~LORg3S0k}<?oq90=0d?B%B%_K_14y)aTsC9KG#idd(oAy(5xD<gM<)4lIzFX2!Nj}ay_}O{NV9-9+`O4NQsOvfOJo)*f3Su>dw({K{zPy_MRx-`L$VRYJ>NkG9tIn?rt?94jlVK-=|r7IfK0!e0xDOi@(|1FsqMzm(C4Um94lZFUq;=!Q&i0$;HzLZcjSKjM$O74b%{eTBHB~DGGSrjIvzR00F<h0gcE7$E-$}vBYQl0ssI200dcD") if SEAM_SHA else ""
+    NBDF_BODY_SHA = "c7129537d78d0cb489b561f47ec0ccd8a4dad57c864aa2f6b821908f49cb00e1"
+    def _nbs2_ds(name, want):                     # E25 NB-S2: a sha-pinned file of the payload dataset (notebook < 400 kB)
+        for d in (INP / "datasets/foysalemonshanto/q27-e25-nbs2-payload", INP / "q27-e25-nbs2-payload",
+                  Path(os.environ.get("NBS2_PAYLOAD_DIR") or "/nonexistent")):
+            f = d / name
+            if f.is_file() and hashlib.sha256(f.read_bytes()).hexdigest() == want:
+                return f.read_bytes().decode("utf-8")
+        raise RuntimeError(f"NBS2_PAYLOAD missing or sha mismatch: {name} (dataset foysalemonshanto/q27-e25-nbs2-payload)")
+    NBDF_BODY_SRC = _nbs2_ds("nbs2_cell7_body.py", NBDF_BODY_SHA)
+    if hashlib.sha256(NBDF_BODY_SRC.encode("utf-8")).hexdigest() != NBDF_BODY_SHA:
+        raise RuntimeError("EMBED_SHA_MISMATCH: the CELL 7 body")
+    exec(compile(NBDF_BODY_SRC, "nbdf_cell7_body.py", "exec"), globals())
+
+
+if not RERUN:
+    # ==================================================================== CELL 8 — report + the identity fallback submission (E18 R2 format)
+    if not RERUN and not os.environ.get("RC2_UNIT"):
+        write_fallback_submission()
+        def _arm_brief(k):
+            r = _arm_rec(k) or {}
+            return {"status": r.get("status"), "why": r.get("why"), "correctness": r.get("correctness"), "quality_gate": r.get("quality_gate"),
+                    "oracle_vs": r.get("oracle_vs"), "long_gate": r.get("long_gate"), "smoke_gate": r.get("smoke_gate"),
+                    "prefix_gate": r.get("prefix_gate"), "al_vs_q": r.get("al_vs_q"), "short_exit": r.get("short_exit"),
+                    "oracle_acceptance": r.get("oracle_acceptance"), "ingraph_meta": r.get("ingraph_meta"), "prefix_reuse": r.get("prefix_reuse"),
+                    "memory_gate_ready": r.get("memory_gate_ready"), "memory_gate_first_decode": r.get("memory_gate_first_decode"),
+                    "pin": r.get("pin"), "tries": r.get("tries"), "ready_sec": r.get("ready_sec"),
+                    "env_readback": (r.get("env_readback") or {}).get("why"), "config_readback": (r.get("config_readback") or {}).get("why"),
+                    "dflash_readback": (r.get("dflash_readback") or {}).get("why"), "dflash_checks": (r.get("dflash_readback") or {}).get("checks"),
+                    "seam_inert": (r.get("seam_inert") or {}).get("ok"), "q_readback_final": (r.get("q_readback_final") or {}).get("label"),
+                    "q_defer_shares": (r.get("q_readback_final") or {}).get("shares"), "kv_layout": r.get("kv_layout"),
+                    "memory_stages": r.get("memory_stages"), "capacity": r.get("capacity"), "long_levels": r.get("long_levels"),
+                    "residency_retry": r.get("residency_retry"), "spec_log_all": r.get("spec_log_all"), "graph_counts": r.get("graph_counts"),
+                    "graph_spans": r.get("graph_spans"), "stage_compute": r.get("stage_compute"), "parity": r.get("parity_record"),
+                    "windows": {k2: T.window_brief(v) | {"prefix_hit_rate": v.get("prefix_hit_rate"), "garbage": (v.get("garbage_review") or {}).get("gate")}
+                                for k2, v in (r.get("steady") or {}).items() if isinstance(v, dict) and not k2.startswith("profile")},
+                    "responses_saved": r.get("responses_saved"), "launch_error_lines": r.get("launch_error_lines"), "error": r.get("error")}
+        R["summary"] = {k: _arm_brief(k) for k in list(ARMS) + list(ISO)}
+        save()
+        _v = NBDF.get("verdict") or {}
+        print("NB-S2 CAPACITY WINNERS:", _v.get("winners"), _v.get("best_arm"), _v.get("best_verdict"), "|", _v.get("why"))   # E25 NB-S2
+        print("NB-S2 TABLE (tok/s, tick, AL per arm):", json.dumps(_v.get("table"), default=str)[:8000])
+        print("NB-S2 BANDS:", json.dumps({k: {b_: (c_.get("status"), c_.get("gain"), c_.get("x_level")) for b_, c_ in (v_.get("bands") or {}).items()}
+                                          for k, v_ in (_v.get("arms") or {}).items()}, default=str)[:6000])
+        print(json.dumps({k: v for k, v in _v.items() if k != "table"}, default=str)[:8000])
+        print(json.dumps(R["summary"], default=str)[:16000])

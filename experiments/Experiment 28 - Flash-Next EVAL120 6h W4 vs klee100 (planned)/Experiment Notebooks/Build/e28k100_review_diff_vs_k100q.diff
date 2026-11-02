@@ -1,0 +1,558 @@
+--- K100Q 4506a71f (code cells)
++++ E28 K100 (readable code cells)
+@@ -48,9 +48,9 @@
+ 
+ # ==================================================================== CELL 1 — NB5 configuration (E25 FN-Duck)
+-# ---- E26 K100 (user 2026-11-01): the commit's ABSOLUTE 150-min DEADMAN, armed first (CELL 0 has written the fallback
++# ---- E26 K100 (user 2026-11-01): the commit's ABSOLUTE DEADMAN (E28 K100: HARD_STOP 410 min + 5 = 415 min), armed first (CELL 0 has written the fallback
+ # submission). A daemon thread sleeps until NOTEBOOK_T0 + K100_DEADMAN_SEC, then: one marker line (stdout fd + stderr fd +
+ # /kaggle/working/k100q_deadman.txt), SIGKILL every child (psutil tree; else os.killpg on the servers' groups + pkill -9 -f
+ # vllm), os._exit(0). It uses no lock, no main thread, no cell. The hidden rerun (RERUN_PROD) has no deadman.
+-K100_DEADMAN_SEC = 9000
++K100_DEADMAN_SEC = 24900   # E28 K100: HARD_STOP (410 min) + 5 min
+ K100_DEADMAN = {"armed": False, "fire_pc": None, "pgids": []}
+ 
+@@ -117,5 +117,5 @@
+           f"{round((K100_DEADMAN['fire_pc'] - time.perf_counter()) / 60, 1)} min)", flush=True)
+ # E15B / E21 profile mechanics; Flash-Next values. Every NB1 / NB2 output that changes the engine is a parameter here.
+-NB5_DEFAULT_PROFILE = "K100QUALITY"
++NB5_DEFAULT_PROFILE = "E28EVAL120"   # E28 K100
+ PROFILE = "RERUN_PROD" if RERUN else os.environ.get("Q27X_PROFILE", NB5_DEFAULT_PROFILE).strip().upper()   # NB6 E1: the hidden rerun = RERUN_PROD
+ E11_HARNESS = os.environ.get("E11_HARNESS") == "1"            # local CPU harness only (fake server, no GPU)
+@@ -178,5 +178,5 @@
+ K100_WINDOW_SEC = 6600                 # user 2026-11-01 (30 tasks; NB5's Q_FP8_K3 window was 4,049.8 s for its 15)
+ K100_BOOT_LEVERS = dict(seqs_rule="k100", caps16=False, k100_caps=True, k100=True)
+-K100_PROFILES = ("K100QUALITY", "RERUN_PROD")
++K100_PROFILES = ("E28EVAL120", "RERUN_PROD")   # E28 K100
+ K100_EXPECTED = [{'kv_bytes': 7933526016, 'gib_step': 5.08, 'gib_per_card': 7.389, 'pool_usable_est': 479, 'f_est': 6, 'workers_est': 21, 'captures_cover': True}, {'kv_bytes': 6859784192, 'gib_step': 4.08, 'gib_per_card': 6.389, 'pool_usable_est': 414, 'f_est': 6, 'workers_est': 18, 'captures_cover': True}, {'kv_bytes': 5270142976, 'gib_step': 2.6, 'gib_per_card': 4.908, 'pool_usable_est': 317, 'f_est': 6, 'workers_est': 14, 'captures_cover': True}, {'kv_bytes': 3553580524, 'gib_step': 1.0, 'gib_per_card': 3.31, 'pool_usable_est': 214, 'f_est': 6, 'workers_est': 9, 'captures_cover': True}, {'kv_bytes': 2479838700, 'gib_step': 0.0, 'gib_per_card': 2.31, 'pool_usable_est': 149, 'f_est': 6, 'workers_est': 6, 'captures_cover': True}]   # per rung: pool / workers estimated from the v1 boot (319 blocks at 5,270,142,976 B, F 6)
+ # user 2026-11-01: 30 tasks = NB5's 15 (its order; the paired W4 comparison) + 10 hard_long + 5 sometimes_new
+@@ -185,61 +185,39 @@
+ NB5_QAB_GROUPS = dict(NB5_QAB_GROUPS, **K100_NEW_GROUPS)      # NB5's three groups + the two new ones (records / reports)
+ NB5_QAB_GROUP_OF = {t: g for g, ts in NB5_QAB_GROUPS.items() for t in ts}
++# ---- E28 K100 (user 2026-11-01, Exp 28 README): EVAL120 6 h with every tested speed lever on klee100. T1 = 104,000 per
++# attempt (= K100Q, reserve 4,096) for A / B1 / C; B2 (cap-cut re-runs) = 120,000 inside K100Q's 131,072 max-model-len and
++# the normal Duck window 130,560 (the 120k rule below holds for B2 too); I8 = DRAFT_HEAD=int8 (NB4T's
++# env, an input of Merlin's build()); the A / B / C scheduler (e28_sched_patch.py, E28_SCHED=1); no ORDER2; workers 21 (the
++# R2 rule) with K100Q's 'slots' admission (the engine schedules KV; preemptions = recompute, counted per attempt)
++E28_T1 = 104000                    # A / B1 / C attempts
++E28_B2 = 120000                    # B2 (cap-cut) re-runs only
++E28_B2_WINDOW = 131072 - 512             # = NB5_WINDOW (K100Q's max-model-len 131,072 is unchanged)
++E28_B2_TIMEOUT = 9000             # E28_B2_REQUEST_TIMEOUT (user 2026-11-01)
++E28_WINDOW_SEC = 21600               # the fixed 6-h solve window
++E28_I8_ENV = {"DRAFT_HEAD": "int8"}     # NB4T arm I8 (Merlin launch.py:319-322 -> "draft_lm_head_quant":"int8")
++E28_I8 = {"want": False, "on": False, "static": None, "dropped": None, "readback": None}   # set in CELL 8 / per boot try
++assert E28_B2 <= 120000 and E28_B2 - 4096 <= E28_B2_WINDOW and E28_T1 == 104000   # the 120k rule, B2 included
++E28_LEVERS = dict(K100_BOOT_LEVERS, nb5_gate=1.0, nb5_attempt={"b0": E28_T1, "b1": E28_T1},
++                  nb5_env={"E12_B_SKIP_B1_IF_ACCEPTED": "0", "E12_B_B1_ACC_MODE": "0", "E12_B_EXTRA_ATTEMPTS": "0"},   # NB6 / E15B SUBMIT
++                  admit_mode="slots", e28_workers_rule=True, f_rule="measured", pin_ladder=True, patch_60490=True,
++                  lever_env={"MERLIN_SHARE_DRAFT_WORKSPACE": "1"}, no_pure_decode=True, continue_after_failed_boot=True,
++                  i8=True, plain_order=True, e28_sched=True,
++                  top_rung_seqs=24)   # user 2026-11-01: 24 workers / --max-num-seqs 24 on the TOP rung only
++E28_PP2_MICROBATCH_TOKENS = -(-E28_LEVERS["top_rung_seqs"] * (1 + 3) // 2)   # 48 tokens per PP2 micro-batch (FULL graphs)
++assert max(K100_CAPS) >= E28_PP2_MICROBATCH_TOKENS and E28_PP2_MICROBATCH_TOKENS in K100_CAPS, (K100_CAPS, E28_PP2_MICROBATCH_TOKENS)
+ PROFILE_TABLE = {
+-    "NB5EVAL120": dict(_NB5_T, source="eval", n_tasks=120,
+-                       nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": True}], ["EVAL", "all", None, "on", "C"]]),
+-    "NB5EVAL30": dict(_NB5_T, source="eval", n_tasks=30,
+-                      nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": True}], ["EVAL", "all", None, "on", "C"]]),
+-    # paired accuracy run (PLAN section 0): the same 30 tasks, MTP on then off, equal windows
+-    "NB5EVAL30MTP": dict(_NB5_T, source="eval", n_tasks=30,
+-                         nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": True}], ["EVAL", "all", 280 * 60, "on", "C"],
+-                                     ["EVALOFF", "all", 280 * 60, "off", "C"]]),
+-    # the paired quality A/B (addendum 5): (FP8 KV, MTP K3) vs (BF16 KV, MTP K3); streams = the no-preemption ceiling at
+-    # a 120k worst-case context = pool // (ceil(120000 / B) + F) (RC2 pools 149 / 78, F 6 -> 4 / 2); attempts of
+-    # 104k (8k prompt + 104k + 8k tools = 120k), gate 1.0 (the ceiling itself), two attempts per task, no stage 3, one
+-    # fixed per-request seed. MTP off is NOT in this A/B (NB0 measures it by teacher forcing)
+-    "NB5QUALITY": dict(_NB5_T, source="eval", task_list=NB5_QUALITY_TASKS, nb5_gate=1.0,
+-                       nb5_attempt={"b0": 104000, "b1": 104000},
+-                       nb5_env={"E12_B_EXTRA_ATTEMPTS": "0", "LOCAL_ANALYZER_SEED": str(20261005)},
+-                       nb5_phases=[["Q_FP8_K3", "all", NB5_QUALITY_WINDOW, "on", "C", "fp8"],
+-                                   ["Q_BF16_K3", "all", NB5_QUALITY_WINDOW, "on", "C", "bf16"]]),
+-    # the long multi-task SMOKE (PLAN v3.6): diagnostic only, never in a production / EVAL profile; no early exit, no EVAL
+-    "NB5SMOKEDIAG": dict(_NB5_T, source="eval", n_tasks=120,
+-                         nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": False}]]),
+-    # budget sweep (PLAN v3.6, off by default): EVAL30, the same 30 tasks per budget, equal 160-min windows
+-    "NB5BUDGET": dict(_NB5_T, source="eval", n_tasks=30,
+-                      nb5_phases=[[f"B{k // 1000:03d}", "all", 160 * 60, "on", "C", None, {"budget": k}]
+-                                  for k in (60000, 80000, 100000, 112000)]),
++    # E28 K100 (size): the unused rows NB5EVAL120 / NB5EVAL30 / NB5EVAL30MTP / NB5QUALITY / NB5SMOKEDIAG / NB5BUDGET are cut (the guard admits E28EVAL120 / RERUN_PROD only)
+     "RERUN_ALL": dict(_NB5_T, source="test", n_tasks=None, nb5_phases=[["EVAL", "all", None, "on", "C"]]),
+-    # spec R2 (lead 2026-10-31): 3 h hard runtime incl. install and both boots; equal solve windows (fixed when the first
+-    # phase starts); commit variant A (C is not validated, A-11); no SMOKE (the boot's fail-fast probes stay); 104k per
+-    # attempt, 2 attempts, no stage 3, one fixed seed; levers a (KV pin ladder + #60490) and b (non-numeric smaller F,
+-    # measured F), the same in both phases; concurrency (simplified, user decision): workers = max_num_seqs =
+-    # max(1, floor(pool / (ceil(65536 / B) + F))) of the boot, launch seqs from SEQS_TABLE per pin step, CAPS16 captures
+-    "NB5QUALITY_R2": dict(_NB5_T, time_budget_sec=180 * 60, source="eval", task_list=NB5_QAB_TASKS, task_order=NB5_QAB_TASKS,
+-                          nb5_gate=1.0, nb5_attempt={"b0": 104000, "b1": 104000},
+-                          nb5_env={"E12_B_EXTRA_ATTEMPTS": "0", "LOCAL_ANALYZER_SEED": str(20261005)},
+-                          quality_ab=True, equal_windows=True, no_pure_decode=True, admit_mode="slots", f_rule="measured",
+-                          pin_ladder=True, patch_60490=True, seqs_rule="table", caps16=True,
+-                          lever_env={"MERLIN_SHARE_DRAFT_WORKSPACE": "1"},
+-                          continue_after_failed_boot=True,
+-                          nb5_phases=[["Q_FP8_K3", "all", None, "on", "A", "fp8"], ["Q_BF16_K3", "all", None, "on", "A", "bf16"]]),
++    # E28 K100 (size): the unused rows NB5QUALITY_R2 are cut (the guard admits E28EVAL120 / RERUN_PROD only)
+     # NB6 E2: the hidden rerun (every hidden test task, ORDER2, one EVAL phase); E18 R2 RERUN_ALL budget 12 h - 3 min
+     "RERUN_PROD": dict(_NB5_T, time_budget_sec=12.0 * 3600 - 3 * 60, source="test", n_tasks=None, **NB6_LEVERS),
+-    # NB6 E2: the commit check before Submit: 3 fast eval tasks, the same levers, scored; 50-min budget (hard stop
+-    # 48 min, solve end 45 min = ~26 min of solving after a ~17-min FP8 boot as in NB5 QUALITY; F8: a boot ready by
+-    # ~33 min still passes the phase budget check)
+-    "NB6COMMIT": dict(_NB5_T, time_budget_sec=50 * 60, source="eval", task_list=NB6_COMMIT_TASKS, **NB6_LEVERS),
+-    # E26 K100: NB5QUALITY_R2's FP8 phase on klee100 (the same row: tasks, order, gate, attempts, env / seed, slots, measured F,
+-    # lever env); 30 tasks (NB5's 15 first), ONE phase, the fixed 6,600-s window, 150-min budget (HARD_STOP 145, deadman 150);
+-    # the klee100 boot levers (seqs per rung, captures to 84, K3 pins)
+-    "K100QUALITY": dict(_NB5_T, time_budget_sec=150 * 60, hard_margin_sec=5 * 60, source="eval", task_list=K100_TASKS, task_order=K100_TASKS,
+-                        nb5_gate=1.0, nb5_attempt={"b0": 104000, "b1": 104000},
+-                        nb5_env={"E12_B_EXTRA_ATTEMPTS": "0", "LOCAL_ANALYZER_SEED": str(20261005)},
+-                        quality_ab=True, equal_windows=True, fixed_window_sec=K100_WINDOW_SEC, no_pure_decode=True, admit_mode="slots",
+-                        f_rule="measured", pin_ladder=True, patch_60490=True, lever_env={"MERLIN_SHARE_DRAFT_WORKSPACE": "1"},
+-                        continue_after_failed_boot=True, nb5_phases=[["Q_K100_FP8_K3", "all", None, "on", "A", "fp8"]],
+-                        **K100_BOOT_LEVERS),
++    # E28 K100 (size): the unused rows NB6COMMIT are cut (the guard admits E28EVAL120 / RERUN_PROD only)
++    # E28 K100: EVAL120 (all 120 eval tasks, plain order), 415-min budget, hard margin 5 (HARD_STOP 410 = 6 h 50 min, the
++    # deadman at 415), ONE phase with the fixed 6-h window (shortened, never skipped, when the boot is late; the K100Q rule)
++    "E28EVAL120": dict(_NB5_T, time_budget_sec=415 * 60, hard_margin_sec=5 * 60, source="eval", n_tasks=120,
++                       quality_ab=True, equal_windows=True, fixed_window_sec=E28_WINDOW_SEC,
++                       nb5_phases=[["Q_E28_K100_EVAL120", "all", None, "on", "A", "fp8"]], **E28_LEVERS),
+ }
+-PROFILE_TABLE["RERUN_PROD"] = dict(PROFILE_TABLE["RERUN_PROD"], **K100_BOOT_LEVERS)   # E26 K100: the hidden rerun boots klee100
++PROFILE_TABLE["RERUN_PROD"] = dict(PROFILE_TABLE["RERUN_PROD"], **E28_LEVERS)   # E28 K100: the hidden rerun = NB6's (every task, 12 h - 3 min, E18 ladder) + klee100 + E28
+ if E11_HARNESS and os.environ.get("NB5H_TASKS"):                 # local harness only: a few tasks, short windows
+     PROFILE_TABLE["NB5HARNESS"] = dict(_NB5_T, source="eval", task_list=os.environ["NB5H_TASKS"].split(","),
+@@ -395,5 +373,7 @@
+ # The milestone context (131,072, drain 58 Ki) is kept: input budget 70,560, trim target 35,280. Only the last message is protected:
+ # a tool-less reply before the resume opener could be dropped (EVAL6: 5 resets; rev 5 B3 counts reasoning correctly).
+-E12_DUCK_REQUEST_TIMEOUT = int(os.environ.get("E12_DUCK_REQUEST_TIMEOUT", 3600 if _E12_REV4 else 0)) or None   # E15B #47
++E12_DUCK_REQUEST_TIMEOUT = int(os.environ.get("E12_DUCK_REQUEST_TIMEOUT", (7200 if P.get("e28_sched") else 3600) if _E12_REV4 else 0)) or None   # E15B #47
++# E28 K100 (lead 2026-11-01): the T1 request timeout 7,200 s (a 99,904-token request at ~24 tok/s per stream ~70 min);
++# B2 requests 9,000 s (E28_B2_REQUEST_TIMEOUT=9000, set with the scheduler env in CELL 3)
+ for _k, _v in (("E12_DUCK_MAX_OUTPUT", E12_DUCK_MAX_OUTPUT), ("E12_DUCK_REQUEST_TIMEOUT", E12_DUCK_REQUEST_TIMEOUT),
+                ("E12_DUCK_TEMPERATURE", E12_DUCK_TEMPERATURE)):
+@@ -509,6 +489,20 @@
+ (TMP / "k100q_report.py").write_text(K100Q_REPORT_SRC, encoding="utf-8")
+ import k100q_report as K100Q                                  # E26 K100: the quality report vs the NB5 FP8 phase
+-K100Q_REF = json.loads((lambda _t: _t if __import__("hashlib").sha256(_t.encode()).hexdigest() == "7012a1dae31ecd0f06488a1d7d03862dcd4c4b2956570b96fb478348d9b6951a" else (_ for _ in ()).throw(RuntimeError("nb5_fp8_reference: embedded source sha256 mismatch")))(__import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;HLErc3l8Hf`9=dZ=W!`=vK@p+lDWnBTkhSF_5hvz}P^Bv9f`#OYd_U*7{cJi7D{IiBO1i;q?I=CjJ6ZGwF4Bsk{B{*utj*XN{s@jkvZqaTA9O%u|z2HM5(|-R`a~uuC4IXMkH+ngUBdXPkT~I`Qn8T)}TJ{&_v*L7Q+`onq06W;xx7A|6A%CB2I!x}+OpOI-~ik|1$ypWF#VSAMYW(tTSN<4jup!L*`#rc~RAqE%N7bU8%Nmzeb3k?`(z(+h4YR6CVW6tk20&4X5;&^I|f1-fi9cTb-AV#aN)Ycf*2t8LLzf`60_O|0d}%?77thf;QaITxj_<f#8CvPSG2>YPvRJO+|+=o~5MS`H;LQr?;!Rva-#&0B3`0y-ePSgL(#lnI+mduU*>{iMLeWNfQ~zHDuO^%V0-_(FfT($i`!IPUOn`&)hii$j|#yu&X=Si}KeC0)28<CGPwJrsL;VLe(U9tSQ7q+9okqoPv6<M^v>!}+?+sC~Ggl+=CcDrvobZ!dUdR>gn;7C1~Db7_|G{pl$pjI&2Y`4j{;5bXQ$wLHLR6#H_N-9D2v#QNmp)hNpytKs=Zg;iuE>>TV|{=JE*+7(!FC91~|0H=`*EfNz@-9OFFqR2qG`)N^4?+1LG+5iCBvNMXCZJ`3alo%`U5prmWm-I);e**UAlGzUI6&YE|t9=n3c`}59jUcL)^7QXk!%X8*ILY7PKeD1sBp&)s-|dzy08)}5h7w1^%MAUqaG76xNVI8m#1E*-mLMduFYhS@vA0@Ib}Vws-3o#cqEeY~aTE;V5&bz1)=CH>$4DY0bmqa=wR!J{@%D&avkprZCVA{*E2C>Kde5YRd8LcCC->(J&Tfd-Te&qD_wYICu8)T}Q>oCdRp-Rs+5Axxo$!7HNVFBuw{SQnFliDw0Z`+9+REI5xB)tTm3B5v^XF_vL6a}jxE<}~Lc&Xjd@m7DE9B#kY<c5@F~LaQsSbNHVdspg#Yj)w%P4uZr5-xTIg-oA>j7>P)AWdV7G{S;7j{|;eeHr#HdO*3To}<{8($yvDGrK*#om{UlTyTyn=B{C<@Ig9o1J=V7ux*0GD&<TMRxvF;2c^ip8Cm{?w}q_#av%K{R>ajh$zmV-=+!eDXC+#$TAsUq{9t%=68E5EBfYaY^Wb}E5ZWk`@NOmx7SIMhb3`csRtpE<o+$NUH^uvfDQQk>DFyJBe!(HWaj_ox{`UKA~isFHXnv?i1J#Y5Hq_LO~hS-aty-7uBTj8O`+bHe&O_LW@4C^1nU-?92j)a0z$;lG|=wyY7^3c!q6u<jrV%}ASsnkHYyKu&N<}*ACmXwFLfcX;dH_GGs|H=szfL@UVdZSo-4NB+PC<q0b`90w?}3XlSMyikoVOSgi5D44|vYoR(#?GHSfO?*Oq0~y;+yWhe`;+!cmYla%U||z0mVO!tiGVFs?sddeu9p1p`E3UhR!pgohyIxpUKtEkBY-I0LN;mqLch91>Vv3wKYy)0o-#Jt-()QhOm$@xAci7La;))KpO~@}QoyRLbg37+rwYig*AF)M<OdLYckYL#{JgQNJ+1=K3@2eu;j6UebWz*g*`KF-aq`!HRE;9|UX=>EiIUrP&sj?*^OvtD78B+zC8Ma5P0ZKqF|`P4C2zqsqMbubPCbCUA0KgVm#vOnuX!<wN=}sk4P%#S21@`tAvru#^>r&yz3e4H8bdO{EoL_p(n!*+~w(sl+w%ru(bsa*>ri1?pu{XL)m)nf-cid}9)6-NrC>nZ#CI8$Bz@ptqbLeX`(c4g)gkB^fTN==cY|me7bR8d#r}H<6T=&U55LQ5}->_fo?P6x-pdNZ*~=u5VIQ?4T)WAZTANT{sXL4GB;e{m-?Z3y^+sJ1litUNv5L27AqtHSgDY4wm*CWIT*+*_jD}-Lc&nM46dB+5KAW-EI6W6yVrS-JhF*Ghd{HlQ+&3n+cHwr^_@;{Ug#=v_VJfeFALS7Tf9tS!=VBfSHo~)N`j5{qmPG2&H=`vsD+@B=lwA>^2({w|T)&YUbB<ucH`a^)o(%5JFF~7Jw;xj6KkzasLjyQzTuo3G4<S%L28>{h*r-R%8TOZ7g>KNUT}y{YD|?_1Zrt+r#B{T`8u(ZRe-((D<lYzIxM_3>NPX*IvbsET}eX-P`zm{-Xm@uh-KXL_z1K4P(sBehfEYrzf5fBOd8^-w+6!33P6kKSH^0)^<cF*_B!XL-h_U(oiC70eppF4Pmam`+_k4Oo+SnU$Ov@*mGUQ19gOtQ6%99y@@A5y#)-nzVs|`1*ghiEkIe9;=8nin06p^*8elG2f|)a+nXfFpuFSe6Yb=p@IWpI)NKC(3%|(*yt>oB#Vxja4(l?&F#>B!IeBSY1|ef=lf)#g^TPD>wdVmR3`DY56{B0Ud5C!BoV947USP@>$$!P<J)|?C5$pnu^&Iq}gM)GbYYlIEnK%RzHII&86S7N&<^|OH;sAeoJgR&DkWDkx&-8ww70ldAheVG?eFPlgbK0y~RW-pW)?JS50ZFv8bj~2(B-VIVRxUoMwSe@FhjHyYcV|GGk(+YBOLqZY0uc3X3+=et5P2y8Qqa|s>z*F{({0pCDn*T@$EYd()#%RAEcY%|%08Ga>irFU)o1OO+E__{jYSRxy!BCg5VS@Fe|bLsxuvFXD&;&SX}D?-Ss4}ybQE2^C}fYvG`&D`l2fw5VJ=FcI;jZ%<10A7sF6D6@xJY$<q&(F25jV|od$fYs7?#m13V`hQ8-ee)|Q196EbC0f}eemPnh2uT@|xPMvb(BO2*H)ca^+0N-Slp)t7d;_^g~e;!#D$)i-1@o8<{#Zto(pvl(1fK0I#d(sPBjJ>oNY7o1NDu=T)ZPp+TvI)m~Eca5OG-r{0JAF3}u>&0iNZz?)EHacGN(xQs3xv!j`l9Dlk6JUuj#0=Fw7490|y5J=h4?o9HrBy%;Bq_)JURVLp05S<$l@1l)BzLeAenhybz67-6STlzx*YQ?&wp}=_$m52Kr6-NdQ67rbROZV*XnzeiF{No=eQWOFsxVtnOa8H6&A9l7*17oX;Z@RJFA^zpM)b5_zV2IqKzcWf;pk?ro9;532dbw*HsN@Q&-qnHmL1QRZl*vaOm*I03!6j89C_dD?t&Vogt*HEIih!9^}T{p(q=FviqI#lJ_a-Et;~c5gtiI@TKjcwwKobXVrfQs#jI}0V4u-;p;ZI_odpIQ+rq6vC2Kj=VZon0_o*kd%_NVMM-0D^x?ye$d2K7DSfI0@cpnmd^mU+?@9ek>Z3$j`O?|`y1`^T*+|}Mn!>+bxCAUh|$0q*V9z#Dlf|zUo6Y5cO4OgWoH<thpYwodTh~bZtzcH0@EQ=q69Q=?;T-p}G-&JU3JzyoJ09+QWR7t~w*EI@kw$!=JqQCXk)X-TUXtS@zItTxHAPCtah&|_}4vV3o!eO)VLsU4z2HM_NQyDz>F}`fJ9SvD&W-p!1D+T8iJ7Hu`*3Z%0QsD+FJ{i0R?|NBPeXx1YloIxnY%CGA&uhY?%rCduu>?Pt1n5#&FhBKnI`x3Gy2WP48CqTM{go%a%c+#v&itj{rJ#C!o)<gG&CBV@*T@obmh(%&Arq!uPv_iPrCD`}KZpGw4h#MsURZ7d7z3zmzBsJ<t3XoAdjf#uooT~B`%vfAc8<eD0Q<&tj{^E3&sIm3-tlXYSW8;zj7wTOkf8DZ81<|+e#Cs%6N=z_@PE^<801a@Cejs^Gh8_US|VFeU^&)~VKMb|E)Q>!S`e_482`1e3r16wJ+07@ul4Bd+xjrWg`Pa-$8oi%ZMno1IohinvPo6{H+lxxD*@9VLbAByTvyxZ&wF&1ZHLGMHYWG312`iE(ra!(?S{FpxEbcsd|n=XWSziJ@<TgX1=TlaXR$WNiHa<!ZHEOS_||sA<5hML)y#}5t?j}DCz}GI*DmvI^FU8Cis$(Ib<fBgemsC>)R(_)7`K8g5+p_qO^fY9bJwbS4W;QX-MnhG<HJT`0ykflqvYNQ&5U4wg8bTe*zsl53eLJLZHv8Jr}ywJ#Caen^o2xHA*NaeV7_GsTFkuXm266=t9CT)@@*qU^HIeRiP@)MoVqKb*}x`7yV4{S>Pq1RD-=goWY4?@Hd)L+fHYYmPkhMEV>JRO@{8pj@HNO2?R^!I8aW7;S-sL+WB;QZhw@=rzmTXMj{cScQdCZ@DOE?wf8|d;Ba`gn7#|#>O?|a(KLu7|Ft)b-{DNFIAS{<JdG|(na5J*kZyhf+`!BdcgCR{9Ps`xHRJx$B7=$=!?bNfDa!DKg*)lQ`xg`&Mj>y%TZU0<VSEw4R8s-tlY8KOdITDACpl&H%9U!=-7HA;e6up27|7xj};)D`a++Qn}kECCmODJ@m<ONSqs@%E&u;_R+*r9tr3zlo57KKTAWdHyGjfE`G2su9#00EL4_RRtS?CXb&vBYQl0ssI200dcD")).decode("utf-8")))   # the NB5 QUALITY FP8 reference
+-K100Q_REF27 = json.loads((lambda _t: _t if __import__("hashlib").sha256(_t.encode()).hexdigest() == "5cf7ec67bd18c29cd65370931fef111f89aca283d05f7ef2e82d29a68dac8010" else (_ for _ in ()).throw(RuntimeError("k100q_ref27b: embedded source sha256 mismatch")))(__import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;5UH<#9aVAf`9=dPR$DjSGJY0rdZkTF>y4csv}_xYv!hadTmDQv4J~y={a)C+#OkW^Q{jw6`DT6XIp*CZ{&Gq>2J&gO8o@lo}~=?X12s&OU_uJ%qi^BKctKbnKCdY)Z%0cifb8~S8(iCG}?pzx9kZAsg$H!3bkqlb&X?vfy;6IfgM4L1X#}Q1FW*w;;RgW9>DclV|@T3_VZ<_tX6}Zz3Ryf69wrHEk;D~63@L|m*AUCQlR6~RLGv)(o|xU#{9D;oo+pYb9oVN$RHHUuP67k-Ig_ybLW5LnkKiM`f79hS~egI5uW!bj5Km^iSf>sTdmzHBG64~ZbKpea1u0LIQ)0U^GTlH^OSZA_Spl+^z1sPA)rO6Ek<DJUfmZu`mXBx7n2XW<Wsb4%2FZgfPsE3nkEd9`UlqHZM>C>2raR@l@i{9YZ2M5MRt1vE?RE_nTnI9n8C>Sn7Dq^uTL9L4=dPwc-JJax4I`Hq*ARbzfGMR*1;uEWZXt6;Ib7gBfJQx2?E@7>Pw&4Jv#>js5~ldDKqdmkH5@zeV$<T&TwQ?-P&EoVEI2r+b6x4up>IVxLK$a?^Bl7c4#C(n|Qt(%oX;_rv3Nvhk6DRkv}K40|-?Y$a}xYt7N^M<!8n@AU&FT`H4w(;+A%zL-VVyIi_zoZfmh_d6DGMs@BrWL!#DFn45_y`s;@G=xs1m`mS~DwpsVkw?oFFm@rpJWIA$S?$dUPi#G|qd>yHsq~G*o2X>PTn+B{@yak`40x(sR^qOe5^spqE+i-dvM)Kbj1tB_FoN8YRyEy$hSYu60w9CjhFtAqm8@u+N-Db8B&H3lJjJfqXBylqDBxaEYsQ3wX<`r^AFUS$sp5Vm+`qu$EUlY%9F#~04ktzITCgJZHgUHB0Sk>frrD-hZj3&|a1klkY0o1$}Pim7|x464Mz|@^RUARGMWx5|btNpY~sZ_#h)!owl4#k^^jk7iE=f3vL=3d<M82?F*9w>&1u;c;KfBUh14JWyFIMZR6^h&F%*+BlAdlp=%O+Z+bD_Gf~JXpv~jPOuk5lOPZC<J9>eQ*a{wQ`#HuJ(R{dsP>G)_=lsJOu0e&w`0=K@TkVa_E<wD!~`ZA_eO!tNdPnH<N-IoMx{j(N%6afck|V`}y{XbF=)I>zmSFiH{&F$y#XK5D`_sa|<qp{;r|lE3k6${c%vnflf&jtHmfM@2Jw!*vV0?LS19tC!iSqN!%_|_>B@v?n#WHlG5Jf!C9-`owmq2NmNCNHx)qiC7ivli(y!D#ul76yvd0ERS*xK6fboqby((h=7`W<h8Jm}9Hd@WH@k!Nre{7Vep;j2csfE#J+EMpB3@5RRp<VEu267aGQcM|Z(U+oz6%{}ggHiOj|kp|L#((}d#q-ufs**snR|TFv5PP`$Yi}bx>M#IsJ3Ig{$}?|9>BR^g?>AC7T?{Vq6)&I+(^dSX_b><1#(7$eQM!$xAl+`nq<)^*y*h`kC_~7@9{<s7PsFWnaW_k&8uJSLik=IHlR~eo9NKo^)5(Pd7njyHUain81_;P)+ZKBeFS9@2V8SZvOTWoWnyPZtc@B%tSSN&jZDVFbtD!hyi@<{RbcAAVvrk*BM0A83OK^RkMvwogLfr`t?)nHcn}$bX+H6Uy_>B0HHeGkB(DfFC@#mGQv=>G`VLKL7Kk1T>5(S*y8cNyVqwh-`m`WNWx!HTk2KqEKcd9zpc=;ZQ9mA&dWw9X=8DOg*4sY!24LI7LQ}A@YPn5v4q$~cvA{O*q7wwHEC~$j$&bsj1j?pB&y;_<f`Dm?eQRahZ!Lc%=rLt}jGZJA#dz5tC9!EJicfRX%H0#-rnV2XWc-~#vO%(6P&Ya{9J<Wnmz~o_X*~%PbS!*gyF^=-_c;07zAFF#wnMVYm{Rv200H0&f^Pr-;|v<6vBYQl0ssI200dcD")).decode("utf-8")))   # 27B Duck R3K2 + ARC Prize xhigh (all 30 tasks)
++K100Q_REF = K100Q_REF27 = None   # E28 K100: the W4 / 27B reference tables are not used (no W4 reference on 120 tasks)
++# ---- E28 K100: the new code, ONE sha-pinned lzma + base85 literal: e28k100_lib.py (I8 read-back / static check, the
++# projected-peak note, the run report) + e28_sched_patch.py (the A / B / C scheduler, Build/E28_SCHED_API.md)
++E28_SRC = json.loads((lambda _t: _t if __import__("hashlib").sha256(_t.encode()).hexdigest() == "d4165f6c859b32ed2f2438d92290b6ba1f7093136196497b94238d6c2836c241" else (_ for _ in ()).throw(RuntimeError("e28_k100_modules: embedded source sha256 mismatch")))(__import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;gXSQfL#DRh=`+9?HCI_#NIBcx$`7r*KjugOHuSNz^H0u5S~qTs<Tx*f<6<39DYnNu-(PrO{geMQf@U^F>B2UPk;yP9&PJHV<EyJZ&4Oj{54HDCN#g(QD|hWCyMZu2=w^iAHX2kV$7rMx;wJbsJjgYmK&)f@NhC|<HkL!qj;aNWw&1!sa%*Q2;STMGk19^L8QBs+0+H@Hohp<H44V(hhr!6#J=3HEL@9Qd~M4)Fu(k75F60)c|7^$Fc4?2Q7y%j2GnO_`7C=d0|3DZlHzmyje8hIt8S^8;xC{P@9kaHPqZW2cMj2j;}QxE!2l1ljy!F-=%RvbYCf$$NeIo2=*LJ8WUAa0A4jK79_};RKmT$aHqU}6rb>Y@tN|UmkK>DJO=pt=TZXT}Sr`H2<I8^(gLF<W;U_-LEJOjkc?G4JS)218N8UnvvotWlA<qNKX&gAl-M*4!>z=I>jwIl*jQz$PdE_Ph0T}VrUjhaw-(83Q#@;Lr2Yg0ZbQz=+w{!IN%aQLE-ipYUDD$-*XpY6+*zqn`7M*HdxS?t%8;ok|kxzuTgEq!UDoi2k!*j&$9O@~1^=(lLMneya&S`FffqvX^z1vP-SSNqYVtxWfU3PYHf_H)2EI(-S#&%ahnt$i|A<egKv)%6J>7(05H0@YdkdY#|%`Jemx6~XjB>X=gOkj^WuLQ*m8ItPtrl2@rE4{&&>_+`nk~R+AF|5g|o%T%Eix!;g)JIO77cy9g`M)`Jf<kOFxn|brT)7EI-Zs8(_mpw!o5RJypQ||;-c@v84ta%GUO}Nf{M>auo(HyIfx~i#&$^B(B!&1Sl@^*$)q%b2_%?CDe<FXQ&UVB;^(_i9DT9`QnI!kW4^(#X<A3<@w&4He1RhJs>YigDD2Xx3`CvF<imlk#6#<Du?P#Q#f~PQ^i+1uY*Sw`ty~o)Tg!E1VAqiSuyTuHDW*T$pOy0#VKe8qHgE9kb)9w)Rd@eVuB~>|bC?<gQb2QBBiw3B}(YHls<9CW^Gv#^cc@!KQWHu0k<zX+g>~C<8t=}3vWRCAKn=bRz8cQQjeEoX_I-#>M<3-3@0~15P5ABsJ#eS=$N^$6UDZo!$!a!7XT0m&u7JHTrH(u{Nc6p+m;j)~!#=_UEuf)5Kaus6}4TOU1<ebx(RRmVMqFpoyNH{K$!~%zQ$0K^|-YkzO;RZU*86zEHC==>SnC(UMp11`TxAOb~OE@l-li|YjC#42n!dNF%F$Q8dn^}ZRUAx#p1W~*a$CTbEGo+o1$b#byr&TvS(I?Lrwuwr!XljoJc;))JbSnl*jpZybC;_QU#LUv^{&wB3O@esxDwksARUz>N5`$gID%6Q&JTfQ8aE<|)ek7Z`;EIx+xNzI6#`$97ZGU`OLD(&$e3)FbU<rLRzg;?d*kZhTkO#^4jwui3M%PCz-Jz_Lmh^_lazZL3yur!KHY7Ahli#)(sMFdPApRnxt|hpq)rc4vBYbm(F^S{Z+bJ6lQ*u9hc|SxTDT4=&i3F&{BnBda)9$v44MGLY%bYPyDFh8s7epza4V)~-ZAVtz7?Rms)3>6O$7QY2)--sKaWiY!=&{IZ*)iWF;3Vd@_!l;qM8ba10gAbu?qyS2A13HMxeMo+ZXIeF#g|z&uL6629vGb-wq=u8j){F-C-wPI-}vcOw<h+f&NPO(V3)#={K@;$1K0EUj&C*egPSWMa`@QBvkXx&n6#=1UqB1z{0*5(DsB);Z&b2#oDAhEe8~!wh*`sc{RgiOFX9q>Q=BoRt;%!zNzNP}*F16SkDizFAxTXQWbPXp1aJzI>1*))OJ)T2-{yf1MAuPfnN5?@F*0FvAPeG2So{cu;iH=D6tQT3&-@hN+^d2L*+*5m9{kAfIZc27{}|IbmoXa<d#1h8*_y?lMP!9t>Dl0AXL{1vB+(By|HVALW9bi$73yxJV=#Ozz^EL&pT22I7;S3TZ)#O7eRwI{!!-|}NGjm{{QC<Pxpdm*aHZmQWtwMVb)-{aQ`(|UR9l(I-cuPZXraZoIIL@5%cD9r4jJZ(sE7^TX^<RwDX`f?aU0*j4m(VIu=ZW0@BAqU_Isl|vZv&sxK)f;z6k3n5JHGfg%>i|sz$DhzkgAD_ihTm1oRX-2~(E2JR%iBY_T<dVRK-Le@cw6G9o=Ft}sL=b|o;wG$!&}fW#mR={b3ijB07%RFiv0hyDEl1wQM_`AR1=SE_l{l@7ufNTeb7=r9%>+fbu}9dl2m45@pD>3^DzLMfDy`Z8dM;s|{S0~91ri%RfyTQ0UMsRwn$WU&#_%p4+Uio>rp!dZj#2sjW<1r<;2k+j4x-4AD2sm*Izu%A>n)XEIAJND4hsB0Jgu_2~d!E+$+g#fuLfm;&9s{#+kk0K>B3h<NDeq8zjQQ+Mps{I66)qlIPfzfk<tDe$e@~aty2MUVZ+#p$9n@3;mw4e2st8hVQW7PxpihdAQkZSIw@Z2p>mDswy67>zLT1(j?C)NfR7Zw%R93p*lgN10NFEf#SXO#G5AI=8V=O2;)SSe0;h!mDsoS{|)9#sFW#9Q*u&71*_(?tC`7slOBVvU=u2L#Pj9A1??KK&#Ey>pO5_H{XZU0c9K;vJgnRGLZMt3D1ZC{svPHn0zjn`{RZ_4LG|?`e?Rb|yIqh{t4ht5z6@b4iA(S&!p>KP$$<&7BX!)lF4WJQ?LV8_V=ye#k}$%9Z788=w@G5!>1W&p(V0_9H}ELB|g9!o~(fR&NLZX;ik;i<xbsyJUpIf_V|L#DuTJI?QMS5E;HylR5JPM+w%hDC%xs2sb?ZRLdpK1)FAM(ymhGQpZ^GZtZ3nJx-9Pdq>REWBFEr(bm1@v;RU_aj;Jo{Nfxt;$nYCpAs_Jj!Na6h=71utRN>aD{#?kC~G=<8;H=gnqu$i9lr9mFyrBw<=ex>9`R~k!gdq8UK3F0qnpX<b%c(+6F?z^*HjCU#T<{ZHv8q>m}e1t8h3n@*wOdfQmsH<kHc(t#uA;*jS;$x19DtNoHO!(b+Y1bzY@8?fYCr(D*?vsgQkxUw%#xIm{16+(+nGO!&lK+IaqGJ>J9i8MPV?WgSHADuk1|<CW?a67h_Mlx^d!OzV}?(pIBqKR4C;{*)vo?|Mn@+A!msD+~Rj@8{bm$a-?~S!Oxlq=P6;9t-V$=7&FBQSc^b430G-KP31INL`m*OR>X`cZ?NQab>@m1w*29WpPDf8=jj$QxxJ+*yL30c1r(!lg=$o=W#LpkiS_5|5;4YHJ!U6N+Zcait1SIY>fs43HsO5ce(LG*(Sp<-)<t4!PueeI2HUxC`8>A3(Mbap=OgdbJnnyPEV?8p%CYRoPK7R`A<a=tl5O&P0C_De9mhKYHNuqJDk}?2sD(T_*y=|@URbstlZ0zlqPhs9Rsz#M3m5dpM^>Fj{G*teOmxt5t_9f`XSZCi_i{sDStN>Vqf3?1@cxao9Z_D=feKtomrrP>w*`-k->`-!7vz=e&8~kE+tE>Kto;)nr7~JL=}@9|Q_kJ$pp-V&7pK?)X>gOQ2|E1~S#r1nSTiR*KO$cei8zS98C{qN{8kC;m-W}DDr^)56z9aWH{a<oA*^R@%!>(~k#`tH5?LD)8>2tsxHlOzE0}Fi@=tr7a@y{EW7Vv;LvO79Ct3Zc;se#&n<rM}q=7ty0PE93MU8WjU`vvIH!m^W?39k?oiDS%_^6dtsUV(o?d_W=wB`&1Xxndo+ugYlFroqDh-7p*g2w({%paWTM6{w{@X6(udhbhQclSLdhd7euc1!qi^`*!q<_#FC5-BFO_v)p5L~#|WVrNq7v*BV+O2=;OY_Y8_bFx7QrOW<Vbx=9OfBR3<<B%Xy<69*E{(#{C);an^#}VrovuSRK^T=qhR;o1;Xy1QTR!r2YDbg~)4^jNNZMfrg;f`@ph7|KX3o}o<rMD}>J%s^|19?F`wYwJ*xQL5ea`&gApRu&vQ?s-Wmb@`lvbn2HLzvTk^)`Z$U_TT2$to*qIfB;9jB(Bb9xIDxH%lmT0?lXYygrTBN~#;Q0qv{m*neFKVR!p8E^yPs*8!6!twNeoydz~uFpbfnG<1e@7)(G$jjDGq%gm|g7;+pv%D&XPkmC=niMu9)(PM?OBe?P|*SRCIJ^-h;5i7r#2#^UUfZABw8se>C!v$P)V*&6YJZ!ZMsAtlo_+K?$3E}mzj-K_W9pIzxbF?9&$nTFkA51%wrVot2+C<!N8SeyKsK-Dh==P|&Zh<E#tzWF;c!+6naS#hD(eF=4HCG)Q4%yZk+N;u|8Iave39^yLYFznX>|lpfE#GM@X*k1{g-8mcUCs>zssU)Lui%8Q_FIQu*el(&><$Z;ugqTdz$EHirTTO;XX`wP8iS_vqBd%S7ZHvW(D0K&ryGvVKx7RP9;bShT6{+=74Eo0$5i4Xm4#*Eo<<vf*Squw#`C1uZ2w}HrDo)Js>HxjONr{NM;Y8|$32_Ad83JOEeLF+q_CsyiNWiB6O)xw-wFlO7O$kwYHrZRB<*e2;{zts&xuqN(p+byG85u<5Xy+cvSbYea0--dw~>eH*7oTP3smOSSuk@*NrJgOOJK1iNwLI<Su*vc2LYoadf2Vl%8iWts7UjU_!g1|4(KV2QpflOo95u_p^*I1y?`KVX71rHmPE+o0G_spD0oc0D#;n~Ir>#FjqE&>$|2ssCL)ZZh9+HHl0UAM=kd$L8FZLotS2L4i$U^mt^Rw9(+)F<&s<6?Z<C#cdnmc&jDnXAc5<MVHdK&!AwyDlR8?B%-e#?xmC3Y9gW;WcI0WTFm7gjlqTV;Qz2v_eG(_Z6X1JK*@Jdl?i68+3@ESd@xgy9U%151V^i}fJBjk=xwGEUl-=!9;GSlYEU{xOSD7;rizva9z<l~E0ytpr(T@0LkUw>JEZZouRbdZUcfoPIDw#^b@T-X&f2W+@JRI?t^Af*;a0}~oziCNi7uca~>A?||MqsVUBGM9fV(s{6b)AHPtQo-!n`i<g3E5ka)BfTiP_vP;IF3HC*oeJ-xqM&aCnB$YmEcBfAJ48w>r%-wY{iQWSxvcZ*^;;OiAk0%WRANT`@*EwwwCN6PuKIS1YEk0EKsqJ}iMktY$O(z;;0HEVa{ys^LJH=1I}U*DjOr^`<<Eg6HYKgGle)vaD~7m~v~(?pbdpUN()ffy*o&0SI{HXNoUF)2p62O_d>Z)VeC;+tEmb_0#;09Ma{oPe224TX{X@0a5}4yL?@e?{tw0&7uh+4Jr<pbc@=f__C}}2y-z)qBAWgi%x#t5(IMvQ-94W}X*pzZP!x>y%Tsii0p(6O*f8fq4TZhwv(oiKfZws$E1Ri;}wwOrUFB@0jf&8~%szRqjP->+bXG{1<O=Hm|aRrccI7Q^z_yPi+G@iC`^dRk5;q_T*ZJlK%Cv#thO+H2;)aXqPf+tqi44`s;8ag4uvzbZ8p;y<+vuO^U$8p8YB^kOk=v<O~>ruG8%-Lr${tjGc(3YNF8C-DP_>EO2=^Xb}qeGL<3EdoOdvz<x8npuhKC#FvDc*NPLtzej7>YU#vbi!dgmh#kS{AcHWi9m<FCaVk0rV+372`dAZFfGFd`&HOk#pjr_1OfeR4$7CcX!*<=H+249)av87&uYj@8C<H=P&9!KLgnVq?@KaeaG>ECJ$4Jnuan=pdc#LR1E@JKY`fzjW}%!#a@ZPoC58K!1L;DFc2Ffm=EVKnL8unfp8IXr^y?n9lNhs88?@CwZ5sgC~m&@#iVb+UrB=%?(Gc)$w`g*=DQFQd3t_$1-nqIP)d_?V&kJ~pud%v-Gve;Vn0fLV~xI{T_b&@YJ3Rv&20g(dSdc4%Xp54<~f(LG@9tVk7HBIAqnDA(=E7UmMS0&pZb4m!;3(7Rfb6;hl+ci7B^N8bRsqVO{{E2%0NG;XF{B|irRRrCJ70_I)|gx3WM2c9Gb|2X+MWv5J-;3LX%lNukqn`95ss?Ud7|dk)!hWwh`{5C*YkjH-u<t6_{)Uvqg-tL7z`}eNhGs@PA8!h*qq&6*rNW{j{SxK{_r_f4)a8m{hZzKUD&rw<Ydk18S#1qD8{0^3t^LsT;b7TcuhwqsT=a8qg73G-Xc#(Uq?6bMrilB`)W{`aY%OnS)@D9qoUFO<xtM_t%}O?jtmIOL&5f?XehC77(^Nx6lDcX`k7x#_&zG;A>J&b?<8>BKNDh2b~1;G3@c<I)I(@Q=m@(X#MX1o$@cd2_ybfdWm3mLP<+@19_!CalueNJQHY}iCl#V?O6c~NYQdhXM+iHRmgQWO!;brR1bb}#rSfF4&+!H__+uo&U1?)+c4Xc69;FL{>x|=*?e)TO+Hd^5PLcE57x_^pv(~D6CAi^LLKPb47SU1v>A;Z^HZn|0ulFF&i5Upi!xqJ8(w7`5zk~4`t7NiKHy}B*xZO{$*Aiy3-qC^R@cmuO;5>OhKkyapOmqyP&9`hvkzQ%1*we96r-2O=#yl@I&0hwT-la|U`S0}6n$?SJkE#4rLJXif{{31lHZ>5x5L}cw)6#rbqUr{Dhjk~QDt!T=5CUUBek!uk&`hG)+6gW^L=d_<z>Do`S3T!rmmAxT3Zov_Uriv2{5p(H2ShcL0ZELj3D-Qkw)vB#!C+-Tp4Hw$uz=|#H}iE_X6E~66PqHhV|FOtA5tj<N2Qs3?3J_iZbG)x!}RS#-s#aU7zNW<mjwZv*(n@J!X2zf!!zHFI`ZFdCHg<JuS$F(lCx#%74`wjn%_|Q7D#S<`v=n89bb~`HUz4+PDrcR!m^g?u7`&{$Yh<0lYPyP;ia<hO2Glgsn%_qN3Xy?1bjY(zEpxaxy3Rl$sw1Rnq%EN3<f!YN#NGknV>?!FJo~F@DnF+*}!h67(j}rr<JiU0gXb9prjL=0`!GL5wJCDwEclC^Vo|j}wj1<a{6t4^kg5RU|ZEZ;T5wJ}5nGbS4%fezciZZt#G#%3~|xOM<Lw3nF{a2K!WmhAWzbqovZN0<*nU(Pa{RM&=!*HsO7dqq21DEYu$N)C}>qcr~;x&I98++o4gfBwss%!l72B>aB2#0xBJ5I^O&QZvi!5ZGSI+Tx+KzR_aYmc&>^i_D$}tWitnK?(J`?Zqx@fSj~)SHT5bc7K}m8=W=(W_T>94cp5x={6eY1&wCye?)E2UQi@bZ2+nQtOq9pqkhHgedSylx`tJI(6>O1oJ=YxZIrE;(jhJ1@*Kpn+`cM)lu2nj=4PSqw6V;z&z(!_TQHhcn#fM<mcGpK%;#8PKX`TjdXi09>cUa3!%thk(;e9Yp6c*5JqG2iyu(^PgvT-cr$fADFSEQNR-GNF&3zUL3iVJ#iM%)-}6|T`mY70v#IffZ@Jf74DMmK|~W`?Mg^|`b!<rTtG37itD0&(<;?Z)3tVTvyEAV#m>sL}7rN$)+1i`{PF&lPnNY4#wtVaK$`OP$5z*~HI<e-_+QPX>lb3FlIvg4D_G0b1DU26{lHC0&hPlIt=|-<$*%r#13DSBH48KPAv?<9YFLkULCVCvChl!9J^`s=8mKGP~Rqr;LYcPl}(}p|_BmF$W5lR_y)dRIM&Nj;^O#G~I$1x(a(k9m$sG(AuLw%`dH`RpV&SKLEK6wB8uwL(;d<%S!=dn-AIZw36;ZZJzllm*|lkZ0%kEw#5l)H-8)k5=8IVgv*diRQ0faWv5r|m5IK?QA{sPd8eQe{Yzx6$?tGJoeNEduBjnr{6aWnZE!v@Fci}5Q3DJ*llp%%6RdEA9nkP9Y#qbieG-&F*A+xO-~tU}9Z;gxz_ke1ish_oTzR>;#SvUf`WiB)s}p>pk4#Dl4g3a8l|pYBYrqR@yVH4c2aV9qBN<D!<Mf6GDjWX95M+G*YxY(Ozx}tY(SMcha2Q61fq6=anfD{_BB|KrpX;R<rRDx4?cZ($8IftW72|p1j|C<1_KSdmTS3N9?HqTL2)eI=-V^ZN7~gtv%7Dq&J?Q2BdVzDo%oK#W12^%MDYMI@Pe7fXjB5@<;L6^h%b#azAf&$8boS77g!n&%tZT@ZXe~r0o!K}U(vkQjmHz*a#de!?*BcNJW$3qbTm4J%(<l#fxCDPavt4uGeAhIanUJV!b)2AK&i~oXg60C-g}6sPf6l%a0_8R!LcE+yE!7NG@as^9VfE8M*I3Se;zIjEB>P92hnbzPzP9zkwFmz9-XSd^pT0mxMO*<bjVcm&3@<w9xHE^zMEt#P9-H@!jbnMCYt1o%1V5=h{fkF|z}dlXY`NCZQW@pIboZ-Zz4%7Usl4hLw6CVQiD7lcij==dMm?1&oblx@R=8Xw)Hi-FkaxNVWA01Dm@+x4L2Vgu*GH)1$D%K9*o7H^lp*l<vQOdF1vG##_K9UOvMq!bq5LK32r-FsM8FMKNX3bH_B&{7P&9NjkDQHqT>Wuwv7^Os`zq6_kDKTpzA}`L_A<cu_qnttxQgs}6yeT~*XHwD9xksh6H7fNNr;rIojH^n$BCc3^?VAxm~)F`TQm%DLbvr)saqfB1Pp&OY+sboys+~v%Nb84PO+l6i{=c?)~*Tz2*Rgg6nQos5~~Dgy><swH102(_639qNZmGtbO||YByBxr+`=U(jfCX=8`~R)_C?DqZg4RVr#9t6WC-GZ(&bSe-o5agMr=s{*=u#9z*J*sa}Lm3B)sro;jb{rs7%l(im?XLMIf<J&FwW|JbiJN@9qe(C$+73U`<+f3Jh(H$ERUbC6<5-VXf64(qnr+%@hFfz9E}!6PD%KFe$WhBU~cK6M5MAU5<S@Y~8IzE&HSVu9&WBrfK>Sn)9Cxf?vSgp;=c)m_Ys63n$`HNkTqniihlOS;0w#u+HP;5BtuProwl1OTO@WsX=L$`=14#$+^0^5bJ`LVF0l<(YgBzYMyNOU;Vz{`2ERY%`IPL2|Fdz4f(XkQgQCNSdt3)w<Lq6+ephBeHLj+4BY2L_Y8gM)r+PF7lP4mk-Xxq6X394l%cBJ%Q$1r^FOzN0#HwJRTL|~Pph55@+Gh$ma=e?Piu{n&a9s#-q@#wgoVZGWS0&CyQHY`bgQwDtnmT<cja)@Te_)1W4?6v`LN67LiAQ^#u!|;obl>H%eIx>)B!5QxvH*C_7g9gt>bJLBb1KtOA<eA)pcKvZ{Ui-43m2ADdM&BWeM8z2$)F$pG-e^rl4n1>;hox&gE6x^zWg+K`7To0j{kSm#5$75&~igVJ#ETp}BOWdDn=Nxh*Y`0emOYH6ry#H-Mu#1qDS{)|kgn_*eG4yDeNCSVw6Y|KW*18lP!$LdTK+n6mLb`An@50e9gzETL?+T@BH9K<X@YZ#wOUA_l}*{E8xKZ+Kd_v(vePXNhY$giT6eOJ1+;e&z~NtT>PuvnS<#3M;!gr1B7Tlp)Y4OnqT>f4X<~a*9SjjKmd`9nh5M5`6qWjzvkV)5om4l2sf5L9Q!VK6n4%{>YK|`2=wvD;I<Rc(ATf%@in2g>}fK*KW&Unr!rs#>z!4YLsX$w=ktb)m)3OZFP38rk0k8k!9YDteKI2(X913kS<70>WPqy+MO(PnzUO`M>{vf6_Ft5`Z1cD)iKA{XxCR}3b!kfuENVNurY6x$CH=#6PpvoM;ajHJe>f0un`J=Dz}^{SnCillv5K1Ar|pEcPFtoi3Sx!4d1-v$!?@@KD#gQ`J)65wmJD629U}YFfbS-u#fVXRHm&M!Fy`o!81bl7oJBtrkfRJ?}psHE14mQUyMGrKCU>JNs81kr8(s!ds_-ro`qU*u3Ev%Ti9$~PJb7qM*Y0^3qs5@>vz@T7%Nk<Am~l~0G)~&{C4}l4u?w=`6M1;>miZR5|=$LEL4~&ul9ZrMB$+pculVH2^>Fb{&Q6X%>>=rQS@b|+DA_;R69h11T>3H$8^{j3A@%BZTc&<?pC_f(Aud8%$5;4$Ar8h+ow29V*PS_0uXhYPiFRqovmp;FIpB^6l`OP`=2U>P+bYM*Ve$R9K!A)O#fH>l;lEOJN;@FXJbf8zOR?dPnE3OEG5<3%`c0={tXO4Dd4=3c}Kr^PLJeT!ojW>KkmcgOPQj(JHo-rW|4XY+Ii5Gc7c6mXCK@7w&{r%0XUPh9%m}SK22$k8{WcS-IE8nk7=XcDc`7`%RArrEy|XOaqJ7bQLU!nc8ei3qHsljTQdU!npzQ{xBc)vs`d9)#l#=%qprC@^^b)WS77alC>LHE%z1ww&l1cCUJCZI<?Sx)Rd112C{DUf9WYNNQx8IWo6HIuf#@JAjGN+#Z-xcPs}DQyg0A@0X;k5?%l!ptu{61OX{VTxuBa#5!ymyAlRu>)bPE+GI%<nu8)BLNZ_%YePjr%3Ca`@zRbBK1h+{$Mv)lp>t=AyjX32yKI}@b!?k)G@^a}1ce@Q@ZO(Mfp$w~8G3vLnm=b)axq<?2$QNcs#3}!n{1-)!nnfmk$dxnh+Igo%YK<~S9uC1U9Gk;jFN^<pn;s@c}MuM5qY()9n$NHx)wAr2G4PNuosz{U1&JxU=shc3`?tim`RJHmPq<QxkB^4LEzxK|yJBY!;W1WGE4*Y#msBmYI_MNJk8W2~!>}ihrVJ=e~tt`wNb9&BI^)oTMoP$WKV_b-IU-k<=v9*xo1U#)=BqFQo0#CguTwvRV7nU<>IrTR}rw?aprrVl=;$R)6QV##gaXj{DA}DcU_Bw?&1{Nd>XJyv<Mf2wXmmv99*lvJ|UJ^Q}_a`&0!IK%(69}D^vy1DWBF->C@?iTSbEA7U!Gct2X~0-r!Fs`EG22TR12$vgYkJbeXx$%D=$FwP>_M_oDxQ3DomW$~>djVO-pk<Bp`U<^K`yNR*X48`HGS~Wd?4$uUQywyWyG4nNwbr>h4~0YnDQ$rF1sgM<w;5(y0B|GbJ;Zb36b^xXa9x@k^e(~L}Y|?>GJ&0>{CA6Q9P9WjrI%I8P00)n2&!rMB-r|h1})l_vWzvYA{cXGLe5FzEmdP<B4Je|H&8T##C++P)@)A7}94s)|dmK)(CZU_qr&Qe~a-2VSdnb@pX|Z1n3SE>;4gcT%963Vj5pgc72`_&HA(^_IcM@32JB<=P+cMlVU#n19nZes>)=rD%DeB%QKU68LC?^h8TAnY{!rI<983P4W*11H2fP3m|p2X7)rr0Un>UMAq6xuf)f94K_Jz~q&rS)$wGZ$=8li@Jrw*23Jbw@+fjx1ggz~punl{q65RUCfRdCG)VK<S^+#PUt8{x-N=me;_WH4L1HKyXR$1mfY__DD_52Bj<(p+OpYihv5-;~HQnq!acQ5VfMfH)9^Hh1&W_d8^a052Jm#jY(^@yfci%KM}au9oOt$*O*Nf9GgJ#!XS4JlDxPM)i(m3VLu3F7=+;feQzPvmHXXHODLL77HPe?h<;<fORRD*}GB$<Ej<NQU$Ol8TqSIG^@^=_%{Y!KZC+cwR(syh8{|+0rT^7bi<m&Y>I?H?`j~7bczDGwAp>I6Z?Ro--@kCYlx@Hz8+-@`J8<2)Mq01jf}K7~%}ujZT`N#O=0==VV6L#D)Feuxy%6KtP_=HVC$Y;(|c0ingY%1a)nowA>j>nz6E&<d_8o`J2a$D@Xk#Eg8sF%mEIaAMs!ds{~bT#icJr_`9T@x}kL3+m%*DR5}f4TGl2MJ;!9|Wa8pMGmHvrorZpRe@M6Q0I;@n#}ut#(s{N;j4ujH-QksZbkDi=CMCcuH??G*CGa}%kBqBg>6UMtUdry>aYTom-6CKesoR}OE_M|%^vwE%hm-zdOZ@t#48kfvS1NR#WdNH1KDP)JS{yoMJ!>tp8F}*+FzdR|j5-}ePwYSTcEOs&fa+@A@=Ko&@;TEf;~JzNwH=kw%;QzaP)<4xwq?Yem*xVRwnW1xnK5n8dmHCyrOhyA;OuZK*671c=TZ;bDqakaEZl|a`h6&iPT;q9#Y=>_wl(<2t9}9T53%c93Mxc64lz7H?rH=vSN;h9Z`4M*bo<sIO4EaF_{S+#a!C>fa2HPrW7)q}H5DUrXWLDx7G`H$DtF}#Vdkd?9)LnhE2)Y>t2HIU7|}(fAs&>KsX8JNf|1C^>#GF{@OWb-D`$?FC6p}ks6h0z+4npn^O;8N;xftQBb$SNYc;Ta`i<;-TRGSn*|e#H4%dS=FrRmD6^<pz%D3V~XAaw%N?rK~3pObkARLNY4XpX8R!O}yo7a&OmtmSKtprqiyA6D?(iVXwvym%=IwSDUs9FAGLWQ^I^>XB#Cg*IahH@6K1C6C8bxFP1*}1pp&SPVupL<WEh3IB4`WlL9P*Me!lK|-<w#tjL3+*WWp{A=zPDyGM1uq&hQ0lY_^(X;If27H3H0|;+(dVDfr;+2jIJieHWXhr*fDl)~i^?v8C`1;fB2;ewk~UUUIwid!MOe|fg}9J0;_F$`KC<OZF>gc@fh&?bO<j{}SFXk33paRBo2ME*(5il4L61Vmx&D4G5R}h*QCSdH{<6+;no8B=!o%bf3&=;gmr|EHJjQ3Ip|E{Vm#i2X(yV7qUkG-8_mfSoefHmXuS>#WARFT`9MgPT*}i^49z8#a?AyK>3W%&+s)o}%>|=CNd5sNXEHR?Q*eK#*(0%BX#QC}e|3}z^(|AG8{QLQ9T-sNxHE&Jv-*=e}SZM{~+pvsJ^58vB8mBsiBZIw9P(|Om7JM`!)78;4PqRb|oi`_<xrBIa1d{-L=>LH;d257zb5p*reTD<y(&)0<G1*jTTR5I@lroW*j>or&rhY~O|LoOsPE{HODJrs2nD==XfP&UQdaCZ)uMZh-S<{`q1DZOkmu>@MGXyr4&$_311wT|(EEg{%lgwZTDI5qMl79%(IPp+a&x>pLuInrZj{}|0%$Ch8m`i|F;?Pr=tSlik<{W%_>;cyE3PnnnqS|KE;-ZD6^T#c#Ua^SAtMl6LwhHL**+<9=IvvHYIY(cuGXk=F>X-EmgJZ-d_+{uKw3HaESSUv_!iHB`E4va@Bwaq}s0$l^hgyFA3;8#$mJOb8S497vOdkV#jIkCTa(<50Q9P@@LrY<Cl~aJBuK{#0Ts-+*UMl1Bo(!|Gh!L=iX%KaFs{~`MrCK^u{s@*Fl@EHDo{BrhiSGiqo#PJACCa*j7C|NXI#;4s_(mtcc9W%gT5UHv?7A9frJlq4ce#=Ura*6@qMyvQcaQ5t)B#rkZK6E?w(f~ZdvRY$EfPc^Ya{4G@mBsbD>3%-?uoq<Q-3hQC2u2JF8F?<<ka6+A}4WP$9og6G`Vc;)?HP$E0)t##H?81L^p)V__Q5wQJP}PJ4NVIK}x@{sYf76$GDlM;ft57ej?)tLg^>)Wdz7I0OHeq+S;Ze#(N^zSDM=#vNWPm8>lvx)jNblO0!%LR^<jbqi97&YV*|GqIkv_gY~j18hC&7t0ouOrwJ8<M2vuENit9z@@h|rtJ3MJg)@}Q89hG|F8@6x9v7kCz}*RNJx!txMoj$bIN`npJPPUX1Jy4*hPoYzZf?8t=okGwtgF|sw9Xx^I}@)F$WP9Q9xc3I-s6;$F5_7`R;Rj5tagqr#Vh}vyN4qFDeK82bGKS6$d{X<*}wCD`lvd}fw|CUPP?%w5Qd?B^!N^&++40dcEvVh;?R%@{wn3B6mR(uro>w6efT|SYI+eX8b^|_Y$v>k1=Bc%yYrVj+jFBfl;NLy7M)xL2ab(&8UMbFmIECAnc{A_FQv!?vjZNgM1LKB(_T<9)?UK)|7~RIh1?*c9cpvqGbkYN%-Cgs(q;bK;43<u_7Ab(4;&h&8<e?j)Kbx=)|xjPa}-PmkB53?h~BY4|3cVMLl{t&SV~!07v*!%NZ>wfxqrgtixS@KYTsqsl|LC^tRG>TBqFl<qvsfMH%a!2;VK&t8?H>M<1=lCwe$MGZ_n*k;bsCSixqMHSy@zb$bayEGcdAj!Py;?Eeq~3MT9E<cD*2B<G-0nd$;BAz5aTb_WacX5f>A2x9rh#_(H8$sy6)x7DG;5<z|AZT>Er&V+q{Lr9Y646ZlFz6^16!3OZz?VTNo9a&A|_*VqKv!h9uAG7fec{}8-{-y-q3tNQs>r$Ua#I0a!xW;F3HYAT+e9d<PUyr<i@{yHcu_yP`Gjlb?ls$A&(h=o)d?k((T(*NzN-^gPFibQlfpnmx=oeeR7q!Z5c{jbrR&@HPb8d9r3W;S3kA=D#A+_3-%N${pkQ9o5aD45dYl*7iB<!~JiG}bE<(kYwg_1(_MK8W`js}*>IFQ4?ve`--u{uWa1n%<LO1QY>%<w3cdnDX9mu-JcE9t2R4b#w|KT|Gq;+?wZU^L83&+j+oIQl(uHW}->@MJx0qF=@_okks8=5O}vA8^e9K?5X^)K+){N$Md-x{FJama=41mMrq4vR0&(H_ZgnFduAxgxG#9&MCYTRUI$JekMY<az@9?YGhmZf7MnVnVyGcrC;#vy)7uYSab@4@Te=)V<B!a$(<N5k<}ed7jF)fxeRjMaUvR())1rjZ?s3!7oeuVT6u;2Sp}<|e!UpT0N-XmEa@HWl6l{o;5oybv@6fE(E(^(^oyE0GFD^<7?`3s+g_L??qcmxwp+yrKj1e?>jIyBZEJtAFW+jHp#$-H!^+_sgYyRgBA5C&%#IqJL>Ip=BZ0)f%09tEju=j;gXMhoO*4Cm*sFtPxYc1@a4(7t+p7dD}t$V|a>4C>b8P7dq?>%;r#@o%HEqEhK=@mqDqs2N@2j+0&{del=-tk12^zW(IC!yE}9KV86XM%9&cJ8_)Io~1?SF(-m%L5Om8oM`FGMX6Qir1emVCj`dbku>NPN1ov*Ue=lq0g#l?Ow`T1gng$y1paej^GuKaw{pH+p`m!4msCf`qGXtE>%ivx0XPWbAekB#o?M5wFKIu-}i571_H*tkldCIBg9r~4qEfD7kEy$RUh7zSyNDKApZze0?9X~nx?L@c<_YQKUcOAp?Wl^S_)=jn*rBj^ze@*ocr~v#lVhL>3VtZOuwai++No9RTFxlv3g+4bSW1noA#a-O{XIPMmQ=GYstS4O+~h5(=oO#H!y^Q>ceht1(p-MSsN8Dp);ry`-hOY`M<0}t)-0(Y-%;q5oH3ph^(t*{g03`LJvv0r;tCY0}4wmxFP7u=nm|58It!b32^|$51-nd@he0eh$<O$`Y-~ibAs`E69%$MOO31N!9nr*2XVyLk)U{hmO|NiOZcwD{tC<7{huy!f}E$^v2xZJ*Vfs4om#ujC;+^Q+lnR#c_x<Apc!tt6??D8Bt5qz0PYXca=c`PF38=2faeI`HHS0wGVOy#TcXot>jz;NbpRD(C+>kB#SHO#hk<wrhX)bfw7*1b1aR<B?#81O45!y%kDj-oEj*s#&k$I?3RCs#l3{$fcsvHeJ4-{G%!KJ;1KB1hF{o+gGm$49qSgAA-fgp*@6ZWEC>BpnDp(!sFy#cDAMt9EW^;y8&AHlB&AY7=66}zqZCv^K9D(30!3-zqT8o=@dTh*q?GEen?(LY^qwiH>667rcsGQ|^YM*Qm8y7OviIYyJuG?X2diHoy;m~E-2YUwl$3!bIcPoV2)4p*7C1dhaPN~6+58>0cb-AE_JucR$pFPrR*_OsNihOe1^}wHHgu34OnF8O+HDCk_MyP*1vMuAtPy}XDkQ~9BURd79_f6R{1Qux4m**IJV45i6Mk&HXAd<{tZ+!`x3^pO1y19VDN}r3HC}sa=1rQ;@xgsjpL+bX!`e}0*cS{uxE@j0iLD>8kQ)?<>qe`6E7j+kg+9iLTnn!g?wp2$+FIjDouU!bf^7i7vTWXXSCNz?T@0{Vlm8%!va~ahtBUk3$Kcf9ebdz+y$<!qVYu$&H!Rq(iK3-4+dAMfsP~Ls&)h-YHmjA)AZH8X1Ao^Ui#(69Au5a>J(R4~=X;P-1f)7s5wCX`P6yQbFI7M-|(FEH5G#RC`-tQ|mY{90e7qZFqY%~w3qPaQC8)y`LeF#yElCC}K4;^M&NO|lW>0+%<RM#1%3Su~5Q{Py<>(E9{Zb{~FHmfDg9EQbGo#A~>GPF`>v-r2uaLyx>dYf)nZoaf!S;*el#tm5j18Mp=3_&0bp#l(Cy@TaDlBjvG;l}JVIFYy0+SdTbsPO&`yFjvnfPr<#y-X;prnv01G9HO;$+<jS>azXJ=huhPng2Q-AZ%Qmb7`&1v;5qc#f6`N#_h5Xm;ti#jCa&}taXKzl}QE|-G7TUeK65^_=3m_rMTJE_eJlpiLZ5(6d9z1azu?ILrd`O!TnSkRj(}=fzU?(0^$#K0Mm4Px!pw2DCquzsf~MIJn{rAW=}1QDVRUI@xra02m~H~^eYHOWl16XS!4CHx?L_;NN*%T>d;r@8sAzz9z}kJ^YXzUnSjG}fhEI)LA3(eP8R#aTLL>#g?%)zuDLzN-`SpM1i~dQQs=%1A@v6lV^@&{4ocZM5)*^2a)Lppqyu8*ecgi!P7@B-^$wU0F3h-JeNQmi#e?8y-Cn}g)p&;WZDT#8pD{4a4>-fb_js!IDoAV~3pl!!$HYyvQyo*dph;QdRS-Cm`;-Jt{&jz^aPpO<nBeLT*Q~`vIFCYwJD&;_3p-Y89g|&d4>yUmegtMVo@q8$H)RT}wnjY;y~K%9G8BeVXQL&zeReGRSP~riQ|>M!Z|hjf_bPNAzxg0(ZBrD(;fni+Xi=hL+pK&qI!NSLxqmQMnD`w@&itp_7qdmNTa%~o==TqUY+o3g;ptez3KNi@Lu=-%v^~bq0HoXWllIUiNw|7C<kF8BS;d=!-<!Z<&YtWoFh6?#z8Bkvq={k^ZdA<>ibAE}gpb07?!}#04f#lK@!+sSGn^rF&L9y5J$lm1o?8_rOM_&X4nM)49PZ4M@7^mqCmcMmrn!Ye<EeoQ<#pD;!t}D@))5rxP3rgop(VQv4)S7P&4*u4mDNam%`+6kN-sM|SHug*;UjkrHdFJWD+?NUlHf!%>OMlKOGAP~CWN7?Ahsn_gsj!uNVg<y7!vS_LJS&+sgX7gcI*!A^{V2|?k>aDRSlOrtx0Ph@A@}lrJZJHf9*tY8bUP<IZ=gH@CBK2TZ0-wZgA9?zeX*=pwrerusxS?BT##Zm>-CljB;20RB#zLLYSF55w2ywSSlesiDc4zJwY3lmA*S?@nR@U2mu3f@%t++iZeOb+KJ0z#vI{eC~!_l&F5OU>cA+GPFR*63I$P>2m^n4Ubrb(!iKiC$7IAt>>HoIi-qUVg}x+rZjM~pH(GI}k7bZ!3~d5sAD6H!s0kA^Cj^)>oXr$b9xSQ|8ioI{-61AJBPng-6hBogW;;yE1^~S2GJPXF9G_8scE_vAg?Cjbexo3^jN#y9kBPlAy4#O9MI2-&w-H(v4#xB-s!*HqqCk1rPF{4uxYtj5OLKlnjA%Xzlv>;b|LLDQ)ugPVJ8Md$7<)B^38L=2`-iC%k`9bGL=e{<TzmZJYJLi0Agq@LwIst(7PM9C%8jav5Wa4mq_9w|N=xfW#I{1GjejRsolL3xq8#@D5w9ed>v1XIGj&}~OL&b6NGyF|lc#yqZ9{SWFJz_s>~lc4DL7^-A`ua13K(*n?N`hu`smHpM#-8+yhJncE@q#Q(ak#SN+Ce`wEFF!NyjgZCjz+ft<*Cs4{v30gJfRs<dFIVXLJq-&YC(xg)QR5`pRg4L9PI{Fe9u)^!pSM@9f`UAhWXZf#t<LB1*6tXT&rggb~`i`>fON)c*+`fF!vqWEI7mxJ};U$UDV}%Y}XkLF3c@NF1?p&b6~Fuk0Q<@!rbF*48Q1g*JZ8ZbW1uKm-EvV@}P;wC#-7BH=z~wRq45r&C5hd(rCrG}uc(mI^&wt1G0>cuQ!Rf}X1s=?za9ExaJA7#)W~)aYf7(Gx&%&lFH~XMIGx6WDE7`oky~oE_sd8UIKWQ9Sw2vFb~mo(2B{3N2-;P@sxV8&{z0+_JNmG`|OoV3K-|>E)KUKb&>j=Kn{A#CS^hspL7{i+|I$|GnpGW45`>aR(~L`N^1H2xP8Irzv&aK-ueyly$-^>=-aigtaV96R_vq9)U8~0g}}&mTjYbLHh<Ry43@LNTN29HNVXsRxh;!m<d(sFadnujz)y<w@<7dCRz~2(dW7Zr1N%P{b{q9!$SuMCRp)1SoCy^&T|{m82YJ$7WoXG(;9D9QlJvhG4YFE*U{kjSqA<Ay~b|QqLb@Lk`J0#AbAD@CYkL%;`2ht7JP*-`L#S56|5DrwKNuL9sIWK*(;}1`hP#TN>nc&AeXR+-Fz^ncm=g)D6TWs@P)U;e{8_ZHI~9*0q><N`>IKi^7vl6?iJI%B#Ye+(%62W^oS<AnZO3TiXjaLreKJK{hStR6e0g1UrTSn6`q9Fl^)EaC1C+qqxY76_m)H0^=fcKmS6C5<Jnxs?YqEM%CrastO6MRB5x4V2fGAv&E-uu!7IyC{W4rZP;p+Tq!&`xP}W*9E3a|<_-7OY<AEX%DFsDEZwXFsz2coJJsJTl;yQV<S#K?}2EHgiR^;gbKzI9Z^hq;X%o;b@8hoG|d?X!K$2&BLlZ@7>W%}>A8bU!0;ZHo~B$;$=>bN);KLvK#BCKud>}2L{VGNv}U%9?9>YKdR@hLKOKfvbSR)2m7Ge!<4#Eb(mT(*O<m`eV>0kJBpjoYZt1{Rdy<ZWFKHZQ2%{~c=(RGi$CGs5PWJ@Wrw8Om2HR3%z<LB9qTw=JZ?N^RGr$!5H#{7$9c;yX7J+OIHTqV<{&ttO&9iY3h)vx>`d?u~`lz;-lTOi}!6^6ka`IgT9=FRaAWdAWcr-p?pV<IlJm6AoYK7DAb+U1j-~cM<_fXf6@|ZD-gr#Sa#NtU`{-JCW3DTkkh&P8VDta01%b9U1?anyR%Lh*`ZGZs5ADBmDNacC^DD`qR77pb>CcW2E8dk^*U?g5n-F^tDz%>ll6N?Ezcx@?p&dZl|{tLKT~U35Nk$TPV<ZI;ZKO)#6|*^+J;CDyp$X>do;13cdecm}f=hkX-`qU8Uea8V7YiNu)QZwU8V&{p99nIN0du>3e5+6sQQ4d9S=-c8=N)gp>oCQ+B{4Nq%(uFfaW~)qc81f*%DrAV~q`I+<_&3%Me5MA+WKfn4a0WYpV6t@JbwRr&h;(8MnVe*=$0I)bp63=t`*c;3OAx@F{WMKkd2fmbEB&&=oYN-RO_TZ!VunvH*xU2es`&6ceS3+`>0ER%)|JNm#|7z~vXw&25&O>~lJp<2<gwN>mxP~q$}oC%{Td-msV0r`Ll9^9@RinceOMcJxND>R7SF<Sj3`#)<+3s^xT(i|>a<$nstEdVrx>$qOXt?qJIa*czJ!BoREY96$zj(Ma~s7UhB;McBJfr-L}q&NxXB3-F+9<1}_r!M7edbOC5MAp?L@rDrH1}<#smLJx~!hquaPUKlYI__}+#C+t@p)pnj$_VJskbR?^!KTg*3zS4^&={-sOSFkF!Z|1x{btr`7}}5#hlK-vw80-?Y7U8kI=V?}7IV?ft@M+?w~ko*(D@8Ei$KtdnLQF3&rhEts+&Wdm&QMCAb&2R8Y`r})Sij!5|tv(Rfx8M>Ri5`RdNMsP-=i2bHrOf8brPm$E(SBUXFaPsCrj`^@)Ud#1xCtu=V=+=$L6@$*tM(%X{X_$=m{gdFZy=@!NYqcnf7MP7-`YG@-PSfM2GR%?%G-rcyS*Jm+^OnK^iO@$WnpJ;g%4o*KbwX^6EAAiAIV8Kd0#hc4i0!^GME`QEsr7gDhWp8|Rhd6MO$u5bJndoF_m@-Enirwpt=Q6HvHqDb|F9(4i_Z>{c&pq7w_a!e_JYwvhk(4%Q{xR#I76U-+0qbr`btX|x`PmyphnPFYb_Xnr%WB&0wwO*FRMI1C!k_>kqv}wWZo@$`=E0gATZ;+7au{qC&;X$dmlX@e<Mc{&kwbRW;O7Ynal*vXo?$t_asRB{=|BtxoUq?3Q78N8O$RMpB3QwYE#h(N)tf5<1cU~J(jHie?$vgR{wLe4bVb2Zta&bF^RJMMnJ3m>|Y%%A0jeoy;acME*Pmul*wp~#_IR%cT_4;WZWrM5=Nx<A4wikQ>tDu9i=7hS<pkOmByw(Xj^fz#{@lsV}vqfYPeEfk8%u8>z5Nl;db>}hl9vms*IPBbG`cX@a=m+P;&}7Am51`{)PVd8S)XzB2E^^$Ra6+jQ*^(5b+FebJwMk-7OMkQ~jWvkYh5^U9{pCVykBpAltR&kV0{XO-GNuA_kDR{Gu5`A8tEpri!(SO2tB(|i*O5cP{qa?xdf{toNEVMjCjS0ye93E~sa$Xeb0?StO$+lPo$BMbJ|CME^niy+PUg(yvhHN<9Z~Q)=MV;_-Hv3)9c`nggE}o5@GFpioHmjZIOVqKI;1)+bHuU_?=Lv-BLMPFC&e365xQreL)nOk{o_uv$f=z5el(L7UYV%F!Ztisiw#ErW!S(9U;Kum!W`#^>ZLURNMI-60%k62cF{Cwr-|RYv#g3G`)<};78k6s-Q^~{1uj}N;Rnmtt$A>;JOYn{p>3+KrJX%76YB3e13y7fG^KtFIMRwvx@ee-l?xj#XInH4pRd{dm3{*C6PO$oBBW8gt2@(D;RGC&JX~gc4O^LlRv77>^4aI$z@bg^_oQ*A#lSng)FTs6JT7@9riSMQ!@#&E!6A58{*px5CQ!PB13WkA*pIbr1*%>Oo8MWZb1>0knOybWDi)8uvEURVgk=)d%Fip>%M_EhUu}rUvmsq$<BGUn=B#qC?>a65R-Awi{oBRejfooWQYJ*K#deKn>!C|E+NjMUo0#m$pefw;8XLH=<Rp_O(6bkm<Kxxg%bJtn-6zXBvZ2Wq*9(m^$-0M3bnNpDGh>x6jcJ3ii+P0y?m&UP1{CaX`qfMoFBMZRm8LiyWJqoV^jzL;HPf{EAjT;w&^pN_J&SSZo<UM|GkmgCggYGH$G=m4MqJN}I6k0O=`sYdMd~}eI(A*CpWANbbH~S&%KT=!tYaMnaVmsZL;$d*wDtC%7S)?|DKmW`7kJ=Z>m^dW7e##4kWl}6)38x@x-h)B$Vw8_Z*L1nFUM02*Whfqxm+;~A=Mhb$ZBS)G(3us9}R(_i3z3UJHo9ANrSQhg)I_d<IrTC7^!MNT0X`XOi$@bOFmVD%`0(ewRnkSZuEAuhr~;UM#>6pL~^%hF<g*HTIK(sM<}=L+J3bCC$tFow)pcX0Uow@>r}_aRjl3a7<NNej}MxuNXoe0@aOLrtctcE3su`8zo2ZS5)SJ^Smp28VcB8kJ|R?~c}5d%jAw<00^=L<<KJgQic8#9@C0{_R!#wZ=qgm7&HUeq5DHic<mS0wHU=lOIa@Y0W0RJD5as*pyc1yG3qSdQke=&%nFch?nT?0p&)W!tJwBf_%q6AiEwgD-x}zYN=<wP$WfNnaOM_Oz%b0E|P1)1T&~|GgU2t)A5B1p5>i`-X^2?VPAg*LAzr0!5L+^1ry4d3lBD4%3>Zz%gpG#6E+7li#aIIuuC=%w)3|MKig4W_0rD4mhUj3{K-^_siV$fLj6`E$B<7nz<E^xU9!9!vpm$wytF!z(qKV$Cz2Op36X4C7xNW?L#m@6a_I`~%ib9e!e;Ka1dm@64D_pP|7oc>?{EFq7NN0avBc-ug&&Pxb6g|O<2`STyy_!wqrt!kNvz1SVkckj%%Q!^<h#4)?Q7arP6JS*D~1fxFkA0o`*&&~C?38?@cU%o_+z}&?~9zi}^T9XohFZ19Rv+5XIZx`v)Z8#z^c5U9y`1$&g@%z4K_N_9lzcnb6ivql30}l!A53k&yzL5HuzL3$$&XLS4t(F&4QSFlH7x19%ECJyY0r3LCMIKqbR+pp4^`a=%DB9b|oZ)q6W$58-CWPNa_}?9p8~;V)IjzJ`ny^`1Ngy}G*CH(ZAAG6Fb_nXkzzSO?Fo^qZfM&8z`O)-(Wudj5h$JiJ19}M2Rj9zk|J*A=g(s7tR5(PeK(w-8|MsefYM8Ti7AFxN>D`A=yT57Kk2Abj^|#QO*UaAS*0!dVJJbmc9z6nTj>AFYXq~e_D_O+7P>hBrgpwDd!jf<Nr-O?2(KvM8Pw+*bn<bxcRorMYAh&u?7r;vprP08fYxYswI}KQ1RwVR70TLa0!}~~Vy+44QCSffs?bAau^99~dfO4T~KylKaKKHGC+5;h{KE%S>>&M`WJ#7yE_Y&Btj*DVcKg$^m8%z!IiSBRtL!i@pUsvnVimmHwwsP7N?y2t3Igay~j!FS@j`ulu(*40h-Qr?kk>&DeRKQCRztNMij6li_yMUk5+`wv%|2oBD-v`&bL}3_T`F7PHj)0Sgd3YHv<Fzekva3`y5?^16^Ptc+AzF<0JYrP;LAe$685smUcM%UD;DYCs>{KrsQUg=t@x<t&OSxrhD4{=eK5#B!%Nnh6#QD&Is(awj*lj3nF$VPnn>tUni8c)bzEmq&p{?`O+Bt0RF{_o?CI1#A2aH2A5(`75Ml;e6HIp|JuVkIA)z-dm+Htp-G4D1@f-3l-=PPHC`1mDj$hu<RJ<Xz74maIJFHA~^06#2;-}1rZ&D^+WjlkE#M3W}L{dUDSexY&fgA;>R3$5|mD#T=`ox)Xsd}nmOeooakFV)@t#yqQsKedC$p+#anpjSk>ArnB|+7R9b0WIH+L6QvA9)WjDbp5t_G~d}@)ZrCjbdSTv#Gu0$kGeYx3vB?42^>+;(9h6*83d@|_KW-03h6i;ZoL<*eC&8LX2rXU{8KrL{LYW_(_>cJxtBz_*Ud@-N6iuw37C2r4G)Yzmu>{dRkde<AAt11q2PmNl2E&Xm;-X|zAj=tlNc`c)#r)1jB+nTWCsHvYqIjMk<e6Mqtl}reF&NRf{a*m5RZp`3m8b{rp?OhP1h<XxYd6L1G4JCBNm)zLj^4%Y~cFCZyB;tTx%DrD%@^^s_O_KPeYVXOJ*bIW`)u?6gS%h_knl&5u>t#9NX~m+{b)1z5j9ivA#73RS?6EB7zc+ZhFeSKu2sPhHU6+NRoO^24X)5!FQn)9H)u=iSZOhx+5{#Vw7K2+i~k_Q?WE_2^iBRVfu>3W3TZb%IEIoC|-eIY<1;n?0s<s8T*@J^5ug??JawyMm^7)J8}QIAc9(hXJt>W6wp=h&&Kp(4i!HP?fFSbJK!zq3%?un76vXy*EbY)E|?e|X%l=AMH}GLd};!~Lduc(frplS7Bne~>kpKbsOghIpT^k=3#+p@_ch?R&*>ts`U(ELSXV~F4LP|4_fSgWp#16J9!%bS6}wSczoUZU@t~$*HqagHJ;;;J0(TQR)<CnKhfA^^<&)Cyl)h@bNbam<FHLGlxZ$l~#V9X;IcVRk@@)V!tQOSAjV6PVO33VW_M}K|3pWKh0tSe5b}kW)O_RZ5!f<z?ECqG3ZGK{rC|rx}MXRu8Z1;?ynsp9;^wBHQJ{N2sS1!zBxy@ij&YoS)3qvqE)@IVr-JL!0gc52;>FDgS{Ez9{*h$$rELib5;8%?58YoSNhP7{0vtB6{F3aA&ZkDKT3wCF9^yAK1*kJE`{H)4Y5>XP|rVxXz5=-TUj+c^r^ae5JB2j7JzY|3le2XfvIz?Lexm>hK;&3P9f}%ub185i(Wu{x;LR+NdoT7%EUnUgStq+D|ccJF<jt-mlWLh)LA+hYKn02y-*4Kz~?=X)6@5$G}E1*2ZF%EN18<hx%o_wBmz=|g-fB7>@TV_IvuF)BCQ|)j%jobI8xjE7FRIj8lf)$IQ49?B%AH;A_{Oc1$T5%^O5}J1ujGAL?x*du)PiCc`_gBPmVVn(0H?~h{g`$Ts9Z(h*bB4;pHv33SCiDMbw+7y<qbiTQ8@GI}8*bJVz8XbU-N6-yJz5T9Q?=64ZKBx#w0?*9;0XP2eE@<r7{-I~77hlWysY7A0e<JOvHd%nDwayYYEJkh9$gf~&MwDa={b8L(-2+u)lgMd)FAxNtWkAy`xn$`9fh!Ug*o-|oI^98AW^|P-W8By#ntwLN!A=DNU+o<Z7d_7#3qpP*G&j+F<*O^;jW5K?V@w&+x4Wkh`Zqro~y*^QU)cs@3E*hUjGcVDYNlw@i`#ky@;Un5Ka77z{m^pC4noKI50$fuDN-)ig;@uG&tPv%V+_j+X#V7{1n6U$L%ggJagCqVZlyR4-#T!Jml^#6KzDF0X)uDd*<F|%m0y$d6(ky?R&&f`k&=&3i&ZkK(2xXTfqa@bzz#>af!VS98s7I9BcMj^AKYo`1USU@%nz+W8~hBgAc4EUwdarq&F3U62&NE0PL?`ui<G2ma06v6AgQ9RP3vOzfUOkN$q{5y?cbUy&8MVkviPMdT<pu#mIu^L;Ks0>y`9wRyD269nz#K14o#cwSmkt%^dtD5%Vd01<kp%FBIN(xG=RoQfv~vxW%UUOhgES)BAeP%2D74Ob6fMyA7?tp1mmHNuR2^b!Dz(2OE}9-^WZ(#?!U>AA+d6okH=Vtu{1y54Tfib3x7?D8@Wv<6##dfSapYfEWOZ$0(db(#9?k$+Ot2>xl*Y1Ukn+f0Zmv!-iWMY%<@aPH-J|d@TsslFM)v83;ssZsKO%XP!Mq!H@p_y~k2l#~FsZZV$2$c<b0)z93+Mu~U<=*p11xi)0oN=81eZNf4O@6C#!VT3y3>F6eK5Ml0|um{aGe)etQx&dvA;PYxuO`1OhVZ+LvXnerze)hq74GBRt3569YJ(*5lG-4Mx}&Y@2MFUmLW9WQ%CiW-9(i#<+<VpE6Y_5WlxqNN5afA}C+QPz;Xl#hq9XGn*DxyI*d|J5tz%hNY=iVIvn>Y`KvE`Q)pf?Zp7jJpfqf1zRg>V9S`*d?PrXv~9VgeWL%GV$B6`&Lz<T0e)St|~Wu<9j>#Jus;JsKgf17JZmpmE~n2L=LMBzwVn@_*94h&@oQUpyiGw-e-K`uyx%}2cwUZv)WvwyK{Gv+dM*&!Jun**#<jOiU|N<b|lGMm2J`<Q%1H*Zk0nSqIlN-_Vs5)-n2vUjK{}bY3i#ItM8d?R-ijV<%%<-{<(2p)UPxnAIxX}f-<XNJ1w7`cK%kxcnOd`jPcrrk|w2aluj^h4te8<A=^K_Up6N74A}dE{Xerz(QeBq0Z{}GO!0?kop;gT3u^vu`LQ~{#)@*ch(Yv@#_8RS`?cu6MhCb&lp87NZT{G)VMZB|kYAUk7S0JHLutzxD5e1W+9NOJj^je!RsVnnQ%=pj4BWi<vPW#vGF&nhVj+dIeT$j)2>m2adZUK`3`rX_8xaUl1e%J`N5Jd73uS%OcEKg1hu7H>bA!y;4mhqD*sx@o1C+=gWF}rM{FWNBE%Xv@Jp0DhY!v%>98AJoPdbY6R;5wQj`}uXJpW8BKGm2olFVKowc37u&*F9{s65B7#6OU^bd$8x&h@++R0cB}(lpJN5+#_x!S9p+o!<=`W~wcYe`vYtJQ+IpO$`y0S+eLLfu5&EKr*M6E^=E|=vx?cb%TTHV*r%KeUV*KPMloXaxUt-J~G``b%16D7}@>7IkFyK*|Hg)?^gCwaGu%JxWP#{bnt)R>w!iIA_vuDj|LElyF}OWRyFnvZ2PKc4|pS(a&4J_9}9>D0Ei<+o!YTG4#!LtX*SDt{MqAQS3M4fa%!Wt{}x^yWa<&F#=L%uzUc--uQruz_i0&jF6b-mSx#Vf*326jC!)Pm9o*qU{8Mw;&P!kZ_J~{0%(qV5p#HPEN$k290Fy`D!Id?wdI`1w_^WKKVzil1N^CP%AR)|SZEEp!D}ffrKMLK>)L|*8OfR>5Y%)uM|JAG+Tu>uTMC(@*yn54iH8;beh}P!*sMxWkrK1s^D;W#QGNFcJYaA#f)j@UrP*fx`aSkDvfo<(E!Dxdk7L`K%ZitNWsbUi+{Vl`9;c_VP_$Xk84+TvT->2&j%SmXK3h@g8@nKo)FW2{v^Hm<Xi#&?mO-{_>4w3Z3*);m2PP`N~Ez${umgd5}u$~C59?38;238QPfY@G~AT?SAC>V{cI4d7YL)1|c$YToE2E}}|Iq50ID5{jb`B~sM?K9Fc&Ssq1Er@}lrEIS0VUfZ7j4od?jfIY7Y}cnS|A11NtwD<@n{0Y(6anqxt9C!nwY>>O#`{oNJ?orh+bLGX*Db=uo7Kobl!+g0b<m2-DvdrvSryoGkr%Ggwmsrca}NIMr`%0{YiP|#Y9?x|0a^nKncZyLm;=v-)w90-+qmnv6<t%{<jgn!FyuktX@JUGcHIGS@kwWj0YPy7S((<qm{F~6RrYbGnR|`fdKpuQDsi+a4?s4qVM|wI<o@Z2#iI-8g#aA=Pxd0U-P|+$=b|OnrO8nby*KeO$sWSTFh(2!Q_eax+fnS4AVf!AEUOcxkq3)<a$pH}p-vfbwuv;SIG24z8Y#@o#^cD~!?~KH9mYm&7?W$!k>68dh4j;_i%zW`W*l$_z9yw6<7<78w1OuGAdu}F9l&bR7Ok@i{(TA8acY+ZcYvkpoNhV@hA!8*s!5PYP*U0K*p2r=>6FO@QG0%oj}holiiFN_LJ6q^WSd!*;`j3<9goX+PKG_CsIoojk#QJQ*L{M3(<x9v2T;y*vezC~yX-8({By5qKmv^ezw$S!8apH89O%uaw>VHiiO>@At2$p)l~XYtDoZ(-Kw5ofdLWkZ1CxO+vcy@{@yxWf7@dMnwUM>zASk@_(XKm`2ut<ueQJ{`N>6$igi-D~x9Aog!lq~dbqBnS<lyBaVYzW%KA;3w1G4b55LQ`UNVS3(&Rscwo)5nlfVi7%*X;)f9GJ1{)^UPRVGfG<U*a@opdg+7FpnK@0F_Txr;Non1h$M9G6m7pMtV%VDqhzIti9zA<##SV5VTq?ubBxEscb50vpk9=)=WKCCUPcl_IT+*T97K)Wag?O{_mFakHUJn0OcSD1{wD~nIL-3S*}SfztMvsV1_zDrzYk@u#m#8W}3g7g>YmQLJB~Y#9i9>!L*y!4hP)zMaz5Y1Zkq_rE^xedx$eQ7P>e&KU|Zur(Y|RZCm+9Z)xO#4r-DF#1?)KhdI}_Ve}wsj-zs!L_Gp<4Lwpk1+O9}iu}CJM8h14x`f>QUSvs}+!%JaJVXmGP*}N_f!8Q7FgXus?${54(*(6#0S|<78kRC<*ll;L+QP5o)aDaDMqnHaMWik9>FFV^6Y<)BrVchE>qo`$1<t(%Isoxv(|(6@FK0xsP%|E@1Tn9hzX~>p3^Ge57gaZ7f&+#I_?M%gwzIPT3PHxphSJX`=852y7AUQqu$Zz{>b-fOlvzI#gi0Mg!xb=H*WUj;u9cKJ$jBRo*oue7m+Gt{=96~qFY3AefvR{-Ci6)$x6(F=$d3*Y70f!!BPEQ0ACvL!ZW62>F<~?6RQHo+7yL=dkHdXU7>|ISzSB-CQEt_xH5s#BhdjZU*Ck{C|L^cMI9Fo4XkLL)t}L-95HpxJ$HsyMZ>TuS3`N8EMk6Vj<RmnrITLNN_7#XurE72CFcXhFY8gV*Jrx~pL6|aU(C-U7pZz=sR{U}@zg2cJSdIu<#pHhli$!`Di_Vu0%hgG>A_@|ekWVSnP>=3n?b=2t#H#!g*rD_JvQ{kCDezSI<1^v1cXckh@BBq~!yyk(IW2Q_-{_^RB-rNJf$sjdJ%a~TODTO6;5#uh3Pe)LTLjsxjWHu`8FHhgR|)041K4Va!jk<)JO9)IX7ls(w2q&$@p*fTp<6Co^W76le{{UT4=7@9krY}rqz^rcra6h>TFMDO%JD})>He$IEX>f}I|;c8c`t0`Q;Mhssl9H^We)Pd3Kc<1pL;VuGs~wcLeTLh8aStyebK0GvU4CenMJqxtMrpM=ys!=7y_XGEBMl*0~|fAN%362@Fr){KwU*~_k+7W%hwl&0Km}Iy1Os&LXlgEV(noeHvI;ZJ$4F@?E*O2I4@Kuc-ItH3ER)4{nYKo&K@mgg9Z!_GM9AO_q-aH^KQ-w7{X{^AR??~?vd1VKv1`MA?Nisuw6nNa-BVOn8#>@pgc*gxUbhXJ~aQ+MF;-NB+0;*Q}BEj=%#~x*7H#Xf(ZG8{xPY(olAy|zH+LIpI{cN3Q%F4>fT)$1<Dsc_{Z8kz&!1E%rf@H7<Fq|v_G2^iP(Hm>xB<m)fYm&bt#6&0E_;naQbkWP&1f6L&6ZoW>=heq~HKX+Htm)pib4};W>JI#GvlGDZvGg@g1n{ln^0*qI5HTZ(jRcqL4cFYG_jCcGUmHCqJIX_urAVGzD1EN-OK)Xz?8nCO7l+y{)j<soH1~V;Gv1puB4Lf_S6KujGEcCxa^YH`vxZ$c}sf07{p7A^|YwR%<K2H?jhM^IC=jfVcKXF1@Wii3y|}Jf&LN#I_NO4`I%0@V8tI8b6k5lG03XS`U>xrxmFe4i0&?gahdMvd6F<$WY!30*rDNWPyaaWY0C90=jX1q-R&;4B8a8i>JkH!N3+AhLWdBG$9RUeca}ch8s&V=Je=>A@=w!E)&G;dt`jfTSUeTv{#I^?rm&9@mCeV`*C&#h4**U02BUCQ8xMgb%TPbGv&p*%<8MB4Ia)8?V0#c&-~ylo<Q4C@Rn9U4*@kED`z9CT|ZO9Qey}O$<7tGaD6huJtk(Pq669Nb^jk)dGZI*lO*i3vLkT25PIm3^fr>!C43+d)35_i0f0Qe0FyyN6y)uCcWs(_5QzoZF$-n{hgGK0NN?IGYUMgvBb8jH*IC+V4m}b_H3WBpeEf<2R}<9jTdWKVTx^=__7$e_nc(b~Lf)yQ?1skSWbDB}k`)Rn$IQ9yEg2=FemgvQFR#V%BijI0n^IaXn`S0+!f6G#wc$-sVXsD|Bo>CO(Ie*kZT(o{=|3h_Z^w7KHIG&EbaLRgOeDO)*akq3yWkv>FJ%lo)EI9Ju@noqs%?q>Bq{-%Rq6@S=#_M5Rn2mBK=GC}H9Rzw0C=5FVtjBjpo&ispR8lgX_#Bl^*S<^?0nEGeF99<b-9;!CM4TOn@1C^OUsM>O>6AH*QJ|IzJA}rv^L2H%{b1#jl}6iW=lF?iv%H@;wiw{i?QzJr`Q{sa{gQz?#W!|E%>B7s+BR8HNsro`|McxS>IyT>GQ(mSECI^I=FTegD>4x^~!))ly56N<DvB3oZ)ln>Alq+(fKB(gA|c3m<p;M!Sa$9*MApy>wATCJGvPH^9ul|Scsf@zkGbso;D06O{TEl2a$#UCESI7j5X2-X$<MG)u8%<K;4V3#Q>{Y{H3)t)|?<W*)5*6a(vkp&J$8DXqUMs3I8hkS2ER#ekM7d2$7=``oG_V?P94{OcXovVRkASum*FRnrhq>arh^Cxx$Gs{&73U@~U_J(|kr<^drx&l5@+mXsRrme9zS=4l=wOu8p3a)6j%VmSF3oACI2<(HxqTKjMN&ezP^vv7}dEjX+0H7GZlR3MpcVpAzMdo|Lkrh6HK-+Eh@LG3H*1s}RAUw=`vMD!-{z7e4;lDTM9+ypS$XFtTsdaGm&(UeJAbix?`B!qV=a2W7Ht%fLcQJ@A(r1C=3|BW|$^q?$c${?x|~eWC$Po!p-1)Ohw)u2XIyVB+H#l6Ds91w$n7U?v03_${I+0R7+L0svmlJXRV6Ndmq4E`un<&JV!L@aPn<H<iE1oP(evP9nESPMy2W(T0u6;3M>rssL%Mt&idV(kR)K0^LiO5y&WPW}nvz*+u)Zx{N+A(jK5UH2L6@1ZPMjihl5l`Miq>_yQc}7WM|~WurO(!3}{plOedD;HvomKhE846B5g#gRXO-LGrLH$Er<@!9`@9$@XXhj1N8`jJd*&!>_KW2mH6J6L`O68!X{II^@f!&ofkig;i~T4QU9F1vL}P+F_E#^T%t;bfdfkz9<&gKado)VTIL=jMpx1uxIlb&Qqy~jHFii-1U{2Mf1<yb6?bl3U*YJlFFh-eqedNXD4+rsv~&T(~v=`F(&?ufAox&;30LYVz}Sm7XIXTw1%+gORX%c>_m`=hbv{yw;&YVVsCEgaHR-rAXMU$khsWayc2YE<vp#->o`P5)+-PZfm?w90++<N*%5;v8lZm2(jO^t;IwTnorNW}T&(Cae9p==y&|8TPtn<u5lG5{{pEvdWRNUaa{$_6Ju=;&)Z=&U(NhqqsBitbWOK@7$WbOOhRf=$uVlb_zYZJgT4#h~irWEVwSy;-(9h1y7Md_F`RE0Q>o2hYQFdqSF6%g%sULHh>YdX6?pH%)JhEF{E-IH7;bI$mX&fjUQmXGNCN86>pKrTO_N>d*tSUCnG4q7QrStnn(cX|TdY*Y85};z5EnY441cNH|zO}=5cG!kJO3g^<B`|n{cN6}F7q>U)`o4DzgIfK*PAAY!U&nfJRiV{}{43}<dQ_nIRff@Jxox;^QaQ&pH`$z83ilmLpKkAi&0JLh(;!20oy1nft)^Y;mn&>!WgDfI4YzCoi-OQEdj&q%M2nQ_3M8f{!Y2b=8^;0r=%T{RmUscIJd(Rd0NJp^i7r7>I`4Z<!MDCQR*RZOU*o(-6>>*LG=VuJJQW%vSj=H;HuhbtBIzhhY0H7r7(u$76|CL9;u$ZFXSNZCdP}ZJ={v3dIE8bX^Ao}p;cb@($*`2N`10y@`+6wR<E*q;y!r{4$cpo>Y*wSN^#b)-!>2)O1tx0@99f}atn-BxBtv@{(;n7WVzG5Suv6gRp<;~TgWYcj@vlaH@i`Kfg0lQVH`6lbuJKF0r<`f%&LuZ{+21R;snB8E@0q0DCF>+E-g!$1ljPR&!Q^4S*mF3mkTwVU1W~aNwG*LFEX<>3A8WVY?8<|(JdGpn&yv#^+AXR>N7qgpwM*It-kvrb?{?@9i>1t4ZgYZPA>ic+oco~H5JeMNdYxu^t_TbCkpq=68443VGvTL?^BJi$>na}wE;B!XQNCYgb>0#E>L7y{u}i*BlbfpDd9ATgB0vvPzS66Z(Z(u%H9dHJzHLEGE}74Wie9wv(pZy;HMcs4IaV24xB$$%=E#DTUdrOuWN1u)3mmn9d$}l)RgRgh8Oc063_l<cX@(s-N#JfQfR+62eQC#76~vJ{TTbS#f!ETDPjvwb^PZUF&ejUf1JkJmZ|E1HBTET|9)ALKKU~ys!Ftw`$hec)0xddx+)^LKSwO>@em#g~#{v@COZtBFVH9KTAvYns_6Rdvwb3pf(KE*2d-cC=Ir`mq*2eDRUNZtqQYlhpq7C6AT7&3M_eHGs9KfjsK`DaqCaT&BCP_P+^^neCw_KmRtxDCU{j1h`9jmH^niYm22&p)lAzDemT@o|-a8#vL<Jk5KBU=_}cUz-}<^jDbjyTj%hwi^2GyaaxT%{n$gVBw-RPl*!d24aKkk9uWZYugWR2dLJSJS6lxC*%9BdYmUsRF~}PwEobfo7KcY6$ixIvl@>SPZs>5ZmLw`<&L%vBF+%TI$ia{MI9Y3Thhu=^<*3#2PyAytC%9W~;1sQ#gbPk)!0?<U`;Ms3&mU?_&bDfV1(<OsGz4hQ??Z2$VgYq2|q;kK8J^RsXFaP=dYmRYMN!|LX2DSKz4o3@p8vvb6AOVsqVhzTfU~l-Nimq&AMO;_-(~C6m6mvX`NFX$m7z6Ej9$fjA{R5gM$tqI16<)hzDFjuQI~VBLTYY5R-~>oG9hfbm3YB~ZufWpuz_XF4TFnL-<VnBFomIqP>hh{tb*U{JuZDSBc7pqbTqrJ~&;L0E+?&W$<xQ!X&>N^B0EKtD1Jd?O;lZD%th2%1SFn4@upHsAO8x5Pw|8#7<6=r$T93g?8fdbjuAXr6TGnIj$HoaI?uIVl)w10up)2e~)&O41+;;1m{Q^U-TD4W^9qj&zZ?Z~bRKvTwH63g1s>C55)x5*&5(l46{T1X59i>I5?f!ZE}(k)aMWZ`}QB%q~vI^Hb)@7FZSGx}Dp^n34uN++G`81AmGO0!)8g$Mo%GccnE;Fc2!YOG+A5glX__X?+;M?AZquqCUR(%~1$p5B1((YvcQMQq+P6-^Y&)<@wGQ8Q0O=%MNjdi2skqvuG5^(iCX9><s;+IGftXX=C+`*Vqwu!cu_Q&FoD;Xgvqxf-khUN|`B%KSQn?JmDaNF9|y>mb#nNyGKB?ml?`p$OW3T)$*OM1GRWj96R1z$RX-_#l^lwyB_9H-}b)@KP*f4c^)*wsnnjWR95nzOpwanYX-98cc!1K4=Ro*vE~Kne4&CjNxgx3JaUJW-;#f$wuOMiV3$9KZcCTbr<0Q#wHr;GR4asyYnO#MOPF(DDjdbPqCIZfBib+Q4i8ZEQZyo#&_Pu51MLDa{<!FAx1_Ma_e8!-w+%AHrSth*mVZ(pC8^qt7<y*b(JQEov1Wd)j;Yi+-+8Xh3O(EI#<52llc3b^KvvZH?@?zsBkyq#;aOzfjME5lQ7)->dtM6yteJCA2Kzj?HglO4FQJTpZ_RLpIV{CcNw%KjAIK$m0vkF4Ll*yQ?ee6o!aZnK^@40ZFHbNdiR2a`767SG@kir4MY)E53FY2>4z1M@1;lqaS%ld$VV9H+n3#@Jx<9LsufH*VVZ5w1d_`lTN-Xf|)4GS%D5AIt`B9zt<5NZ4_e{4hXYfk^>K17QVeHuB#QkA&i%p=5YqOEtAe1s%cRNOISSdVC3uC*6e8|COE8O!*f%3-t6*p?PMhtHWOcFL^)=;*-yW4Cjt$?eFJ*GCY&ESvvM<Ofxkro@sjB{zf0e9Y29)1p#aMrl7AaX^`oCg}Yk#*Dq>i!!^T8;P7hB4*@KWfcfJt&@p5rfEqrc-UX4)8UOZOlHZ|EcvNyHN7>R+vBGk@_xQa^)s)erd9ytDV|_%9|o)vhU3$S@ohHDvT^n{v&5KYwqWdO?YE1ixFZ%x@;?l$jfQENqq<HBY~*>#P%KWEvIixc`nHrbwLe-y_wYBl%6ZZKA;IZpTVsy;Ta;!`nbR`|5GN6UTf$6UB%ZbLER$tX$+S*9NY6#=A8$Ve0BX_Q6_-n9*7POBF5A%Xs4A^^+oiZrHR{ezz!VI-+9c<E^@GyXF#>Z^kI<~rZd~cZ^^UnB`C%TezK*+oGtH()0tJCn&9cCT;j=NVMROuKhK#F1(e5s;IUn?O-0^%3xCmXAnZ=4rjmO-u3-IA(FXBkM&v{jlG^vzrz{0X61c!I6j?8MUysSVb+7tM5}lrV2ZnP^R5O*+)1}ylt^p(k>M@RkRFv4%;REeX<5Wh+c5bPfh|}gTBAR2Cf>)U+)QvQc{EpO^Jl>s8;yjnYrjHSr{>Z7k$_?`rsg;>5Rd<H3@pbB@PLFFdW;L%6e+LID1TFiW4$Yh*@rkM|kN9Q-o%A^W0fhLB`xXb>tl-==)6|(P2kR-^Q;EBM@~ofjPyM2sN$6H#Vk1_S@iIAw4E%S%axFZ5>$Yw8bLvWRZ?4iKb3%FPf5|7P{%lTwCH&WQ=wP-_fd~m!VgY0qz2?k${=O<Banh7`xYo51<3I0gvDn5(TP-7R1u*lY624=<4j;y{ZB-kvMyfwK+WF#m#+j&>^7Iz>e9hnJN;_WkR?Je>kdD4Xt$H+sy@1uikmh$4=oB-chT_Qn6sjGVj{PEO_Lj7?54}=&SUJGH1ug$y1)t7%6EZ<L_$Y_)t*G(4;N(vxdcFnaYYu^`Lx1&eS&q6Om_{q0ulzoHoCD&v|86wUC8Zw(dC<)z@rFk6ELsW^+?ZB@HSZ*~bT#;f8Y)R31xrO@1+ZpCF}&+1{m3{YQ=n8X-H5m??kxP&5hn~uQqiX?ku7bqiVnny7S0hnH3CTWy}(<$nJS`hKN`^bKvLAASncSEx{K$M?;37u7pcd<MO~oPk_Fqzi<RSe^s&d=RIr7f(UtUNL+mkepeR_+MFq;KvEuy!tY*00l76y~eRNEGk8KgCSivewpOUBY6wgZrn<ZmITdGXQKqGhmLm+ZoT&W?h-hf(ThrnUxV{S@BpZ~o7%NchgcBq(qU~2~n&I0Ow+H~cLu1NR?l5ZQ?xvwmt`{j|<@q@P$&&gGMOw`TX;dPnM>%QfKlCT~A;Kg3f{U`->q<P7Td}x?JDbJJs#>!jB@h_RrNf2#vhhd>;Xi@@gHi*3$4Sgv-YODm@R{M&Aib)ToBq$_yFJ8oy@ZqQ99~1K}8iwySR!Wuu5dyu|Dz5XCq=@x5|Fs@`3OeX(%`22EA-e8R1{tI~Bh#p2I-aiL?U^J`a!aYw6{g41=ze0)Nh*Xav*`-gR#;|eJ~h>)mIkVNiNLxHd~qb)x6sf)K^+55?z`<SfSsQYIrfv^1{Xi8KI=0sbFx2PJ8<)Brys5P(H?c8=YS)TWFo>Bi+*+1Q0prAaQW#F_>9K}BB7K6mTNFomvAdscT96&lh<tUou2*21MymWZ-uYN?DjW}_5ilT1t}B?e<qka_dJxJ`Rvte#-xSOK|mjB&~geOI6L{JOM46AW47`HT%5Ip#i^2C^V2bDdI=pWL>vi{#?|}DYufB9#m~9OXGyI}9a3|dzzQF$8KrSRa$YtXh+#m5n3w-mmn17wF0|>a{w@#E?LlGjnRQ>|Tz)BSRHwFG1UE|$9mdKF%w(hiU~m;0+gq6SvUQ)GMz&UDPmG=f9Bwta?0CGHB7u73zZ)TjoYY0-!Nee!mI1aYiw`TzNdu|KZm#D9EMo*KH$**qI9!2S;LXL5I#eg>_`nJ9$ZDe@P$ofz+B$xJrWhCtE<VOn*~BA;GYD#pz~e*kkL=U8AKOk=e|5_s1@{pcd<9Vu&4TF#Itc{u!6C}xrCqp9#iBcM*S=-|x}iTa(@lzr00ErS0g|N#4&j^|vBYQl0ssI200dcD")).decode("utf-8")))
++for _n, _s in E28_SRC.items():
++    (TMP / _n).write_text(_s, encoding="utf-8")
++import e28k100_lib as E28L
++E28S, E28S_ERROR = None, None
++if "e28_sched_patch.py" in E28_SRC:
++    try:
++        import e28_sched_patch as E28S
++    except Exception as _e:
++        E28S_ERROR = f"{type(_e).__name__}: {_e}"[:400]
++        print("!!!!!!!!!! E28 SCHED MODULE NOT LOADED:", E28S_ERROR, flush=True)
++else:
++    E28S_ERROR = "interim build: e28_sched_patch.py not embedded"
+ PPK, PPK_ERROR = None, None   # E26 K100 Q-defer: NB4S's nb4_ppack.py rev 2 (sha 8dadf076); a miss = no Q-defer, the run goes on
+ try:
+@@ -534,4 +528,9 @@
+                          "boot_levers": K100_BOOT_LEVERS, "tasks": K100_TASKS, "new_groups": K100_NEW_GROUPS,
+                          "ref27_sha256": hashlib.sha256(json.dumps(K100Q_REF27, sort_keys=True).encode()).hexdigest() if K100Q_REF27 else None}   # E26 K100
++CONFIG["nb5"]["e28"] = {"t1": E28_T1, "b2": E28_B2, "server_max_len": 131072, "b2_timeout": E28_B2_TIMEOUT,
++                        "b2_window": E28_B2_WINDOW, "window_sec": E28_WINDOW_SEC, "i8_env": E28_I8_ENV, "levers": E28_LEVERS,
++                        "modules": {n: hashlib.sha256(s.encode()).hexdigest() for n, s in E28_SRC.items()},
++                        "sched_sha": getattr(E28S, "E28_SCHED_SHA", None), "sched_error": E28S_ERROR,
++                        "lib": E28L.LIB_VERSION}   # E28 K100
+ print("NB5:", json.dumps(CONFIG["nb5"], default=str), flush=True)
+ 
+@@ -580,4 +579,40 @@
+ _bad = [p for p, h in _E12_MANIFEST.items() if hashlib.sha256((E12_DIR / p).read_bytes()).hexdigest() != h]
+ assert not _bad, ("E12 package hash mismatch", _bad)
++# ---- E28 K100: the A / B / C scheduler (e28_sched_patch.py, Build/E28_SCHED_API.md section 2) on arc2_duck.py: after the
++# manifest check (the ORIGINAL payload bytes), before the import; the module checks the pre sha, writes atomically, verifies
++# the post sha + marker + py_compile. Commit: any failure = NO_GO_E28_SCHED (raised: no solve, CELL 0's fallback stays);
++# rerun: recorded loudly, reverted to the original file, E28_SCHED unset (the original scheduler runs; never worse than none)
++E28_SCHED_REC = {"want": bool(P.get("e28_sched")), "applied": False}
++if E28_SCHED_REC["want"]:
++    try:
++        if E28S is None:
++            raise RuntimeError("E28_SCHED_MODULE_MISSING: " + str(E28S_ERROR))
++        E28_SCHED_REC.update({k: v for k, v in E28S.apply_e28_sched(E12_DIR).items() if k != "text"})
++        _ok, _why = E28S.verify_e28_sched(E12_DIR)
++        E28_SCHED_REC.update(verify_ok=_ok, verify_why=_why, state=E28S.tree_state(E12_DIR))
++        if not _ok:
++            raise RuntimeError("E28_SCHED_VERIFY_FAILED: " + str(_why))
++        _e28env = dict(E28S.server_env())
++        if E11_HARNESS:              # local / CPU-kit harness only: the fake run's short attempts (NB5_ATTEMPT_B0 / E28H_B2_TOKENS)
++            _e28env.update(E28_T1=str(NB5_ATTEMPT["b0"]), E28_B2_TOKENS=os.environ.get("E28H_B2_TOKENS", _e28env["E28_B2_TOKENS"]))
++        _e28env["E28_B2_REQUEST_TIMEOUT"] = str(E28_B2_TIMEOUT)   # E28 K100 (user 2026-11-01): B2 requests 9,000 s; T1 7,200 s
++        if int(_e28env["E28_T1"]) != int(NB5_ATTEMPT["b0"]):
++            E28_SCHED_REC["warning"] = f"E28_T1 {_e28env['E28_T1']} != NB5_ATTEMPT b0 {NB5_ATTEMPT['b0']}"
++        os.environ.update(_e28env)
++        E28_SCHED_REC.update(applied=True, env=_e28env)
++        print("E28 SCHED: applied", json.dumps({k: E28_SCHED_REC.get(k) for k in ("applied", "before", "after", "sha_after", "verify_why")}), flush=True)
++    except Exception as _e:
++        E28_SCHED_REC.update(applied=False, error=f"{type(_e).__name__}: {_e}"[:800])
++        for _k in (getattr(E28S, "ENV_NAMES", None) or ("E28_SCHED",)):
++            os.environ.pop(_k, None)
++        try:
++            E28_SCHED_REC["revert"] = {k: v for k, v in E28S.revert_e28_sched(E12_DIR).items() if k != "text"}
++        except Exception as _e2:
++            E28_SCHED_REC["revert_error"] = f"{type(_e2).__name__}: {_e2}"[:400]
++        print("!!!!!!!!!! NO_GO_E28_SCHED:", E28_SCHED_REC["error"], "-> " + ("RERUN: the ORIGINAL scheduler runs" if RERUN
++              else "commit: no solve (CELL 0's fallback)"), flush=True)
++        if not RERUN:
++            raise RuntimeError("NO_GO_E28_SCHED: " + E28_SCHED_REC["error"])
++CONFIG["e28_sched"] = E28_SCHED_REC
+ sys.path[:0] = [str(E12_DIR), str(E12_DIR / "vendor")]
+ import arc2_duck as E12A
+@@ -698,5 +733,7 @@
+ def _nb5_peak_len(self):
+     """C-9: the attempt's own projected peak tokens min(131072, prompt_allow + budget + tool_allow) (CELL 5 capacity)."""
+-    pk = NB5_BLOCKS.get("peak_b0" if int(getattr(self, "arc2_branch", 0) or 0) == 0 else "peak_b1")
++    _e28p = getattr(self, "_e28_plan", None)         # E28 SCHED N1: the attempt's own plan budget (B2 = 120k)
++    pk = ((NB5_PROMPT_ALLOW + int(_e28p["budget"]) + NB5_TOOL_ALLOW) if _e28p
++          else NB5_BLOCKS.get("peak_b0" if int(getattr(self, "arc2_branch", 0) or 0) == 0 else "peak_b1"))
+     return int(min(MAX_LEN, pk)) if pk else MAX_LEN
+ 
+@@ -871,5 +908,8 @@
+         return self.status
+     slots = NB5_ADMIT_MODE == "slots"
+-    need = (int(NB5_BLOCKS["b0" if self.branch == 0 else "b1"] or 1) if NB5_ADMIT_MODE != "live"
++    _e28p = getattr(self, "e28_plan", None)          # E28 SCHED N2: an E28 attempt reserves its own projected peak
++    need = (int(NB5L.cdiv(min(MAX_LEN, NB5_PROMPT_ALLOW + int(_e28p["budget"]) + NB5_TOOL_ALLOW), NB5_BLOCKS["block"])
++                + int(NB5_BLOCKS["f"] or 0)) if (_e28p and NB5_ADMIT_MODE != "live" and NB5_BLOCKS.get("f") is not None)
++            else int(NB5_BLOCKS["b0" if self.branch == 0 else "b1"] or 1) if NB5_ADMIT_MODE != "live"
+             else int(NB5_BLOCKS["start"] or 1))
+     if (need > int(NB5_POOL_CAP["blocks"] or 0)) if slots else res.above_pool(need):
+@@ -899,4 +939,49 @@
+ 
+ E12A.BranchSession.run = _nb5_session_run
++
++
++def _e28_try_reserve(key, plan):
++    """E28 SCHED N4: the scheduler's non-blocking fit check = a reservation taken NOW or refused NOW (never waits), so a
++    free worker can backfill a smaller attempt when the head (a B2) does not fit. The blocks are N2's; the
++    attempt's own acquire in _nb5_session_run then finds its key held. Same grant rules as NB5L.Reservation.acquire
++    (idle grant; live hold; C-7 = a need above the capacity is left to _nb5_session_run, which denies it)."""
++    res = NB5_RES
++    if res is None:
++        return True
++    if NB5_ADMIT_MODE == "slots":
++        need = 1
++    elif NB5_ADMIT_MODE == "live":
++        need = int(NB5_BLOCKS["start"] or 1)
++    elif NB5_BLOCKS.get("f") is not None:
++        need = int(NB5L.cdiv(min(MAX_LEN, NB5_PROMPT_ALLOW + int(plan["budget"]) + NB5_TOOL_ALLOW), NB5_BLOCKS["block"])
++                   + int(NB5_BLOCKS["f"] or 0))
++    else:
++        need = int(NB5_BLOCKS["b0" if int(plan.get("branch") or 0) == 0 else "b1"] or 1)
++    with res.cond:
++        if key in res.held:
++            return True
++        n = need + int(res.f_extra)
++        if n > res.cap:
++            return True
++        if res.held and (res.live_hold or res.used + n > res.cap):
++            return False
++        if not res.held:
++            res.stats["idle_grants"] += 1
++        res.held[key] = n
++        res.used += n
++        res.stats["grants"] += 1
++        res.stats["e28_try_grants"] = res.stats.get("e28_try_grants", 0) + 1
++        res.stats["max_used"] = max(res.stats["max_used"], res.used)
++        res.stats["max_held"] = max(res.stats["max_held"], len(res.held))
++        return True
++
++
++def _e28_release(key):
++    """E28 SCHED N4: frees a reservation taken by _e28_try_reserve (idempotent; the attempt's own finally also frees)."""
++    if NB5_RES is not None:
++        NB5_RES.release(key)
++
++
++E12A.E28_TRY_RESERVE, E12A.E28_RELEASE = _e28_try_reserve, _e28_release   # read by the E28 scheduler (E28_SCHED=1)
+ print("NB5: commit dispatcher + request trace + reservation hook installed", flush=True)
+ 
+@@ -1845,4 +1930,42 @@
+ 
+ 
++
++# ==================================================================== E28 K100: I8 static check (NEW, e28k100_lib)
++def e28_i8_static():
++    """E28 K100 I8 (README section 1; measured on W4 only, NB4T): Merlin's conditions for the INT8 draft head
++    (speculator._maybe_quantize_draft_lm_head, QuantizedDraftLMHead) on THIS checkpoint, read before any boot from the
++    merged klee100 dir and the installed Merlin tree (E28L.i8_static_check). Never raises (an error = INCONCLUSIVE)."""
++    try:
++        cfg = json.loads((CKPT / "config.json").read_text(encoding="utf-8"))
++        qf = CKPT / "quantization_config.json"
++        qc = json.loads(qf.read_text(encoding="utf-8")) if qf.is_file() else (cfg.get("quantization_config") or {})
++        tree = None if FAKE else ((MERLIN_ENG or {}).get("kv") or {}).get("MERLIN_TREE")
++        src = {}
++        for rel in ("vllm/models/qwen4_exp/nvidia/mtp.py", "vllm/models/qwen4_exp/nvidia/model.py",
++                    "vllm/v1/worker/gpu/spec_decode/speculator.py"):
++            if tree and (Path(tree) / rel).is_file():
++                src[rel] = (Path(tree) / rel).read_text(encoding="utf-8", errors="replace")
++        return dict(E28L.i8_static_check(cfg, qc, src), files=sorted(src), fake=bool(FAKE))
++    except Exception as e:
++        return {"verdict": "INCONCLUSIVE", "why": [f"{type(e).__name__}: {e}"[:300]]}
++
++
++def e28_i8_gate(trec):
++    """E28 K100 I8 (audit 2026-11-01, HIGH): a boot with DRAFT_HEAD=int8 is trusted only on the read-back label I8_ENGAGED
++    (argv + log spec int8 and the 'Draft lm_head: INT8 weight-only copy' build lines, NB4T's evidence). Anything else on a
++    real server (I8_SPEC_ONLY, I8_CONTRADICTION, a BF16 head) -> status I8_READBACK_UNVERIFIED + trec["i8_failure"]; the
++    caller returns (with_servers stops this server) and nb5_boot retries the SAME pin with the BF16 head
++    (I8_UNSUPPORTED_ON_K100, kind READBACK_UNVERIFIED). The fake server keeps its own label (FAKE_SERVER). True = stop."""
++    rb = trec.get("i8_readback") or {}
++    if FAKE or (NB5_BOOT_LEVERS or {}).get("DRAFT_HEAD") != "int8" or rb.get("label") == "I8_ENGAGED":
++        return False
++    trec["status"] = "I8_READBACK_UNVERIFIED"
++    trec["i8_failure"] = {"label": rb.get("label"),
++                          "why": rb.get("contradictions") or [k for k, v in (rb.get("checks") or {}).items() if v is not True]}
++    log("!!!!!!!!!! E28 K100 I8_READBACK_UNVERIFIED", json.dumps(trec["i8_failure"], default=str)[:600],
++        "-> this server stops; the same pin with the BF16 draft head")
++    return True
++
++
+ # ---- RC2 CELL 1 input block, wrapped
+ def nb5_rc2_inputs():
+@@ -2676,8 +2799,11 @@
+     plan.update(pool_source=src, f_source=("f_log (server max-concurrency line)" if NB5_F_RULE == "measured" and plan.get("f_log")
+                                            is not None else f_src), caps=caps, kv_dtype=kv, live_pool=live, nb1=nb1)
+-    if NB5_ADMIT_MODE == "slots":                  # R2 (user decision): workers = max_num_seqs = the 64k-context rule
++    if NB5_ADMIT_MODE == "slots" or P.get("e28_workers_rule"):   # R2 (user decision): workers = max_num_seqs = the 64k-context rule
++        # E28 K100: the R2 rule (21 workers) also when a profile is not "slots" (E28 runs "slots", as K100Q)
+         _wr = NB5L.workers_rule(pool, block, plan["f_eff"])
+         _seq = caps.get("max_num_seqs")
+         _w = min(_wr, int(_seq)) if _seq else _wr
++        if P.get("top_rung_seqs") and _seq and int(_seq) == int(P["top_rung_seqs"]):   # E28 K100 (user 2026-11-01): the top
++            _w = int(_seq)                   # rung launched 24 -> 24 workers (lower rungs: K100Q's R2 value, the min above)
+         plan["r2_workers"] = {"rule": _wr, "rule_text": "max(1, floor(pool / (ceil(65536 / B) + F)))", "pool": pool,
+                               "f_eff": plan["f_eff"], "launch_max_num_seqs": _seq, "workers": _w,
+@@ -2685,9 +2811,13 @@
+                                                                        ("RULE_BELOW_LAUNCH" if _wr < int(_seq) else "RULE_ABOVE_LAUNCH")),
+                               "projected_120k_workers": plan["workers"],
+-                              "captures_cover_workers": NB5L.captures_cover(NB5_CAPS16 if P.get("caps16") else (K100_CAPS if P.get("k100_caps") else [32]), _w)}   # E26 K100
++                              "captures_cover_workers": NB5L.captures_cover(NB5_CAPS16 if P.get("caps16") else (K100_CAPS if P.get("k100_caps") else [32]), _w),   # E26 K100
++                              "captures_cover_pp2_microbatch": max(K100_CAPS) >= -(-_w * 4 // 2), "top_rung_seqs": P.get("top_rung_seqs"),
++                              "rung_workers": _w}   # E28 K100: this rung's workers
+         if plan["workers"] >= 1:                   # C-8 stays: no attempt kind fits the pool -> NO_GO (workers 0)
+             plan["workers"] = _w
+     if caps.get("max_num_seqs") is None:
+         plan["warning"] = "max_num_seqs not found in the server log: workers = pool streams"
++    plan["e28"] = E28L.capacity_note(pool, block, plan["f_eff"], NB5_GATE, E28_T1, E28_B2, MAX_LEN, MAX_LEN,
++                                     plan["workers"])   # E28 K100: T1 / B2 blocks (recorded; "slots" admits by workers)
+     plan["other_dtype_plan"] = {k: NB5L.capacity_plan(NB5_POOL_PLACEHOLDER[k] if not (NB5_NB1_CAPACITY.get(k) or {}).get("pool_blocks")
+                                                       else int(NB5_NB1_CAPACITY[k]["pool_blocks"]), block, NB5_ATTEMPT,
+@@ -3023,5 +3153,5 @@
+     cap = NB5_CAPACITY or {}
+     busy = [r_ for r_ in rows if isinstance(r_.get("running"), int) and (r_.get("inflight") or 0) > 0]
+-    tasks = NB5L.qab_tasks(E12_RECORDS, SOLUTIONS, rep.get("eval_unit_records"), NB5_QAB_GROUP_OF, P["task_list"],
++    tasks = NB5L.qab_tasks(E12_RECORDS, SOLUTIONS, rep.get("eval_unit_records"), NB5_QAB_GROUP_OF, P.get("task_list") or list(TASK_IDS),   # E28 K100
+                            {"b0": E15B["E12_B_ATTEMPT_TOKENS"], "b1": E15B["E12_B_ATTEMPT_TOKENS_B1"]}, ws_ep, we_ep,
+                            (NB5_TRACE.summary() or {}).get("by_attempt"))
+@@ -3348,4 +3478,9 @@
+                                                                        if k_ == "NB4_PPDEFER"})
+         trec["config_readback"] = NB5L.config_readback(s.log(), s.argv, NB5_BOOT_KV, mtp_on)    # C-11
++        trec["i8_readback"] = ({"label": "FAKE_SERVER", "want": NB5_BOOT_LEVERS.get("DRAFT_HEAD")} if FAKE else
++                               E28L.i8_readback(s.log(), s.argv, NB5_BOOT_LEVERS.get("DRAFT_HEAD")))   # E28 K100 I8 (NB4T, recorded)
++        E28_I8["readback"] = trec["i8_readback"].get("label")
++        if e28_i8_gate(trec):                                # E28 K100 I8 (audit 2026-11-01): INT8 requested -> I8_ENGAGED required
++            return {}                                        # this server stops (with_servers); the ladder retries the same pin, BF16
+         if not trec["config_readback"]["ok"] and not RERUN:
+             trec["status"] = "INCONCLUSIVE_CONFIG_MISMATCH"
+@@ -3453,14 +3588,19 @@
+             brec["ladder_stop"] = f"only {round(left() / 60, 1)} min left: no further boot try"
+             break
+-        NB5_BOOT_LEVERS = dict(levers)
++        NB5_BOOT_LEVERS = dict(levers, **(E28_I8_ENV if E28_I8["on"] else {}))   # E28 K100 I8: DRAFT_HEAD=int8 into build()
+         seqs = NB5L.seqs_for(NB5_BOOT_KV, tr["gib"]) if NB5_SEQS_RULE == "table" else (K100_SEQS_TABLE[round(float(tr["gib"]), 2)] if NB5_SEQS_RULE == "k100" else None)   # E26 K100
++        if P.get("top_rung_seqs") and abs(float(tr["gib"]) - K100_PIN_STEPS_GIB[0]) < 1e-9:   # E28 K100 (user 2026-11-01):
++            seqs = int(P["top_rung_seqs"])            # 24 on the TOP rung only (an I8 -> BF16 retry there keeps 24)
+         NB5_BOOT_EXTRA = base_extra + (["--max-num-seqs", str(seqs)] if seqs else [])
+-        name = (tag if not P.get("pin_ladder") else f"{tag}_pin{int(round(tr['gib'] * 100))}" + ("" if levers or not NB5_LEVER_ENV else "_nolever"))
+-        trec = {"name": name, "pin_gib": tr["gib"], "kv_bytes": tr["kv_bytes"], "max_num_seqs_launch": seqs, "levers": dict(levers)}
++        name = (tag if not P.get("pin_ladder") else f"{tag}_pin{int(round(tr['gib'] * 100))}" + ("" if levers or not NB5_LEVER_ENV else "_nolever")
++                + ("_i8" if E28_I8["on"] else ""))   # E28 K100
++        trec = {"name": name, "pin_gib": tr["gib"], "kv_bytes": tr["kv_bytes"], "max_num_seqs_launch": seqs, "levers": dict(levers),
++                "e28_i8": bool(E28_I8["on"])}   # E28 K100
+         brec["tries"].append(trec)
+         globals()["NB6_READY_SEC"] = ((30 if len(brec["tries"]) == 1 else 15) * 60 if P.get("e18_ladder")
+                                       else NB5_READY_TIMEOUT)          # NB6 P3: E18 R2 cell 6 L485
+         nb5_boot_try(trec, name, tr["kv_bytes"], phases, mtp_on)
+-        fail = NB5L.boot_failure(trec.get("status"), trec.pop("log_text_for_ladder", ""), levers, trec.get("phases_started", False))
++        _e28_log = trec.pop("log_text_for_ladder", "")   # E28 K100: kept for the I8 drop record
++        fail = NB5L.boot_failure(trec.get("status"), _e28_log, levers, trec.get("phases_started", False))
+         if P.get("e18_ladder"):   # NB6 P3: E18 R2 retries on ANY failed attempt (not ready, stall, smoke) before solving
+             fail["failed"] = trec.get("status") != "DONE" and not trec.get("phases_started", False)
+@@ -3468,4 +3608,16 @@
+         log("NB5 boot try", name, trec.get("status"), "| ladder", json.dumps({k: fail[k] for k in ("failed", "lever_suspect")}))
+         nb5_write_report()
++        if (E28_I8["on"] and not ABORT.get("why") and not trec.get("phases_started") and not (P.get("e18_ladder") and len(brec["tries"]) >= 3)
++                and (fail["failed"] or str(trec.get("status")) in ("INCONCLUSIVE_CONFIG_MISMATCH", "I8_READBACK_UNVERIFIED"))):
++            # E28 K100 I8 (user 2026-11-01): a try that failed with the INT8 draft head, or booted without a verified INT8
++            # head (audit 2026-11-01: I8_READBACK_UNVERIFIED) -> the SAME pin with the BF16 head (I8_UNSUPPORTED_ON_K100, a
++            # lever drop: the proven pin and the 21 workers stay)
++            _e28_dr = (dict(label=E28L.I8_DROP, kind="READBACK_UNVERIFIED", status=trec.get("status"), readback=trec.get("i8_failure"))
++                       if str(trec.get("status")) == "I8_READBACK_UNVERIFIED" else E28L.i8_failure_reason(trec.get("status"), _e28_log))
++            E28_I8.update(on=False, dropped=dict(_e28_dr, try_name=name, pin_gib=tr["gib"]))
++            brec.setdefault("levers_dropped", []).append({"keys": ["DRAFT_HEAD"], "why": E28L.I8_DROP + ": " + E28_I8["dropped"]["kind"],
++                                                          "try": name})
++            log("!!!!!!!!!! E28 K100", E28L.I8_DROP, json.dumps(E28_I8["dropped"], default=str)[:600], "-> the same pin, BF16 draft head")
++            continue
+         if not fail["failed"] or not P.get("pin_ladder") or ABORT.get("why") or (P.get("e18_ladder") and len(brec["tries"]) >= 3):
+             break                                  # NB6 P3: E18 R2 ladder = at most 3 engine attempts
+@@ -3530,5 +3682,6 @@
+ 
+ 
+-    E12_ORDER = sorted(TASK_IDS, key=lambda t: (-_e12_order2_score(t), _e12_total_cells(t), _E12_INDEX[t]))
++    E12_ORDER = (list(TASK_IDS) if os.environ.get("E28_SCHED", "").strip() == "1" or P.get("plain_order")   # E28 SCHED N3: no ORDER2
++                 else sorted(TASK_IDS, key=lambda t: (-_e12_order2_score(t), _e12_total_cells(t), _E12_INDEX[t])))
+     if P.get("task_order"):      # NB5 R2: the lead's fixed task order (the same in both paired phases)
+         E12_ORDER = [t for t in P["task_order"] if t in TASK_IDS] + [t for t in E12_ORDER if t not in P["task_order"]]
+@@ -4702,7 +4855,17 @@
+         log("NB5 #60490:", json.dumps(NB5_PIN["patch_60490"], default=str)[:600])
+     k100_setup()   # E26 K100: OVERLAY_MERGE_K6 gate, worker extension, static scales sidecar (any miss: no boot)
++    E28_I8.update(want=bool(P.get("i8")), on=bool(P.get("i8")))   # E28 K100 I8: DRAFT_HEAD=int8 from the first boot try
++    if E28_I8["want"]:
++        E28_I8["static"] = e28_i8_static()
++        if E28_I8["static"].get("verdict") == "UNSUPPORTED_STATIC":
++            E28_I8.update(on=False, dropped={"label": E28L.I8_DROP, "kind": "STATIC", "why": E28_I8["static"].get("why")})
++            log("!!!!!!!!!! E28 K100", E28L.I8_DROP, "(static):", json.dumps(E28_I8["static"], default=str)[:600], "-> BF16 draft head")
++    NB5_REPORT["e28_i8"] = E28_I8
++    NB5_REPORT["e28_sched"] = E28_SCHED_REC
++    log("E28 K100 I8", json.dumps({k: E28_I8.get(k) for k in ("want", "on", "dropped")}, default=str)[:600], "| static",
++        (E28_I8.get("static") or {}).get("verdict"), "| scheduler applied", E28_SCHED_REC.get("applied"))
+     if P.get("fixed_window_sec"):    # E26 K100: NB5 QUALITY's solve window, fixed (not split: one phase)
+         NB5_EQ.update(window_sec=float(P["fixed_window_sec"]), plan={"window_sec": float(P["fixed_window_sec"]), "fixed": True,
+-                      "source": "NB5 QUALITY Q_FP8_K3 window (planned 4049.8 s, actual 4049.5 s)"})
++                      "source": "E28 K100: the fixed 6-h EVAL120 window (README section 1)"})
+     _groups = []
+     for _sp in P["nb5_phases"]:
+@@ -4813,5 +4976,5 @@
+             "paired": {t: {n: {k: (p.get("quality") or {}).get(t, {}).get(k) for k in ("exact_all_tests", "complete", "output_tokens",
+                                                                                          "wall_sec", "tool_call_rate", "first_request_latency_sec")}
+-                           for n, p in _q.items()} for t in (P.get("task_list") or NB5_QUALITY_TASKS)}}
++                           for n, p in _q.items()} for t in (P.get("task_list") or NB5_ALL_IDS)}}   # E28 K100
+     if P.get("quality_ab"):                    # R2: per phase + the paired FP8 / BF16 summary (all / finished in both)
+         _pc = {n: {"kv": p.get("kv_dtype"), "status": p.get("status"), "fp8_status": p.get("fp8_status"),
+@@ -4845,6 +5008,5 @@
+               json.dumps(_qa["phase_diff"]["differences"], default=str)[:2500], flush=True)
+         else:
+-            print("deployment_comparison: not applicable (single phase Q_K100_FP8_K3; k100_quality_report.json compares it with "
+-                  "NB5 QUALITY's FP8 phase)", flush=True)
++            print("deployment_comparison: not applicable (E28 K100: one phase; e28_k100_report.json is its report)", flush=True)
+     nb5_write_report()
+     print("NB5 REPORT:", json.dumps({"throughput": NB5_REPORT["throughput"], "phases": {n: {k: p.get(k) for k in (
+@@ -4852,78 +5014,52 @@
+ except BaseException:
+     print("NB5 report error:", traceback.format_exc()[-2000:], flush=True)
+-# ---- E26 K100: the klee100 quality report vs NB5 QUALITY's FP8 phase (k100q_report.build_quality_report; reference embedded)
+-K100Q_OUT = {"status": None}
++# ---- E28 K100: the run report (e28k100_lib.build_e28_report): score, tok/s, preemptions, prefix hit, the per-attempt table
++# (A / B1 / B2 / C), the B2 (200k) attempts with their context reached, I8 / Q-defer / scheduler / boot facts
++E28_OUT = {"status": None}
+ try:
+-    _kn = "Q_K100_FP8_K3"
++    _kn = P["nb5_phases"][0][0]   # E28 K100: the commit phase (Q_E28_K100_EVAL120) / the rerun's EVAL
+     _kp = (NB5_REPORT.get("phases") or {}).get(_kn) or {}
+     _kd = BASE_OUT / f"phase_{_kn}"
+     _kpc = ((NB5_REPORT.get("quality_ab") or {}).get("per_config") or {}).get(_kn) or {}
+     _kb = NB5_BOOTS[-1] if NB5_BOOTS else {}
+-    _kws = (_kpc.get("window") or {}).get("start_sec")
+-    _kws_ep = (time.time() - (time.perf_counter() - (NOTEBOOK_T0 + float(_kws)))) if _kws is not None else None   # = nb5_qab_phase_record
+-    _kg = ((_kb.get("tries") or [{}])[-1] or {}).get("k100_gates") or {}
+-    K100Q_OUT = {"boot": dict({k: _kb.get(k) for k in ("tag", "status", "pin_used", "ready_sec", "t0_sec")},
+-                              k100_gates={k: v for k, v in _kg.items() if k != "method_map_raw"}),
+-                 "boot_tries": [{k: t_.get(k) for k in ("name", "status", "pin_gib", "kv_bytes", "max_num_seqs_launch", "ladder", "ready_sec")}
+-                                | {"k100_gate_fatal": (t_.get("k100_gates") or {}).get("fatal")} for t_ in _kb.get("tries") or []],
+-                 "k100_setup": NB5_REPORT.get("k100_setup"), "phase_status": _kp.get("status"), "phase_error": _kp.get("error"),
+-                 "finish": k100_finish(_kpc.get("tasks"), _kpc.get("window"), _kd, _kws_ep, _kp.get("task_solve")),
+-                 "expected": K100_EXPECTED}
+-    if RERUN:
+-        K100Q_OUT["status"] = "SKIPPED_RERUN"
+-    elif K100Q is None:
+-        K100Q_OUT["status"] = "REPORT_LIB_NOT_EMBEDDED (interim build)"
+-    elif not _kp:
+-        K100Q_OUT["status"] = "NO_PHASE_RUN"
+-    elif not (_kd / "e12_run_report.json").exists():      # audit F: one final status (INCOMPLETE_PHASE first)
+-        K100Q_OUT.update(K100Q.notebook_status(_kp, None, run_report_present=False))
+-    else:
+-        _rr = _load_json(_kd / "e12_run_report.json")
+-        _ga = _load_json(_kd / "e12_generated_attempts.json") if (_kd / "e12_generated_attempts.json").exists() else {}
+-        _sr = _kd / "nb5_sampler.jsonl"
+-        _eng = K100Q.engine_facts(_kpc, _kp, _kb, [json.loads(l_) for l_ in _sr.read_text(encoding="utf-8").splitlines() if l_.strip()]
+-                                  if _sr.exists() else None)
+-        _sol = {t: v for t, v in (SOLUTIONS or {}).items() if t in (P.get("task_list") or [])}
+-        _miss = [t for t in P["task_list"] if t not in _sol]
+-        K100Q_OUT["solutions_check"] = {"tasks": len(P["task_list"]), "with_solutions": len(P["task_list"]) - len(_miss), "missing": _miss}
+-        K100Q_OUT["quality"] = K100Q.build_quality_report(_rr, _ga, _eng, _sol, K100Q_REF, records=E12_RECORDS,
+-                                                          by_attempt=(NB5_TRACE.summary() or {}).get("by_attempt"), phase_dir=str(_kd),
+-                                                          order=list(P["task_list"]), group_of=dict(NB5_QAB_GROUP_OF), ref27=K100Q_REF27,
+-                                                          finish=K100Q_OUT.get("finish"))   # audit E: the matched 4,050-s cutoff
+-        K100Q_OUT.update(K100Q.notebook_status(_kp, K100Q_OUT["quality"], missing_gold=_miss))   # audit: VALID only when clean
++    _to_ep = lambda s_: (time.time() - (time.perf_counter() - (NOTEBOOK_T0 + float(s_)))) if s_ is not None else None
++    _kw = dict(_kpc.get("window") or {})
++    _kw.update(start_epoch=_to_ep(_kw.get("start_sec")), end_epoch=_to_ep(_kw.get("end_sec")))
++    _rr = _load_json(_kd / "e12_run_report.json") if (_kd / "e12_run_report.json").exists() else {}
++    _ga = _load_json(_kd / "e12_generated_attempts.json") if (_kd / "e12_generated_attempts.json").exists() else {}
++    _qrb = ((_kb.get("tries") or [{}])[-1] or {}).get("qdefer_readback") or {}
++    _qd = {"applied": K100_QD.get("applied"), "status": K100_QD.get("status"), "error": K100_QD.get("error"),
++           "readback_label": _qrb.get("label"), "exec_share_min": _qrb.get("exec_share_min"), "launch_env": K100_QD.get("launch_env")}
++    _sch = {"rec": E28_SCHED_REC, "e28": ((_rr.get("e12_run") or {}).get("rev6_scheduler") or {}).get("e28")}
++    _ksr = _kd / "nb5_sampler.jsonl"   # E28 K100: the 15-s sampler (preemption counter) -> the per-attempt preemption flag
++    _ksamp = [json.loads(l_) for l_ in _ksr.read_text(encoding="utf-8").splitlines() if l_.strip()] if _ksr.exists() else None
++    E28_OUT = E28L.build_e28_report(phase=_kp, per_config=_kpc, run_report=_rr, generated_attempts=_ga, records=E12_RECORDS,
++                                    solutions=SOLUTIONS, task_ids=list(NB5_ALL_IDS), boot=_kb, i8=E28_I8, qdefer=_qd, sched=_sch,
++                                    window=_kw, budgets={"T1": E28_T1, "A": E28_T1, "B1": E28_T1, "C": E28_T1, "B2": E28_B2},
++                                    phase_of=lambda r_: (r_.get("e28") or {}).get("phase"), rerun=RERUN, max_model_len=MAX_LEN,
++                                    sampler=_ksamp)
++    if not RERUN and _kp:
+         try:
+-            K100Q_OUT["table_md"] = K100Q.markdown_table(K100Q_OUT["quality"]) + "\n" + K100Q.markdown_extra(K100Q_OUT["quality"])
++            E28_OUT["finish"] = k100_finish(_kpc.get("tasks"), _kpc.get("window"), _kd, _kw.get("start_epoch"), _kp.get("task_solve"))
+         except Exception as _e:
+-            K100Q_OUT["table_md_error"] = repr(_e)[:300]
++            E28_OUT["finish_error"] = repr(_e)[:300]
++        E28_OUT["flags"] = K100Q.review_flags(P, NB5_PIN, _kp, _kpc)
++        E28_OUT["table_md"] = E28L.markdown(E28_OUT)
+ except BaseException:
+-    K100Q_OUT.update(status="ERROR", error=traceback.format_exc()[-2500:])
+-try:                       # E26 K100: review flags (#60490, shortened window) + the summary (preemptions, fresh prefill, tasks / h)
+-    K100Q_OUT["flags"] = K100Q.review_flags(P, NB5_PIN, _kp, _kpc)
+-    _qrb = ((_kb.get("tries") or [{}])[-1] or {}).get("qdefer_readback") or {}
+-    K100Q_OUT["qdefer"] = {"applied": K100_QD.get("applied"), "status": K100_QD.get("status"), "error": K100_QD.get("error"),
+-                           "readback_label": _qrb.get("label"), "exec_share_min": _qrb.get("exec_share_min"),
+-                           "launch_env": K100_QD.get("launch_env")}
+-    K100Q_OUT["engine_summary"] = K100Q.engine_summary(_kp, _kpc, K100Q_OUT.get("finish"), K100Q_OUT.get("quality"), K100Q_OUT["qdefer"])
+-    if isinstance((K100Q_OUT.get("quality") or {}).get("notes"), dict):
+-        K100Q_OUT["quality"]["notes"]["engine_summary"] = K100Q_OUT["engine_summary"]
+-        K100Q_OUT["quality"]["notes"].setdefault("lines", []).extend(K100Q_OUT["flags"] + K100Q_OUT["engine_summary"]["note_lines"])
++    E28_OUT.update(status="ERROR", error=traceback.format_exc()[-2500:])
++try:
++    write_json_atomic(BASE_OUT / "e28_k100_report.json", E28_OUT)
++    print("E28 K100 REPORT:", json.dumps({k: E28_OUT.get(k) for k in ("status", "score", "engine", "attempt_summary", "b2", "flags",
++                                                                         "boot", "boot_tries", "errors")}, default=str)[:12000], flush=True)
++    print("E28 K100 I8 / Q-defer / scheduler:", json.dumps({"i8": E28_OUT.get("i8"), "qdefer": E28_OUT.get("qdefer"),
++                                                            "sched_applied": E28_SCHED_REC.get("applied")}, default=str)[:3000], flush=True)
++    print(E28_OUT.get("table_md") or "E28 K100: no per-attempt table", flush=True)
+ except BaseException:
+-    K100Q_OUT["flags_error"] = traceback.format_exc()[-800:]
+-try:
+-    write_json_atomic(BASE_OUT / "k100_quality_report.json", K100Q_OUT)
+-    print("K100 QUALITY:", json.dumps({k: K100Q_OUT.get(k) for k in ("status", "flags", "qdefer", "solutions_check", "boot", "finish")},
+-                                      default=str)[:6000], flush=True)
+-    for _fl in K100Q_OUT.get("flags") or []:
+-        print("K100 QUALITY FLAG:", _fl, flush=True)
+-    print("K100 SUMMARY: status", K100Q_OUT.get("status"), "|", json.dumps(K100Q_OUT.get("engine_summary"), default=str),
+-          "| flags", len(K100Q_OUT.get("flags") or []), flush=True)
+-    print("K100 QUALITY report:", json.dumps(K100Q_OUT.get("quality"), default=str)[:12000], flush=True)
+-    print(K100Q_OUT.get("table_md") or "K100 QUALITY: no per-task table", flush=True)
+-except BaseException:
+-    print("K100 report write error:", traceback.format_exc()[-1500:], flush=True)
++    print("E28 K100 report write error:", traceback.format_exc()[-1500:], flush=True)
+ try:
+     _pack = WORKING / "Q27X_NB5_BUNDLE.zip"
+     with zipfile.ZipFile(_pack, "w", zipfile.ZIP_DEFLATED) as z:
+-        for fp in [BASE_OUT / "nb5_report.json", BASE_OUT / "k100_quality_report.json", SUBMISSION_PATH, ENG_OUT / "nb5_engine.json", ENG_OUT / "telemetry.jsonl"] \
++        for fp in [BASE_OUT / "nb5_report.json", BASE_OUT / "e28_k100_report.json", SUBMISSION_PATH,   # E28 K100
++                   ENG_OUT / "nb5_engine.json", ENG_OUT / "telemetry.jsonl"] \
+                 + sorted(LOGS.glob("*.log")) + sorted(TRACES.glob("*")) + sorted(BASE_OUT.glob("phase_*/e12_run_report.json")) \
+                 + sorted(BASE_OUT.glob("phase_*/nb5_sampler.jsonl")):

@@ -17,9 +17,12 @@ out = {"ref_fp8_mtp3_s16": {"vllm": "0.32.0", "flags": g["vms_flags"](g["MODEL_P
        "int4_target_only_noprefix": {"vllm": "0.32.0", "flags": g["vms_flags"](g["VMS_INT4"], seqs=20, spec=0, prefix=False), "env": {}}}
 for name, fl, kw in g["PLAN"] + g["PLAN_INT4"]:
     out[name] = {"vllm": "0.32.0", "flags": [str(x) for x in fl], "env": kw.get("env_extra") or {}}
+# rev 2b: the profiled launch, with the same --profiler-config the notebook appends (Kaggle working dir)
+out["int4_s20_profile"] = {"vllm": "0.32.0", "env": {}, "flags": g["vms_flags"](g["VMS_INT4"], seqs=20) + [
+    "--profiler-config", json.dumps({"profiler": "torch", "torch_profiler_dir": "/kaggle/working/e14/vms/profile"})]}
 (E22 / "src/e22_flags.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
 print(len(out), "commands")
 for k, v in out.items():
     f = v["flags"]; sc = f[f.index("--speculative-config") + 1] if "--speculative-config" in f else None
-    extra = [x for x in f if x.startswith("--") and x in ("--prefix-match-unit", "--enable-mamba-shared-prefix-checkpoint", "--mamba-ssm-cache-dtype", "--compilation-config", "--attention-backend")]
+    extra = [x for x in f if x.startswith("--") and x in ("--prefix-match-unit", "--enable-mamba-shared-prefix-checkpoint", "--mamba-ssm-cache-dtype", "--compilation-config", "--attention-backend", "--profiler-config")]
     print(f"{k:30s} seqs={f[f.index('--max-num-seqs')+1]:>3} spec={sc} {extra} env={v['env']}")
