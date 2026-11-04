@@ -4,6 +4,20 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
 
 ## 1. Status
 
+- **2026-11-04 (checked against the competition overview)**
+  - The Kaggle citation is now the official one from the competition page: Chollet, Knoop, Kamradt, Reade, Cruz, Howard,
+    "ARC Prize 2026 - ARC-AGI-2", Kaggle 2026.
+  - Scoring:
+    - The overview words the score as an average over test outputs.
+    - All 18 distinct LB values in our records are multiples of 100/720, which matches per-task averaging over 120 tasks
+      with 1-3 test inputs. No plain average over N outputs (N = 100-399) fits them. The check is in `paper_stats.py` `[lb]`.
+    - The paper now says this, and states that LB scores are percentages (32.64 %, 5.28 percentage points).
+  - The rest of the overview matches the paper: 2 attempts, offline, 12 h, 4xL4, pre-trained models allowed.
+  - Timeline from the overview:
+    - the final submission deadline was 2026-11-02;
+    - Grand Prize write-ups are due within 7 days of it, i.e. by 2026-11-09;
+    - the paper-track deadline is not on this page.
+  - The arXiv package was rebuilt with `make_arxiv.py --draft`: 11 pages, clean build, abstract 1,900 characters. Not submitted.
 - **2026-11-04 (step 6, arXiv conversion; draft package, NOT submitted)**
   - Re-checked before any change:
     - `score_all.py` gives the expected output (41; 64/172, 46.50; pools 55 / 56; pool union 61, 44.50; all evidence 70, 50.83);

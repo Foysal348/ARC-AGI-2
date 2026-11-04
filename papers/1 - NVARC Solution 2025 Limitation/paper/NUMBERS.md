@@ -46,6 +46,7 @@ Log line numbers refer to the `*_stdout.txt` files.
 | all orders: after 2 runs 52-59 | P `[growth] all 120 orders` |
 | core 37 (27.50); in exactly one run 4; pairwise 41-45 of 52-59; D adds 0 | P `[core]`, `[union6]` |
 | union of all submissions 64 (46.50 = 38.75 %); pools 61 (44.50); all evidence 70 (50.83 = 42.36 %); 102 = 172 - 70 | S |
+| LB = per-task averaging (percent): 18 distinct values all multiples of 100/720, no N in 100-399 fits a plain average over N outputs | P `[lb]` (`fit_task_average_100_720`, `unit_average_N_fitting_100_399`); wording of the overview: Kaggle competition page, Evaluation section |
 | LB best 32.64; 10 submissions of one version (331102752) 27.36-32.64, mean 29.36; 63 submissions, 19 notebooks | P `[lb]` (`data/lb_by_notebook.csv` incl. `scored_versions`, from the NVARC family README table) |
 | run B: 37.8/111, 47/120, same 37.8 for probmul and dual | `v3_misleading_claims_audit_2026-11-04.md` items 3, 8, 10, 11 (cell outputs of the provided v3 notebook) |
 | pitfalls 1-5 (R2 diagnostics) | R2 log Experiments 5, 8, 10, 16, 18-20; `v25_v2_ceiling_findings_2026-11-04.md` section 6 |

@@ -277,6 +277,13 @@ best = max(lb, key=lambda r: r[5])
 out["lb"] = {"notebooks_with_scored_submissions": len(lb), "submissions": sum(r[2] for r in lb),
              "best_max": best[5], "best_slug": best[0], "best_slug_subs": best[2], "best_slug_min": best[3],
              "best_slug_mean": best[4], "best_slug_versions": best[6]}
+# Which scoring rule do the LB values fit? Per-task averaging over 120 tasks with 1-3 test inputs (as in the public set)
+# gives multiples of 100/720; a plain average over N test outputs gives multiples of 100/N. Values are rounded to 0.01.
+lbv = sorted({v for r in lb for v in (r[3], r[5]) if v > 0})
+fit = lambda step: all(abs(v - round(v / step) * step) <= 0.005 + 1e-9 for v in lbv)
+out["lb"]["distinct_min_max_values"] = len(lbv)
+out["lb"]["fit_task_average_100_720"] = fit(100 / 720)
+out["lb"]["unit_average_N_fitting_100_399"] = [n for n in range(100, 400) if fit(100 / n)]
 
 json.dump(out, open(os.path.join(ROOT, "data", "paper_numbers.json"), "w", newline="\n"), indent=1, default=list)
 

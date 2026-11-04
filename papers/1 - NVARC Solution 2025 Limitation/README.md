@@ -55,7 +55,9 @@ The status and the next steps are in `PLAN.md`. This file says what the paper is
 
 - **Unit.** One test input (172 in the eval set).
 - **Pass@2.** A unit is right if `attempt_1` or `attempt_2` equals the solution grid.
-- **Task-norm.** The sum over right units of 1 / (test inputs of that task), out of 120. This is what Kaggle's LB uses.
+- **Task-norm.** The sum over right units of 1 / (test inputs of that task), out of 120. This is what Kaggle's LB uses, as a percentage.
+  - The competition overview words the score as an average over test outputs.
+  - But all 18 distinct LB values in our records are multiples of 100/720, which matches per-task averaging, and no plain average over N outputs fits them (`scripts/paper_stats.py`, `[lb]`).
   - Notebook-printed scores such as "37.8/111" use their own denominators.
   - Always re-score from `submission.json` with `scripts/score_all.py`.
 - **Candidate pool.** The "GT Present cases" table of EXPERIMENT 1 in a run log: the test inputs whose decoded candidates contain the answer.
