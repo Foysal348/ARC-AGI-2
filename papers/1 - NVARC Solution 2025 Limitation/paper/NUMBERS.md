@@ -50,3 +50,6 @@ Log line numbers refer to the `*_stdout.txt` files.
 | run B: 37.8/111, 47/120, same 37.8 for probmul and dual | `v3_misleading_claims_audit_2026-11-04.md` items 3, 8, 10, 11 (cell outputs of the provided v3 notebook) |
 | pitfalls 1-5 (R2 diagnostics) | R2 log Experiments 5, 8, 10, 16, 18-20; `v25_v2_ceiling_findings_2026-11-04.md` section 6 |
 | pipeline settings | R2 `arc_solver.py` (LoRA r 256, alpha 32, rsLoRA, lr 5e-5, 16 train augmentations, `augment(n=2)` for test views, `max_score = -ln 0.2`, `MAX_BEAM_CANDIDATES = 10`, 540 s and 1600 s caps, placeholder), `arc_loader.py` (`augment`: transpose x rot90 x colour permutations), `arc_decoder.py` (probmul, kgmon, dual selection) |
+| abstract (arXiv version): 7-10 lost in selection, 116-117 without a correct candidate | the rows above (+7 / +10 units; 116 / 117); `paper/arxiv/METADATA.md` holds the same abstract |
+| a third attempt would add 6 and 3 units (Section 4.1) | P top-k: rank <= 3 minus rank <= 2 (51 - 45, 52 - 49) |
+| resubmissions vary by up to 5.28 LB points (Conclusion) | P `[lb]`: 32.64 - 27.36 |

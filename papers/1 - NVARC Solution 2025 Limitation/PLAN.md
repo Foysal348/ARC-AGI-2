@@ -4,6 +4,38 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
 
 ## 1. Status
 
+- **2026-11-04 (step 6, arXiv conversion; draft package, NOT submitted)**
+  - Re-checked before any change:
+    - `score_all.py` gives the expected output (41; 64/172, 46.50; pools 55 / 56; pool union 61, 44.50; all evidence 70, 50.83);
+    - `paper_stats.py` leaves `data/` and `paper/figures/data/` unchanged;
+    - the draft builds (11 pages).
+  - No number or claim changed. Layout fixes only:
+    - title broken into three balanced lines;
+    - Figure 2 legend left-aligned;
+    - "ARC Prize" / "Kaggle" capitalised in the bibliography;
+    - `\pdfoutput=1` on line 1.
+    - The build now has no overfull and no underfull boxes.
+  - Abstract shortened for the arXiv metadata limit: 1,900 characters (limit 1,920).
+    - Points (i)-(iii) and their numbers are kept. No number is added; only "37 correct in all five runs" is dropped (still in Section 4.4).
+    - `main.tex` has the same text.
+  - NVARC citation filled: Sorokin & Puget, "NVARC solution to ARC-AGI-2 2025", https://github.com/1ytic/NVARC.
+    - Source: the write-up PDF in that repo, which ARC Prize 2025 Technical Report (arXiv:2601.10904) cites as ref. [25].
+    - Hamid confirmed the URL choice.
+  - Code / data link: the team will make the repo public, so the URL stays and its TODO is removed.
+    - On 2026-11-04 it returned 404 without login: check before submitting.
+  - New `scripts/make_arxiv.py` builds `paper/arxiv/`:
+    - `main.tex` without comments, `main.bbl` from this exact `refs.bib`, `refs.bib`, `figures/data/*.dat`;
+    - `arxiv_source.tar.gz`;
+    - a clean pdflatex-only test build from the extracted tarball: 11 pages, 0 errors, 0 undefined, 0 overfull / underfull;
+    - checks against `METADATA.md`.
+    - The clean build's PDF text is identical to that of `paper/main.pdf`.
+  - pgfplots: arXiv uses TeX Live 2025 (default) or 2023, both with pgfplots 1.18.1. `compat=1.18` works, so there is no externalisation.
+  - `paper/arxiv/METADATA.md` holds the title, abstract, comments line, cs.LG + cs.AI, the suggested CC BY 4.0 license, the endorsement note and the open items.
+  - **Open:**
+    - authors: Hamid said leave open; the `TODO(authors)` line stays, so the package is built with `--draft`;
+    - make the repo public;
+    - endorser / submitter: not decided;
+    - Foysal's final review.
 - **2026-11-04 (Hamid's AI, draft v1)**
   - Numbers reproduced: `scripts/score_all.py` gives exactly the expected output (41 runs; 64/172, 46.50; pools 55 and 56;
     pool union 61, 44.50; all evidence 70, 50.83).
@@ -76,13 +108,20 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
    - union growth vs number of runs;
    - where the answer is lost (generation classes: close / partial / far / no grid; selection);
    - unique-candidate histogram.
-6. Endorsement for arXiv cs.LG / cs.AI (first-time submitters need an endorser). LaTeX source + figures + code / data link.
-   - Before submission, fill the `TODO(authors)` items in `main.tex` / `refs.bib`:
-     - author list;
-     - the official NVARC write-up citation;
-     - confirm the repo is public, or archive it.
-   - Sami vai converts to the final arXiv format.
-   - arXiv does not run BibTeX: upload `main.bbl` with `main.tex`, `refs.bib` and `figures/data/*.dat`.
+6. [in progress 2026-11-04: package built as a draft] arXiv package `paper/arxiv/` (`scripts/make_arxiv.py`, `METADATA.md`).
+   - Done:
+     - format;
+     - short abstract (1,900 characters);
+     - NVARC citation;
+     - code-link TODO;
+     - package + clean test build;
+     - metadata sheet.
+   - Open before submission (see `paper/arxiv/METADATA.md`, last section):
+     - author list, affiliations and contact (`TODO(authors)` in `main.tex`);
+     - make https://github.com/Foysal348/ARC-AGI-2 public and check the link;
+     - decide who submits and requests the cs.LG / cs.AI endorsement (a human action);
+     - rerun `python -B scripts/make_arxiv.py` without `--draft` and commit;
+     - Foysal's final review and approval. Only then submit (never by the AI).
 7. Kaggle discussion post: a short version of the findings, after the user approves the text.
 
 ## 3. Paper outline (draft)
