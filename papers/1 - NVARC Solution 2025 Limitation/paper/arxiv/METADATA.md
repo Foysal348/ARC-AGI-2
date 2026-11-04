@@ -31,7 +31,7 @@ Every number in it is in `paper/NUMBERS.md`. Compared with draft v1b, it drops o
 ## Comments
 
 ```text
-12 pages, 5 figures, 2 tables
+14 pages, 5 figures, 2 tables, 3 algorithms
 ```
 
 Once the repository is public, the team may append `; code and data: https://github.com/Foysal348/ARC-AGI-2`.

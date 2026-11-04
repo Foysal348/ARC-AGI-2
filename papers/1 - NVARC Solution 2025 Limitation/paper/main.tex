@@ -9,7 +9,10 @@
 \usepackage{lmodern}
 \usepackage{microtype}
 \usepackage{amsmath}
+\usepackage{amssymb}
 \usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 \usepackage{xcolor}
 \usepackage{pgfplots}
 \usepgfplotslibrary{fillbetween}
@@ -150,7 +153,12 @@ For every task, a fresh LoRA adapter~\citep{hu2021lora} (rank 256, $\alpha=32$, 
 
 \paragraph{Generation.}
 Each test input is presented in up to 16 augmented views (8 dihedral transforms $\times$ 2 colour permutations). For each view, a depth-first search (\code{turbo\_dfs}) keeps a partial output only while its cumulative negative log-likelihood stays below $-\ln 0.2 \approx 1.609$. A completed output is therefore one whose probability under the adapted model, given that view, exceeds 0.2.
-Distinct completed outputs are prefix-free, so their probabilities sum to at most 1. A view can therefore return at most 4 outputs, and a test input at most 64.
+Let $Y_v$ be the completed outputs of view $v$ and $C_u$ the multiset of candidates of test input $u$. Distinct completed outputs are prefix-free, so their probabilities sum to at most 1:
+\begin{equation}
+\label{eq:bound}
+1 \;\ge\; \sum_{y\in Y_v} p_\theta(y\mid v) \;>\; 0.2\,|Y_v|
+\quad\Longrightarrow\quad |Y_v|\le 4, \qquad |C_u| \le 16\cdot 4 = 64 .
+\end{equation}
 The code also caps the number of next tokens expanded per step: 10 in \R{2}, 5 in \R{1}, A and D. This cap never binds, because a token survives only if its conditional probability exceeds 0.2, and at most 4 tokens can.
 Each output is decoded into a grid and mapped back through the inverse augmentation.
 If the search returns no completed output for a test input, the pipeline writes an all-zero placeholder grid of the test-input shape.
@@ -159,8 +167,8 @@ If the search returns no completed output for a test input, the pipeline writes 
 Every distinct grid $y$ is re-scored by the adapted model under 8 further augmentations. Each occurrence $g$ of $y$ (from different views or search paths) carries its search NLL $b_g$ and eight augmentation NLLs $a_{g,1..8}$.
 Two rankers order the distinct grids by
 \begin{align}
-\text{probmul}(y) &= \sum_{g\in G(y)} (\beta - b_g) + \frac{1}{|G(y)|}\sum_{g\in G(y)}\sum_{j=1}^{8} (\beta - a_{g,j}), \qquad \beta = \max_{g\in G(y)} b_g + 1,\\
-\text{kgmon}(y) &= |G(y)| - \frac{1}{|G(y)|}\sum_{g\in G(y)} \frac{1}{8}\sum_{j=1}^{8} a_{g,j},
+\text{probmul}(y) &= \sum_{g\in G(y)} (\beta - b_g) + \frac{1}{|G(y)|}\sum_{g\in G(y)}\sum_{j=1}^{8} (\beta - a_{g,j}), \qquad \beta = \max_{g\in G(y)} b_g + 1, \label{eq:probmul}\\
+\text{kgmon}(y) &= |G(y)| - \frac{1}{|G(y)|}\sum_{g\in G(y)} \frac{1}{8}\sum_{j=1}^{8} a_{g,j}, \label{eq:kgmon}
 \end{align}
 where $G(y)$ is the set of occurrences of $y$ (functions \code{score\_full\_probmul\_3} and \code{score\_kgmon}). The augmentation NLLs are computed once per grid, so $a_{g,j}$ is the same for every occurrence of $y$. Both rankers reward grids found many times.
 
@@ -168,6 +176,55 @@ where $G(y)$ is the set of occurrences of $y$ (functions \code{score\_full\_prob
 The submitted pair (``dual selection'') is built from the top 3 grids of each ranker, de-duplicated with the probmul list first. Attempt~1 is the probmul top grid, and attempt~2 is the next grid in that pooled list.
 Both rankers order the same set of distinct grids. Attempt~2 is therefore the probmul rank-2 grid whenever there are two or more grids, and the kgmon ranking never changes the submitted pair.
 In both logged runs, the set of correctly answered test inputs equals the set whose answer probmul ranks 1 or 2 (\cref{sec:selection}).
+\Cref{alg:solver,alg:dfs} give the solver and the search as pseudocode, following the code.
+
+\begin{algorithm}[t]
+\caption{The NVARC solver for one task, as run in our notebooks (code of \R{2}). In the code, the batches of different test inputs of a task are interleaved.}
+\label{alg:solver}
+\begin{algorithmic}[1]
+\Require task $t$ with demonstration pairs $D_t$ and test inputs $x_1,\dots,x_{n_t}$; base model $\theta_0$; threshold $\tau=-\ln 0.2$
+\State $\theta \gets \theta_0$ plus a fresh LoRA adapter, trained one epoch on $\mathrm{Aug}(D_t)$ \Comment{8 dihedral $\times$ 16 colour perm.}
+\For{$i = 1,\dots,n_t$}
+  \State $C_i \gets \emptyset$ \Comment{multiset of candidates $(y, b, \mathbf{a})$}
+  \For{each batch of 4 of the 16 views $v$ of $x_i$} \Comment{8 dihedral $\times$ 2 colour perm.}
+    \If{task $t$ has used more than 1600\,s} \textbf{break} \EndIf
+    \For{each completed output $(\sigma, b) \in \Call{ThresholdedDFS}{\theta, v(D_t, x_i), \tau}$} \Comment{\cref{alg:dfs}}
+      \State $g \gets \mathrm{decode}(\sigma)$; \textbf{if} $g$ is not a valid grid \textbf{then continue}
+      \State $y \gets v^{-1}(g)$ \Comment{undo the augmentation}
+      \If{$y$ has no augmentation scores yet}
+        \State $\mathbf{a}_y \gets \big(\mathrm{NLL}_\theta(w_j(y) \mid w_j(D_t, x_i))\big)_{j=1}^{8}$ \Comment{8 further augmentations $w_j$}
+      \EndIf
+      \State $C_i \gets C_i \cup \{(y, b, \mathbf{a}_y)\}$
+    \EndFor
+  \EndFor
+  \If{$C_i=\emptyset$} $C_i \gets \{(\mathbf{0}_{\mathrm{shape}(x_i)},\, 999,\, 999\cdot\mathbf{1})\}$ \Comment{placeholder} \EndIf
+  \State $L_a \gets$ distinct grids of $C_i$ by decreasing probmul \eqref{eq:probmul}; $L_b \gets$ the same by kgmon \eqref{eq:kgmon}
+  \State $L \gets \mathrm{dedup}\big(L_a[1..3] \,\Vert\, L_b[1..3]\big)$
+  \State submit $(L[1], L[2])$, or $(L[1], L[1])$ if $|L| = 1$ \Comment{$L[2]=L_a[2]$ whenever $|L_a|\ge 2$}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Thresholded depth-first search (\code{turbo\_dfs}) for one view. In the code, the views of a batch are searched together, and a call stops after 540\,s. $K$ is 10 in \R{2} and 5 in \R{1}, A and D; it never binds (\cref{sec:pipeline}).}
+\label{alg:dfs}
+\begin{algorithmic}[1]
+\Function{ThresholdedDFS}{$\theta$, prompt $h$, $\tau$}
+  \State \Return \Call{Expand}{$h$, $0$, $m_{\max}$} \Comment{each returned $(\sigma, s)$ has $p_\theta(\sigma\mid h)=e^{-s}>e^{-\tau}=0.2$}
+\EndFunction
+\Function{Expand}{$h$, $s$, $m$} \Comment{$s$: NLL of the partial output, $m$: tokens left}
+  \State $O \gets \emptyset$
+  \For{each grid token $w$ with $s_w = s - \log p_\theta(w \mid h) < \tau$, by increasing $s_w$}
+    \If{$w = \textsc{eos}$}
+      \State $O \gets O \cup \{(\textsc{eos},\, s_w)\}$
+    \ElsIf{$m > 1$ and $w$ is among the $K$ best non-\textsc{eos} tokens}
+      \State $O \gets O \cup \{(w \Vert \sigma,\, s') : (\sigma, s') \in \Call{Expand}{h \Vert w,\, s_w,\, m-1}\}$
+    \EndIf
+  \EndFor
+  \State \Return $O$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
 
 \paragraph{Compute.}
 Runs use a Kaggle machine with four NVIDIA L4 GPUs (one solver worker per GPU) and a 12-hour limit.
@@ -180,6 +237,12 @@ A search call stops after 540\,s. Before each batch of 4 views, generation for a
 \paragraph{Evaluation set and metric.}
 We use the public ARC-AGI-2 evaluation set: 120 tasks with 172 test inputs. We call one test input a \emph{unit}.
 A unit is correct if attempt~1 or attempt~2 equals the answer grid (pass@2). The \emph{task-normalised score} gives each correct unit the weight $1/n_t$, where $n_t$ is the number of test inputs of its task, and sums over units. Its maximum is 120.
+For unit $u$ of task $t(u)$, with answer $y^\star_u$ and submitted attempts $\hat y^{1}_u, \hat y^{2}_u$,
+\begin{equation}
+\label{eq:score}
+c_u = \mathbf{1}\big[\,y^\star_u \in \{\hat y^{1}_u, \hat y^{2}_u\}\,\big], \qquad
+S = \sum_{u} \frac{c_u}{n_{t(u)}} \in [0, 120] .
+\end{equation}
 The competition overview~\citep{arcprize2026kaggle} words the leaderboard score as an average over test outputs. The leaderboard values in our records fit per-task averaging instead: all 18 distinct values are multiples of $100/720$ to two decimals, as per-task averaging over 120 tasks with one to three test inputs produces, while no plain average over $N$ test outputs ($100 \le N < 400$) fits them. We therefore read the leaderboard as the task-normalised score expressed as a percentage.
 We report both units (of 172) and the task-normalised score (of 120).
 All scores are recomputed from the saved submission files against the public answers. For the two downloaded runs, no submission file was saved; we use the set of correct units printed by the decoder's built-in pass@2 benchmark, whose code compares the first two submitted grids with the answer.
@@ -189,8 +252,16 @@ Our team's Kaggle account holds 34 notebooks that use the NVARC solver, with 58 
 Six runs trained and searched all 120 tasks (\cref{tab:runs}). Most of them are versions of the pipeline with code changes between them (fixes, selector variants, diagnostics).
 The exception is \R{1} and \R{2}, versions 1 and 2 of one notebook. Their loader and decoder code is identical, and their solver differs only in the non-binding cap above. All 240 seed lines (one training and one evaluation seed per task) are identical. Yet their training losses differ (e.g.\ 0.018519 vs.\ 0.018989 on task \code{271d71e2}), and so do their results. They are two runs of one program, and we use them to measure run-to-run variation (\cref{sec:union}).
 These two runs end with analysis cells that print, for every unit, the rank of the answer among the decoded candidates under both rankers, the number of candidates and distinct grids, and the mean cell agreement of the candidates with the answer. The candidate grids themselves were not saved.
-We parse these tables from the run logs and use our own counts. The ``candidate pool'' of a unit is the set of distinct grids the run decoded for it. A unit is \emph{in the pool} if one of them equals the answer.
-\emph{Oracle selection} submits the answer for every in-pool unit; its score is the pool coverage.
+We parse these tables from the run logs and use our own counts. The ``candidate pool'' $P_u$ of a unit is the set of distinct grids the run decoded for it (the distinct elements of $C_u$). A unit is \emph{in the pool} if one of them equals the answer.
+\emph{Oracle selection} submits the answer for every in-pool unit; its score is the pool coverage $O$. With $r_u$ the probmul rank of $y^\star_u$ in $P_u$ ($r_u=\infty$ if it is absent),
+\begin{equation}
+\label{eq:oracle}
+O = \sum_{u} \frac{\mathbf{1}[\,y^\star_u \in P_u\,]}{n_{t(u)}}, \qquad
+H = O - S, \qquad
+C(k) = \big|\{\,u : r_u \le k\,\}\big| .
+\end{equation}
+$H$ is the selection headroom and $C(k)$ the top-$k$ coverage. The submitted grids belong to $P_u$, so $S \le O$, and every unit falls into exactly one of three groups: correct, in the pool but not submitted, or not in the pool.
+\Cref{alg:measure} gives the decomposition as pseudocode.
 
 \paragraph{Leaderboard records.}
 Public-leaderboard scores (computed on hidden tasks) come from our team's submission list: 63 scored submissions from 19 notebooks. Each submission is a fresh run of the notebook. Leaderboard scores are percentages, not points out of 120.
@@ -198,6 +269,26 @@ Public-leaderboard scores (computed on hidden tasks) come from our team's submis
 \paragraph{Reproducibility.}
 \code{scripts/score\_all.py} re-scores every submission and computes the unions. \code{scripts/paper\_stats.py} computes the pool, generation, diversity, union and leaderboard statistics and the figure data from the saved logs and submissions. Neither script needs a GPU.
 The few numbers quoted directly from a run log are marked as printed by the run. \code{paper/NUMBERS.md} lists the source of every number.
+
+\begin{algorithm}[t]
+\caption{Pool decomposition of one logged run (\code{scripts/paper\_stats.py}).}
+\label{alg:measure}
+\begin{algorithmic}[1]
+\Require per-unit table of the run ($r_u$, $|C_u|$, $|P_u|$, $a_u$, placeholder flag); the run's submission; the answers $y^\star$
+\For{each of the 172 units $u$}
+  \If{$c_u = 1$} \State class$(u) \gets$ correct \Comment{\cref{eq:score}}
+  \ElsIf{$r_u < \infty$} \State class$(u) \gets$ in the pool, not submitted
+  \ElsIf{$u$ has only the placeholder grid} \State class$(u) \gets$ no completed output
+  \ElsIf{$a_u > 90$} \State class$(u) \gets$ close \Comment{\cref{eq:agree}}
+  \ElsIf{$a_u > 50$} \State class$(u) \gets$ partial
+  \Else \State class$(u) \gets$ far
+  \EndIf
+\EndFor
+\State compute $S$, $O$, $H$ and $C(k)$ (\cref{eq:score,eq:oracle}); assert $\{u : c_u = 1\} \subseteq \{u : r_u < \infty\}$
+\State report whether $\{u : c_u = 1\} = \{u : r_u \le 2\}$, and the duplicate ratios $d_u$ (\cref{eq:dup})
+\State over all full runs: union growth $U_m$ (\cref{eq:union}) for every order of the runs
+\end{algorithmic}
+\end{algorithm}
 
 \begin{table}[t]
 \centering
@@ -229,7 +320,7 @@ In \R{2}, the submission answers 45 units (33.50). A correct grid is present for
 In \R{1}, the submission answers 49 units (35.83) and the pool covers 56 (40.50): a headroom of +4.67 points (7 units).
 The rest of the gap to a perfect score is not a selection problem: 117 units in \R{2} and 116 in \R{1} have no correct candidate at all.
 
-\Cref{fig:topk} shows where the answer sits in the probmul ranking when it is present.
+\Cref{fig:topk} shows the top-$k$ coverage $C(k)$ of \cref{eq:oracle}, i.e.\ where the answer sits in the probmul ranking when it is present.
 It is ranked first for 36 (\R{2}) and 39 (\R{1}) units, within the top 3 for 51 and 52, and within the top 10 for 55 and 55. Every in-pool answer is ranked within the top 20.
 A third attempt, if the rules allowed one, would add 6 and 3 units.
 The two rankers are close to redundant. They put the answer at the same rank for 48 of 55 (\R{2}) and 51 of 56 (\R{1}) in-pool units; the Pearson correlations of the two ranks are 0.961 and 0.991.
@@ -287,7 +378,12 @@ kgmon top 2 submitted instead & 48 (34.17) & 47 (34.83) \\
 \label{sec:generation}
 
 In \R{2}, 117 of 172 units (68.0\,\%) never receive a correct candidate; in \R{1}, 116 (67.4\,\%).
-\Cref{fig:loss} splits these units by how close the candidates come to the answer. Closeness is measured by the mean cell agreement with the answer over all candidates of the unit; a candidate whose shape differs from the answer counts as 0. We use the cut points of the runs' own analysis: above 90\,\% is \emph{close}, 50--90\,\% \emph{partial}, otherwise \emph{far}.
+\Cref{fig:loss} splits these units by how close the candidates come to the answer. Closeness is measured by the mean cell agreement with the answer over all candidates of the unit, where a candidate whose shape differs from the answer counts as 0:
+\begin{equation}
+\label{eq:agree}
+a_u = \frac{100}{|C_u|} \sum_{c \in C_u} \mathbf{1}\big[\mathrm{shape}(c) = \mathrm{shape}(y^\star_u)\big] \cdot \frac{1}{|y^\star_u|} \sum_{(i,j)} \mathbf{1}\big[c_{ij} = y^\star_{u,ij}\big] ,
+\end{equation}
+with $|y^\star_u|$ the number of cells of the answer (notebook cell~30 of \R{2}). We use the cut points of the runs' own analysis: above 90\,\% is \emph{close}, 50--90\,\% \emph{partial}, otherwise \emph{far}.
 \begin{itemize}
 \item \textbf{Close (48 in \R{2}, 47 in \R{1}).} The mean agreement over all candidates exceeds 90\,\%, yet no candidate is exact. Because a candidate of another shape counts as 0, most of these candidates have the right shape.
 \item \textbf{Partial (33, 32)} and \textbf{far (22, 22).}
@@ -328,7 +424,12 @@ No ranking of such candidates can produce the answer.
 \subsection{The candidate pools have few distinct grids}
 \label{sec:diversity}
 
-A unit receives 14.0 candidates on average in \R{2} and 14.4 in \R{1}, but only 7.3 and 7.6 distinct grids. The mean duplicate ratio ($1-$distinct/candidates) is 0.378 and 0.381.
+A unit receives 14.0 candidates on average in \R{2} and 14.4 in \R{1}, but only 7.3 and 7.6 distinct grids. The duplicate ratio of a unit is
+\begin{equation}
+\label{eq:dup}
+d_u = 1 - \frac{|P_u|}{|C_u|} ,
+\end{equation}
+and its mean over the 172 units is 0.378 in \R{2} and 0.381 in \R{1}.
 Excluding the placeholder units, the averages are 15.20 candidates and 7.85 distinct grids in \R{2}, and 15.64 and 8.19 in \R{1}. The largest pool has 27 candidates, well below the bound of 64 from \cref{sec:pipeline}.
 \Cref{fig:unique} shows the distribution of distinct grids per unit. Thirty-three units in \R{2} and 26 in \R{1} have at most 3 distinct grids, and for 19 and 14 of these, none of the grids is the answer.
 For example, for \code{5961cc34} (test input 0), all 16 candidates are the same wrong grid in both runs, with 95.9\,\% of cells right.
@@ -359,7 +460,12 @@ The search has no term that rewards diverse outputs~\citep[cf.][]{vijayakumar201
 \subsection{Repeated runs re-solve the same test inputs}
 \label{sec:union}
 
-The six full runs score 33.50--37.83 (45--51 units; \cref{tab:runs}). \Cref{fig:union} shows the union of correct units over five of them (A, \R{1}, \R{2}, B, C, in this order): 51, 57, 58, 61 and 62 units, or 37.67, 42.00, 42.50, 44.00 and 45.00 points.
+The six full runs score 33.50--37.83 (45--51 units; \cref{tab:runs}). With $R_j = \{u : c_u = 1 \text{ in run } j\}$, the union after $m$ runs is
+\begin{equation}
+\label{eq:union}
+U_m = \Big|\, \bigcup_{j=1}^{m} R_j \,\Big| .
+\end{equation}
+\Cref{fig:union} shows $U_m$ over five of the full runs (A, \R{1}, \R{2}, B, C, in this order): 51, 57, 58, 61 and 62 units, or 37.67, 42.00, 42.50, 44.00 and 45.00 points.
 Over all 120 orders of these five runs, the union after two runs lies between 52 and 59 units, and it reaches 62 after all five. The sixth full run, D, adds no new unit.
 Thirty-seven units (27.50 points) are correct in all five runs; of the 62 units in the union, 4 are correct in only one run. Any two of these five runs share 41--45 correct units out of a union of 52--59.
 

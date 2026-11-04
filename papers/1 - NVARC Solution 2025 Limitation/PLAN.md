@@ -4,6 +4,22 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
 
 ## 1. Status
 
+- **2026-11-04 (equations and pseudocode)**
+  - Equations added (numbered, referenced from the text):
+    - search bound (at most 4 outputs per view, at most 64 per test input);
+    - probmul / kgmon labels;
+    - pass@2 indicator and task-normalised score S;
+    - oracle O, headroom H = O - S and top-k coverage C(k);
+    - mean cell agreement a_u (as in notebook cell 30);
+    - duplicate ratio d_u;
+    - union growth U_m.
+  - Pseudocode (algorithm / algpseudocode), written from the code:
+    - Algorithm 1: the solver for one task, R2 code (TTT, 16 views in batches of 4, the 1600 s check, decode, inverse
+      augmentation, rescoring, placeholder, dual selection = probmul top 2);
+    - Algorithm 2: `turbo_dfs` as a recursive thresholded search (EOS and the K cap as in the code, 540 s per call);
+    - Algorithm 3: our pool decomposition (`paper_stats.py`): classes, S / O / H / C(k), the subset assert, union growth.
+  - No number changed. The paper is now 14 pages, 5 figures, 2 tables, 3 algorithms.
+  - arXiv package rebuilt (`--draft`): clean build, abstract unchanged. Not submitted.
 - **2026-11-04 (architecture figure)**
   - New Figure 1 (`fig:arch`, TikZ, at the start of Section 2):
     - (a) the solver pipeline: generation boxes in blue, scoring and selection boxes in orange;
