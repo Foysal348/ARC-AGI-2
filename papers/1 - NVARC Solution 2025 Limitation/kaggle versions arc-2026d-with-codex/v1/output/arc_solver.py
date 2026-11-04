@@ -1,0 +1,602 @@
+
+import os
+os.environ["UNSLOTH_DISABLE_RL_PATCH"] = "1"
+os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
+
+from unsloth import FastLanguageModel, UnslothTrainingArguments, UnslothTrainer
+from arc_loader import ArcDataset, QwenFormatter
+
+import gc
+import os
+import io
+import time
+import copy
+import queue
+import torch
+import numpy as np
+from datasets import Dataset
+from collections import defaultdict
+
+from typing import Any, Union
+from transformers import DataCollatorForLanguageModeling
+
+import logging
+from contextlib import redirect_stdout, redirect_stderr
+
+from peft import get_peft_model_state_dict, set_peft_model_state_dict
+
+import bz2
+import pickle
+
+import hashlib
+
+def deterministic_seed(s, mod=10000):
+    """
+    Python's built-in hash() is randomized by PYTHONHASHSEED,
+    so it gives different values across processes/runs.
+    This function provides a consistent, reproducible seed across all runs.
+    """
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % mod
+
+logging.disable(logging.WARNING)
+
+# ------------------------------------------------------------
+# Fixed token IDs (as used in fine-tuning)
+# ------------------------------------------------------------
+ARC_VOCAB = {
+    "0": 0, "1": 1, "2": 2, "3": 3, "4": 4,
+    "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+    "Ċ": 10,
+    "<|im_end|>": 15,
+}
+
+ARC_TOKENS = list(ARC_VOCAB.values())
+USER_TOKEN_ID = 11
+ASSISTANT_TOKEN_ID = 12
+PAD_ID = 13
+EOS_ID = 15
+
+MAX_BEAM_CANDIDATES = 5
+class UnslothFixedTrainer(UnslothTrainer):
+    # Issue https://github.com/unslothai/unsloth/issues/2435
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Fixed compute_loss that handles Unsloth's view tensor issue"""
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs)
+        if labels is not None:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            if hasattr(unwrapped_model, "_get_name") and "unsloth" in unwrapped_model._get_name().lower():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        if hasattr(loss, "clone"):
+            loss = loss.clone()
+        if self.accelerator.num_processes > 1:
+            loss = loss * self.accelerator.num_processes
+        return (loss, outputs) if return_outputs else loss
+
+
+class QwenDataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
+    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+        batch = super().torch_call(examples)
+        for i in range(len(examples)):
+            labels = batch["input_ids"][i].clone()
+            # Ensure labels is 1D (avoid scalar tensor)
+            if labels.dim() == 0:
+                labels = labels.unsqueeze(0)
+            # Use torch.nonzero instead of torch.where to avoid bool scalar issues
+            user_mask = (labels == USER_TOKEN_ID)
+            assistant_mask = (labels == ASSISTANT_TOKEN_ID)
+            user_start_idx = torch.nonzero(user_mask, as_tuple=True)[0].tolist()
+            assistant_start_idx = torch.nonzero(assistant_mask, as_tuple=True)[0].tolist()
+            start_idx = sorted(user_start_idx + assistant_start_idx)
+            eos_mask = (labels == EOS_ID)
+            end_idx = torch.nonzero(eos_mask, as_tuple=True)[0].tolist()
+            batch["labels"][i, :] = -100
+            for j, (start, end) in enumerate(zip(start_idx, end_idx)):
+                if start >= end:
+                    continue
+                if j % 2 == 1:  # assistant response part
+                    start += 2
+                    end += 1
+                    if start < end and end <= labels.size(0):
+                        batch["labels"][i, start:end] = labels[start:end]
+        return batch
+
+
+def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, start_time, end_time):
+    n = logits.size(0)
+    nll = torch.tensor(scores, dtype=torch.float32).view(n, 1) - logits.float().cpu().log_softmax(-1)
+    suffixes = defaultdict(list)
+    candidates = dict()
+
+    for i in range(n):
+        candidates[i] = []
+        for t in ARC_TOKENS:
+            score = nll[i, t].item()
+            if score < max_score:
+                if t == EOS_ID:
+                    suffixes[i].append((score, [t]))
+                elif max_new_tokens > 1:
+                    candidates[i].append((score, t))
+
+    for i in range(n):
+        candidates[i].sort(key=lambda x: x[0])
+        candidates[i] = candidates[i][:MAX_BEAM_CANDIDATES]
+
+    while time.time() - start_time < 540 and time.time() < end_time:
+        batch_tokens = []
+        batch_scores = []
+        num_alive_beams = 0
+
+        for i in range(n):
+            if len(candidates[i]) == 0:
+                batch_tokens.append(PAD_ID)
+                batch_scores.append(1000.0)
+            else:
+                score, t = candidates[i].pop(0)
+                batch_tokens.append(t)
+                batch_scores.append(score)
+                num_alive_beams += 1
+
+        if num_alive_beams == 0:
+            break
+
+        # Direct cache pass (fast, no clone)
+        outputs = model(
+            input_ids=torch.tensor(batch_tokens, device=model.device, dtype=torch.long).view(-1, 1),
+            position_ids=torch.full((n, 1), pos, device=model.device),
+            past_key_values=cache,
+            return_dict=True,
+            use_cache=True,
+        )
+
+        next_cache = outputs.past_key_values
+
+        next_suffixes = turbo_dfs(
+            model,
+            logits=outputs.logits[:, -1],
+            max_new_tokens=max_new_tokens - 1,
+            max_score=max_score,
+            scores=batch_scores,
+            pos=pos + 1,
+            cache=next_cache,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        del outputs
+        # torch.cuda.empty_cache() removed for speed
+
+        for batch_id, beams in next_suffixes.items():
+            for score, suffix_tokens in beams:
+                suffix_tokens.insert(0, batch_tokens[batch_id])
+                suffixes[batch_id].append((score, suffix_tokens))
+
+    return suffixes
+
+
+@torch.no_grad()
+def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, end_time):
+    input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
+    outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+    suffixes = turbo_dfs(
+        model,
+        logits=outputs.logits[:, -1],
+        max_new_tokens=max_new_tokens,
+        max_score=max_score,
+        scores=[0.0] * input_ids.size(0),
+        pos=input_ids.size(1),
+        cache=outputs.past_key_values,
+        start_time=time.time(),
+        end_time=end_time,
+    )
+    result = []
+    for batch_id, beams in suffixes.items():
+        sorted_beams = sorted(beams, key=lambda x: x[0])
+        result.append((batch_id, sorted_beams))
+    return result
+
+
+@torch.no_grad()
+def calc_scores(queries, answers, tokenizer, model):
+    batch_query_tokens = []
+    batch_answer_tokens = []
+    batch_tokens = []
+    batch_lengths = []
+    for query, answer in zip(queries, answers):
+        query_tokens = tokenizer.encode(query)
+        answer_tokens = tokenizer.encode(answer)
+        tokens = query_tokens + answer_tokens
+        batch_query_tokens.append(query_tokens)
+        batch_answer_tokens.append(answer_tokens)
+        batch_tokens.append(tokens)
+        batch_lengths.append(len(tokens))
+    
+    max_len = max(batch_lengths)
+    padded_tokens = []
+    attention_masks = []
+    for tokens in batch_tokens:
+        pad_len = max_len - len(tokens)
+        padded = tokens + [PAD_ID] * pad_len
+        padded_tokens.append(padded)
+        attention_masks.append([1] * len(tokens) + [0] * pad_len)
+        
+    input_ids = torch.tensor(padded_tokens, device=model.device, dtype=torch.long)
+    attention_mask = torch.tensor(attention_masks, device=model.device, dtype=torch.long)
+    
+    # FIX: use_cache=False because padding breaks KV cache
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, use_cache=False)
+    
+    result = []
+    # FIX: Slicing on GPU before transferring to CPU to prevent massive OOM Crash
+    for i, (query_tokens, answer_tokens) in enumerate(zip(batch_query_tokens, batch_answer_tokens)):
+        query_length = len(query_tokens)
+        answer_logits = outputs.logits[i, query_length-1 : query_length-1+len(answer_tokens), :]
+        answer_log_probs = answer_logits.float().log_softmax(-1).cpu()
+        answer_score = answer_log_probs[torch.arange(len(answer_tokens)), answer_tokens].sum()
+        result.append(-answer_score.item())
+        
+    return result
+
+
+def worker(rank, p_queue, end_time):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
+
+    rerun_mode = os.getenv("KAGGLE_IS_COMPETITION_RERUN")
+
+    peft_params = dict(
+        r=256,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"],
+        lora_alpha=32,
+        lora_dropout=0.0,
+        bias="none",
+        use_gradient_checkpointing=False,
+        random_state=42,
+        use_rslora=True,
+        loftq_config=None,
+    )
+
+    train_args = dict(
+        per_device_eval_batch_size=1,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        num_train_epochs=1,
+        warmup_ratio=0.1,
+        max_grad_norm=1.0,
+        learning_rate=5e-5,
+        optim="adamw_torch_fused",
+        weight_decay=0.0,
+        lr_scheduler_type="cosine",
+        seed=42,
+        report_to="none",
+        save_strategy="no",
+        eval_strategy="no",
+        logging_strategy="no",
+        fp16=False,
+        bf16=True,
+        fsdp="",
+        ddp_find_unused_parameters=False,
+        dataloader_num_workers=0,
+        gradient_checkpointing=False,
+    )
+
+    max_seq_length = 8192
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name="/kaggle/input/models/sorokin/qwen3_4b_grids15_sft139/transformers/bfloat16/1",
+        full_finetuning=False,
+        load_in_4bit=False,
+        local_files_only=True,
+        use_gradient_checkpointing=False,
+        max_seq_length=max_seq_length,
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    )
+
+    model = FastLanguageModel.get_peft_model(model, **peft_params)
+
+    for name, param in model.named_parameters():
+        if param.dtype == torch.float32:
+            param.data = param.data.to(torch.bfloat16)
+
+    default_weights = get_peft_model_state_dict(model, adapter_name="default")
+    default_weights = {k: v.clone().detach() for k, v in default_weights.items()}
+
+    collator = QwenDataCollatorForCompletionOnlyLM(tokenizer=tokenizer, mlm=False)
+    formatter = QwenFormatter(tokenizer=tokenizer)
+
+    max_new_tokens = formatter.max_new_tokens()
+    max_score = -np.log(0.2)
+
+    if rerun_mode:
+        test_path = "/kaggle/input/competitions/arc-prize-2026-arc-agi-2/arc-agi_test_challenges.json"
+    else:
+        test_path = "/kaggle/input/competitions/arc-prize-2026-arc-agi-2/arc-agi_evaluation_challenges.json"
+
+    arc_test_set = ArcDataset.from_file(test_path)
+
+    dir_outputs = "/kaggle/inference_outputs"
+    os.makedirs(dir_outputs, exist_ok=True)
+
+    def save_fallback_result(bk, reason):
+        try:
+            puzzle_id, test_id = bk.rsplit("_", 1)
+            test_input = np.asarray(
+                arc_test_set.queries[puzzle_id]["test"][int(test_id)]["input"],
+                dtype=int,
+            )
+            fallback_grid = np.zeros_like(test_input, dtype=int)
+        except Exception:
+            fallback_grid = np.zeros((1, 1), dtype=int)
+
+        fallback_result = [{
+            "beam_score": 999.0,
+            "score_aug": [999.0] * 8,
+            "solution": fallback_grid,
+        }]
+
+        fallback_path = os.path.join(dir_outputs, f"{bk}.fallback")
+        with bz2.BZ2File(fallback_path, "w") as f:
+            pickle.dump(fallback_result, f)
+
+        print(f"[Rank {rank}] FALLBACK_SAVE {bk}: {reason}", flush=True)
+
+    while True:
+        if time.time() > end_time:
+            print(f"[Rank {rank}] stop!", flush=True)
+            break
+
+        try:
+            key = p_queue.get(timeout=60)
+        except queue.Empty:
+            continue
+
+        if key is None:
+            break
+
+        start_time = time.time()
+        processed_bks = set()
+
+        try:
+            torch.cuda.reset_peak_memory_stats()
+
+            set_peft_model_state_dict(model, default_weights.copy(), adapter_name="default")
+            model = FastLanguageModel.for_training(model)
+
+            puzzle_ds = arc_test_set.change_keys([key])
+
+            train_seed = deterministic_seed(key)
+            print(f"[Rank {rank}] train_seed={train_seed} for puzzle {key}", flush=True)
+            train_ds = puzzle_ds.augment(n=16, shfl_keys=True, seed=train_seed)
+            train_ds = train_ds.cut_to_len(
+                formatter=formatter,
+                name="text",
+                max_len=max_seq_length,
+            )
+
+            with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
+                trainer = UnslothFixedTrainer(
+                    model=model,
+                    tokenizer=tokenizer,
+                    data_collator=collator,
+                    train_dataset=Dataset.from_list(train_ds.as_list(formatter)),
+                    dataset_text_field="text",
+                    max_seq_length=max_seq_length,
+                    args=UnslothTrainingArguments(**train_args),
+                )
+                stats = trainer.train()
+                model = trainer.accelerator.unwrap_model(model, keep_fp32_wrapper=False)
+                del trainer
+
+            model = FastLanguageModel.for_inference(model)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
+            print(f"[Rank {rank}] allocated {memory_allocated}MB for training", flush=True)
+            torch.cuda.reset_peak_memory_stats()
+            print(f"[Rank {rank}] training stats for puzzle {key}: {stats}", flush=True)
+
+            puzzle_ds_multi = puzzle_ds.split_multi_replies()
+
+            eval_seed = deterministic_seed(f"{key}_eval")
+            print(f"[Rank {rank}] eval_seed={eval_seed} for puzzle {key}", flush=True)
+            eval_ds = puzzle_ds_multi.augment(n=2, seed=eval_seed)
+            eval_ds = eval_ds.cut_to_len(
+                formatter=formatter,
+                name="input",
+                max_len=max_seq_length - max_new_tokens,
+            )
+
+            test_id_to_subkeys = defaultdict(list)
+            for subkey in sorted(eval_ds.keys):
+                test_id = subkey.split(".")[0].split("_")[1]
+                test_id_to_subkeys[test_id].append(subkey)
+
+            batches = []
+            for test_id, subkeys in test_id_to_subkeys.items():
+                batch = []
+                for offset in [0, 4]:
+                    batch.extend(subkeys[offset:offset + 2])
+                if batch:
+                    batches.append(batch)
+
+                batch = []
+                for offset in [2, 6]:
+                    batch.extend(subkeys[offset:offset + 2])
+                if batch:
+                    batches.append(batch)
+
+            for test_id, subkeys in test_id_to_subkeys.items():
+                batch = []
+                for offset in [8, 12]:
+                    batch.extend(subkeys[offset:offset + 2])
+                if batch:
+                    batches.append(batch)
+
+                batch = []
+                for offset in [10, 14]:
+                    batch.extend(subkeys[offset:offset + 2])
+                if batch:
+                    batches.append(batch)
+
+            with torch.inference_mode():
+                known_scores = {}
+
+                for subkeys in batches:
+                    spend_time = time.time() - start_time
+                    if spend_time > 1600 or time.time() > end_time:
+                        print(f"[Rank {rank}] timeout after {spend_time:.1f}s for puzzle {key}", flush=True)
+                        break
+
+                    print(f"[Rank {rank}] decoding {subkeys}", flush=True)
+
+                    token_groups = defaultdict(list)
+                    for subkey in subkeys:
+                        data = eval_ds.get(subkey, formatter)
+                        input_tokens = tokenizer.encode(data["input"])
+                        token_groups[len(input_tokens)].append((subkey, input_tokens))
+
+                    if len(token_groups) > 1:
+                        print(
+                            f"[Rank {rank}] split uneven token lengths "
+                            f"{ {k: len(v) for k, v in token_groups.items()} }",
+                            flush=True,
+                        )
+
+                    for token_len, group_items in sorted(token_groups.items()):
+                        group_subkeys = [x[0] for x in group_items]
+                        group_tokens = [x[1] for x in group_items]
+
+                        try:
+                            dfs_result = inference_turbo_dfs(
+                                model, group_tokens, max_new_tokens, max_score, end_time
+                            )
+                        except Exception as e:
+                            print(
+                                f"[Rank {rank}] DFS_EXCEPTION token_len={token_len} "
+                                f"subkeys={group_subkeys}: {type(e).__name__}: {e}",
+                                flush=True,
+                            )
+                            for subkey in group_subkeys:
+                                bk = subkey.split(".")[0]
+                                processed_bks.add(bk)
+                                save_fallback_result(bk, f"DFS_EXCEPTION {type(e).__name__}")
+                            continue
+
+                        for subkey_id, scored_beams in dfs_result:
+                            subkey = group_subkeys[subkey_id]
+                            bk = subkey.split(".")[0]
+                            processed_bks.add(bk)
+                            decoded_result = []
+
+                            for beam_score, beam_tokens in scored_beams:
+                                try:
+                                    array = formatter.convert_tokens_to_array(beam_tokens)
+                                    if array is None:
+                                        continue
+
+                                    solution = puzzle_ds_multi.invert_mod(array, subkey, inv_perm=True)
+                                except Exception as e:
+                                    print(
+                                        f"[Rank {rank}] DECODE_EXCEPTION {subkey}: "
+                                        f"{type(e).__name__}: {e}",
+                                        flush=True,
+                                    )
+                                    continue
+
+                                grid_id = (bk, tuple(map(tuple, solution)))
+
+                                if grid_id in known_scores:
+                                    augmented_scores = known_scores[grid_id]
+                                else:
+                                    print(f"[Rank {rank}] scoring {subkey} #{len(decoded_result)}", flush=True)
+
+                                    try:
+                                        aug_dataset = ArcDataset(
+                                            keys=[bk],
+                                            queries={bk: puzzle_ds_multi.queries.get(bk)},
+                                            replies={bk: [solution.tolist()]},
+                                        )
+                                        aug_seed = deterministic_seed(f"{bk}_aug", mod=1024**2)
+                                        aug_dataset = aug_dataset.augment(seed=aug_seed)
+                                        aug_dataset = aug_dataset.cut_to_len(
+                                            formatter=formatter,
+                                            name="input",
+                                            max_len=max_seq_length - max_new_tokens,
+                                        )
+
+                                        aug_queries = []
+                                        aug_answers = []
+                                        for augmented_sample in aug_dataset.as_list(formatter):
+                                            aug_queries.append(augmented_sample["input"])
+                                            aug_answers.append(augmented_sample["reply"])
+
+                                        augmented_scores1 = calc_scores(
+                                            aug_queries[:4], aug_answers[:4], tokenizer, model
+                                        )
+                                        augmented_scores2 = calc_scores(
+                                            aug_queries[4:], aug_answers[4:], tokenizer, model
+                                        )
+                                        augmented_scores = augmented_scores1 + augmented_scores2
+                                    except Exception as e:
+                                        print(
+                                            f"[Rank {rank}] SCORE_EXCEPTION {subkey}: "
+                                            f"{type(e).__name__}: {e}",
+                                            flush=True,
+                                        )
+                                        augmented_scores = [999.0] * 8
+
+                                    known_scores[grid_id] = augmented_scores
+
+                                decoded_result.append({
+                                    "beam_score": beam_score,
+                                    "score_aug": augmented_scores,
+                                    "solution": solution,
+                                })
+
+                            if decoded_result:
+                                with bz2.BZ2File(os.path.join(dir_outputs, subkey), "w") as f:
+                                    pickle.dump(decoded_result, f)
+                            else:
+                                save_fallback_result(bk, "EMPTY_DECODED_RESULT")
+
+            for i in range(len(arc_test_set.queries[key]["test"])):
+                bk = f"{key}_{i}"
+                if bk not in processed_bks:
+                    save_fallback_result(bk, "NOT_PROCESSED")
+
+            memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
+            print(f"[Rank {rank}] allocated {memory_allocated}MB for inference", flush=True)
+            spend_time = time.time() - start_time
+            print(f"[Rank {rank}] finished {key} in {spend_time:.1f}s", flush=True)
+
+        except Exception as e:
+            print(
+                f"[Rank {rank}] PUZZLE_EXCEPTION {key}: {type(e).__name__}: {e}",
+                flush=True,
+            )
+
+            try:
+                for i in range(len(arc_test_set.queries[key]["test"])):
+                    save_fallback_result(f"{key}_{i}", f"PUZZLE_EXCEPTION {type(e).__name__}")
+            except Exception as fallback_error:
+                print(
+                    f"[Rank {rank}] FALLBACK_FAILED {key}: "
+                    f"{type(fallback_error).__name__}: {fallback_error}",
+                    flush=True,
+                )
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
