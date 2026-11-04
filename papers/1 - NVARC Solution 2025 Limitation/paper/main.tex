@@ -1,0 +1,399 @@
+% Paper 1 (Hack2Publish, ARC Prize 2026): NVARC saturation analysis.
+% Every number is produced by ../scripts/score_all.py, ../scripts/paper_stats.py (data/paper_numbers.json),
+% a data/*.csv file, or a quoted run-log line; see NUMBERS.md next to this file for the source of each one.
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{pgfplots}
+\usepgfplotslibrary{fillbetween}
+\pgfplotsset{compat=1.18}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+% Okabe-Ito colours (colour-blind safe)
+\definecolor{oiblue}{HTML}{0072B2}
+\definecolor{oiorange}{HTML}{E69F00}
+\definecolor{oigreen}{HTML}{009E73}
+\definecolor{oiver}{HTML}{D55E00}
+\definecolor{oisky}{HTML}{56B4E9}
+\definecolor{oigrey}{HTML}{999999}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}[1]{R#1}
+
+\title{Where the NVARC Pipeline Saturates on ARC-AGI-2:\\
+Candidate-Pool Ceiling, Selection Headroom and Generation Collapse}
+% TODO(authors): final author list, affiliations and contact; team name Hack2Publish.
+\author{Hack2Publish team\thanks{Kaggle ARC Prize 2026 (ARC-AGI-2 track).}}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The pipeline that won ARC Prize 2025 (NVARC) is publicly available, and our team built 34 ARC Prize 2026 notebooks on it. It consists of a 4B-parameter Qwen3-based grid model, per-task LoRA test-time training, a probability-thresholded depth-first search over 16 augmented views of each test input, augmentation-based rescoring and two submitted attempts.
+We ask where this pipeline stops improving on the public ARC-AGI-2 evaluation set (120 tasks, 172 test inputs). We re-score 41 distinct results of these notebooks, and analyse two full runs whose logs report, for every test input, the rank of the answer among the decoded candidates and the size of the candidate pool.
+Three measurements locate the limit.
+(i)~\emph{Candidate-pool ceiling}: a correct grid is among the decoded candidates for only 55 and 56 of the 172 test inputs; 117 and 116 test inputs (68.0\,\% and 67.4\,\%) never receive a correct candidate.
+(ii)~\emph{Selection headroom}: an oracle that always submits the correct candidate when one exists would raise the task-normalised score only from 33.50 to 41.17 and from 35.83 to 40.50 (+7.67 and +4.67 points). Every answer that is in the pool is ranked within the top 20, and swapping the ranker that picks the two attempts changes the score by $-1.67$ to $+1.33$ points.
+(iii)~\emph{Generation collapse}: a test input receives 14.0--14.4 candidates on average but only 7.3--7.6 distinct grids, and among the test inputs without a correct candidate, 48 and 47 have candidates whose mean cell agreement with the answer exceeds 90\,\%.
+Across five full runs the union of correctly answered test inputs grows from 51 to 62, and 37 are answered correctly by all five. Two runs of the same program with identical seeds answer 49 and 45 test inputs.
+In both runs whose pools were logged, 116--117 test inputs had no correct candidate, against 7--10 lost in selection: the score was bounded mainly by what the generator produced.
+We also document diagnostics printed by the analysed notebooks that misreport these quantities, and we list the variants that this study did not measure: more samples, diversity-promoting search and other models.
+\end{abstract}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Introduction}
+
+ARC-AGI-2~\citep{chollet2025arcagi2} continues the Abstraction and Reasoning Corpus~\citep{chollet2019measure}. Each task gives a few input--output grid pairs, and a solver must produce the output grid for one or more new test inputs.
+In the Kaggle competitions of the ARC Prize~\citep{chollet2024arcprize,arcprize2026kaggle}, a solver runs offline under a fixed compute budget. It may submit two attempts per test input, and a test input counts as solved if either attempt matches the answer exactly.
+The winning entry of 2025, NVARC~\citep{nvarc2025}, combines a small language model fine-tuned on grids with test-time training~\citep{akyurek2024ttt} and augmentation-based candidate scoring in the style of \citet{franzen2025poe}.
+Its code and model are public, and our team built 34 Kaggle notebooks on it for ARC Prize 2026.
+
+Improving such a pipeline requires knowing which stage limits it. A test input is lost either because no correct grid is ever generated or because a correct grid is generated but not among the two submitted. These two failure modes call for different work: better \emph{selection} (rankers, voting, verification) or better \emph{generation} (search, sampling, model).
+Several of our notebook versions changed the selection logic (a ``dual'' selector, three alternative selectors). In this paper we measure how much headroom selection actually has.
+
+We decompose pass@2~\citep{chen2021codex} into \emph{pool coverage} (is a correct grid among the decoded candidates?) and \emph{selection} (is it among the two submitted?). We measure both on two complete runs whose logs report, for every test input, where the answer ranks among the candidates.
+We complement this with all saved results of our NVARC notebooks (41 distinct results) to measure how much repeated runs add.
+Our contributions are:
+\begin{itemize}
+\item a decomposition of the NVARC pipeline's pass@2 score into pool coverage and selection on two full runs of the public ARC-AGI-2 evaluation set. The pool covers 55 and 56 of 172 test inputs, and perfect selection would add +7.67 and +4.67 task-normalised points (\cref{sec:selection});
+\item a characterisation of the test inputs that never receive a correct candidate (68.0\,\% and 67.4\,\%): how close their candidates come to the answer, and how few distinct grids the search returns (\cref{sec:generation,sec:diversity});
+\item the growth of the solved set over repeated full runs and of all our submissions together, including two runs of the same program with identical seeds that differ by 4 correct test inputs (\cref{sec:union});
+\item a list of measurement pitfalls in the notebooks' own diagnostics, with the corrected numbers (\cref{sec:pitfalls}).
+\end{itemize}
+We report what we measured: one model with one search procedure, run in several code versions. We do not claim that no variant of the pipeline can do better. \Cref{sec:limitations} lists the variants we did not test.
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{The NVARC pipeline as run in our notebooks}
+\label{sec:pipeline}
+
+All runs in this study use the same model and the same solver code family. Settings below are taken from the solver source saved with run \R{2} (\code{arc\_solver.py}, \code{arc\_loader.py}, \code{arc\_decoder.py}). Run \R{1} uses the same code except for one constant, noted below.
+
+Our notebooks modify the released solver. Compared with our team's reproduction notebook of the 2025 release, the main differences are:
+\begin{itemize}
+\item the probmul ranker uses a per-grid baseline instead of a fixed baseline of 3;
+\item the submitted pair comes from the ``dual'' selector instead of the kgmon top 2;
+\item the per-task cap is 1600\,s instead of 1200\,s;
+\item augmentation seeds are derived from MD5 hashes instead of Python's randomised \code{hash()};
+\item a placeholder grid is written when no output is produced.
+\end{itemize}
+Run~A still uses the fixed baseline, the 1200\,s cap and \code{hash()} seeds.
+The results below describe the pipeline as run in these notebooks.
+
+\paragraph{Model and test-time training.}
+The base model is \code{sorokin/qwen3\_4b\_grids15\_sft139}, a Qwen3-4B~\citep{qwen3} model fine-tuned on grid tasks, loaded in bfloat16 with Unsloth~\citep{unsloth}.
+For every task, a fresh LoRA adapter~\citep{hu2021lora} (rank 256, $\alpha=32$, rank-stabilised scaling~\citep{kalajdzievski2023rslora}, applied to all attention and MLP projections, the embeddings and the output head) is trained for one epoch. The training data are augmented copies of the task's demonstration pairs: 8 dihedral transforms $\times$ 16 random colour permutations. This gives 128 training samples, and training runs 128 steps. Training uses learning rate $5\cdot10^{-5}$ with cosine decay, batch size 1 and a maximum sequence length of 8192 tokens.
+
+\paragraph{Generation.}
+Each test input is presented in up to 16 augmented views (8 dihedral transforms $\times$ 2 colour permutations). For each view, a depth-first search (\code{turbo\_dfs}) keeps a partial output only while its cumulative negative log-likelihood stays below $-\ln 0.2 \approx 1.609$. A completed output is therefore one whose probability under the adapted model, given that view, exceeds 0.2.
+Distinct completed outputs are prefix-free, so their probabilities sum to at most 1. A view can therefore return at most 4 outputs, and a test input at most 64.
+The code also caps the number of next tokens expanded per step: 10 in \R{2}, 5 in \R{1}, A and D. This cap never binds, because a token survives only if its conditional probability exceeds 0.2, and at most 4 tokens can.
+Each output is decoded into a grid and mapped back through the inverse augmentation.
+If the search returns no completed output for a test input, the pipeline writes an all-zero placeholder grid of the test-input shape.
+
+\paragraph{Scoring.}
+Every distinct grid $y$ is re-scored by the adapted model under 8 further augmentations. Each occurrence $g$ of $y$ (from different views or search paths) carries its search NLL $b_g$ and eight augmentation NLLs $a_{g,1..8}$.
+Two rankers order the distinct grids by
+\begin{align}
+\text{probmul}(y) &= \sum_{g\in G(y)} (\beta - b_g) + \frac{1}{|G(y)|}\sum_{g\in G(y)}\sum_{j=1}^{8} (\beta - a_{g,j}), \qquad \beta = \max_{g\in G(y)} b_g + 1,\\
+\text{kgmon}(y) &= |G(y)| - \frac{1}{|G(y)|}\sum_{g\in G(y)} \frac{1}{8}\sum_{j=1}^{8} a_{g,j},
+\end{align}
+where $G(y)$ is the set of occurrences of $y$ (functions \code{score\_full\_probmul\_3} and \code{score\_kgmon}). The augmentation NLLs are computed once per grid, so $a_{g,j}$ is the same for every occurrence of $y$. Both rankers reward grids found many times.
+
+\paragraph{Selection.}
+The submitted pair (``dual selection'') is built from the top 3 grids of each ranker, de-duplicated with the probmul list first. Attempt~1 is the probmul top grid, and attempt~2 is the next grid in that pooled list.
+Both rankers order the same set of distinct grids. Attempt~2 is therefore the probmul rank-2 grid whenever there are two or more grids, and the kgmon ranking never changes the submitted pair.
+In both logged runs, the set of correctly answered test inputs equals the set whose answer probmul ranks 1 or 2 (\cref{sec:selection}).
+
+\paragraph{Compute.}
+Runs use a Kaggle machine with four NVIDIA L4 GPUs (one solver worker per GPU) and a 12-hour limit.
+A search call stops after 540\,s. Before each batch of 4 views, generation for a task stops if the task has already used 1600\,s in total, training included. A full run over all 120 evaluation tasks took 4.68--4.80\,h (\cref{tab:runs}).
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Data and measurement}
+\label{sec:data}
+
+\paragraph{Evaluation set and metric.}
+We use the public ARC-AGI-2 evaluation set: 120 tasks with 172 test inputs. We call one test input a \emph{unit}.
+A unit is correct if attempt~1 or attempt~2 equals the answer grid (pass@2). The \emph{task-normalised score} gives each correct unit the weight $1/n_t$, where $n_t$ is the number of test inputs of its task, and sums over units. Its maximum is 120, and it is the score used by the Kaggle leaderboard.
+We report both units (of 172) and the task-normalised score (of 120).
+All scores are recomputed from the saved submission files against the public answers. For the two downloaded runs, no submission file was saved; we use the set of correct units printed by the decoder's built-in pass@2 benchmark, whose code compares the first two submitted grids with the answer.
+
+\paragraph{Runs.}
+Our team's Kaggle account holds 34 notebooks that use the NVARC solver, with 58 saved versions. Their outputs contain 39 distinct submission files (by SHA-256) from 20 of these notebooks. Two more runs (B and C in \cref{tab:runs}) were downloaded by hand as notebooks with their cell outputs. That makes 41 distinct results, most of them partial runs over a subset of tasks.
+Six runs trained and searched all 120 tasks (\cref{tab:runs}). Most of them are versions of the pipeline with code changes between them (fixes, selector variants, diagnostics).
+The exception is \R{1} and \R{2}, versions 1 and 2 of one notebook. Their loader and decoder code is identical, and their solver differs only in the non-binding cap above. All 240 seed lines (one training and one evaluation seed per task) are identical. Yet their training losses differ (e.g.\ 0.018519 vs.\ 0.018989 on task \code{271d71e2}), and so do their results. They are two runs of one program, and we use them to measure run-to-run variation (\cref{sec:union}).
+These two runs end with analysis cells that print, for every unit, the rank of the answer among the decoded candidates under both rankers, the number of candidates and distinct grids, and the mean cell agreement of the candidates with the answer. The candidate grids themselves were not saved.
+We parse these tables from the run logs and use our own counts. The ``candidate pool'' of a unit is the set of distinct grids the run decoded for it. A unit is \emph{in the pool} if one of them equals the answer.
+\emph{Oracle selection} submits the answer for every in-pool unit; its score is the pool coverage.
+
+\paragraph{Leaderboard records.}
+Public-leaderboard scores (computed on hidden tasks) come from our team's submission list: 63 scored submissions from 19 notebooks. Each submission is a fresh run of the notebook.
+
+\paragraph{Reproducibility.}
+\code{scripts/score\_all.py} re-scores every submission and computes the unions. \code{scripts/paper\_stats.py} computes the pool, generation, diversity, union and leaderboard statistics and the figure data from the saved logs and submissions. Neither script needs a GPU.
+The few numbers quoted directly from a run log are marked as printed by the run. \code{paper/NUMBERS.md} lists the source of every number.
+
+\begin{table}[t]
+\centering
+\caption{The six full runs (all 120 tasks trained and searched). Scores are recomputed from the submission files. For B and C ($^\dagger$ downloaded by hand as notebooks with outputs; no submission file saved), they are recomputed from the correct-unit set printed by the decoder's pass@2 benchmark. \R{1} and \R{2} log per-unit pool statistics.}
+\label{tab:runs}
+\small
+\begin{tabular}{llrrr}
+\toprule
+label & notebook, version & wall (h) & units (/172) & task-norm (/120) \\
+\midrule
+A & \code{arc-2026d}, v4 & 4.68 & 51 & 37.67 \\
+\R{1} & \code{arc-2026d-with-codex}, v1 & 4.77 & 49 & 35.83 \\
+\R{2} & \code{arc-2026d-with-codex}, v2 & 4.75 & 45 & 33.50 \\
+B & \code{fork-of-arc-2026d-32-22lb-updated-v3}$^\dagger$ & 4.69 & 51 & 37.83 \\
+C & \code{arc-2026d-with-codex}, ``v25''$^\dagger$ & 4.75 & 51 & 37.67 \\
+D & \code{experiment-with-arc-agi-2}, v10 & 4.80 & 47 & 33.67 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Results}
+
+\subsection{Selection headroom is small}
+\label{sec:selection}
+
+\Cref{tab:pool} decomposes the two logged runs.
+In \R{2}, the submission answers 45 units (33.50). A correct grid is present for 55 units, so oracle selection would reach 41.17: a headroom of +7.67 points (10 units).
+In \R{1}, the submission answers 49 units (35.83) and the pool covers 56 (40.50): a headroom of +4.67 points (7 units).
+The rest of the gap to a perfect score is not a selection problem: 117 units in \R{2} and 116 in \R{1} have no correct candidate at all.
+
+\Cref{fig:topk} shows where the answer sits in the probmul ranking when it is present.
+It is ranked first for 36 (\R{2}) and 39 (\R{1}) units, within the top 3 for 51 and 52, and within the top 10 for 55 and 55. Every in-pool answer is ranked within the top 20.
+A third attempt, if the rules allowed one, would add 6 and 3 units.
+The two rankers are close to redundant. They put the answer at the same rank for 48 of 55 (\R{2}) and 51 of 56 (\R{1}) in-pool units; the Pearson correlations of the two ranks are 0.961 and 0.991.
+Changing the selector moves the score little. Submitting the kgmon top 2 instead of the probmul top 2 would answer 47 units (34.83, $+1.33$) in \R{2} and 48 units (34.17, $-1.67$) in \R{1}; the decoders' own benchmarks print the same values.
+Run~D evaluates three selectors on one candidate pool, scoring the two grids each would submit. Its log reports 33.67, 33.67 and 34.67 (\code{CURRENT}, \code{IMBUE\_EXACT}, \code{IMBUE\_QWEN\_DIVERSE}; as printed by the run). The first value matches our re-scoring of D's submission.
+
+\begin{table}[t]
+\centering
+\caption{Pool coverage and selection in the two logged runs (units of 172; task-normalised score of 120 in parentheses).}
+\label{tab:pool}
+\begin{tabular}{lrr}
+\toprule
+ & \R{1} & \R{2} \\
+\midrule
+submitted pair correct (pass@2) & 49 (35.83) & 45 (33.50) \\
+answer in candidate pool (oracle selection) & 56 (40.50) & 55 (41.17) \\
+selection headroom & +7 (+4.67) & +10 (+7.67) \\
+no correct candidate & 116 (67.4\,\%) & 117 (68.0\,\%) \\
+\midrule
+answer at probmul rank 1 & 39 & 36 \\
+answer at probmul rank $\le$ 2 (= submitted pair) & 49 & 45 \\
+answer at probmul rank $\le$ 3 & 52 & 51 \\
+answer at probmul rank $\le$ 5 & 54 & 54 \\
+answer at probmul rank $\le$ 10 & 55 & 55 \\
+answer at probmul rank $\le$ 20 & 56 & 55 \\
+same rank under probmul and kgmon & 51 of 56 & 48 of 55 \\
+kgmon top 2 submitted instead & 48 (34.17) & 47 (34.83) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.8\linewidth, height=5.2cm,
+  xmode=log, log basis x=10, xtick={1,2,3,5,10,20}, xticklabels={1,2,3,5,10,20},
+  xlabel={$k$ (top-$k$ grids of the probmul ranking)}, ylabel={units with answer in top $k$},
+  ymin=30, ymax=62, xmin=0.9, xmax=22, grid=major, grid style={gray!20},
+  legend pos=south east, legend style={font=\small}, tick label style={font=\small}, label style={font=\small}]
+\addplot[oiblue, thick, mark=o] table[x=k, y=v1] {figures/data/topk.dat};
+\addlegendentry{\R{1}}
+\addplot[oiorange, thick, mark=square] table[x=k, y=v2] {figures/data/topk.dat};
+\addlegendentry{\R{2}}
+\addplot[oigrey, dashed, domain=0.9:22, samples=2] {56};
+\addlegendentry{pool \R{1} (56)}
+\draw[oigrey, densely dotted] (axis cs:2,30) -- (axis cs:2,62) node[pos=0.93, right, font=\scriptsize] {2 attempts};
+\end{axis}
+\end{tikzpicture}
+\caption{Top-$k$ coverage of the answer in the two logged runs. The submitted pair equals the probmul top 2 ($k=2$); beyond $k=10$ almost nothing remains to select (the pool of \R{2} has 55 units, that of \R{1} 56).}
+\label{fig:topk}
+\end{figure}
+
+\subsection{The limit is generation}
+\label{sec:generation}
+
+In \R{2}, 117 of 172 units (68.0\,\%) never receive a correct candidate; in \R{1}, 116 (67.4\,\%).
+\Cref{fig:loss} splits these units by how close the candidates come to the answer. Closeness is measured by the mean cell agreement with the answer over all candidates of the unit; a candidate whose shape differs from the answer counts as 0. We use the cut points of the runs' own analysis: above 90\,\% is \emph{close}, 50--90\,\% \emph{partial}, otherwise \emph{far}.
+\begin{itemize}
+\item \textbf{Close (48 in \R{2}, 47 in \R{1}).} The mean agreement over all candidates exceeds 90\,\%, yet no candidate is exact. Because a candidate of another shape counts as 0, most of these candidates have the right shape.
+\item \textbf{Partial (33, 32)} and \textbf{far (22, 22).}
+\item \textbf{No completed output (14, 15).} The search returned no output above the probability threshold, the log records \code{FALLBACK\_SAVE \ldots{} NOT\_PROCESSED}, and an all-zero placeholder was submitted. These units belong to 11 tasks in each run. All of them finished normally (in 182--802\,s in \R{2} and 134--873\,s in \R{1}). Neither run logged a task time-out or an exception. The longest search call, including scoring, took 246.9\,s in \R{2} and 227.1\,s in \R{1}, below the 540\,s cap.
+\end{itemize}
+Units whose answer is in the pool but was not submitted (10 and 7) are the only losses that a better selector could recover.
+
+A single task shows what these near misses look like. For task \code{142ca369}, \R{2}'s repair analysis prints the closest candidates for both test inputs (as printed by the run). They agree with the answer on 72.84\,\% and 93.16\,\% of cells, and at every one of the 88 and 26 differing cells the candidate predicts background (colour 0) where the answer has a colour.
+In \R{1}, the closest candidate for the first test input agrees on 95.68\,\%; its 14 wrong cells have colour 2 where the answer has 6.
+No ranking of such candidates can produce the answer.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  xbar stacked, width=0.95\linewidth, height=3.6cm, bar width=12pt,
+  symbolic y coords={R2,R1}, ytick=data, xmin=0, xmax=172, enlarge y limits=0.45,
+  xlabel={test inputs (of 172)}, legend style={at={(0.5,1.05)}, anchor=south, legend columns=3, font=\small, draw=none},
+  tick label style={font=\small}, label style={font=\small}]
+\addplot[fill=oigreen, draw=white] table[y=run, x=submitted] {figures/data/loss.dat};
+\addlegendentry{submitted pair correct}
+\addplot[fill=oiorange, draw=white] table[y=run, x=selection] {figures/data/loss.dat};
+\addlegendentry{in pool, not submitted}
+\addplot[fill=oiblue, draw=white] table[y=run, x=close] {figures/data/loss.dat};
+\addlegendentry{no answer: close ($>$90\,\%)}
+\addplot[fill=oisky, draw=white] table[y=run, x=partial] {figures/data/loss.dat};
+\addlegendentry{no answer: partial}
+\addplot[fill=oiver, draw=white] table[y=run, x=far] {figures/data/loss.dat};
+\addlegendentry{no answer: far ($\le$50\,\%)}
+\addplot[fill=oigrey, draw=white] table[y=run, x=fallback] {figures/data/loss.dat};
+\addlegendentry{no completed output}
+\end{axis}
+\end{tikzpicture}
+\caption{Where each test input ends in the two logged runs. Only the orange segment can be recovered by selection; the other unsolved segments have no correct candidate.}
+\label{fig:loss}
+\end{figure}
+
+\subsection{The candidate pools have few distinct grids}
+\label{sec:diversity}
+
+A unit receives 14.0 candidates on average in \R{2} and 14.4 in \R{1}, but only 7.3 and 7.6 distinct grids. The mean duplicate ratio ($1-$distinct/candidates) is 0.378 and 0.381.
+Excluding the placeholder units, the averages are 15.20 candidates and 7.85 distinct grids in \R{2}, and 15.64 and 8.19 in \R{1}. The largest pool has 27 candidates, well below the bound of 64 from \cref{sec:pipeline}.
+\Cref{fig:unique} shows the distribution of distinct grids per unit. Thirty-three units in \R{2} and 26 in \R{1} have at most 3 distinct grids, and for 19 and 14 of these, none of the grids is the answer.
+For example, for \code{5961cc34} (test input 0), all 16 candidates are the same wrong grid in both runs, with 95.9\,\% of cells right.
+
+This is consistent with how candidates are generated. The search is deterministic and keeps only outputs with probability above 0.2. The views differ only by symmetry and colour relabelling, and they often lead the adapted model to the same grid.
+The pool therefore holds, in effect, a few of the model's highest-probability outputs. In units such as \code{5961cc34}, all views produce the same wrong grid. In units with several distinct grids, the rankers favour the grids found most often.
+The search has no term that rewards diverse outputs~\citep[cf.][]{vijayakumar2016diverse}, and the pipeline does not draw stochastic samples. We did not measure whether either would add correct grids (\cref{sec:limitations}).
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar, width=0.95\linewidth, height=5cm, bar width=3.2pt,
+  xlabel={distinct grids in the candidate pool of a test input}, ylabel={test inputs},
+  xmin=0.3, xmax=19.7, xtick={1,3,5,7,9,11,13,15,17,19}, ymin=0,
+  legend pos=north east, legend style={font=\small}, tick label style={font=\small}, label style={font=\small},
+  grid=major, grid style={gray!20}]
+\addplot[fill=oiblue, draw=none] table[x=unique, y=v1] {figures/data/unique_hist.dat};
+\addlegendentry{\R{1} (157 units)}
+\addplot[fill=oiorange, draw=none] table[x=unique, y=v2] {figures/data/unique_hist.dat};
+\addlegendentry{\R{2} (158 units)}
+\end{axis}
+\end{tikzpicture}
+\caption{Distinct grids per test input, excluding the units with only a placeholder grid. Each unit is searched in up to 16 views.}
+\label{fig:unique}
+\end{figure}
+
+\subsection{Repeated runs re-solve the same test inputs}
+\label{sec:union}
+
+The six full runs score 33.50--37.83 (45--51 units; \cref{tab:runs}). \Cref{fig:union} shows the union of correct units over five of them (A, \R{1}, \R{2}, B, C, in this order): 51, 57, 58, 61 and 62 units, or 37.67, 42.00, 42.50, 44.00 and 45.00 points.
+Over all 120 orders of these five runs, the union after two runs lies between 52 and 59 units, and it reaches 62 after all five. The sixth full run, D, adds no new unit.
+Thirty-seven units (27.50 points) are correct in all five runs; of the 62 units in the union, 4 are correct in only one run. Any two of these five runs share 41--45 correct units out of a union of 52--59.
+
+\R{1} and \R{2} isolate run-to-run variation, because they run the same program with the same seeds (\cref{sec:data}). They answer 49 and 45 units (35.83 and 33.50), share 42, and together answer 52.
+Their pools hold 56 and 55 units, share 50, and together hold 61 (44.50).
+Repeated runs therefore do add correct candidates. The union of the five full runs (45.00) and the union of the two pools (44.50) both exceed the oracle score of either single run (41.17, 40.50).
+The additions are small, however.
+The union of all 41 distinct results, including partial runs, is 64 units (46.50 points, 38.75\,\%), against 51 units (37.83) for the best single run.
+Submissions and pools together cover 70 units (50.83 points, 42.36\,\%). For the remaining 102 units, no submission and neither logged pool contains the answer.
+
+On the public leaderboard (hidden tasks), the best NVARC submission of our team scored 32.64. Ten submissions of that same notebook version, each a fresh run, scored between 27.36 and 32.64 (mean 29.36).
+A single leaderboard score of this pipeline therefore says little about a code change of a few points.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.8\linewidth, height=5.2cm, xmin=0.8, xmax=5.2, ymin=40, ymax=74, xtick={1,2,3,4,5},
+  xlabel={number of full runs combined}, ylabel={units correct in the union},
+  legend style={at={(0.5,-0.32)}, anchor=north, legend columns=2, font=\small, draw=none},
+  tick label style={font=\small}, label style={font=\small},
+  grid=major, grid style={gray!20}]
+\addplot[name path=lo, draw=none, forget plot] table[x=n, y=lo] {figures/data/union_growth.dat};
+\addplot[name path=hi, draw=none, forget plot] table[x=n, y=hi] {figures/data/union_growth.dat};
+\addplot[oiblue!20] fill between[of=lo and hi];
+\addlegendentry{range over all 120 orders}
+\addplot[oiblue, thick, mark=*] table[x=n, y=union] {figures/data/union_growth.dat};
+\addlegendentry{union (A, \R{1}, \R{2}, B, C)}
+\addplot[oiorange, only marks, mark=x, mark size=3pt] table[x=n, y=single] {figures/data/union_growth.dat};
+\addlegendentry{the added run alone}
+\addplot[oigrey, dashed, domain=0.8:5.2, samples=2] {64};
+\addlegendentry{all 41 results (64)}
+\addplot[oiver, dotted, thick, domain=0.8:5.2, samples=2] {70};
+\addlegendentry{submissions + pools (70)}
+\end{axis}
+\end{tikzpicture}
+\caption{Growth of the set of correctly answered test inputs as full runs are combined.}
+\label{fig:union}
+\end{figure}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Pitfalls in the notebooks' own diagnostics}
+\label{sec:pitfalls}
+
+The analysed notebooks print their own diagnostics. Several of them would lead to the opposite conclusion if quoted as printed. We list them because they are easy to repeat in any pipeline of this kind. Every number in this paper is recomputed, or quoted from a run log and marked as printed by the run.
+\begin{enumerate}
+\item \textbf{Generation losses reported as ranking losses.} A survival table in \R{2} prints ``Lost at ranking stage: 117 (68.0\,\%)''. These 117 units have no correct candidate at all; the loss happens in generation.
+\item \textbf{Inverted comparisons.} A score audit in \R{2} labels the answer as having the ``better'' search and augmentation score when its NLLs are higher (worse), e.g.\ augmentation mean 12.78 vs.\ 4.18 for the rank-1 grid.
+\item \textbf{A losing variant reported as the winner, from a test of a different ranker.} The ``scoring optimization'' experiment in \R{2} prints ``WINNER'' and a recommendation for a variant that is 4.67 points below the baseline. All seven variants lost (between $-4.67$ and $-9.33$, as printed).
+The variants are not re-weightings of the shipped ranker. The experiment scores every occurrence of a grid on its own, which drops the occurrence count that both shipped rankers reward and lets one grid fill both attempts. With a per-occurrence baseline, the search term is also constant, so four of the variants are one and the same ranking and print the same score (26.50).
+\item \textbf{Placeholders reported as crashes.} Units with only the all-zero placeholder are labelled ``Worker crashed or timed out''. In the logs, these tasks finished normally and the search returned no completed output (\cref{sec:generation}).
+A second label, ``Pruned by max\_score'', describes the outcome correctly, but the notebook derives it from the placeholder's dummy score of 999, not from the search.
+\item \textbf{Simulations that cannot see what they claim to measure.} A threshold sweep only re-filters candidates that already passed the real threshold, so it cannot show pruned answers. A ``beam width'' sweep is top-$k$ of the existing pool. A meta-selector simulation reports 0.00 against a 33.50 baseline.
+\item \textbf{Headroom counted from the wrong baseline.} The top-$k$ experiment prints that selection ``can recover at most 18 additional puzzles'' (\R{2}; 15 in \R{1}), counting from top 1. Two attempts are already submitted, so the gain to top 5 is 9 units (\R{2}) and 5 (\R{1}).
+\item \textbf{Scores over the wrong denominator.} Run~B prints ``37.8/111'', i.e.\ over the 111 tasks with any decoded output. The score is 37.83 of 120 (51 of 172 units).
+\item \textbf{Pool coverage reported as solved.} Run~B's summary ``47/120 puzzles solved'' counts a task if any candidate anywhere is correct (an oracle). A later cell's ``34/120 puzzles solved by dual selection'' counts only answers at rank 1 and ignores attempt~2. Both differ from the decoder's own pass@2 benchmark, whose correct-unit set we use for B (\cref{tab:runs}).
+\item \textbf{Methods that do not match the code.} Run~B's description says the dual selector takes the top grid of each of the two rankers. As shown in \cref{sec:pipeline}, attempt~2 is the probmul rank-2 grid whenever one exists, and kgmon never changes the submitted pair. Run~B prints the same score, 37.8, for probmul alone and for the dual selector.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Related work}
+
+Test-time training on augmented demonstrations~\citep{akyurek2024ttt} and augmentation-based scoring of candidates~\citep{franzen2025poe} were key ingredients of the strongest open ARC Prize 2024 entries~\citep{chollet2024arcprize}. NVARC~\citep{nvarc2025} carries them into the ARC-AGI-2 setting~\citep{chollet2025arcagi2}.
+Outside ARC, repeated sampling studies~\citep{brown2024monkeys} separate coverage (does any sample solve the problem?) from selection (can the solver pick it?), the same split we measure here.
+Diverse decoding~\citep{vijayakumar2016diverse} targets the low diversity we observe in the candidate pools.
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Limitations}
+\label{sec:limitations}
+
+\begin{itemize}
+\item \textbf{One model and one search procedure.} All runs use the same 4B model, the same test-time training recipe and the same thresholded search, as modified in our notebooks (\cref{sec:pipeline}). The results describe this pipeline as it was run. They do not show that no NVARC variant can exceed these numbers.
+\item \textbf{Generation-side variants were not measured.} We did not test more views or samples, a lower probability threshold, stochastic sampling, a diversity term in the search, longer test-time training or a larger model. Any of these could change the pool. Two runs of the same program already reach a pool union of 61 units against 55 and 56 for each run alone, so more sampling could add correct grids; how many is open.
+\item \textbf{Two logged pools.} Pool-level statistics come from two runs of one program. The other four full runs provide submission-level data only. The two runs differ by 4 correct units, so single-run numbers carry run-to-run noise of that order.
+\item \textbf{Quoted diagnostics.} Run~D's three-selector comparison and the 142ca369 cell counts are quoted from the run logs; the candidate grids were not saved, so we could not recompute them. D's baseline value matches our re-scoring. The rank correlations and duplicate ratios we recomputed from the per-unit tables.
+\item \textbf{Public evaluation set.} All pool and union statistics are on the public evaluation set; the leaderboard uses hidden tasks, for which we only have scores.
+\item \textbf{Coarse closeness measure.} Mean cell agreement over all candidates ignores which cells are wrong and penalises shape errors fully. It does not measure how hard the remaining error is to fix.
+\end{itemize}
+
+% ---------------------------------------------------------------------------------------------------------------------
+\section{Conclusion}
+
+On the public ARC-AGI-2 evaluation set, the NVARC pipeline as we ran it is capped by its candidate pool in both runs whose pools we logged.
+Perfect selection would add only +4.67 to +7.67 task-normalised points. About two thirds of the test inputs (67.4--68.0\,\%) never receive a correct candidate, often while the candidates are more than 90\,\% correct, and the pool holds few distinct grids.
+Repeated runs mostly re-solve the same test inputs, and resubmissions of the same notebook version vary by up to 5.28 leaderboard points.
+For this pipeline, work on selection has a small, measurable ceiling. Generation-side changes are where the remaining headroom would have to come from, and we did not measure them.
+
+\paragraph{Code and data.}
+% TODO(authors): confirm the repository is public, or replace with an archived copy (e.g. Zenodo) before submission.
+The scripts, run logs, submissions and extracted tables are available at \url{https://github.com/Foysal348/ARC-AGI-2} (folder \code{papers/1 - NVARC Solution 2025 Limitation}).
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

@@ -39,6 +39,8 @@ The status and the next steps are in `PLAN.md`. This file says what the paper is
 | `data/run_scores.csv` | per-run score table (written by `scripts/score_all.py`) |
 | `data/union_units.json`, `data/pool_units.json` | right units across all submissions; candidate-pool units per run log |
 | `scripts/score_all.py` | **reproduces every score and union in the findings** (run: `python -B scripts/score_all.py` from this folder) |
+| `scripts/paper_stats.py` | every paper number that `score_all.py` does not print (pool decomposition of v1 / v2, generation classes, diversity, union growth, LB table) and the figure data; writes `data/paper_numbers.json`, `data/lb_by_notebook.csv`, `paper/figures/data/*.dat` |
+| `paper/` | the arXiv draft: `main.tex`, `refs.bib`, `main.pdf`, `main.bbl`, `NUMBERS.md` (source of every number), `figures/data/` (pgfplots tables) |
 | `scripts/fetch_versions.py` | downloads every saved version's output + log of every NVARC notebook (needs Kaggle auth, see section 4) |
 | `provided notebooks/` | 2 notebooks the user downloaded by hand from Kaggle with outputs: `fork-of-arc-2026d-32-22lb-updated-v3.ipynb` (eval 37.83), `arc-2026d-with-codex_v25.ipynb` (eval 37.67) |
 | `source notebook arc-2026d-with-codex/` | the 2026-10-19 copy of `arc-2026d-with-codex` = Kaggle version **v2**: notebook (35 cells, 34 numbered experiments), run log, extracted stdout `output/arc-2026d-with-codex_stdout.txt` |

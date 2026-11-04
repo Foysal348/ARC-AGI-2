@@ -4,6 +4,47 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
 
 ## 1. Status
 
+- **2026-11-04 (Hamid's AI, draft v1)**
+  - Numbers reproduced: `scripts/score_all.py` gives exactly the expected output (41 runs; 64/172, 46.50; pools 55 and 56;
+    pool union 61, 44.50; all evidence 70, 50.83).
+    - On macOS it rewrites `data/run_scores.csv` and `data/pool_units.json` with LF endings and one row in another order
+      (same content). Those changes were reverted (byte-exact rule).
+  - New `scripts/paper_stats.py` computes every other paper number from the run logs and submissions. It writes
+    `data/paper_numbers.json`, `data/lb_by_notebook.csv` and `paper/figures/data/*.dat`.
+    - It reproduces the findings: top-k, the 48/33/22/14 classes, union growth 51 -> 62, core 37, pairwise 41-45.
+    - New numbers:
+      - R1 classes 47/32/22/15;
+      - the submitted right set equals probmul rank <= 2 in both runs;
+      - the placeholders fall in 11 tasks per run, all of which finished normally (no time-out, no exception);
+      - 5961cc34_0 has 1 distinct grid of 16 (95.9 %);
+      - union band over all 120 run orders;
+      - LB table extracted to csv.
+  - Correction: Experiment 18 `avg_sim` is the MEAN agreement over all candidates (not the closest candidate). Fixed in the
+    findings file, section 3.
+  - Code fact used in the paper: both rankers order the same distinct grids, so kgmon never changes the submitted pair. The
+    "dual selection" is probmul top-2. The search keeps outputs with p > 0.2, so a view returns at most 4 and a test input
+    at most 64 (observed max 27).
+  - Step 4 and step 5 done:
+    - `paper/main.tex` and `paper/refs.bib`, 10 pages; `paper/NUMBERS.md` maps every number to its source;
+    - 4 figures drawn with pgfplots from the `.dat` tables;
+    - compiles with `latexmk -pdf main.tex`.
+  - Independent audit of every number and claim (agent, read-only):
+    - All major numbers were confirmed.
+    - Fixed:
+      - the logs hold per-unit summaries, not every candidate;
+      - 41 = 39 files from 20 notebooks + 2 printed sets (B is not one of the 34 notebooks);
+      - kgmon top-2 recomputed: R2 +1.33, R1 -1.67;
+      - Exp 10 is not a re-weighting of the shipped ranker (it scores each occurrence alone), so it moved to the pitfalls;
+      - 142ca369 holds for R2 only;
+      - "Pruned by max_score" comes from the dummy score 999;
+      - the beam cap is 10 in R2 and 5 in R1 / A / D, and never binds;
+      - the differences from the reproduction notebook (baseline 3, kgmon top 2, 1200 s, `hash()` seeds) are now stated;
+      - the abstract claim is limited to the two logged runs.
+    - New: R1 and R2 are the same program with identical seeds (240 lines) but differ (49 vs 45 units, pool union 61).
+      This is run-to-run noise, and it shows that reruns add some correct candidates (stated in the limitations).
+    - Search calls took at most 246.9 s, below the 540 s cap.
+    - Draft v1b: 11 pages.
+  - Step 3 is written as a limitation for now (no GPU run). If Hamid gives a GPU go, the result would replace the limitation.
 - **2026-11-04 (later)**
   - All 58 saved versions fetched and scored. The union is unchanged at 64 units.
   - 6 full runs exist. The union-growth curve is ready (findings 4c).
@@ -25,16 +66,23 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
    - re-run `scripts/score_all.py`;
    - read each new log for pool / experiment data;
    - update the findings file and README section 5.
-3. Decide the open item: run the diversity / more-samples test, or state it as a limitation.
+3. [open, written as a limitation in draft v1] Decide: run the diversity / more-samples test, or state it as a limitation.
    - A GPU run needs the user's explicit go.
    - Candidate: v2 Experiment 34 (diversity penalty in `turbo_dfs`), and a run with more augmentations or samples, measuring pool growth.
-4. Paper outline (sections below), then the LaTeX draft. Every number must come from `scripts/score_all.py` output or a cited log line.
-5. Figures:
+4. [done 2026-11-04, draft v1] Paper outline, then the LaTeX draft (`paper/main.tex`). Every number must come from
+   `scripts/score_all.py`, `scripts/paper_stats.py`, a data csv or a cited log line (`paper/NUMBERS.md`).
+5. [done 2026-11-04] Figures (pgfplots inside `main.tex`, data in `paper/figures/data/`):
    - top-k coverage curve (v1, v2);
    - union growth vs number of runs;
    - where the answer is lost (generation classes: close / partial / far / no grid; selection);
    - unique-candidate histogram.
 6. Endorsement for arXiv cs.LG / cs.AI (first-time submitters need an endorser). LaTeX source + figures + code / data link.
+   - Before submission, fill the `TODO(authors)` items in `main.tex` / `refs.bib`:
+     - author list;
+     - the official NVARC write-up citation;
+     - confirm the repo is public, or archive it.
+   - Sami vai converts to the final arXiv format.
+   - arXiv does not run BibTeX: upload `main.bbl` with `main.tex`, `refs.bib` and `figures/data/*.dat`.
 7. Kaggle discussion post: a short version of the findings, after the user approves the text.
 
 ## 3. Paper outline (draft)

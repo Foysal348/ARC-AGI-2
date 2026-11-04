@@ -27,11 +27,14 @@ Sources:
 ## 3. The real wall is generation
 
 - **117 / 172 test inputs (68 %) never get a correct candidate** (v2 Experiments 5, 14, 19).
-- v2 Experiment 18 classifies those 117 by the closest candidate's cell similarity to the answer:
-  - 48 "close" (about 90 %+ of cells right, but never exact);
-  - 33 "partial" (about 80 %);
-  - 22 "far off";
+- v2 Experiment 18 classifies those 117 by `avg_sim`, the MEAN cell agreement with the answer over ALL candidates of the
+  test input (a candidate of another shape counts as 0; notebook cell 30). Corrected 2026-11-04: an earlier version of this
+  file said "closest candidate", which is not what the code computes. Cut points are the notebook's: > 90, > 50, else.
+  - 48 "close" (mean agreement > 90 %, but no candidate exact);
+  - 33 "partial" (50-90 %);
+  - 22 "far off" (<= 50 %);
   - 14 only a fallback grid (no valid grid produced at all).
+  - v1: 47 / 32 / 22 / 15 (`scripts/paper_stats.py`).
 - **Diversity collapse** (v2 Experiments 2, 21, 22, 23, 26, 27, 32, 33): on average 14.0 candidates per test input but only 7.3 unique (duplicate ratio 0.378).
   - Several test inputs have 1-3 unique grids out of 16-18 candidates, e.g. `38007db0_1` 1 / 16, `38007db0_0` 2 / 16, `45a5af55_0` 2 / 18.
   - In many test inputs 100 % of candidate pairs are > 95 % similar.
