@@ -21,6 +21,7 @@ The parent process never initializes CUDA; workers are separate processes (one p
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import signal
@@ -967,11 +968,14 @@ def int8_eval(torch, xs, out8, n, world, dt):
         err = (o[fin] - exact[fin]).abs()
         within = err <= bound  # NaN err -> False
         r["within_bound_frac"] = float(within.double().mean().item())
+        # E23 rev 3h (three GPT SMOKE audits): the pass test is the elementwise all(), not the float mean == 1.0
+        # (fp32 983044 B summed to 0.9999999999999999 with every element inside its bound, worst 0.959)
+        r["all_within_bound"] = bool(within.all().item())
         r["worst_err_over_bound"] = float((err / bound).nan_to_num(nan=float("inf")).max().item())
         r["int8_vs_exact"] = err_stats(torch, o[fin], exact[fin])
     else:
-        r["within_bound_frac"], r["worst_err_over_bound"] = 1.0, 0.0
-    r["ok"] = nan_ok and r["within_bound_frac"] == 1.0
+        r["within_bound_frac"], r["worst_err_over_bound"], r["all_within_bound"] = 1.0, 0.0, True
+    r["ok"] = nan_ok and r["all_within_bound"] and math.isfinite(r["worst_err_over_bound"]) and r["worst_err_over_bound"] <= 1.0
     return r
 
 

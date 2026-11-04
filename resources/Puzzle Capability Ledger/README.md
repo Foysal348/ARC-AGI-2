@@ -383,3 +383,33 @@ ARC Prize XHigh, 120 tasks:
 - Solved by nobody: 40 queries.
 
 The Poetiq oracle includes the deep HARD66 runs (D66 77.8k, L66 122.9k) and R5 EVAL120 (78 / 172). The Duck oracle includes the 3 EVAL120 G4B runs and the E15B commits.
+
+## Update 2026-11-02: oracle by family, both models (`oracle_by_family_2026_11_02.py`)
+
+**New runs added:**
+- 27B: E15P Poetiq EVAL120, the E18 / E20 Poetiq commits, the E21 Duck B halves.
+- Qwen3.8-Flash-Next: E25 NB5 / NB6, E26 K100 quality, E28 W4 and E28 K100 EVAL120, E31 Direct (30 tasks), the E29 hybrid smoke.
+
+A query counts as solved when attempt_1 or attempt_2 equals gold. Task-norm is out of 120.
+
+| Family | Runs | Oracle queries / 172 | Oracle task-norm (% of 120) | Best single run |
+|---|---|---|---|---|
+| 27B Direct | 8 | 60 | 45.33 (37.8 %) | E10 ORDER2 EVAL120: 58/172 |
+| 27B Poetiq | 13 | 125 | 90.33 (75.3 %) | E10 Poetiq R5 EVAL120: 78/172 |
+| 27B Duck | 19 | 97 | 71.67 (59.7 %) | E15B R3K2 EVAL120: 65/172 |
+| ARC Prize 27B (task level) | 4 | 68 | 51.00 (42.5 %) | xhigh: 55/172 |
+| Flash-Next Duck (klee100 / W4) | 6 | 126 | 91.00 (75.8 %) | **E28 K100 EVAL120 6 h: 107/172 (task-norm 65.0 %)** |
+| Flash-Next Direct (E31, 30 tasks only) | 1 | 11 / 46 | 7.50 | E31: 11/46 |
+| Flash-Next hybrid (E29 smoke, 12 tasks) | 1 | 6 / 15 | 5.33 | 6/15 |
+| All 27B runs of ours | 43 | 132 | 95.33 (79.4 %) | |
+| All Flash-Next runs | 8 | 128 | 92.33 (76.9 %) | |
+| **All our runs (both models)** | 51 | **143** | **102.83 (85.7 %)** | |
+| **Total oracle (ours + ARC Prize)** | 55 | **146** | **104.17 (86.8 %)** | |
+
+**What only one side solved:**
+- **Flash-Next only, no 27B run:** 11 queries (7.5 task-norm).
+- **27B only, no Flash-Next run:** 15 queries (10.5).
+- **Flash-Next Direct vs the E28 K100 run:** 6 queries that K100 missed (142ca369, 4c3d4a41 ×2, 9385bd28, a6f40cea, f931b4a8#1). Every one of them is solved by some other run of ours.
+- **Unsolved by every run:** 26 queries (15.83 task-norm).
+
+The lists are in `oracle_by_family_2026_11_02.json`, and per query in `oracle_units_by_family_2026_11_02.csv`.

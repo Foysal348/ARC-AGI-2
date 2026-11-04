@@ -143,7 +143,8 @@ class Server:
                                                                r"RuntimeError|AssertionError", l)][:12]
         pick = lambda pat, n=8: [l.strip()[:240] for l in t.splitlines() if re.search(pat, l, re.I)][:n]
         # rev 3 (measurement H5): the decisive startup evidence for the graph mode actually used with spec decode
-        downgrade = pick(r"not supported with spec-decode.*setting cudagraph_mode|setting cudagraph_mode\s*=", 4)
+        downgrade = pick(r"not supported with spec-decode.*setting cudagraph_mode|setting cudagraph_mode\s*=|"
+                         r"[Oo]verriding cudagraph_mode to", 4)       # rev 3e: + the 0.32 wording
         capture = sorted(set(re.findall(r"Capturing CUDA graphs \(([^)]+)\)", t)))
         configured = sorted(set(re.findall(r"CUDAGraphMode\.(\w+)", t)))
         return {"kv_tokens": min(kv) if kv else None, "kv_tokens_all": kv, "max_concurrency": float(mc[-1]) if mc else None,
@@ -427,8 +428,8 @@ def degenerate(text):
         return "REPEATED_CHAR"
     if t.count("!") > 0.5 * max(1, len(t)):
         return "BANG_GARBAGE"
-    words = re.findall(r"\w+", t)
-    if len(words) > 40 and len(set(words)) < 0.08 * len(words):
+    words = re.findall(r"[A-Za-z]{3,}", t)            # rev 3c: words only; ARC grid dumps (digits) are not garbage
+    if len(words) > 60 and len(set(words)) < 0.08 * len(words):
         return "LOW_VARIETY"
     return None
 
@@ -452,8 +453,8 @@ def compare(ref, cand):
                 mm = a.get("margins") or []
                 m = mm[d] if d < len(mm) else None
                 st = "INCONCLUSIVE" if m is None else ("FAIL_HIGH_MARGIN" if m >= FAIL_MARGIN else "NEAR_TIE")
-        g = degenerate(b.get("text"))
-        if g and degenerate(a.get("text")) is None:           # rev 3: only when the oracle itself is clean
+        g = degenerate(b.get("text")) if (b.get("tokens") and not b.get("error")) else None
+        if g and degenerate(a.get("text")) is None:           # rev 3c: a request error is not corruption
             st = "FAIL_HIGH_MARGIN"
         per.append({"first_diff": d, "oracle_margin": m, "status": st, "garbage": g})
         worst = st if rank[st] > rank[worst] else worst
@@ -481,10 +482,28 @@ def chat_probes(port, model="q27", cases=(("Reply with exactly one number: 7 * 6
     return {"ok": all(x["ok"] for x in out), "cases": out}
 
 
+def template_probe(port, messages, want_ids, model="q27", timeout=120):
+    """rev 3h (three GPT SMOKE audits): what the SERVER's chat path renders for `messages` (its own template and default
+    chat-template kwargs, no per-request kwargs) against the production xhigh render `want_ids`. MATCH / MISMATCH /
+    ERROR; the load requests themselves use pre-rendered ids, so this shows chat-path equivalence only."""
+    body = {"model": model, "messages": messages, "add_generation_prompt": True}
+    try:
+        r = json.loads(U.urlopen(U.Request(f"http://127.0.0.1:{port}/tokenize", data=json.dumps(body).encode(),
+                                           headers={"Content-Type": "application/json"}), timeout=timeout).read())
+        got = list(r.get("tokens") or [])
+    except Exception as e:
+        return {"status": "ERROR", "error": repr(e)[:200]}
+    want = list(want_ids)
+    first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None if len(got) == len(want) else min(len(got), len(want)))
+    return {"status": "MATCH" if got == want else "MISMATCH", "server_tokens": len(got), "want_tokens": len(want),
+            "first_diff": first}
+
+
 def teacher_forced(port, ids, last=256, model="q27", timeout=1800):
     """rev 3 (measurement M3): prompt logprobs of the last `last` positions of a long prompt (one prefill, 1 token out),
     for a lossy-KV comparison (NVFP4 vs FP8 KV) at the context lengths that matter. Returns per-position
-    (logprob of the actual token, rank) or an error."""
+    [logprob of the actual token, its rank, the engine's own rank-1 token id] or an error. rev 3h (three GPT SMOKE
+    audits): the rank-1 token id is kept, so top-1 agreement compares the two engines' predictions."""
     body = {"model": model, "prompt": list(ids), "max_tokens": 1, "temperature": 0, "prompt_logprobs": 1,
             "return_tokens_as_token_ids": True}
     try:
@@ -499,22 +518,51 @@ def teacher_forced(port, ids, last=256, model="q27", timeout=1800):
         if not isinstance(d, dict):
             out.append(None)
             continue
-        e = d.get(str(ids[pos])) or d.get(f"token_id:{ids[pos]}") or next(iter(d.values()), None)
-        out.append([e.get("logprob"), e.get("rank")] if isinstance(e, dict) else None)
+        e = d.get(str(ids[pos])) or d.get(f"token_id:{ids[pos]}")     # rev 3c: no fallback to another token
+        top1 = [_tok_id(k) for k, v in d.items() if isinstance(v, dict) and v.get("rank") == 1]
+        out.append([e.get("logprob"), e.get("rank"), top1[0] if len(top1) == 1 else None] if isinstance(e, dict) else None)
     return {"positions": out, "n": len(out)}
 
 
+def _tok_id(k):
+    """A prompt-logprob key ('123' or 'token_id:123') as an int id; anything else stays a tagged string."""
+    m = re.fullmatch(r"(?:token_id:)?(-?\d+)", str(k))
+    return int(m.group(1)) if m else "str:" + str(k)
+
+
 def compare_tf(ref, cand):
-    """Teacher-forced comparison: mean / max |delta logprob| of the actual tokens and rank-1 agreement."""
+    """Teacher-forced comparison: mean / max |delta logprob| of the actual tokens and rank-1 agreement. rev 3d (four
+    GPT audits): MEASURED only when EVERY expected position is valid on both sides (1 of 256 used to be MEASURED);
+    MEASURED is a measurement, not a PASS (the caller applies the A/A-derived tolerance)."""
     if not ref or not cand or ref.get("error") or cand.get("error"):
         return {"status": "INCONCLUSIVE"}
-    pairs = [(a, b) for a, b in zip(ref["positions"], cand["positions"]) if a and b and a[0] is not None and b[0] is not None]
-    if not pairs:
-        return {"status": "INCONCLUSIVE"}
-    d = [abs(a[0] - b[0]) for a, b in pairs]
-    r1 = sum(1 for a, b in pairs if (a[1] == 1) == (b[1] == 1)) / len(pairs)
+    a_, b_ = ref.get("positions") or [], cand.get("positions") or []
+    if not a_ or len(a_) != len(b_):
+        return {"status": "INCONCLUSIVE_INCOMPLETE_TF", "ref_n": len(a_), "cand_n": len(b_)}
+    if any(not a or not b or a[0] is None or b[0] is None for a, b in zip(a_, b_)):
+        return {"status": "INCONCLUSIVE_INCOMPLETE_TF", "valid": sum(1 for a, b in zip(a_, b_) if a and b and a[0] is not None
+                                                                     and b[0] is not None), "expected": len(a_)}
+    pairs = list(zip(a_, b_))
+    if any(len(a) < 3 or len(b) < 3 or a[2] is None or b[2] is None for a, b in pairs):
+        return {"status": "INCONCLUSIVE_TOP1_MISSING", "expected": len(pairs),
+                "with_top1": sum(1 for a, b in pairs if len(a) >= 3 and len(b) >= 3 and a[2] is not None and b[2] is not None)}
+    d = sorted(abs(a[0] - b[0]) for a, b in pairs)
+    # rev 3h (three GPT SMOKE audits): top-1 agreement = both engines predict the same rank-1 token id. rev 3d-3g counted
+    # "the forced token is rank 1 on both sides or on neither", which reads 1.0 for ranks 2 vs 3.
+    r1 = sum(1 for a, b in pairs if a[2] == b[2]) / len(pairs)
+    both = sum(1 for a, b in pairs if (a[1] == 1) == (b[1] == 1)) / len(pairs)
+    p99 = d[min(len(d) - 1, int(round(0.99 * (len(d) - 1))))]          # rev 3e: robust to one outlier position
     return {"status": "MEASURED", "n": len(pairs), "mean_abs_dlogprob": round(statistics.mean(d), 4),
-            "max_abs_dlogprob": round(max(d), 3), "rank1_agreement": round(r1, 4)}
+            "p99_abs_dlogprob": round(p99, 3), "max_abs_dlogprob": round(d[-1], 3), "rank1_agreement": round(r1, 4),
+            "forced_token_rank1_both_or_neither": round(both, 4)}
+
+
+def tf_complete(rows):
+    """rev 3e: a teacher-forced row set counts as a reference only when every position of every band is valid
+    (rev 3h: including the rank-1 token id)."""
+    return bool(rows) and all(isinstance(r, dict) and not r.get("error") and r.get("positions") and
+                              all(p and p[0] is not None and len(p) >= 3 and p[2] is not None for p in r["positions"])
+                              for r in rows.values())
 
 
 # ------------------------------------------------------------------ steady decode
@@ -555,6 +603,8 @@ def steady(port, prompts, level, secs=60.0, admit=None, max_new=8192, temperatur
             time.sleep(sample)
             if all(not g.is_alive() for g in ss):          # rev 3: checked before the metrics read (a dead server)
                 r.update(status="INCONCLUSIVE_STREAMS_ENDED_IN_ADMISSION", errors=[g.err for g in ss if g.err][:3])
+                if barrier:
+                    barrier.abort()                       # rev 3c: the other replicas must not wait for this one
                 return r
             try:
                 m = prom(port)
@@ -595,18 +645,26 @@ def steady(port, prompts, level, secs=60.0, admit=None, max_new=8192, temperatur
                 return r
         m0, t0 = prom(port), time.perf_counter()
         runs, waits, kvs, mids, gmem, stalls = [], [], [], [], [], [0] * len(ss)
-        last_tok = [len(g.tokens) for g in ss]
+        last_tok, track, misses = [len(g.tokens) for g in ss], None, 0
         while time.perf_counter() - t0 < secs:
             time.sleep(min(sample, max(0.1, secs - (time.perf_counter() - t0))))
-            m = prom(port)
+            try:
+                m = prom(port)
+            except Exception:                              # rev 3c: one failed metrics read is not a crash
+                misses += 1
+                if misses >= 5:
+                    break
+                continue
             mids.append(m)
             runs.append(m.get(RUN, 0))
             waits.append(m.get(WAIT, 0))
             if KVU in m:
                 kvs.append(m[KVU])
             now_tok = [len(g.tokens) for g in ss]
+            if track is None:                              # rev 3c: only streams decoding at window start can stall
+                track = {i for i in range(len(ss)) if now_tok[i] > last_tok[i]}
             for i, g in enumerate(ss):
-                if g.t_first is not None and g.is_alive():
+                if i in track and g.is_alive():
                     stalls[i] = stalls[i] + 1 if now_tok[i] <= last_tok[i] else 0
             last_tok = now_tok
             if any(x >= 3 for x in stalls):
@@ -634,7 +692,9 @@ def steady(port, prompts, level, secs=60.0, admit=None, max_new=8192, temperatur
                  kv_usage_mean=round(statistics.mean(kvs), 3) if kvs else None, kv_usage_max=max(kvs) if kvs else None,
                  gpu_mem_peak_mib=[max(row[i][1] for row in gmem if len(row) > i) for i in range(max(map(len, gmem)))] if gmem else None,
                  preemptions=m1.get(PREEMPT, 0) - m0.get(PREEMPT, 0), t0=t0, t1=t1)
-        if any(x >= 3 for x in stalls):
+        if misses >= 5:
+            r["status"] = "INCONCLUSIVE_METRICS_LOST"
+        elif any(x >= 3 for x in stalls):
             r["status"] = "INCONCLUSIVE_STALLED_STREAM"
         elif sum(g.is_alive() for g in ss) < min(level, best):
             r["status"] = "INCONCLUSIVE_STREAMS_ENDED_IN_WINDOW"
@@ -714,7 +774,8 @@ def wait_idle(port, wait=90.0):
 # ------------------------------------------------------------------ profiler (FULL-graph proof + per-category time)
 # rev 3: matched on the kernel BASE name, attention before GDN ("fla" is a substring of "flashinfer"), real 0.32 GDN names
 CATS = [("nccl", ("nccl", "allreduce", "all_reduce", "allgather", "all_gather")),
-        ("attention", ("flashinfer", "flash_fwd", "unified_attention", "paged", "attn", "attention", "batchdecode", "batchprefill")),
+        ("attention", ("flashinfer", "flash_fwd", "unified_attention", "paged", "attn", "attention", "batchdecode", "batchprefill",
+                   "reshape_and_cache")),
         ("gdn_linear_attn", ("gdn", "delta_rule", "chunk_", "recurrent", "causal_conv", "l2norm", "solve_tril", "merge_16x16",
                              "recompute_w_u", "kkt", "cumsum", "post_conv", "layer_norm_gated", "gated_delta")),
         ("gemm_marlin", ("marlin",)),
@@ -723,8 +784,33 @@ CATS = [("nccl", ("nccl", "allreduce", "all_reduce", "allgather", "all_gather"))
 
 
 def _cat(name):
-    base = str(name).split("<")[0].split("(")[0].lower()
+    # rev 3h: "void (anonymous namespace)::gdn_decode_post_conv_mtp_kernel<...>(...)" used to reduce to "void " -> other
+    s = re.sub(r"\(anonymous namespace\)::", "", str(name))
+    s = re.sub(r"^\s*void\s+", "", s)
+    base = s.split("<")[0].split("(")[0].lower()
     return next((k for k, pats in CATS if any(p in base for p in pats)), "other")
+
+
+COMPUTE_CATS = ("nccl", "attention", "gdn_linear_attn", "gemm_marlin", "gemm_other")
+# rev 3h: vLLM 0.32 marks each model execution as execute_context_N(N)_generation_N(N) (no gpu_model_runner range)
+SCOPE_RE = re.compile(r"^execute_context_\d+\(\d+\)_generation_\d+\(\d+\)$")
+
+
+def _is_scope(e):
+    n = str(e.get("name", ""))
+    return SCOPE_RE.match(n) is not None or ("forward" in n.lower() and "gpu_model_runner" in n.lower())
+
+
+def _scope_kind(g, compute_eager, unresolved):
+    """FULL = graph-launched with no eager model compute (attention / GDN / GEMM / NCCL) inside the execution scope;
+    eager input-preparation kernels are counted apart and allowed. Unresolved eager launches never read FULL."""
+    if g == 0:
+        return "EAGER"
+    if compute_eager:
+        return "PIECEWISE"
+    if unresolved:
+        return "PIECEWISE" if g > 1 else "MIXED"
+    return "FULL"
 
 
 def trace_summary(pdir):
@@ -739,14 +825,28 @@ def trace_summary(pdir):
     rt = [e for e in ev if e.get("ph") == "X" and str(e.get("cat", "")).lower() in ("cuda_runtime", "cuda_driver")]
     is_graph = lambda e: "GraphLaunch" in str(e.get("name", ""))
     is_kl = lambda e: re.search(r"LaunchKernel|cuLaunchKernel", str(e.get("name", ""))) is not None
-    # per-forward counts inside gpu_model_runner forward annotations (needs VLLM_CUSTOM_SCOPES_FOR_PROFILING=1)
-    fw = [e for e in ev if e.get("ph") == "X" and "forward" in str(e.get("name", "")).lower()
-          and "gpu_model_runner" in str(e.get("name", "")).lower()]
-    per_fw = []
+    # per-scope counts inside the execution annotations (rev 3h: execute_context_*_generation_*; the older
+    # gpu_model_runner forward ranges still count). rev 3c: user_annotation only, not the gpu_user_annotation copies.
+    fw = sorted([e for e in ev if e.get("ph") == "X" and str(e.get("cat", "")) == "user_annotation" and _is_scope(e)],
+                key=lambda e: e.get("ts", 0))
+    kname = {(e.get("args") or {}).get("correlation"): str(e.get("name", "")) for e in kern
+             if (e.get("args") or {}).get("correlation") is not None}
+    per_fw, aux = [], {}
     for a in fw[:400]:
         lo, hi, tid = a.get("ts", 0), a.get("ts", 0) + a.get("dur", 0), a.get("tid")
         inside = [e for e in rt if e.get("tid") == tid and lo <= e.get("ts", -1) <= hi]
-        per_fw.append([sum(1 for e in inside if is_graph(e)), sum(1 for e in inside if is_kl(e))])
+        kls = [e for e in inside if is_kl(e)]
+        ce = un = 0
+        for e in kls:
+            kn = kname.get((e.get("args") or {}).get("correlation"))
+            if kn is None:
+                un += 1
+            elif _cat(kn) in COMPUTE_CATS:
+                ce += 1
+            else:
+                b = re.sub(r"^\s*void\s+", "", re.sub(r"\(anonymous namespace\)::", "", kn)).split("<")[0].split("(")[0][:60]
+                aux[b] = aux.get(b, 0) + 1
+        per_fw.append([sum(1 for e in inside if is_graph(e)), len(kls), ce, un])
     corr = {(e.get("args") or {}).get("correlation"): str(e.get("name", "")) for e in rt
             if (e.get("args") or {}).get("correlation") is not None}
     per, tot, names = {k: 0.0 for k, _ in CATS + [("other", ())]}, 0.0, {}
@@ -763,20 +863,27 @@ def trace_summary(pdir):
     eager_share = round(sum(v["eager"] for v in src.values()) / tot_k, 3) if tot_k else None
     fw_g = statistics.median([x[0] for x in per_fw]) if per_fw else None
     fw_k = statistics.median([x[1] for x in per_fw]) if per_fw else None
-    if per_fw:
-        verdict = "FULL" if fw_g == 1 and fw_k == 0 else ("PIECEWISE" if fw_g and fw_g > 1 else ("EAGER" if not fw_g else "MIXED"))
-        basis = "per_forward_annotation"
-    elif tot_k:
+    kinds_l = [_scope_kind(g, ce, un) for g, k, ce, un in per_fw]
+    if per_fw:                   # rev 3f (GPT rev 3e audit: 2 FULL + 1 EAGER forwards read FULL by the median)
+        kinds = set(kinds_l)
+        verdict = kinds.pop() if len(kinds) == 1 else "MIXED"       # every scope must agree
+        basis = "per_scope_annotation (all scopes; eager input-prep kernels allowed, eager model compute is not)"
+    elif tot_k:                  # rev 3d (GPT-2 reproduced FULL with 0 forwards): CUPTI alone never proves FULL
         att = src["attention"]
-        verdict = ("FULL" if att["eager"] == 0 and (eager_share or 0) < 0.05 else
-                   "PIECEWISE" if att["eager"] > 0 and any(v["graph"] for v in src.values()) else
-                   "EAGER" if not any(v["graph"] for v in src.values()) else "MIXED")
-        basis = "cupti_correlation"
+        hint = ("FULL" if att["eager"] == 0 and (eager_share or 0) < 0.05 else
+                "PIECEWISE" if att["eager"] > 0 and any(v["graph"] for v in src.values()) else
+                "EAGER" if not any(v["graph"] for v in src.values()) else "MIXED")
+        verdict, basis = "UNPROVEN", f"no forward annotations (cupti hint: {hint})"
     else:
         verdict, basis = "UNKNOWN", "none"
     return {"file": f.name, "files": len(files), "kernels": len(kern), "kernel_us_sum": round(tot),
             "graph_launches": sum(1 for e in rt if is_graph(e)), "kernel_launches": sum(1 for e in rt if is_kl(e)),
-            "forwards": len(per_fw), "per_forward_median_graph_launches": fw_g, "per_forward_median_kernel_launches": fw_k,
+            "forwards": len(per_fw), "forward_kinds": {k_: kinds_l.count(k_) for k_ in ("FULL", "PIECEWISE", "EAGER", "MIXED")},
+            "per_forward_median_graph_launches": fw_g, "per_forward_median_kernel_launches": fw_k,
+            "per_forward_median_compute_eager": statistics.median([x[2] for x in per_fw]) if per_fw else None,
+            "per_forward_unresolved_eager": sum(x[3] for x in per_fw),
+            "scope_names": sorted({str(a.get("name", "")) for a in fw})[:5],
+            "aux_eager_kernels_in_scopes": dict(sorted(aux.items(), key=lambda x: -x[1])[:20]),
             "launch_source": src, "eager_kernel_share": eager_share, "graph_verdict": verdict, "verdict_basis": basis,
             "by_category_pct": {k: round(100 * v / tot, 1) for k, v in per.items()} if tot else {},
             "top_kernels_us": dict(sorted(((k, round(v)) for k, v in names.items()), key=lambda x: -x[1])[:25]),
@@ -812,9 +919,11 @@ def profile(port, pdir, secs=6.0, delay_iters=20, max_iters=40):
     return rec
 
 
-def profiled_load(port, prompts, level, pdir, secs=6.0, max_new=8192, model="q27", prefill_tok_s=700.0):
+def profiled_load(port, prompts, level, pdir, secs=6.0, max_new=8192, model="q27", prefill_tok_s=700.0, spec=False):
     """`level` decoding streams (own window: the profiler slows decode), profile() only after prefill settled exactly
-    as in steady() (prompt counter + preemptions flat, every running request emitted and gaining tokens)."""
+    as in steady() (prompt counter + preemptions flat, every running request emitted and gaining tokens). rev 3d: no
+    profile when unsettled; the profile window must be decode-only (prompt counter flat) and, with `spec`, show
+    speculative drafts (else the trace cannot speak for multi-token verification)."""
     plen = len(prompts[0]) if prompts else 0
     settle = max(300.0, 120.0 + level * plen / prefill_tok_s)
     ss = [Stream(port, prompts[i % len(prompts)], max_new, 1.0, 4321 + i, model=model) for i in range(level)]
@@ -845,13 +954,27 @@ def profiled_load(port, prompts, level, pdir, secs=6.0, max_new=8192, model="q27
             if ok >= 3:
                 break
         rec["settled"] = ok >= 3
+        if not rec["settled"]:
+            rec["status"] = "INCONCLUSIVE_PREFILL_NOT_SETTLED"
+            return rec
         try:
-            rec["running_at_start"] = prom(port).get(RUN)
+            m0 = prom(port)
+            rec["running_at_start"] = m0.get(RUN)
         except Exception:
-            pass
+            m0 = {}
         rec.update(profile(port, pdir, secs))
-        if not rec["settled"] and isinstance(rec.get("trace"), dict):
-            rec["trace"]["note2"] = "prefill had not settled: the trace may mix prefill and decode"
+        try:
+            m1 = prom(port)
+        except Exception:
+            m1 = {}
+        rec["window_deltas"] = {"prompt_tokens": m1.get(PROMPT, 0) - m0.get(PROMPT, 0), "drafts": m1.get(DRF, 0) - m0.get(DRF, 0),
+                                "accepted": m1.get(ACC, 0) - m0.get(ACC, 0), "generated": m1.get(GEN, 0) - m0.get(GEN, 0)}
+        if not m0 or not m1:
+            rec["status"] = "INCONCLUSIVE_METRICS_UNAVAILABLE"
+        elif rec["window_deltas"]["prompt_tokens"]:
+            rec["status"] = "INCONCLUSIVE_PREFILL_IN_PROFILE"
+        elif spec and not (rec["window_deltas"]["drafts"] and rec["window_deltas"]["accepted"]):
+            rec["status"] = "INCONCLUSIVE_NO_SPEC_DECODE"            # rev 3e: drafts AND accepted tokens in the window
         return rec
     finally:
         for g in ss:

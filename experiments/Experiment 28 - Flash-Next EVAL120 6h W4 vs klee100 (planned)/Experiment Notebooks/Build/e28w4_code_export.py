@@ -1,0 +1,3518 @@
+# ==================================================================== CELL 0 — mode + fallback submission (stdlib only)
+import os, sys, json, time, random, hashlib, re, shutil, subprocess, threading, traceback, zipfile, math
+from pathlib import Path
+from datetime import datetime, timezone
+import concurrent.futures as cf
+
+NOTEBOOK_T0 = time.perf_counter()
+# S1 (CLOCK): Kaggle's 12 h counts from kernel start; R5's cell 0 began 7 s later. Anchor the clock at the kernel
+# process start (capped at 10 min in case the value is odd).
+try:
+    import psutil as _ps
+    _since_kernel_start = max(0.0, min(600.0, time.time() - _ps.Process(os.getpid()).create_time()))
+except Exception:
+    _since_kernel_start = 0.0
+NOTEBOOK_T0 -= _since_kernel_start
+RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true", "yes"}
+ARC_ROOT = Path(os.environ.get("Q27X_ARC_ROOT", "/kaggle/input/competitions/arc-prize-2026-arc-agi-2"))
+if not ARC_ROOT.exists():
+    for _alt in ("/kaggle/input/arc-prize-2026-arc-agi-2",):
+        if Path(_alt).exists():
+            ARC_ROOT = Path(_alt)
+WORKING = Path(os.environ.get("Q27X_WORKING", "/kaggle/working")); WORKING.mkdir(parents=True, exist_ok=True)
+OUT = WORKING / "q27x"; OUT.mkdir(parents=True, exist_ok=True)
+SUBMISSION_PATH = WORKING / "submission.json"
+
+def _load_json(p):
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+test_challenges = _load_json(ARC_ROOT / "arc-agi_test_challenges.json")
+
+def write_json_atomic(path, obj):
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+def identity_submission(challenges):
+    return {tid: [{"attempt_1": q["input"], "attempt_2": q["input"]} for q in task["test"]]
+            for tid, task in challenges.items()}
+
+write_json_atomic(SUBMISSION_PATH, identity_submission(test_challenges))
+print("MODE:", "COMPETITION RERUN (hidden test)" if RERUN else "COMMIT / INTERACTIVE (evaluation)",
+      "| fallback submission.json:", len(test_challenges), "tasks | RUN_ID", RUN_ID,
+      "| clock anchored", round(_since_kernel_start, 1), "s before cell 0")
+
+
+# ==================================================================== CELL 1 — NB5 configuration (E25 FN-Duck)
+# E15B / E21 profile mechanics; Flash-Next values. Every NB1 / NB2 output that changes the engine is a parameter here.
+NB5_DEFAULT_PROFILE = "E28EVAL120"   # E28 W4 W1: the commit profile (the hidden rerun stays RERUN_PROD)
+PROFILE = "RERUN_PROD" if RERUN else os.environ.get("Q27X_PROFILE", NB5_DEFAULT_PROFILE).strip().upper()   # NB6 E1: the hidden rerun = RERUN_PROD
+E11_HARNESS = os.environ.get("E11_HARNESS") == "1"            # local CPU harness only (fake server, no GPU)
+_NB5_T = {"time_budget_sec": 710 * 60, "admit_frac": 0.90, "drain_frac": 0.94, "hard_margin_sec": 2 * 60,
+          "verify_margin_sec": 1 * 60, "drain_margin_sec": 8 * 60, "admit_margin_sec": 2 * 60}   # 11:50 hard stop
+# SMOKE = real evaluation tasks, the Duck's real multi-turn continuation, exact-match scored (addendum 4): two fast ones
+# (S1COMMIT4) + the known-answer 0934a4d8 (RC2's FP8 116k answer was wrong, 15/27 cells; 27B xhigh solves it). Never
+# tuned on: it is a check, recorded per KV dtype.
+NB5_SMOKE_TASKS = ["2ba387bc", "1818057f", "0934a4d8"]
+# paired quality A/B (addendum 5, user-approved; OFF by default; runs only after NB0's FP8 gate = PASS; GPU needs the
+# user's go): the 10 tasks the 27B solved on every one of >= 3 of our attempts (Puzzle Capability Ledger,
+# ledger_all120.csv) + the known-answer 0934a4d8; the same seeds, budgets, prompts and harness in both configs
+# revision 4: SMOKE = a 37-min solve window inside a hard 40-min gate (the paired replay must fit before it); the
+# gate decides EVAL / switch to variant A / abort; it never moves the 11:45 solve end or the 11:50 watchdog
+NB5_SMOKE_GATE_SEC = int(os.environ.get("NB5_SMOKE_GATE_SEC", 40 * 60)) if E11_HARNESS else 40 * 60
+NB5_QUALITY_TASKS = ["1ae2feb7", "38007db0", "3e6067c3", "65b59efc", "d8e07eb2", "1818057f", "409aa875", "5961cc34",
+                     "7491f3cf", "b99e7126", "0934a4d8"]
+NB5_QUALITY_WINDOW = int(os.environ.get("NB5_QUALITY_WINDOW_SEC", 150 * 60))   # a bound per config (expected 1.3 / 1.8 h)
+NB5_NB0_FP8 = os.environ.get("NB5_NB0_FP8_GATE", "").strip().upper()             # NB0's FP8 verdict: PASS | FAIL | ""
+# ---- the paired FP8-vs-BF16 KV ARC accuracy test NB5QUALITY_R2 (lead 2026-10-31, user-approved; spec R2): the 15 tasks
+# the lead chose from resources/Puzzle Capability Ledger/tokens_to_solve.csv (our 27B Duck + Poetiq runs on the public
+# eval set), in this order, with their group labels; ONE notebook, phase Q_FP8_K3 then Q_BF16_K3 (separate boots), the
+# same seeds / budgets / prompts / Duck config / task order / capacity levers, equal solve windows inside 3 h
+NB5_QAB_GROUPS = {"solid": ["1818057f", "45a5af55", "bf45cf4b", "2ba387bc", "8f215267", "38007db0", "58f5dbd5"],
+                  "sometimes": ["247ef758", "f931b4a8", "b5ca7ac4", "65b59efc", "221dfab4"],
+                  "never": ["2b83f449", "16b78196", "64efde09"]}
+NB5_QAB_TASKS = [t for g in ("solid", "sometimes", "never") for t in NB5_QAB_GROUPS[g]]
+NB5_QAB_GROUP_OF = {t: g for g, ts in NB5_QAB_GROUPS.items() for t in ts}
+# A-9: R2 never requires NB5_NB0_FP8_GATE == PASS; NB0's verdict is baked and recorded, the FP8 run is labelled
+NB5_QAB_NB0 = {"verdict": "NO_GO_FP8_TF_DIVERGENCE", "full_prompt_rank1": {"2k": 0.90, "8k": 0.93, "40k": 0.749, "90k": 0.661},
+               "source": "E25 Experiment Results/E25_GPU_wave1_NB0_NB1_2026-10-31.md (NB0 esfersami50 sha 37a427a2)"}
+NB5_QAB_FP8_LABEL = "UNVALIDATED_FP8_UNDER_TEST"
+NB5_CAPS16 = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 64]                                        # NB1 CAPTURE_HI (FULL decode covers 16 x (1 + K3) = 64)
+# phase = [name, tasks ("smoke" | "all"), solve window sec (None = until the hard stop), MTP ("on" | "off"), commit
+# variant, KV dtype (None = NB5_KV_DTYPE), options {"early_exit": SMOKE exits as soon as its gates pass, "budget":
+# both attempts' generated-token budget for this phase}]
+# ---- NB6 E2 (production SUBMISSION, lead 2026-11-01): the levers of NB5QUALITY_R2 (Kaggle-run 2026-11-01, sha 9c71ba89,
+# FP8 phase 13 / 15, pool 214, 9 workers): FP8 KV, MTP K3, commit variant A, KV pin ladder (RC2 pin + 1.0 GiB per card =
+# 3,553,580,524 B first, then 0.75 / 0.5 / 0), #60490, measured F, slots admission, launch seqs table, CAPS16 captures,
+# MERLIN_SHARE_DRAFT_WORKSPACE=1, gate 1.0, 104k per attempt. Attempt policy = E15B SUBMIT (LB 22.92): its
+# solve_all_r6 call passes no skip / extra / b1-mode argument -> skip_b1_if_accepted False, extra_attempts False,
+# b1_accepted_mode "" (two attempts per task, plain priority). No fixed LOCAL_ANALYZER_SEED (E15B SUBMIT has none).
+# Engine attempts = E18 R2's ladder (e18_ladder: <= 3, any failure before solving -> the next pin step, 30 / 15 / 15 min).
+NB6_COMMIT_TASKS = ["1818057f", "2ba387bc", "45a5af55"]      # NB5 QUALITY's solid group, solved in both phases
+NB6_LEVERS = dict(nb5_gate=1.0, nb5_attempt={"b0": 104000, "b1": 104000},
+                  nb5_env={"E12_B_SKIP_B1_IF_ACCEPTED": "0", "E12_B_B1_ACC_MODE": "0", "E12_B_EXTRA_ATTEMPTS": "0"},
+                  admit_mode="slots", f_rule="measured", pin_ladder=True, patch_60490=True, seqs_rule="table", caps16=True,
+                  lever_env={"MERLIN_SHARE_DRAFT_WORKSPACE": "1"}, no_pure_decode=True, continue_after_failed_boot=True,
+                  e18_ladder=True,          # NB6 P3: E18 R2 cell 6 L468-507
+                  nb5_phases=[["EVAL", "all", None, "on", "A", "fp8"]])
+PROFILE_TABLE = {
+    "NB5EVAL120": dict(_NB5_T, source="eval", n_tasks=120,
+                       nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": True}], ["EVAL", "all", None, "on", "C"]]),
+    "NB5EVAL30": dict(_NB5_T, source="eval", n_tasks=30,
+                      nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": True}], ["EVAL", "all", None, "on", "C"]]),
+    # paired accuracy run (PLAN section 0): the same 30 tasks, MTP on then off, equal windows
+    "NB5EVAL30MTP": dict(_NB5_T, source="eval", n_tasks=30,
+                         nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": True}], ["EVAL", "all", 280 * 60, "on", "C"],
+                                     ["EVALOFF", "all", 280 * 60, "off", "C"]]),
+    # the paired quality A/B (addendum 5): (FP8 KV, MTP K3) vs (BF16 KV, MTP K3); streams = the no-preemption ceiling at
+    # a 120k worst-case context = pool // (ceil(120000 / B) + F) (RC2 pools 149 / 78, F 6 -> 4 / 2); attempts of
+    # 104k (8k prompt + 104k + 8k tools = 120k), gate 1.0 (the ceiling itself), two attempts per task, no stage 3, one
+    # fixed per-request seed. MTP off is NOT in this A/B (NB0 measures it by teacher forcing)
+    "NB5QUALITY": dict(_NB5_T, source="eval", task_list=NB5_QUALITY_TASKS, nb5_gate=1.0,
+                       nb5_attempt={"b0": 104000, "b1": 104000},
+                       nb5_env={"E12_B_EXTRA_ATTEMPTS": "0", "LOCAL_ANALYZER_SEED": str(20261005)},
+                       nb5_phases=[["Q_FP8_K3", "all", NB5_QUALITY_WINDOW, "on", "C", "fp8"],
+                                   ["Q_BF16_K3", "all", NB5_QUALITY_WINDOW, "on", "C", "bf16"]]),
+    # the long multi-task SMOKE (PLAN v3.6): diagnostic only, never in a production / EVAL profile; no early exit, no EVAL
+    "NB5SMOKEDIAG": dict(_NB5_T, source="eval", n_tasks=120,
+                         nb5_phases=[["SMOKE", "smoke", 37 * 60, "on", "split", None, {"early_exit": False}]]),
+    # budget sweep (PLAN v3.6, off by default): EVAL30, the same 30 tasks per budget, equal 160-min windows
+    "NB5BUDGET": dict(_NB5_T, source="eval", n_tasks=30,
+                      nb5_phases=[[f"B{k // 1000:03d}", "all", 160 * 60, "on", "C", None, {"budget": k}]
+                                  for k in (60000, 80000, 100000, 112000)]),
+    "RERUN_ALL": dict(_NB5_T, source="test", n_tasks=None, nb5_phases=[["EVAL", "all", None, "on", "C"]]),
+    # spec R2 (lead 2026-10-31): 3 h hard runtime incl. install and both boots; equal solve windows (fixed when the first
+    # phase starts); commit variant A (C is not validated, A-11); no SMOKE (the boot's fail-fast probes stay); 104k per
+    # attempt, 2 attempts, no stage 3, one fixed seed; levers a (KV pin ladder + #60490) and b (non-numeric smaller F,
+    # measured F), the same in both phases; concurrency (simplified, user decision): workers = max_num_seqs =
+    # max(1, floor(pool / (ceil(65536 / B) + F))) of the boot, launch seqs from SEQS_TABLE per pin step, CAPS16 captures
+    "NB5QUALITY_R2": dict(_NB5_T, time_budget_sec=180 * 60, source="eval", task_list=NB5_QAB_TASKS, task_order=NB5_QAB_TASKS,
+                          nb5_gate=1.0, nb5_attempt={"b0": 104000, "b1": 104000},
+                          nb5_env={"E12_B_EXTRA_ATTEMPTS": "0", "LOCAL_ANALYZER_SEED": str(20261005)},
+                          quality_ab=True, equal_windows=True, no_pure_decode=True, admit_mode="slots", f_rule="measured",
+                          pin_ladder=True, patch_60490=True, seqs_rule="table", caps16=True,
+                          lever_env={"MERLIN_SHARE_DRAFT_WORKSPACE": "1"},
+                          continue_after_failed_boot=True,
+                          nb5_phases=[["Q_FP8_K3", "all", None, "on", "A", "fp8"], ["Q_BF16_K3", "all", None, "on", "A", "bf16"]]),
+    # NB6 E2: the hidden rerun (every hidden test task, ORDER2, one EVAL phase); E18 R2 RERUN_ALL budget 12 h - 3 min
+    "RERUN_PROD": dict(_NB5_T, time_budget_sec=12.0 * 3600 - 3 * 60, source="test", n_tasks=None, **NB6_LEVERS),
+    # NB6 E2: the commit check before Submit: 3 fast eval tasks, the same levers, scored; 50-min budget (hard stop
+    # 48 min, solve end 45 min = ~26 min of solving after a ~17-min FP8 boot as in NB5 QUALITY; F8: a boot ready by
+    # ~33 min still passes the phase budget check)
+    "NB6COMMIT": dict(_NB5_T, time_budget_sec=50 * 60, source="eval", task_list=NB6_COMMIT_TASKS, **NB6_LEVERS),
+}
+# ---- E28 W4 W2 (lead 2026-11-01, user decisions: Exp 28 README sections 1 / 3 / 4): every tested speed lever on NB6Q's base.
+# T1 = 104,000 per attempt (user 2026-11-01, NB6Q's proven value: attempt 1, B1 re-runs, Phase-C attempts; reserve 4,096 ->
+# the longest request 99,904); B2 (cap-cut) re-runs = 120,000 (user 2026-11-01); the server keeps NB6Q's proven --max-model-len
+# 131,072 and every attempt (B2 too) the 130,560 Duck window.
+# C12 (NB4T arm C12: a trailing --max-num-seqs 12; CAPS16 covers 12 x (1 + K3) = 48): launch seqs 12 and workers 12 ONLY on
+# the I8 start pin (seqs_fixed_kv_bytes = 3,285,145,068 B) and its same-pin BF16 retry; every lower rung (0.5 / 0 GiB: smaller
+# pools, the RC2 pin ~149 blocks) keeps NB6Q's proven rule: SEQS_TABLE seqs (seqs_rule 'table', inherited) and workers =
+# min(the slots rule, launch seqs) (coordinator 2026-11-01). Admission = NB6Q's 'slots' (lead 2026-11-01, the user's no-idle
+# rule, = K100Q): one slot per attempt, the engine schedules KV (a preemption = a recompute: counted at run level and per attempt);
+# C-7 (an attempt whose own projected peak exceeds the pool never starts) stays.
+# I8 (NB4T arm I8): DRAFT_HEAD=int8 into
+# Merlin's build() only; it OOMed at RC2 + 1.0 GiB and booted at RC2 + 0.75 GiB = 3,285,145,068 B -> the ladder starts there
+# (then 0.5 / 0 GiB; E18 R2's <= 3 attempts). --language-model-only = NB4T's Q flags. No ORDER2 (user 2026-11-01): plain task
+# order; the A/B/C scheduler (e28_sched_patch.py, E28_SCHED=1) for the commit AND the hidden rerun. Request timeout (Duck's
+# E12_DUCK_REQUEST_TIMEOUT, E15B #47 = 3,600 s): 7,200 s for A / B1 / C (lead 2026-11-01: a ~100k-token request at ~25 tok/s
+# per stream takes ~67 min); B2 = 9,000 s (user 2026-11-01, E28_B2_REQUEST_TIMEOUT).
+E28_LEVERS = dict(NB6_LEVERS, nb5_attempt={"b0": 104000, "b1": 104000}, seqs_fixed=12, workers_fixed=12,
+                  seqs_fixed_kv_bytes=3285145068,
+                  nb5_env=dict(NB6_LEVERS["nb5_env"], E12_DUCK_REQUEST_TIMEOUT="7200"),
+                  pin_start_gib=0.75, build_env={"DRAFT_HEAD": "int8"}, e28_extra_args=["--language-model-only"],
+                  b2_attempt=120000, b2_request_timeout=9000, no_order2=True, e28_sched=True)
+# E28EVAL120: source eval, all 120 tasks; NB5's long-commit timing (_NB5_T: admit / drain fractions, 2-min hard margin) with a
+# 412-min budget -> HARD_STOP 410 min (6 h 50 min), the solve end 407 min, the deadman 415 min; a FIXED 6-h solve window
+# (K100Q's mechanism: it starts after the boot + preflight and is shortened, never skipped, when the boot is late)
+PROFILE_TABLE["E28EVAL120"] = dict(_NB5_T, time_budget_sec=412 * 60, hard_margin_sec=2 * 60, source="eval",
+                                   n_tasks=120, equal_windows=True, fixed_window_sec=21600, **E28_LEVERS)
+# the hidden rerun: NB6's proven 12 h - 3 min budget, every test task, one EVAL phase, the same E28 levers
+PROFILE_TABLE["RERUN_PROD"] = dict(_NB5_T, time_budget_sec=12.0 * 3600 - 3 * 60, source="test", n_tasks=None, **E28_LEVERS)
+if E11_HARNESS and os.environ.get("NB5H_TASKS"):                 # local harness only: a few tasks, short windows
+    PROFILE_TABLE["NB5HARNESS"] = dict(_NB5_T, source="eval", task_list=os.environ["NB5H_TASKS"].split(","),
+                                       nb5_phases=json.loads(os.environ["NB5H_PHASES"]))
+if PROFILE not in PROFILE_TABLE:
+    raise ValueError(f"unknown profile {PROFILE}; choose {list(PROFILE_TABLE)}")
+P = PROFILE_TABLE[PROFILE]
+if PROFILE == "NB5QUALITY" and NB5_NB0_FP8 != "PASS":
+    # addendum 5: only after NB0's FP8 gate; a clear FP8 FAIL skips the A/B (production then uses BF16)
+    raise RuntimeError(f"NB5QUALITY needs NB5_NB0_FP8_GATE=PASS (got {NB5_NB0_FP8!r}): A/B skipped")
+assert not any(_p.get("parity") for _p in PROFILE_TABLE.values()), "NB5-2: the E12 DFlash parity path is not part of NB5"
+NB5_QAB = ({"nb0": NB5_QAB_NB0, "nb0_gate_env": NB5_NB0_FP8 or None, "nb0_gate_required": False, "fp8_label": NB5_QAB_FP8_LABEL,
+            "groups": NB5_QAB_GROUPS, "tasks": NB5_QAB_TASKS} if P.get("quality_ab") else None)   # A-9: recorded, never a gate
+for _k, _v in (P.get("nb5_env") or {}).items():
+    os.environ.setdefault(_k, _v)                             # read by the E15B block below / by Duck at import
+SEED = 20261005
+TASK_SAMPLE_SEED = 20261005
+POETIQ_NUM_EXPERTS = POETIQ_MAX_ITERATIONS = 0                # (printed by the E10 task-order cell; no Poetiq here)
+
+# ---- time (E15B / E21 CELL 1 block, verbatim)
+TOTAL_BUDGET_SEC = float(os.environ.get("Q27X_TIME_BUDGET", P["time_budget_sec"]))
+# v1.3: deadlines derived in a guaranteed order (v1.2 had DRAIN after HARD_STOP for EVAL12, so the drain never ran)
+VERIFY_DEADLINE = NOTEBOOK_T0 + TOTAL_BUDGET_SEC - P.get("verify_margin_sec", 8 * 60)   # reporting only since v1.4
+HARD_STOP = NOTEBOOK_T0 + TOTAL_BUDGET_SEC - P.get("hard_margin_sec", 25 * 60)        # abort everything, write outputs
+DRAIN_DEADLINE = min(NOTEBOOK_T0 + TOTAL_BUDGET_SEC * P["drain_frac"], HARD_STOP - 8 * 60)    # force-close thinking
+ADMIT_DEADLINE = min(NOTEBOOK_T0 + TOTAL_BUDGET_SEC * P["admit_frac"], DRAIN_DEADLINE - 7 * 60)  # no new task after this
+if "drain_margin_sec" in P:   # v1.4.4 (RERUN): fixed offsets from the hard stop, so the slots stay full until the drain
+    DRAIN_DEADLINE = HARD_STOP - P["drain_margin_sec"]
+    ADMIT_DEADLINE = DRAIN_DEADLINE - P["admit_margin_sec"]
+assert NOTEBOOK_T0 < ADMIT_DEADLINE < DRAIN_DEADLINE < HARD_STOP < VERIFY_DEADLINE < NOTEBOOK_T0 + TOTAL_BUDGET_SEC
+# ---- E28 W4 W5 (lead 2026-11-01): the commit's ABSOLUTE DEADMAN at HARD_STOP + 5 min = E26 K100Q's deadman code (cut from
+# build_e26_k100_quality.py by ast, sha-pinned at build time; only the names, the marker file and the fire time differ).
+# A daemon thread sleeps until NOTEBOOK_T0 + E28_DEADMAN_SEC, then: one marker line (stdout fd + stderr fd +
+# /kaggle/working/e28w4_deadman.txt), SIGKILL every child (psutil tree; else os.killpg on the servers' groups + pkill -9 -f
+# vllm), os._exit(0). No lock, no main thread, no cell. The hidden rerun (RERUN_PROD) has no deadman (= K100Q).
+E28_DEADMAN_SEC = (HARD_STOP - NOTEBOOK_T0) + 300   # E28 W4 W5: HARD_STOP + 5 min
+E28_DEADMAN = {"armed": False, "fire_pc": None, "pgids": []}
+
+
+def e28_deadman(t_fire_pc, marker, poll=5.0, use_psutil=True):
+    """Sleep until perf_counter >= t_fire_pc, then the marker, SIGKILL every child process (group), os._exit(0)."""
+    while True:
+        d = t_fire_pc - time.perf_counter()
+        if d <= 0:
+            break
+        time.sleep(min(poll, d))
+    line = f"@@E28W4_DEADMAN_FIRED@@ t={round(time.perf_counter() - NOTEBOOK_T0, 1)}s pid={os.getpid()}\n"
+    for fd in (1, 2):
+        try:
+            os.write(fd, line.encode())
+        except Exception:
+            pass
+    try:
+        with open(marker, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+    killed = False
+    if use_psutil:
+        try:
+            import psutil
+            for c in psutil.Process(os.getpid()).children(recursive=True):
+                try:
+                    c.kill()
+                except Exception:
+                    pass
+            killed = True
+        except Exception:
+            killed = False
+    g = globals()
+    pg = list(E28_DEADMAN.get("pgids") or [])
+    for s in list(g.get("NB5_SERVERS") or []) + [g.get("E11_SERVER")]:
+        pid = getattr(getattr(s, "proc", None), "pid", None)
+        if pid:
+            pg.append(pid)                            # MServer starts each server in its own session (pgid = pid)
+    if hasattr(os, "killpg"):
+        for x in pg:
+            try:
+                os.killpg(int(x), 9)
+            except Exception:
+                pass
+    if not killed:
+        try:
+            subprocess.run(["pkill", "-9", "-f", "vllm"], timeout=10)
+        except Exception:
+            pass
+    os._exit(0)
+
+
+if not RERUN:
+    E28_DEADMAN.update(fire_pc=NOTEBOOK_T0 + E28_DEADMAN_SEC, marker=str(WORKING / "e28w4_deadman.txt"))
+    E28_DEADMAN["thread"] = threading.Thread(target=e28_deadman, args=(E28_DEADMAN["fire_pc"], E28_DEADMAN["marker"]),
+                                              daemon=True, name="e28w4_deadman")
+    E28_DEADMAN["thread"].start()
+    E28_DEADMAN["armed"] = True
+    print(f"E28 W4 DEADMAN armed: fires at +{E28_DEADMAN_SEC / 60:.0f} min after the notebook start (in "
+          f"{round((E28_DEADMAN['fire_pc'] - time.perf_counter()) / 60, 1)} min)", flush=True)
+
+# ---- NB5 engine + workload parameters. Values marked PLACEHOLDER must be replaced by NB1 / NB2 measurements.
+INP = Path(os.environ.get("E23_INPUT", "/kaggle/input"))
+TMP = Path(os.environ.get("E23_TMP", "/tmp"))
+NB5_KV_DTYPE = os.environ.get("NB5_KV_DTYPE", "fp8").strip().lower()   # PROVISIONAL: RC2 TF FP8-vs-BF16 under study in NB1
+if NB5_NB0_FP8 == "FAIL":
+    NB5_KV_DTYPE = "bf16"                                     # addendum 5: NB0 failed FP8 clearly -> BF16
+assert NB5_KV_DTYPE in ("fp8", "bf16"), NB5_KV_DTYPE
+NB5_KV_BYTES = {"fp8": 2479838700, "bf16": 2464415744}         # RC2 pins (Merlin L4 rule); NB1 may change them
+# NB1 capacity table (addendum 2), JSON: {"fp8": {"pool_blocks": n, "f_blocks": n, "kv_bytes": n}, "bf16": {...}};
+# the live server values (cache_config_info, the max-concurrency line) override it; then the PLACEHOLDERS below
+NB5_NB1_CAPACITY = json.loads(os.environ.get("NB5_NB1_CAPACITY_JSON", "{}") or "{}")
+NB5_POOL_PLACEHOLDER = {"fp8": 149, "bf16": 78}               # PLACEHOLDER: RC2 (513,940 / 269,042 tok, block 4096)
+NB5_F_PLACEHOLDER = 6                                         # PLACEHOLDER = RC2 measured (149 / 3.92 - 32 = 6.0); NB1 refines
+NB5_ADMIT_MODE = os.environ.get("NB5_ADMIT_MODE", P.get("admit_mode", "projected"))  # projected (default) | live | future | slots
+# R2 'slots' (lead 2026-10-31, simplified): the engine schedules; the reservation is only a safety cap of `workers`
+# attempts in flight (1 slot each); C-7 still denies an attempt whose projected blocks exceed the pool
+NB5_F_RULE = P.get("f_rule", "max")                          # 'measured' (R2, lever b): F from the server's own line
+NB5_SEQS_RULE = P.get("seqs_rule")                           # R2: launch --max-num-seqs from nb5_lib.SEQS_TABLE[kv][pin]
+NB5_LEVER_ENV = dict(P.get("lever_env") or {})               # lever b (R2): non-numeric Merlin env; dropped if it fails
+# 'future' = a PLACEHOLDER hook for a later NB1-memory-telemetry mode (nb5_lib.future_admission_blocks returns None):
+# it behaves exactly as projected now and is recorded as such
+assert NB5_ADMIT_MODE in ("projected", "live", "future", "slots"), NB5_ADMIT_MODE
+NB5_THINK_FLOOR = int(os.environ.get("NB5_THINK_FLOOR", 60000)) if E11_HARNESS else 60000   # user floor, every request
+NB5_CTX_MARGIN = 2048                                         # PLAN v3.6: safe output = min(cap, 131072 - prompt - 2048)
+NB5_GATE = float(P.get("nb5_gate", 0.95))                    # one gate: projected blocks <= 0.95 x pool
+_att = P.get("nb5_attempt") or {"b0": 112000, "b1": 100000}
+NB5_ATTEMPT = {"b0": int(os.environ.get("NB5_ATTEMPT_B0", _att["b0"])), "b1": int(os.environ.get("NB5_ATTEMPT_B1", _att["b1"]))}
+NB5_RESERVE = int(os.environ.get("NB5_RESERVE", 4096))        # the commit turn's reserve (E15B #48)
+NB5_CAP = NB5_ATTEMPT["b0"] - NB5_RESERVE                     # the longest single request (uninterrupted thinking)
+NB5_WINDOW = 131072 - 512                                     # Duck context window = max-model-len - Duck's safety margin
+NB5_PROMPT_ALLOW = NB5_TOOL_ALLOW = 8192                      # projected peak = prompt + budget + tool results
+NB5_COMMIT_MODE = os.environ.get("NB5_COMMIT_MODE", "")      # "" = per phase (SMOKE split, EVAL C); else C | A | split
+NB5_EXTRA_ARGS = json.loads(os.environ.get("NB5_EXTRA_ARGS_JSON", "[]") or "[]")   # NB1 / NB2 levers (trailing vllm args)
+if P.get("caps16"):                                           # trailing args win (NB2 CAPS16 rule: FULL covers seqs x (1 + K))
+    NB5_EXTRA_ARGS = NB5_EXTRA_ARGS + ["--compilation-config", json.dumps(
+        {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": NB5_CAPS16}, separators=(",", ":"))]
+NB5_EXTRA_ARGS = NB5_EXTRA_ARGS + list(P.get("e28_extra_args") or [])   # E28 W4 W3: --language-model-only (NB4T Q)
+NB5_BASE_ENV = json.loads(os.environ.get("NB5_BASE_ENV_JSON", "{}") or "{}")       # Merlin knobs, e.g. {"DRAFT_HEAD": "int8"}
+NB5_BOOT_LEVERS = {}                                          # the lever env of the current boot try (set by nb5_boot)
+NB5_MTP_OFF_ARGS = ["--speculative-config", "None"]           # vLLM optional_type: "None" -> no speculation (last wins)
+NB5_BOOT_EXTRA = []                                           # set per boot by the runner
+NB5_READY_TIMEOUT = 30 * 60                                   # spec section 2: readiness gate <= 30 min per boot
+NB5_RELAUNCH_MIN_SEC = 30 * 60                                # a Merlin relaunch needs ~17-20 min before it serves
+NB5_RAM_NEED_MIB = (69 + 4) * 1024                            # Merlin's floor 69 GiB + 4 GiB margin
+NB5_PORT = int(os.environ.get("NB5_PORT", 8001))                # RC2 FP8 port; the local harness picks a free one
+if not E11_HARNESS:                                           # user floor: thinking >= 60k (never below without approval)
+    assert min(NB5_ATTEMPT.values()) >= 60000, NB5_ATTEMPT
+assert NB5_CAP <= 131072 - 512 and max(NB5_ATTEMPT.values()) <= 120000, NB5_ATTEMPT
+# ---- E28 W4 W3: the E28 constants. Every attempt keeps the asserts above (<= 120,000 per attempt, the 130,560 window) and the
+# server NB6Q's --max-model-len 131,072; the B2 (cap-cut) re-run = 120,000 (user 2026-11-01; its projected peak is capped at
+# 131,072 by NB5's own C-9 rule, as every NB6Q attempt). E28_BUILD_ENV = Merlin launcher knobs read by build() only (I8:
+# DRAFT_HEAD=int8, NB4T CELL 2).
+E28_BUILD_ENV = dict(P.get("build_env") or {})
+E28_B2_ATTEMPT = int(os.environ.get("E28_B2_ATTEMPT", P.get("b2_attempt") or 0)) if E11_HARNESS else int(P.get("b2_attempt") or 0)
+if E28_B2_ATTEMPT:
+    assert E11_HARNESS or E28_B2_ATTEMPT == 120000, E28_B2_ATTEMPT                    # B2: the user's 120k (<= 120,000)
+    assert E11_HARNESS or E28_B2_ATTEMPT <= 120000, E28_B2_ATTEMPT
+assert not P.get("seqs_fixed") or max(NB5_CAPS16 if P.get("caps16") else [32]) >= int(P["seqs_fixed"]) * (3 + 1), P.get("seqs_fixed")
+assert not P.get("seqs_fixed") or (P.get("seqs_fixed_kv_bytes") == NB5_KV_BYTES["fp8"] + int(round(float(P["pin_start_gib"]) * 2 ** 30))
+                                   and P.get("seqs_rule") == "table"), (P.get("seqs_fixed_kv_bytes"), P.get("seqs_rule"))
+E28_RUNG = {}   # E28 W4 W9: the current boot try's rung (kv bytes, gib, c12, seqs, workers); nb5_boot sets it, nb5_capacity reads it
+SGL_MODEL_PATH = INP / "models/foysalemonshanto/qwen3-8-flash-next-w4a16-merlin-p1/transformers/default/1"   # tokenizer
+SGL_DRAFT_PATH = Path("/nonexistent/nb5-no-separate-drafter")  # (read by the rev 6 preflight; MTP is built in)
+SGL_MAX_RUNNING = 8                                           # Duck env placeholder; the phase sets the real streams
+SGL_RELAUNCH_TIMEOUT_SEC = NB5_READY_TIMEOUT
+SGL_URL = None
+CONFIG = {"PROFILE": PROFILE, "RERUN": RERUN, "profile_row": P}
+CONFIG["e28"] = {"build_env": E28_BUILD_ENV, "b2_attempt": E28_B2_ATTEMPT, "b2_request_timeout": P.get("b2_request_timeout"),   # E28 W4 W3
+                 "t1": NB5_ATTEMPT, "seqs_fixed": P.get("seqs_fixed"), "workers_fixed": P.get("workers_fixed"),
+                 "seqs_fixed_kv_bytes": P.get("seqs_fixed_kv_bytes"), "seqs_rule_lower_rungs": P.get("seqs_rule"),
+                 "pin_start_gib": P.get("pin_start_gib"), "extra_args": P.get("e28_extra_args"), "no_order2": bool(P.get("no_order2")),
+                 "sched": bool(P.get("e28_sched")), "fixed_window_sec": P.get("fixed_window_sec")}
+os.environ["E12_RAW_REASONING_HISTORY"] = "1"                 # E14-P (E15B CELL 1b): Duck keeps the raw reasoning
+# ---- E12: Duck REPL agent (Experiment 12, user option A 2026-10-19). Duck's own settings are in arc2_duck.DUCK_ENV
+# (= dfranzen milestone-2 cell 4): 12,288 output per request, yield at 2,048 generated tokens, preserved thinking,
+# 128 Ki context with drain to 58 Ki. Approved exception to the 60k-per-request floor (thinking accumulates in context).
+E12_BRANCHES = int(os.environ.get("E12_BRANCHES", 2))                 # independent branches per task -> attempt_1/2
+_E12_REV5 = True                                # rev 5 build: every profile (incl. the hidden rerun) runs the fixes
+_E12_REV6 = True                                # rev 6 build (user 2026-10-21): code-first view + coverage scheduler
+_E12_REV4 = PROFILE == "EVAL6" or _E12_REV5                            # rev 4 defaults (pre-run capacity check, 2026-10-20)
+E12_STREAMS = int(os.environ.get("E12_STREAMS", 16 if _E12_REV4 else 0))   # Duck ARC3_MAX_ACTIVE_STREAMS; 0 = engine concurrency
+E12_MAX_GEN_PER_BRANCH = int(os.environ.get("E12_MAX_GEN", NB5_ATTEMPT["b0"])) or None   # NB5: Flash-Next attempt 1   # E15B rev 3f: attempt 1 = 50,000 (attempt 2: E15B block)   # Duck max_generated_tokens_per_game
+# rev 4: at most N branches alive (resident contexts <= KV 867k / 128k context = 6; EVAL30: 30 live -> 8.4 M re-prefill),
+# branches of a task start together; and up to 60,000 output per request (EVAL30: 29/30 first requests cut at 12,288)
+E12_LIVE_BRANCHES = int(os.environ.get("E12_LIVE", 12 if _E12_REV4 else 0)) or None   # 6 x 131k = 786k <= KV 867k; S12 (user): 12 x rev 5 context p50 58k = 697k
+# rev 5 B5 (evidence, 2026-10-21): no productive EVAL6 reply exceeded 44,779 tokens; the 7 replies that hit 60,000 made no
+# tool call; at 49,152 the input budget is 81,408 (4 of the 6 real-overflow trims would have fitted). 40k would have cut one.
+E12_DUCK_MAX_OUTPUT = int(os.environ.get("E12_DUCK_MAX_OUTPUT", (NB5_ATTEMPT["b0"] - NB5_RESERVE)
+                                         if _E12_REV4 else 0)) or None   # rev 6: the first-request cap; later caps are per request
+# rev 5 B9 (user 2026-10-21): Qwen3.8 model-card thinking temperature 1.0 (Duck milestone 0.7)
+E12_DUCK_TEMPERATURE = float(os.environ.get("E12_DUCK_TEMPERATURE", 1.0 if _E12_REV5 else 0)) or None
+E12_REASONING_EFFORT = os.environ.get("E12_REASONING_EFFORT", "xhigh").strip().lower()   # NB5: forced xhigh   # "" = model default (xhigh)
+if E12_REASONING_EFFORT:   # user 2026-10-21: low-effort variant of rev 5 (Qwen3.8 template: xhigh / medium / low)
+    assert E12_REASONING_EFFORT in ("xhigh", "medium", "low"), E12_REASONING_EFFORT
+    os.environ["E12_REASONING_EFFORT"] = E12_REASONING_EFFORT
+if _E12_REV5:   # B1-B4, B6-B8 in arc2_duck (E12_ARC2_REV5); B3 counts reasoning with the served model's tokenizer
+    os.environ["E12_ARC2_REV5"] = "1"
+    os.environ["E12_TOKENIZER_JSON"] = str(SGL_MODEL_PATH / "tokenizer.json")
+# rev 6 (user 2026-10-21; fix list "Rev 6 gap check", both plan reviews): facts view + trusted helpers + auto-check +
+# state-aware resumes (arc2_duck E12_ARC2_REV6); request caps 12,288 -> 24,576 after the first successful Python call,
+# 32,768 after two no-call cuts (thinking kept in history, branch allowance >= 60k, soft cap 100k); first exposure: branch 0
+# of every task in ORDER2 order, paused at about 28k generated tokens, then stage 2 by evidence (resume / branch 1 with the
+# grid view = the representation hedge); 10 workers, context window sized to the KV pool in CELL 6; per-request deadline.
+E12_R6 = {"E12_R6_CAP_FIRST": NB5_CAP, "E12_R6_CAP_PROGRESS": NB5_CAP, "E12_R6_CAP_RESCUE": NB5_CAP,   # NB5: no 12k/24k/32k
+          "E12_R6_FIRST_EXPOSURE": 0, "E12_R6_B1_VIEW": "facts", "E12_R6_MIN_ADMIT_SEC": 300,   # E15B #3, #1, #49
+          "E12_CHECK_VERIFY_CAP": 24, "E12_AUTOCHECK_CAP": 24, "E12_AUTOCHECK_PER_CALL": 3, "E12_DUCK_DRAIN_TOKENS": 16384,
+          # rev 6c (user 2026-10-21: 12 streams): the per-stream window = 1.0 x KV / 12 (= 73.4k at 881k). 0.9 would give
+          # 66.1k (history 41.5k at the 24,576 cap); D66 ran 12 slots at context 155,648 with KV peak 90 % and 0 preemptions,
+          # rev 6e G4-1 (user 2026-10-21): workers stay 12; no new task or branch while KV usage >= 0.95
+          "E12_R6_FACTS_MAX_CHARS": 3600, "E12_R6_SHOW_MAX_CELLS": 900, "E12_R6_KV_FRACTION": 1.0,
+          "E12_R6_P90_CUTOFF": 0,
+          # rev 6b (gap check vs the problem->fix map): facts <= 800 Qwen tokens (Q-5; 120 eval tasks: full p50 1,237 ->
+          # bounded p50 736 / p90 837 / max 1,396), fair-share stage 2 (R6-S3) with a 24,576-token minimum chunk
+          "E12_R6_FACTS_MAX_TOKENS": 800, "E12_R6_FAIR_SHARE": 0,   # E15B #45: no chunks / pauses
+          # rev 6e (user 2026-10-21: "take all", fix list G4-1..G4-18; G4B evidence): KV gate 0.95 polled every 5 s (G4-1);
+          # branch-1 first cap 24,576 (G4-2; G4B b1 first calls at 12.4-18.0k); show() up to 900 cells per grid, 1,000 per
+          # call (G4-4; 30x30 = 2,033 Qwen tokens of the 3,072 tool cap); provisional nudge (G4-6: 27,000 in rev 6e; 24,000 since rev 6f, H6-1; G4B
+          # solved branches defined transform at 18,383 / 26,228); branch-1 indexed view <= 12,000 tokens (G4-11);
+          # minimum stage-2 chunk 12,288 (G4-17: every G4B share 3.8-7.5k was below 24,576); cache diagnostic (G4-8)
+          "E12_R6_KV_ADMIT": NB5_GATE, "E12_R6_KV_POLL": 5.0, "E12_R6_CAP_FIRST_B1": NB5_CAP, "E12_R6_SHOW_CALL_CELLS": 1000,
+          "E12_R6_NUDGE_TOKENS": 24000, "E12_R6_B1_GRID_MAX_TOKENS": 12000, "E12_R6_MIN_CHUNK": NB5_CAP,
+          "E12_R6_CACHE_DIAG": 0}   # NB5: the SGLang cache diagnostic is not run on vLLM
+# rev 6f (user 2026-10-22, the H6 set of the three GPT rev 6e audits): the provisional nudge at 24,000 tokens, sent in the
+# next tool result (H6-1: in G4B no branch 0 started a new turn at >= 27k before the 28k pause); the cache diagnostic
+# runs AFTER solving (H6-3); every commit window starts after the preflight (H6-6); one isolation retry (H6-17)
+if _E12_REV6:
+    os.environ["E12_ARC2_REV6"] = "1"
+    for _k, _v in E12_R6.items():
+        E12_R6[_k] = type(_v)(os.environ.get(_k, _v))
+        os.environ[_k] = str(E12_R6[_k])
+# audits (verified): non-streaming read timeout 900 s < a 60k reply at ~61 tok/s per stream (978 s) -> 1,800 s.
+# The 100k per-branch cap is soft (checked after each request). max_tokens 60,000 is a ceiling, not a minimum thinking.
+# The milestone context (131,072, drain 58 Ki) is kept: input budget 70,560, trim target 35,280. Only the last message is protected:
+# a tool-less reply before the resume opener could be dropped (EVAL6: 5 resets; rev 5 B3 counts reasoning correctly).
+E12_DUCK_REQUEST_TIMEOUT = int(os.environ.get("E12_DUCK_REQUEST_TIMEOUT", 3600 if _E12_REV4 else 0)) or None   # E15B #47
+for _k, _v in (("E12_DUCK_MAX_OUTPUT", E12_DUCK_MAX_OUTPUT), ("E12_DUCK_REQUEST_TIMEOUT", E12_DUCK_REQUEST_TIMEOUT),
+               ("E12_DUCK_TEMPERATURE", E12_DUCK_TEMPERATURE)):
+    if _v:
+        os.environ[_k] = str(_v)                                         # read by arc2_duck (CELL 3 / CELL 6)
+# E15B (user 2026-10-24, Exp 15 Notes/02; rev 3f 2026-10-25): config B = 2 independent attempts per task, attempt 1 =
+# 50,000 and attempt 2 = 45,000 generated tokens (attempt 1 on every
+# task first, then attempt 2 with its own agent and the facts view); no pause / chunk / resume; request cap = remaining
+# budget - 4,096 (a final commit turn); fixed 100,000-token Duck window (no trim inside an attempt); 16 real streams
+E15B = {"E12_B_MODE": 1, "E12_B_ATTEMPT_TOKENS": E12_MAX_GEN_PER_BRANCH or NB5_ATTEMPT["b0"], "E12_B_RESERVE": NB5_RESERVE,
+        "E12_B_WINDOW": NB5_WINDOW, "E12_B_ATTEMPT_TOKENS_B1": NB5_ATTEMPT["b1"],
+        "E12_B_SKIP_B1_IF_ACCEPTED": 0, "E12_B_EXTRA_ATTEMPTS": 1, "E12_B_MAX_ATTEMPTS": 8, "E12_B_WEAK_COMMIT": 1, "E12_B_B1_ACC_MODE": 2}
+for _k, _v in E15B.items():
+    E15B[_k] = int(os.environ.get(_k, _v))
+    os.environ[_k] = str(E15B[_k])
+assert E15B["E12_B_ATTEMPT_TOKENS"] == E12_MAX_GEN_PER_BRANCH, "the attempt budget and the session cap must agree"
+assert 0 < E15B["E12_B_ATTEMPT_TOKENS_B1"] <= E15B["E12_B_ATTEMPT_TOKENS"], "attempt 2's budget (rev 3f)"
+E12_SOLVE_WINDOW_SEC = P.get("solve_window_sec")                      # SMOKE1 only
+E12_STOP_BEFORE_HARD_SEC = 180   # branches stop; outputs are written after it. rev 3 (GPT re-audit): a submit at the
+                                 # deadline can still verify for <= 60 s, then CELL 6/7 write; 60 s left no margin
+E12_MAMBA_TRACK_64 = os.environ.get("E12_MAMBA_TRACK_64", "0") == "1"  # Duck's --mamba-track-interval/--page-size 64 (measure)
+# rev 2 (GPT audits, validated 2026-10-19): Duck request snapshots (the exact messages sent; large) for the smoke only,
+# and a per-sandbox-process address-space limit (Duck sets CPU / file size / open files only)
+E12_REQUEST_LOGS = os.environ.get("E12_REQUEST_LOGS", "1" if PROFILE == "SMOKE1" else "0") == "1"
+E12_SANDBOX_MEM_MB = int(os.environ.get("E12_SANDBOX_MEM_MB", 4096))
+CONFIG["e15b"] = dict(E15B)
+CONFIG["e12"] = {k: globals()[k] for k in ("E12_BRANCHES", "E12_STREAMS", "E12_MAX_GEN_PER_BRANCH", "E12_SOLVE_WINDOW_SEC",
+                                           "E12_LIVE_BRANCHES", "E12_DUCK_MAX_OUTPUT", "E12_DUCK_REQUEST_TIMEOUT",
+                                           "E12_DUCK_TEMPERATURE", "_E12_REV5", "E12_REASONING_EFFORT",
+                                           "E12_STOP_BEFORE_HARD_SEC", "E12_MAMBA_TRACK_64", "E12_REQUEST_LOGS",
+                                           "E12_SANDBOX_MEM_MB", "_E12_REV6")}
+if _E12_REV6:
+    CONFIG["e12"]["rev6"] = dict(E12_R6)
+CONFIG["e12"]["duck_commit"] = "10882e332d883af3e61616df8c8a17d03a328a75"
+print("E12:", json.dumps(CONFIG["e12"]))
+for _k in ("E12_B_ATTEMPT_TOKENS", "E12_B_ATTEMPT_TOKENS_B1"):
+    assert E11_HARNESS or E15B[_k] >= 60000, (_k, E15B[_k])   # the 60k floor holds after any env override too
+E21_VARIANT = "NB5"
+E21_SERVED = {"fp8": "q27", "bf16": "q27"}                     # RC2's served model name
+E21_VLLM_MAX_MODEL_LEN = 131072
+E21_HALF = None
+E21_HALF_END_PC = HARD_STOP - E12_STOP_BEFORE_HARD_SEC
+E21_STATE = {"halves": {}}
+E15B_SOLVE_END_PC = float("inf")
+
+
+Q27X_PAYLOAD_SLUG = "foysalemonshanto/q27-e15b-payload"      # NB5: the foysalemonshanto copy (esfersami50 second)
+Q27X_PAYLOAD_DIRS = ["datasets/foysalemonshanto/q27-e15b-payload", "datasets/esfersami50/q27-e15b-payload"]
+Q27X_PAYLOAD_USED = {}                                       # NB5: payload name -> the file that was used
+
+
+def q27x_payload(name, sha):
+    """One file of the payload dataset (Notes/21: Kaggle commit runs of a 745 kB notebook never started, so the big
+    payloads live in a dataset), found by its exact name under Q27X_PAYLOAD_DIR or /kaggle/input (at most 3 directory
+    levels deep) and verified by sha256 before use."""
+    roots = [Path(x) for x in os.environ.get("Q27X_PAYLOAD_DIR", "").split(os.pathsep) if x] + [Path("/kaggle/input")]
+    seen = []
+    for r in roots:
+        for pat in [d_ + "/" + name for d_ in Q27X_PAYLOAD_DIRS] + [name, "*/" + name, "*/*/" + name, "*/*/*/" + name]:   # NB5
+            for f in (sorted(r.glob(pat)) if r.is_dir() else []):
+                b = f.read_bytes()
+                if hashlib.sha256(b).hexdigest() == sha:
+                    Q27X_PAYLOAD_USED[name] = {"path": str(f), "sha256": sha, "rejected_before": list(seen)}   # NB5
+                    print("payload", name, "<-", f, flush=True)
+                    return b
+                seen.append(str(f))
+    raise FileNotFoundError(f"payload {name} (sha256 {sha[:12]}) not found or wrong under {[str(r) for r in roots]}; "
+                            f"seen {seen}; attach the dataset {Q27X_PAYLOAD_SLUG}")
+
+
+# ---- NB5 library (new code, E25 Build/nb5_lib.py; verbatim)
+NB5_LIB_SRC = (lambda _t: _t if __import__("hashlib").sha256(_t.encode()).hexdigest() == "18efcbc1dde9c590a14ac1937b45dec563ff76ed4d92b16632d273dec2c88500" else (_ for _ in ()).throw(RuntimeError("nb5_lib: embedded source sha256 mismatch")))(__import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;Z}WLp<MtGXbna~Q3)_*QbaB=+OkN>n!qY0PhmtmX4RGO{&>Dw?D(UD00cT?M#f{rRmr2i>C_P&l09B<vGsUJ&}>DB(Tv#(b)%;|>1`3iTvr$!h*NMo>c|cn;ZO;)!OWl^H|O)IyC-btr8oBVZQ7P`kF||DwIeE=wHO#a5?%iD-$@q%is5Gty3?YC=Gb~F@x#5IB@6RnBwOi_qNdD2YdfKU9=2kV-4$nRyY-7>C@*eqQ5PQ$oe4*C9gN*Ai?I@Dw`TL@_(sTDcn@}VV|>6Ugni!Hg=gN)I!kjQ!*_W8apBOUXYI$nTEpY5^{B}n)-*3MoLRE9Q1VnlQX<0DYgbSq3^SZOB+U?*=ZJ_h-q?Hn_JuJfE^%j?Iu|Pr3~Js#M5a?9C_ah#y%)iOGm#nef<GJ$bKkY^ppxGSawwdXeUj@b3hi@RBxK&@<o{%%n#3As2ET;odV8iXkupISykQ^{iUkAZ6%#;9e-#z}HU}Tt4(6!-s<%oUKn;beizFLCd;yeVU>s!5q_!6<c71xn{-M6+Ba{yV9x=4y$_V(0{A{mq7$@QTY+V88Rf;;mrAmw~rH7H5ibUIoFG-Cj^yuSIsgyX8AMUQ+UPajB;d%m2)ZS_VC`a3exm~Mr?I_70u+nJFxK=DKPb=w@72SoVU7(Uilzd2XPit|J3;ZH33lK6K;nE1l(@(PCVIE5y^it!r;BghB*^Cl#_@H;RzNc-%wP%tSOb2lAzSE`sId3X%goW|VlyKwR7ixjEYFRF=<i`bUX#dH}>w@AvvEh-A2sd1@F4sqeV=LAl=elQRyedmrd#z@z72t8c-4U7^3l`h!umtU8nv|JI@8Gj1%30AG`^R|zKg=-}2q#LnW3VpOp7?iffU*J5W<B6@Nd&#(0H2qTY*5%-WP`}`#AIX>+Aq7Jp2>Jmy{gK-Bdf{_Y7}_UzH!4`jq8q>LL>X2#;g@-{B@1sB?|?%vj%pNAuf9?+PP=OWbfL5n|yTLH%g8Fs3<1{7lb8@X6E`^FKNBiayxsaD~>@V*klt)wup$fEp+VvX4WmM{_@qi6<+$G@+nXL8Zn3UH>dZ^BtKNH>v3D3U!b0T5JU0fR8J#3Cj>4=rl_dI&1I5Ct71$2qLGK!3lXrCncdeCeEb3*qFTupfOpBC9(L=$q8Ps@GWk(A#eP_Jp0c8f2wmb_H^ooc0#`gC!}MlOJqH2}QQM}|+WSkf8fHBYa_WvVO);i`8*3rW$AMtzaR^G0BGgw%MgN|__<%jZ-1JTfzX^N{^zEA7tJK!ZHw;m$@p|h8&X4O?wn<BBE8ezLs8QCkfY&K6ABEmGf&%h@1KT#dGX1FAkrHVOv`rkB^&ehvSwyc*qTLrXECh^xr};|w<tr0XMZA<Uwa~VoArb_$J@d<1cXYEK5WoU<mXED5^oKE0@~k79N^MS#>oe3E+P2V6#`v8^aWizYl**)~&q}m7K&H7sa8RiW=xPNH?xW`JsY9LG3BeT6>pJZE=}$SDZ{C@k14;UYR61to4dRfSZsi0WhzdOz@eR2~*oa$y&jMW<%}<0l=qiYr?#<(g$0Yn|IyN!}6!L<b|J4~pZz@P1eHs62?5}p1{Q8Vx9flWkgahN$8j{1L%NyuJ>x5|@fl}_seEl@U8fTO05fo>gIi@GYn53U|3z4fZsRk~f63z+jx-sw*IWpRcKuUXgq%`+`xGbmZGZ#|X3b4L7U2C<{%DrzwAgD>6AIVAmYKT{rDeaUwI_r;4*}zxLrw3i$6id$PtwN#fA$_cM?-|ggqy<|5(*+V0sx+8HWi^A_b|=pg=!ZjF;|g4t0svN`5A(E<ld(Wr;fzfw%A%L)obeA|_{0U_#ljr^1Le+&n^F5rP6=2!G%+n0T@bVh$cfWxu&Ho|#wy)pFPLi<VoXao=e!wvW<ZnhLEWd8?;ZXcrkt-Xy8iXPK5aO+sg*=xUoB9R5%#mBMnwhy^JP@dt&&Qw*E`@2;7N_&BaH%&2WIj!2w=Js$w?gexVcq*@W<SbfemuAHP(#Ce14TYSljjk;Q35lk{><=v{6Y?_9j-hbB<2~xM_N%iX%wTLd=pAae<Rd8g$FS_d3by^ayuV22PK{gai-b$kWV?a!o{E4&{;=Ahiv_Mf>q1u_#PvxsD@>Fo8!zZ%4Q?6P`SGvpPLn2K+te%I&sT0WCAXhj!|<x8Yb7dr3nOp)UNt_}(dEHdnUQv&jT`XI!#U`LV4K0S~c-aK9%_T!i^ft%afslqy`FM?=vU$KI?>Wl%)46XSDFc~<j2>s(Jb;@70`Ex>Fgi?#igvU!`r_5|aNmc`T_w$n<1w!R9>Dc4nS(3`=)ZgP`}3m*Wh?V@^#Cc=`<oolQ(ln&8IV<ly=h8xdKdyl(#U(43Pjgo2vSH2;7+Y=CHOPF!?7JAgR=%vHP)s<OK*51an-E;M4;08YSi`LroHH7({)*wWOi;+erFL+go!xPt6xkQ#?G0!&M>^pyJ=z*Rl?M`cREToh4=%+4P${_%}3I(<sUIb6uaOVl23M16|m#He8!FE=ctI+J9HgT*;B1tmhdCv>&GpQZRmH|BXd5?-oZ~BXvjG(Jb5#b+yK1+VU*KV<uVeECTt)s??C49&E%VjLVNjKO&ptSpyuDqu5EjH+-bHc^7_uUmytAkX+(@JcGkE5V?B`8WZGwlowy2F5FBe+hCS6W0bALK`TXfDJ1xW-jlPD8hq8>E{X#q~ny9Z2uY(3jL!XPTTdpxzq~NJ1^pA&okQJUwUI*`Q`;9^Pq|HtF|jLJYu!xWNmpN4loE?wqw!Zi(bS_k7sL=!n+x6RGS1NJsFbN(Z^o|DW-@aMQ+pkLmjZx``}xzU%kMd$rjt&(AvUN}gT`c_Q<6wYu#ffg~l1*R773ZB|FklXMN}xH-t0Uk%G6u(fM=h&Z^<Z8Fk6`&6@kTvlQ_#-xowpVMpIp~TK?cWaNZb=Oz(&rF*EFKC)#Bm;GqJL6$iryIB4nMsHHwo45i2IQBaA@v+!#<JMrS_|3ePFbI5`3!Ztz^<oaWmRXP-u;qmAE7A=>-37$a=4+*DG~X4dpKx8NBnWnUpi_A@!F^kb>gB=_A8KY3#mx3M^@;Xc{4C4qRkaxp|Qakd*tfi{DVcT2_nxX>7pzr7yIEqY}{WQ1QKs;HXez54P{Zwq$<H<m|fI!uXuQKl|)QLVAJmjgV^*F<v&^%+}#G0p`4>%Oi@tX4jGaODtg;;fc5^CbShC*%bIHe80TM*EJOd^NGeeTG#(W`cgLp5MgyB`8zHX9N|=PEtjEm1SG3q0&|^QXR!chUA=P2Q2;1P}xNueb@$s+=Xh2>mF|IHbBbpSuJm`i9d*#TzoWNbg?eTpvrz_5E3eBx2OX{B6K{6M$49d*n+l9kGdOLR;3cbhSj7wEW@<)b5pa-x@$%*p-*Yuz&HEo+*VQy1bcg&tGqg4XnLpkjER$BzFzy+a#^_>#0;blFSso6$6XShA~s!%QxfEbj*e`G8Y(Iw6r$F<^K`9i9VTk+O>r`7u_dO!cp;>Tiqb6?Pz^4A8MG&Hlbzctu)t<{i6CXMGfSuGKH@88|9jt(pKK)lc;qnYV4Or=)wm}99KCwg2{ykDwwH|-uBsNA*;!zIg`8ncIlHy;5{zG2O#YJ9+)A{(V*x46`5MSXmM9N2DT0mYFYWdd>&7vhgR7Rdae8L~uC^<kiz8R}E)@F5M<?f#(<*;Jx>R|<t~cySasQt6kFG<%RbSr+44<{D7x-a%J(@ryVH5)hC8ykL*<-XEXYxgAAqSBXE+Z<AYeTZP~)u_gJbm`ZQt-?D;2=UB%Tn+<DNV?QifijTLvLsH@+TnE)NumJFVXl|6T!S~BY^ct5gPqOvI(=V6&bept*dV}D3zv1&4_r7LkQa!eVfm;N#YYvaeNNRzQT_90}zZ0i*k#$a(6H9Gnezfe#RJ-Ve{`>{KRuyr2&cNw#VrWPO{o;cbZiO_HpAOFW?9ntRrM&!vUi7!hr3p2iN$_S=Yw^#|___NdJ>@w~UKoTRBK%m#({G}#PdAcg_}7-dR|XoQ8t_umU<bx&4GMK-3a@%z840_yPt#A2>H13)KG>deX@B#08u~4V_`AX_{t~g&L5Mn%9a?17s6%L;fcikTx*mrp>Elz@``z_90LGWX;Zz}TK#S<QNToYkQn-vG2>4!eZGPlxVvuabN%|tuw-*{nb9WVU_^J|1`D_r!Gvc$7RfR|0?skQ|q?}DNM#?=DobEVd=Y&m$82r3C=r>2~x$=&J*uJS(MAwoB!M){)aVTTvX+__pc63{;9XG9cTJ@NSAEsz&ZwL+%NgYr3x_k`hCv_j+zX9Q8P)j#ATaC$itRtalL<*(h){R_|S=fk57)g2*TtWy!yVnar%yMxT>!4^Mo|hWA6<SvLFIY_|Ubx18mk*_gmg^<Aez8TrS%mHi|E;hif>`5V8kBoJPb7pY5a%lK3q8`fJ)_ySh2B6>1Opvd*-B(M;F@Yg!8EoiI)FiOwVZQK@@I#Q>Bj)_`}hJVBpCieer)vu9LO5uJEgBte}=RnDoqnKeQzz!lVoE8V`%_`4($VjsFV0&jHz5rD!o#_!Xx<s^|YIJr#^Uol%A`!<l$E7sW8mLbs>+&{M-mq$Rsz<8zB7u@1B+1CY;&c5s5`46KU^k$I^E4vjwJy$fs65P1H(=x+=6G@EcDtib;~*XoYfHSox}BfF$)AzphyS{SA%9^AeDJT`8<ggJ5Jym}LoA9*TOuMnwsC&*X#5*q;;I(+rLdCI^6(fV8b1CTE?6rouK*MHh9crk-WBN5qlWPXq~!{>YB@!dM#`@<=$NLOc-5<eeKJgfqXBh6gpH;W1N={4KC%LM!mMssC=fSa9X<`C*{blxideC`lSiO;Mv8-@f|rX|oFT)qCwk#OQhcvIt3_Zc86gYqlAI8(?X2lE=n)8N^9H5;$`O%Iglu!+xsxP$TJaE_c@|uySGiLGbcG(->WD`sfLx8;%Du7J$NyXFAmdiz=)>JbxWS6Fx)NMqc4l0RdU6_beOuEwi=@wkID?;qD%BnMATki@M!Jk%O@X1e+#q7_!xx{j%k9^9%!Z)`P2=w7s!20WMY!u0Obbb2r&6uMxyF#^<-gi)w&2&0Q*%*2P1}^#=6%obUS~=c)6Ev8E8$Cq0_eo;DF3$AWJ7>OirRQ1^A+)|d{D5=1na3uYG|#S-BmWhOGsDYdI{NhkcccjC@K98yl781#Xo;r~?89<2L_5$hcGekhvh&sbZLDnQQ<4rX|HWKHbgKx_)xPHn9-3WbI{ZZr8mpeZCOF;txu*~lhp7=%4(^R@~3KS?>_eyhTDFxk+mvKWU)Jh^p4yXHtoCM_r`JC_GI3^s_9E)(qjz0c-t?6~?-<}vPmfs+9znCXt{mrE^!V&ekBPVz9q5~GR#8>E>O<zD;VA$-6)tv0W~95f){|7VfVV_%#vKtx2tX0v*%#!mHa@Oz$>mAyg6aqt)ss;kFY|B$)4N^#Gx9;t>`Hi`rZ4YKb)F3YESd}8DL%{3U-AtC`8_+fJhX~Ex>kzSfMTfk6phhxl;^r)#I4{bESb++7G(xa;UtS5$Ul)`^J+pM33oKB>fX#$I60~8FTeOGFHIQj=&vI>q2q4@brjtO?=%sLs-If_NhW!-<E^-hntWN~az_4=mk;4j$f2l_H@a8COCOHn$5fN6dtpo+l<(Qa!ZG~^}S3c1)~Ce8JBC_V~73HgVys8H9il7loHxu|hs&n3JiLw?La%$zo>ol=kWOf9z2PKGL#ZPG+2Ty7gt5ndt_4DV9`_MIFcgFom>n`6g6cihu86EI6h9o|y6An!C2{7vt$J}vXys&0hIMYk)Fdy2%|mA!#OmV2Wtm~K=@lFU9Iae4QAr8mUTyOca!a*j9-irrTqFQWyc*Ff=J<OIM1i6Upnxk+Zzs>(u|?XX7V78*c<B)-}E1eC{P4F%OA63S^#;!^~cUiK!~L@AM1XSHZEmT9(D7N)xY92YyOazAySi6No^xTvnkh_Zf7ICs6U(%xum6nW64FR4BBzi1<zeRmFYlDQuDrGNtcL*V6%E1J2hi0m*8p%u1zMZ%;i0x{Gx2a_|%?Z@my&lKzwf<^rUjj)IPYCPq&2*JPSY|qvIpcL-=n%56d1l8{U)C$NuAQ=fmUERffb>o0J<1<cT;W7oLeg10qWFH-}?^I{~)RUZY0Z&Fu$-M?aZK$Ij%6vl|J`IW&GC<sd1?(1Rw?@iE)5OyLx$gi%LqD}!oYQ`qT*V&|O13E0LsH>AN&#s((T)Fzztg76J@vf>jO9(_8CzxkwE^$Q9}DhAYBcJ%NFbFyzdu-Ss*ryiKN}$d!$qiKARi!A%(1~9Fz9oJ375~|eeKCOc=xi8VFOD8vbC_=$;h%Zp4J(W#$Uu}{d3{==}|~WNS^v*2+PngE7o`0yV3tdm5-)-c&Da?)YDuAMcI0x?{%O?H~+>N49WREv#1{Cn)kNYuSj0gOj?T!6786BA<&>~IF=aN2p#}-3JNllI~8{S!ZO_gZ>PF{5#9q~K1QT6@+y;<P4;TzmSCOv?2&R&2Ydw2LXwt&xb`Lj^K54IbwxKLmJ#*^8P_XK{(mZhPHaRN3re0DAsQApHz<ho#m1M$L3ld6%!{}!bu)I$P{|-zQGCzZaHMB*Al*J}OVjRRx$q>>iEG!cP8e>$WkDxl2)XuVy@d~6D+X-<wdIwT8}~Z<pG$TB44k*9mUe|p)|LX&bJil-B3lygG+t#FClGVni1lD81riR>|EmTitURs3Qwa%i9hh&<7<um*ZIEY{kChFgvuKYkR52}USAYx`uS2YnVGuU)G|Y)m9IsdovB!-^ZbLs?CEvfq7v^rNpmBOLjXng|QheHtDN&~LzL^G>*)nx9z;MEK=V&|%i_Wz;6@6?-f0s>nXkxJp8xp`+$Qi~nCSQZgHcKRXb!q0Gh|6;xVIQ?4(M2NzGE7*PLF8aS>KOTQv5R4<$2iNZ!L3?-XkN?Vt3WvDSq=5<znVt(oZ9_{K`*YI(-vUP#GVtyu;}HPx2%*_UX+|t{k{+5fEC{;@E_1XoNvdFO^k7;cvRufK(u+zWbq9mqI_@}7+Q>QH1{tyVl3Ut-r&|;ma3&9Vd(JlgiyODN*LuV110nF>C!D%mP}F`x(M*~no?@S)Mch?uo;MDLJW+(dv~*Ij?;J5E*i^bB&h2hTnwu1m_=hL99<&DCbkn)?nYcUFGsD6%vv+&AsOr4|55#9X17yjTOZ)FsVBKTR{LKbC84G`PvS>83+16L@37T^S$~X#V(8>Ot;Ft-$JwgZYwy~+47zvf<9aVTBF5v6^1b6vAs8=R13U|RwKHpe)L~fQprqa*xjU)nL=%_n277)RuxGtH7=0v)0<R;x9>ZUn3~&>2o<UEn%CQXHS6mb&g$-M$C$4+>*PsCb0T2YV_<B^(gtb-|Uxo3pa3DJ_NR(ONIewDR*`3_hoj@Q3V68Xdr8uvkm_`*F`<srhU$DWX_ZmKeLIaqz@kqiMU3S6QSdvD%a99}|+qFzANewACYMlo*jge~R=7+Y5nPk$dyzm&GVLd2HCA<l7z4@M37Th0Ub~kw92^|*HkJE@Kd{wy0*))eOkvX%f(SEx}Yu2`^3YXzg%^og;#?(o@$RIgHN-R#5jxyB{88mpKT*JF*`f=*J3XwT%nyaSJIgb(U+w67%(cV_Z@Ii(;_|zbkxI(H__WC6Aj<CK~n%YcQm;>n1FGLEIcU;)eJa@HywncacuSeEUIb{WmmWKPgLjcL1H<0`gb=(5BpV_9N>m}Nh2_WPYY42$Q{m>$OlCG%W16_qm&$S1DU`HnRfBl~!Z;S#m++SyXCXuB?N}U?1ViWuGM>o4A+Fepxe#MTb``cpKq_-K|gSS@2VkHOB1PdN@fMg_WU^?q?0CSH_GzYhQOc(9r@*eh-_UN6){tnAOb0(EAdBteMe_(Rk6bwt?Tt#B12$m7{_p(tW!#B%qKIf|+?6Yh7N<YK!9h9#!#ESF3INbl^@=SEgv#^tB{fM1&=lx<QvNyCt=b{Xa+F{x6<TYVXMaJ{yyCLfRSZ1Ht!P83AW5;{IDwww7Q`cU_R5&>(cu`NGE90?v^uD0~=0I4o%i#6jXHm8FB=ZB-ny1$SrM5pjUj#>zF)KMlbz3z78mYB}LUc-S<ZujiJtk&^<~7?(;cyF`vqiUFW1HR?SFxD`OO!u*rO5Zcik00CW`Rdxc|iuUJxhR#<FMogZ-CTbD?O0Q9Ycn8k*?PgB}n9Qyz=Bqw$BMV9UM1KD*o_<NHyQ6W0b@%24J66EHsUoB_#CE$c(G3kNC3Pg9BYzCIuY6TZoK1W2h1(Ck}-j-SI2kjl)RK$8_p$9K*)gKjfPqwMU*}8A+nUyck^yn?2p~dKxJMValcYyY^Xnl6^J_Cq<8SrF~T)(q|?;4AtwLs#;#P4_^E3jID}))}2}e43I!FB5b}+pH>8mxzk7s^6N>7wxDrv^fnizB0IACzFGACNq;9ZwbhH3uIs`85%w54+^d#a&3Zw@OHy=ik|bY}=IE9&XDC--?IQno*c_;>1aBk97)z4gslPDA!{_B3L@t*gFy_qANfG!0owsuWH7n5j^jKR*frQV4hKzH{+;(B<PuT8bjO<j?Z^ww_S-`&Kg2;b3^Y8=l;m2a&2<Vy08F6<>MleBc?=Vu-CqZ&kG<(wP(PLNwP1v6&w0+y{L+ET#IIK3506dL=+4O$!2?ucsm|mhoIO;@GlYPOmBLM=#g8bPae9jV;LGEK9ybgB;N8}Dyy)x<TDN!?<UrF}JIW8&mFNOJOBof9gb7kED3lV-6fPx3$Ix^)B03#QIp$4i7&szqC8rGlq*M&3_agI9rH;N@<YOa`GM4kF-^zHl-z6@oL9SJ545Eh4u*a99wd3R$bD1P<pke(d?S1qh3NREb^?jx<cXdbIdH<Zm+4y3}PZZJ5-b^^8}Q%&J^bbz_nr6RUn-qBHSrn8H)#PFV|qT!STs`=|<SpO)UJ><uLwSU1Unj>^pl$agEG39~PN-l~EE|`;XzoxiuW%y7)PWM@bP$X7=PxXIq->*Q>sh*2HOA=u@nA7%RtIw1QPh;+iGuP*bJ^ATTibWkYY1Tb2+&VE4Yuh|ED0fTO`?J?`r1u{<_{H#lUu<ZdA}%sGLK{L>MF7&1kzg8Fhn=9Z#rcd+t=)WKtcPP}qb+_OMg)A<pGF8dtsxQJRXFUb>*pb0UxY+&?<eP)S{RnTZbrewwXe<3Awvvav+vbBDlS8%B^X<C5|yd2i}@}j$P9DW8S1qbXXMu1cpp97F|x0&lAOZRXK<DZTKz^pT{Agx`3!4vq@o0-n-@UHV#jRn)l9GnBUqYzR&B3^^_!QL+&1UHMawlVrp+%BA%rP!o@4xQP5XH@(&)Yp4P-Nn<6(CX7LZuQr8xX4Mkv0mpP-GZH%o^L0kB3Fu+7Ds$QHxNz3owo-r3tDKJ;pFGq0=S|GNkjl_SNX12p^7y6{^17AQfi2OU}vi@7zK`WZ_h_8-7RXbH4WE|+cqe@IM9u+SUIT#YjNR??FgFj;0Nz#>Lf7j+#N2|ezk?orwmd-9<#xQOaU`hzr1OMvsglrZ*LqYX{`1Tqy;9-b6pN|LinxBOuMr3)S1FdmR-)>-n(h+iet&}<{eQe&m)u7=jM@P$Ns$?nieov<I|Zh>ANRlWnK`tLH=cTCxl%MW2AJ-mI*67h;+mgaimVc9BBvTP|ATJM~W5=P{_887&#@@ve|$}USLLST0Lu|4=^5~_ODx>_S1tvvOikBrDVQ?tIDBeRoMN#AaEJ^eefys^$;-pcNKB9jb0)i_AGVxeP6=%L<X02VgWI2ja2pyaT~_fCa0LbRrxJ4PPx%9l~8+mM5!#;#maEk~ZeP$x@nNC>#kE;Y;-qA06iXp>?`&jTup$m6qPSjv@}9|emb5hLA+dsD92qj{PIK=V`~M*1^g$}gxxu~S(d2a9o>&q7fKb=IVn?FfksP5~se^tIW5=?}RBN10V~Qig(k|I<5?S!@1TXsVy#Mk!t5`x(kz1POqJ<c7B0fP>gv8J``mZ#kT!1#a9elN5k*VvZ$3M|M%KZ_&uLg75Oa3A1JB%pE>Sc7>1CYXPSpwB7V~h~`ODHODZBSe)q+ES$g)EN)lhGXxL|q?X&)9U=zGQ*vXEa=pYTjk@5nL~#oY)>o*w$-aX>iS?@NsP$v6u!yK(lR;0c=&rWvk~NDpU2aizB_pq%RB}FHd^yy%xXQCBfArUTFSQ9ZOV5Es$Px!#GTxT~#<uW__3I*+1xbm9=5|i8bj#d@TbuB;lt;g)+uXqHW&9{*6KRu-yUz@P9+^L*v4rU8uD(j4p(`-4GC0KnP%TK5S9l3%-GB?=<X6$%TDCJCxwkRTlH1s)IfgbaFKH4W{*ax<G<9NuSJF$A`W=ZEbMVhES4=e*(Z|=dD%A5L<_wl`eq8&YC(pz2?M+A!odfO_hk3l(vmx1}cq6x5vreRaX1g`bTBHdS2^JF@vTcJmO-Jerd!$ZzN>ue^!Sa~oxp~#?W2Hxa`eNqT91u2qx0PJEEuwWDN2M|x2r+&-2`KWGdjS@0PmoVZlVux=5mq$F?Lx<-^D1FAl8*^1g#a%3&uas09!$XZ+1k*tDgTn)6mYvYDc%jf4dwg$M+Sl$w+Ca=vXc{xx!+d2LTl;nXGi};_7Q(9swBSe$}Mw1EH_TtP^RX#@teo1PDK;JTEL-CjoOX^Gr{}*@XH)7Xw#?N$W%#Ksm8~wCyj{47x%QL`;oi88=t$NsEmz))fqjl5y#2JSYyl=r*>{InL!`O>41!I^7!&xd2EDJBU(3YKJ3$_<QaJN;rZZ(15zK#31;8s3HYU8`W1`I1@<fl*AX0X5wV-GRdv4Sy%EZJfv#%I?opaecT4%nKOMh4>`JAsuUE_?#qo(+5>qUqhYL67$G6!w7gCLTk)RcK31Cg>mk8|*v_zVrvaY-=nz}BUU-yMI=+_<P^O{#aWIv44pV#Wp####MenFyVk-5}1_OIBe)duguVlaULTn03-C!;tE36M8O%r1V);KnUJ{Zj<e0_>q(W_%_V@c5;@YhhyzE$L)rdlP3ZKLjC-Z!+QJV8bbD@ehOKSn;b&Uv=m-Ln#^S^Xq9|_yN&0{8en}!Hniu&Jf+N*g_Y19(%`cpo3mIC+NH5UA7G7`~endL#}N(ivm}V61$_p%2$rw5^-7|^&oh3%azrSg)f<G@>N^%k7#}anIeFL+Ep(}t||UorY45V1*Du{4gDhO|0?K*R)d`U-i~=EaO-VKR4n>#9%@%0UQ3-&@xRN!rml~Q5K3y;J0;jWbDBXM|KiTPr^@N5Lhthe_c*YkL-h5M>e?j|a|kK4=Tux4Cl6395iz~LkDEzVe>HSRqziCayH<{qoj!pay70Z^sKmMsQK_SMImFs^*rDPKZkqRe0wR-$M-G!I8Vnf;q~jL$OYU5og6L1Qn_7|c1Ida+cQ_SZslW^h+6_Tkb5mvb)oL2gJ?FWI?fP8v`~5{9#<Bnldx4T~0WdbZVkJf0v4V>2!cUsPo>~SBf4$lkL-i|$Y&>|*;??gxBz&^$x8owUfRImlzx(@EJSYj^iT4yNS^98rP^dgvyn0t5cnxVDTVjYrgbpsaGv8cqzB8}b;Ewx$TowV~kYv~H(|rRdTNQEd4T^08eMmc>_}*1qBP0EV8Z`t1a18vPdHN}Dhtxt8iyjW}aG6Uzu)Id2J^Q^YhKH!e5cDPRH_=gX$B8=VRS<4{m7lO`MUDcK2x~@dOxzc`1<GCY8iS?%v){@hL2!Gpp`5|kWBGt6IRal|ZLg}*=ZiwuvT1)-PVU`=h~?Rt>amS_=RA0{mcU4rUAqVDWXtRWZ1<j?+<&}Bg-tfm2zRc6Ju2z-a*E4H`@}qU?mO{1!PuF&Q9%sDAYGazIuvwghTSFz9%dTIn&a$2+pn2SNYIdS=@DwA`E_<Y{P^ECFoRMxF+0(<asm>eDA$p;!aP9p<^QxKR@?v)cXy8A`)6~iLs2FR>yvoHjb64G4ua=>E--!Lkg}!{1CMt8VB}~geZU@T#(G{#mJNwdgUw|eNu9K|iV}(qn-qjTCiM4KOE4bpmX?P547wb2Ew4Gf9Re+tS|O5h;U&g)Dw5c+=>UI&$h_opAY>hUXDRZ=N*TU<>SkcPXYX>Yar=s|!X&SVmAS+=<HtFZ_b!&H)Gi`o!*xGnF1}Y3azER<6NwAPRgtVLF<vQSSZ0(~<#iOBW-!jbQCy})7WFBy$s_wO;&RUo#~xN5!UdT3Q))mT&O(*>^w(oWUGLy(G7<iF?|4*NjF4!*iOc&lLXxIZ|2Ynq4DeHrEmr^U@lN&<=Uak$EMQ!S`$wnyR4Nckq1+O(>KT>1LM;&+;7n}TW!M|RVqVW2iV<GXEuJ%Bj%d^s*hq6$#xSgbEIK{}u!OoL%m#^^H24}gK*2@2Rsg@>4*XJZ4&Mk}K?44h=Q7-1;86SN<7zfH<~{hT^2M)YJh9y|g@3YLG{U7*<l{g1uFCPkF^qDg;*5)ppiP{1zT@Z{CzxtKWepI(GPG>f*D!lc3uDxyIL*k^<CMvLCoDLOg_kV)==C>$<;6BJkQ)ed!d5885Y<dH7marqV;(+v%;+FpA`BiV+;cHd^(ZlQ5O*LSJInRZ`siq;!aTidQz7pK6QzUYUei5i85U;-T2`sav1aTxdFTW6qi4Q1X<D74zTW`bPt%<1ECdja)keKx5fK97FPiAw)aG0go&Pfv6OXNVOI(ngulnejd`&X50rb#k9DDeiAwmGcwpt<JavdK=3sf!}v@+HSbKl}2B{Z~aCz5~e?S_tK<Kb7l-P}0AGb7~@C22SO?7TPzzU!ozDQH*osLHyZ>h1+nU4-7Pxol}uTv<qw>u2c(NG@<PwBWlXSe-JSF@y3CJJ^n`2rlZ{?*F8Eyf^nfeL>&BFPQ0DM2X*?p~{<-kz^vhz4pPnQHH?Ei3nR=QIT3)b74iQ3(*6I7)iZdL1e-2KT=oOSicVSu>QZl8bb$&NqTH?ClOb}!sTe8FqlUId?lx1SYE$5>@Wy|aR<jkAL?V~(oqy>2d7<@RI$pkD&j<qZSY!%O7G2AM0v^{<rN{pwp>8V%Bfd*sJ8!uhLR6_TS$*}nLB<g`r!#wvThsSUG*F!o!`=2E0ngfHT<(R0>Q~?Pa=$c!0MyZjY~;%kfHM+Lb6E9T{r%2#7E@qVf}-Ukza4W*JFmvbuysPOJ)eP{~k%6kyAg%)|>Amz841*(7^iPNXNbANd<5?x50rBsq#z;3uxBF1i${2l=oV89i<+H7G>f@@FfS*6=6UNT^lqx=9F7kXuhM9fsFHXf{anAI<c)|R|aC8GvQ<;?fce38F2|4Ku2|40zQG5UOb)jmgFu4J~$(GS1TO0!rgwFRJL*YAu@#S1eS(MMui%~hnIUQ+UxG`tWcWt`}a8iTiKdfsQhOBg~)_~?7ptRR8!r+$pZE%$Jm&Y*oJni4;Mro27247CZUPEctBf;{(~DyWkeBTBxQIkiU$@c=wP>#ZR2gul&7waQ)&x#o14zM_=^0xS>)j>qZnL})x99*zSEEMDHE{$Jp!6oXu{C6mQq_%p_k1H)@+{lQxc-4cp2I~B(XUiZuYkHRgGaYkzLau{=*6%FfDN~r2Q;Qe<Wqbyl6cwISpK6!6pO<>3Ks71C@R3oz<5uFJ9mn-C^N%yB}L|>(pfJSdDdmDZR@e7|2jD3YvLT)`N;3$fhVLs&F<*7uYUfmp@Zk+vm%`fzL7EGOg(g`TBz0>>Fv2V@0x*I-pJqib6<p3Z{L^l_0~!#35Jw4+g**6se18i&EhD&Wcc;#}#&3&QbXAOzWzF-=Icw6+~beBnWeD?DHulkU&eXo2V@U&>og6)2}EmVqgz8fve-eJL>qzGmSww4OhqiDb%pz^p-MRCvvSxz@S%n{iNk`&((7R_1>oI9=qbOGm3P+{ULWCszhdcyhpiKa?=|^k_YzVlSg!JD_*xW0=P?w|JNJ>vf=Q|cH0xydw1h~sdvk6gZBwyVNFaacJdFdptLd3T+~3le%PG3FHLM!w&kMp7@%?py{CZa+_+4ji9KGgqv7K7oAlW9PaN*hCRn;(gbL`BrCiVERth0`0{B3(<gPg;jIWb|gLYGKBF}sG_k40f4(=zR7SD=QMm-o-?mArwddMC^g7r;_8uzs)p$9?=l*dWMK7Px{kl}WYqfS}&V1FQt7_5sQkJMaH_GM4Gl<LHMH2Nxq<-%^Z7rO&O&Z3w&Q<9zhFIJz8A})QQV_GDAK^*vR!t;J;eCa{VBK7}I8`DqWLbSc!0qH!7tZ(;RAOQ<vj5i$uBc`y~w1Y>EUT{KhAsQF{YK>qr)4yDOmdyPfgzK-I4b`30tG|gOtz;qp9YTKcK)nI!)UUgDj=7yxJf)xi5SuV50NO-Iamx0lrz69cLL@d-NIow9xsAsn-&+%31f>Ky#+mK_sYV-~{stwiBC-U|v1Wd(6l_{Ut{M6@)hQ*M*n`#s4X4d~L{@Vm@$rI8v^^BjA3kjkXg~D^>r{WWJQ58dO91h%@riA#sJzuU<6Z)Bg@PHNbQIkk!OP@#cT8@FbQxvJjCCo~b}SE_rIcEJ8G~JP9W<&myJT6w>$5yLhm*-AlSvekAUSzpZISV2t$^LoR`A-+u@r;qFWD?c))(y23<w(Mc8LCU;j4E_h`O_Cj}5PZ&u4gW1L%|UZp^@Tbq%Q3e&F3U;)WGboSNMFlUl^trw343+|Mhj!8R14dmWyBWd$Ws^KNoGZKHzHr12C{EFT0mx~GFt(p-e%Va%?~W9h&|Ee!K%ii4&^Qr}gSc)Tn`ouY?6Y+mbS5!P9}D}xb>wKk>itCLawDlCg)Bk|oui@@5sStQPAy*3K26!*bg`)my;v&@;TVDlN_DE6S@MrgYVY92{3AQFIlg7e4^AY$~Z0x<UsZ}lO<rlt2Il7zR^&<eWEnV@uhtGtZl#h)R6wL3YyFggjTQbv$2FFKsOu*OnY_b4Cki9&ee`>3U?n|B1SUk>7eEPv)hq96{54@K+yZlJX+T*r{a@Hd;lI!f_bHwO(K_f^qg@p(?yR0tErH#06ZFz<uh>tiqL5g0|6LRw2F^oHlnISz`A)BfZ8w4}@d=Vu)2z@ihKPBlTS1lK#N+*zV;+m($swC%?pC0#a-KmH`-6{NX2S3!!j=3_H5ayyBhIaAhO!fYt|3&a?;%czmBn9vUL_4DC7yVI%jp%VnBNTWBCH3I<AHSaK&_Z+ns&A{9$a@=12+Yy)*(+A&o5%0zz)962wK?Tg2ziL3d0{9Dn=4a>t%h0Ze1DLic#n^!+W%1v=D$N2=F`m)gFq!Uzt(U*~aFz*2kB|csAQY0!RDa{P)rYtliWE_2XI_6eWuRdvg>DJgGh@RTH*t4Yc<t@jDj%{Fx5dq`arz?qcC}Ym=KZyjPowgV35ZLBdEXv;&P)(=4`vZLiGD_{j1XCz_e#ncY0r%7CFXkZgdlS{-(qb`yb;T9cqDH(f4CFo?m~eD1ENwZ-3CAA-j)bRNs<x$vf{xtD-YG(HRyfaa9PSem4?K24K}lA?bQ)r>O&U|goE+;q}^U3sh4tOoM+FoZEQX6Cx&Wq&jzMGsW5uIVk=dDS<V6PdgDFh`MmGq^4>rZvhq8A7;^Q?p|X^7Ftzz{bmd?}7t=hW!c7|vib5oEpJ{{jR!oHs<?Cz?VsbwYO02)~0>}h*=B%bYjsH0~t@4^h^c##=jo<;0=ul1(SV+2)m~CXNP@c$r1SmLJawFJ>JFvQ8R+ncCWg7Pu_gQi(%9upLq%OvXM*e>5ZJ_-`pb8TW9X5NHplxp0uoNotoHeDM7>6fZ3uNMy0DDco0m8TTE#yNc29<hbqDfq&o<);0))}|pw0G}N5MxXyEn)i+&8b7uCs0ZjxM;UTVWBmo8~Gn8r~)Y+_jDed0J;9Y>AN4PdFENxJe0=z9ot_jdphi&V?r(;SPQohgr*z_6u1PLrFE~_XWm;E_t$!Jqw7QwWI$+EQ%QgS*L;@1gVF{QN24fppE~hq%xHk$4tM<iL|fNI6d)=nQ2sG!l}L}p3-;;tdoE2r_n^<1+%_@+kLvR(b=~q!IE@`yLiNW>a?*e38}k^AtbzFQx2K&$%WBmq;oxgA&OL<->0}@37HxQ`Zz2${P?!dQ5xTa%c1OF>C@*w#J<yqsr&lBZU~K|!G;!uqux{BoDO?rh>jQNseq(sS`S3fbRD~*O`%F&Cy;mv39CC6d8BXSgId6T4SC-<Sj**Bd6q6NpM)uo-EEtvnnt91@*dDm1u95-kr#3f{J#G_y&6YdTuCvRg8z?IQ(Adm6zo9^B&L}W_y}*)te{mKhalVxN%rn{~yhByB=vF6q_hD~}wBE_cR!6=#6sgQ0o9q>+uuN=gbYtu!>q?uhR0l@aNhSvomWkBT6xkNcP1OORBhI#a{ElIX9{EmCth4Aikcc&XJ_yzvmT^CKilyoPAS{(m+r#$2&xt+{^)v<KH`8Fq2ZO`33KXu9Sj`iw|NJVPPdSIA4aX@nt8$c%`1E#umTHjy&$<GrP(_%C45h-J#kG)!ZP%4)p9~Iv#Bn>=sSWfF{0zq)k{Z%(;OFTz>-<A^&fmht1HLjYONQc|O<4duU0sfBv9(<nB12}0&%U4@s~j1zg8?U{W^(tpB!{hu9$#b#uWMSfv+IR}p{1~qq0eXe6X-RaTlvR-Lq&(qDbmq7OHJszES)eGUEYgjhs9|;r4_@aO35drB!yGO-%ZR7@YN~*cK+fnfuJ~%dn_9vToz=JwYFvKc|SEuEsYi%%E2sC%`jHWF-l&tY51&)sEQohh5z^t9JhMxm0=Ul=Ihw_oFAfzezB>@V1en>I#x^!D>(&5nVp+G%C=6O!gvC}=4bxNP@h!<DJUp~A44L$KsWraVzRaVBs)PMiR1BK0WiKJ-8Q(Jww~Gb@8fc;x-aCWF?x=tX+yddq!en=eOrawj5ZaQbV@)U0sBEi$wRpT_8)}_*`rJq(@u$fyF%rOi{5c)Oa6HQ5QuF}<maC+I>X>D@zZw2YQY2J{XjMcBuvXpz`EaktpDFtF@uOb=eFm0OV>EoR{<dzXkx3Xtkls%j;tzTzjq^;0uCc4>CU>@lD=7*A0+jlW-fgA_T4c59bJsLbtqvLsu|qAHLJ<FlXO=<(=A^=2vg*K9gqI!j&7%apxreaEv=7;hR+9qYyG%ja+3kzP3#WfEp`-bxb5zIMw&5*EMx&-__1vBWeK)rnX1ojfj~ArnLgiCNV%6SD)rUg3Hv(#84zbdV$(VZ1N{Fme67M71bkF7HF|JM*YIZ|EiJa`xLn12F1#U`UnWD9_rGVvgR`tN9JcEYh<0}w^#+&>khN3#GXdW|sK&|=KlS2Hjb*nujq4utyctj0$VB*<jZS}zlwF<lOs96Z73LfTV%c=j5y`hBT;!cu8UQGJK{~mrfuZcvPKGyWt^ZppC3Z7(CZ`{dzq1Z^@-KvvemKM!@psTko76O!o!fQz6e*6t&AUgg_`SN~qKrvE2A}beK)^`RYWFLH-~&>3t1a!AjyjMZW=A^pcUW^UY4J3=FC9imOGqN1M0@l<a^dG8hWYjKA<+Jj8sk><VG~zTFL9h-#{ek3f6=EFg%%MHs|z)`{%i&g)K1>0`cWx&Qf<JS!3sMAZ*n90v7nF_rY7%gI7pMAa{9Rw)L)x;N*u$9%|z^_V{JtBV>#4pU9m>yj}Y48j4Z4%&7MdH<6bx**$PVnv-!=@x)U?AvG?|%a!bX1Kq7@s4o(|BOPCK3R=CMo2h4t33bcK5d1WQ(yyF4Ag4l>^N9=OGtK<9q2)IWUiaUX(YDs!E=lEn`=cAs5Qn9KzNM)ivazj#Mq+gq;a4$j_Dt)6A34ke+LoNV}S+fGZ!QQ0IKTxHF$p&lTOxY>p^#4Qxqd_qx4i?Is_N^q{gQdc)Qmac6E{phe;q7A>2WYE`-#NK%w2(F-cctf!Ei+%^**<S6SA8Zm?+Neej?V7jEfH5($Y^Il_#JnF1<scu+>H<w`Cfu?(x8NHJ_^#d3@HjTj+kk)Cv&w`j=;`6oe|kF>T#g4qvc)M51V~q*YoVBtWOep>(TAJzurkEMCwa8pqj=h3qTdBrOpul*imPJ9;7KJ7}3`Kg^A7bye*)LYO8n#Q+|Y1#fj$s*yQy8_JPxhjU@(Ro}Z<ooKbIQ&e0^bK7D2CM$--;oc?wK+j{&r)WuvApPKl`*Fs}Mf)7RzJ6I4XZY&Z9VetU@+EEY3y{=1+st?!Ve(?ADcLmusY0`6>_g`?+8-pnO+PR18(V>zYC?Q!+9ex(5t@%coQ}%5C^I#=bQ?|WkQm{O7MmZ_5^tFX*iw#tQ&A*|q5t^|Ifq~PJ{INa5UynfD8s`|vh}uSR`fX2m@76f=sOD-0aI|n@DF%4ZBhY$x9QIiKGDmXv`rW1&TFS*lN{A$jJ4?c7`BABI5LEvyjjIL}8ITh-B_FI#Jit_^=B%gPCCCnzQPuKWoSbMkPQu-(Bb0NLJUKNox61C|p>`s|Y4snyDK|BOzma(>F$>MW!f3LdTt=Bf$vhF6v~2;;7X5~)oCknn#enWQRV1AVMa{qd#HW;GqRl6I)5YeFsHZMBnd2Z^{Ro_7&zCb3hnrrFJN`sK>F1~>6$V(GaiSLwa5z0Z%x8;=^CH!vg2%ho#Eij(q6zlOW_`lDxLV0?vV!;kC8Jbx$QSg_^^F&*@gjXOc_R*-!qBY)y8u^v+ZHGX8dfXqZ&3dIp~BIKs}oTXU7sr#kqLIdRM`i=zE=&|oyhN!#qxfWwa&5?lw^J+#%i@mV~kh5?tw^R<`2kDa@3$Y-<$&glEa-kE#OIzOIHG+y|=i0I(xVY#Ke~pjE&A;_2uptOq<b(^yY9J$fq%uq!8cLjKwjZm|bohkGv(xc%1)TyU<}74ebzaR>1sWX+!_vwTC27uR}MsQ~7@kQltFT(KiXdfIBBYQ%)~;-cs&pwm9|EcDXGQGEsbYWEFYBn}1OY*;|#K88>3NXa6Tny#X?U_zG-?9TQyS$Vh?rIV@x=!WqD|+Ul9J+zv*tH()x$o}8MY*Bg|QybL4cG>PN1!exz8{o^F$Hn%}*#rk$rNC+_hCzY;@hNyq89i6t>rM@kmD6_tz4pf`xK{gL`&W99sqQ?V)b2vYV6f~(?E7+F4=kSg8N)r(<;pV+sREelKAsg3~4p)c@4O`GbZ{s{IW3h!Zm+xP@_g5$}DMLE95a-*|!ZPi5GEW4eO9oi|{gGW(c}KC-2@cf5DFMy=C6?=b`Q#Gx6FXsYNDE!&bKZ}sC3sICv^gwc7B^*htsEu_(XCoU?qZ4+F!=Qg8e|K9cHq+ErOtixN5VaA<4B07QX>7PaG6A*Rjt{#R&C-CZN@fSAX_17wpmIjy3n9;NMM1?B?`pbqK{w7z=jn~*^3Sv>ce!N-mbj(-ttcl)Q^ZvL#Mh6DucrPd?TgI(4f})Qgw?^B_%GfgvjkLsv(K8>Szkt>@bhF6+z$bV(_^cM#8B2MzcI1X#>aWJ`(pcziFBle5}{@46Nr*2^==zD0JhfZibltl%gYr7skY1CNCh^k7gnBm6JsLr?mD{#P3d`olZpxeP<)8w&l#6<Vdv_=oK6^0%bf3dEg;wuR44aA0eUnvw-)aNM!R3^-9rGe5Y}|87D8tUxahmR5QI?o&iUL3bPEfoW`ip|0VG5zpMyF8d=~BWsDV$Kfn6QT$Lk(c8&pYDnIg_S1f?7@lb1zY~kPgaswdCz#VcUUaiz(4j%}@NTz-qJX){m55BP_cJpN{xfI-jPN%9hp+_@e$y$mfYA1gYQO?{7#+P|QgRi>%CcIO=<M*jv0tYEk##2Q0Yo2ffPWrZ4b7ZqjJMQ0d50<vBA`)_WXgq<@`#=7bcEL!B`2Whbf#Wjr34bQ9pzvhWJ7#;=Kszg|ZKSywF>owmsAg*?B&7@yjXk}ehGLc=K&h>@j&=ShtXvu*v2;-wejI}57fh+{$54mz=CQNX0hBNN(+Af=?1n1D5pXtfSpahDXQVXhCsGj)20pZ)T2Nn?*dJNm0U3o6hI6w>Gd5D-MGn}89Z62awZ_I=7c3SS&?SMDBct*L%0k_Zi9#;~9HuSd;Mh#)w(rii%sXp26Z;($*}Sg9j5kIH?CwrFpDUa=pb7RakXm3lh|*mz!wYcT9(P;vuYv_g&i)kQ*5O$iL|kRzVm|W0B40({SH}yRQ8g#v=<VE943Do~DO^Q@h45q;gl}I4ryo=dzko;0L^~FfQQGZqWjR!y4bUu_Vlh>-f{{VBHa1^pOn>6}!*e9qhW15gj59wNM~hr00%78+?k8F?zG6dDTqYy}{I_U`R{6<_qI<))S1aOo6TFzop&ljGX#YMVJENhPSKQ+6+V<cTKX#$Fiqkh*l>pBYbB(yu(NszRmtjobpKest++{TJrLhv2={?$a+51L7RsnJw42{GqoG*0cgV@ci-`9G)&n5|*t+05V>6Y!*#OCfWQQ1&!RV|*|8jmsBKq`c&n`Jcd`^ZjCWj52vGbZ)xPt54zBimk*S@cD_AF3D(v2GZaEK*_f8_w?Nl!F?o7BzM9HhyX3Ml}_kd1<RYpx{9T1tkvAAa)0@vfea-!lu48&yyK5PnQa#i35cAd~eBt4_wYqQKfj=lD$5HRws4$-v>JFeoH`XQCskohBtC_bGWzG99>-n5@|_x@}R5Q!dj2Bp*?OOnd(03wX8*%o-xr3DA>C=N_#r{9}9GW*za|^lQY8JUptU_VCFq(*t?@@vVqqB??w4trZ{`wOn!%ooIEYxrIAB5i-U$ON<qft=Gv?;bZcf9_;$xNw^IFhY+wFpnHN#<w+h}j+XBjv8N;wgt{GBr3eT=69-@i|4`=pUE2A2h2kO0G5L!B9NaS>kHezS3j^QLGGD8vf!<)_MZHo`^2l=CO_mL}Xni@avbpJ7ZBRTb}dkHh-Pl44u5K2m<_qwN~1GRGj=c(sJXN)%ZKrCjE>|@+zpAY>DS@PaRR+PJhHI%vIwySG5l8uK;^mcQdL`P{e(rfu=G{VAIpn2#U3=||=oibSYAhQoKg7VE|Mj{+^k*4TjDgu2!%QXQ5MA)vh)F7Y;kETI+I_G!OJr#~+GMz@U?&R~Qi6frfBhI#+kEPydSx%bJh?F{uh{`@fqD#!uw)^|lCrDt{W+P?3iknPcjvLhpvJy{rQSh6k$)VsQCC9711D_F@XI*dpw2K?W1%X600cQX<S>?>~;fibU$jI9k9~!cj?>e4i791P1G8O>#an}i1dI=1LHPMQUx`)#`WTSow8$0zS(@Ua6(fe&)!SZP9;3{nhzAxGCy*}BFy@e*kRc6DuWL!M}<@&BTXBnG~U6631|EdqcU~bbYX*pcLi!HHG%$>qV!B(~i-se;xLP&3=0}ZyneIAVt=qyw%)rkYU&3JHwv`1T@X?ls2ja>->c6kyeG!#q@4*TBK==PT3kz*jyS%9wDBzF%*Ck4P)cEG6J%8e9p<VERg)9hG9M?dtVW5iNPMtxJHGzvZuf?670|7UGh=}akyYTM(o{0_*GwddIK037{UgeAHoYh+q*W5@$#u4aV}J1#&KDiy6NCdw&e?l_Ae{L(9Fx*)Q#q>@QhPQ49$PNJ|@>bOgUH=$&qyH`$e6kR{pLXA+DJ%|`;ltDrBdN*WvY!s0p&*7T1Un~lqt-=OgC1L{zRpKzc)szs=@9^Ofmf477j3&dRPD|~RCmF~3t)`m~`wJN`pz^t)U`bL-mLMI>pVkzq;kuwnWcxlw@SXinvatmHZ0pZ7iOhT+6Kw!lE66UaNnE>{5|lvx#dkeb_{-<)=YNBffegNX<#E;*8lnX(W)A5Vr-2#kPAlI6y763sWs?{iMn*u1>T!6-xRkV}mn(XBG0<+o;A-C6T{FH=qS+t~2Bs_N3N>EoAqzS>F92%YVL)`3#Qj)YQ!csu9CF2=j<|Wen(#5s&lmw>4y0hu5%=G7H`E3p?kZ#No&@Xt%7OnBJ=XSzc{|N1`B~HS2%E8XFYRB-8j$eHl~rd-(b~467Q*(ui=llNI!6iEZ%BxYiOw0Eb?rTVd2h4P#U$Zf`hDIdza5pts6_**C|iGp>$C&PZ%-7{vbQ$riW{f@@0k76CMbfULy-CDy^h6+Ls`@Ol+Kwqc0wq(1WDv<0`z4}BNdz4e+`c+xJ(%5D+I4)wX&Yw*sX3cU}XQ9V<LVa*Dvzy_|T}lu&<A7q}xxG0BU#fOn$C7fs_KG<m88NFeZe`c$>bH;dkQbR$<7)eL2qrIrw9Vb^`W}X~w*Gz-?`ln$8Gtv|3?qLZ!NrQG8H(ud`4jI7x?{I0T~h_-BxFtwpo>Gd~qd=H=bK0_KCqNPPigdyqGyn;{B$&{#$FMntBHO1!&%WpL-SE>rO7N&=~O(AkL4FxZta%wEY{SV>~yOPfU2usp&LPuT>Oyx%1{lL@oejK>IP!4J1TZRk(^;Vs?4(%1lH(T97Pg~89S4j*%oSt1z*eTer!SNZdKu>$kv2do%H5bpk)bjU{V;xEqdL@xtB!F|(DK#H*3oEMDuBo&?QQ^@Uwkm4D|Mdbi?cz&W<=n86LQ-zO13XfrE#gX7lmu-=$gqC>-->%7%gy9nLp~hIoE|3-tX6=ZE+oRpe11sLXq6m-0DebI%i|AW8gG%vpvpkHN2mq}>te&cHs~Ak+Fh!+^(oW?c?WS5;GK2k(Fy+y}EIMA9OT+Y%OM|3lXYIjG-u4U#6~%=$3oH)2{<mi{zihKnWh3xdO)G0uOp3HLZ9Yapu_~v}s?xrh6$an(<E<_3T*^8sphsd8iBf#Ae+fA1GDN6vaX_JhqI6_Qm0>?XhMTQKd}JOG$EEkje+~mQ0z&O*=B*9?G)^nn>3;E15^gT4M`Oldok3LX>`72$avxi4-%qVk)KsX|bYzQx153uGr)xS`NU~z5_c5mk`<_3t1aF+Vi*wq)R1W`Rrs^MP{Oh=BT?3?`aFXyX&J;*7YPEq`PK-36v<EIj_bxh|$^|0KII7#*018-WQg%X!dajRD&`U-%zFK{q)n?~MCV~ri%gETGT?}BT|G;!w3<Ebo+j@bdXArbKE5>%;Xm(Od!A?ILbX!{**IG5Rg2yshpvCAnQ1*B_(h!1RBCSkr3e;S*+HKu&-d=lpHH0z39+5X5GU&+T`e{T2j(F}5Ev*;=X6Bq{i#H{B`>TmPx6hl2k0T5~MK|EthrL%P7U`?ekzegpZU|T$=AHi%L`h_}Ku$Mhp|n_&D-?ECO(bPpH-U1|ekVOH_JCjlj4=9oNgO|whw|X9w9T~lvJ#yfu@*Wz>)^5uL=_a;RXb;)M$p@kkjaZiQS~9ILAs<Xah%SHcHUT_-q8k^?OrpdrZl7=_0;{%ew;LNt=NE>Z`HdAfJ&Gp4}o|1-&yp}N4DJ{v=f=JoL-J%PupHi`t9mL@_k+|kVsJ!x?%Rr0eZ6SBp31^l~c&U+X1)_Wxd<d8%O`h!T+39l$RlxnMUW9cCi$qJi<|hh8#YykWh0u9;Jd<i}L_12Q2*`kcMC-m=_2Kq(vY7hF)h>aX2=B<I-a=_yTo{NkEq4CT!hx&4=iGL#zzz0+I38&jCR~BvZBM8F^HhJylB*6Cc>O&j)CYztUYt1xKh`eRefoic|YzFn!JE88oI2R_o(OL<`r*h%Tf@Vyh|87UtkEERV1z6JB^qx-W~9R~S)73>)_H1f9;cdb9w|-+#3Yl)hJL;3xo7yry-*^}hvmEDI8S4bpcExcqhK%QKI@0YV+I5N}HXD`%6yHi;xDtJWi#{VfImYKTR4og_)@%8AKEHN+2~^nk#d<A!>WU^9=7ixag<3}SIqkg_8DLMjIJ_i<C7P0`84kqoLt^OIMD`V9*8js{hyT{88dMAL&QOfo?uzSa0CRf0l<zO3N~Yv~sSD4TMafCg|>WD!JOzt*v^KErMe;i>|I?$CqVc@>d0(IeQ{3%raAvPC-BOjb@>{r2pLKHzyI+URjh&}7Z0f96&tS%qgPe*8uCX}wd{AI8;>OF>kP(YLV(xW%{YX5FD?0uA9BQz5R==TIJAeNkUwRB>?~RAZ;mHNY^hmW(ebOfWJ8GuL>qUiiz`6|V?`ETL+=oS&*35~UwAM^Du8ut3jFHC$2cixBS9&j4JnIfmzkZs8Ivq0kX))vmWa-Tikob<@9uS^KV3RD#bL4cDyl_QhJFF5H)x-Gg{M9&SlgQ1tFwE+byucr{DTfd&+oe$!lA=_|1uqglcW-xJU;3b7-!?UI;}%)Jl8opaw>J&#Yr^qbMV4HaIP8sBG4O8z(%K+t0MA;yKV&HDPEgmz-Dm!k&|oaqH<yuD_**oTaJ44x2cmO%BBiu!!WPhYF^chGOH)J>9_kB=h;yR{<V6FFR$l2r^<T4Tw|hov4#_<xj`X#?YqcA6et^YyG2vlS4xX)B26r>9;bW?cFzI+&;y8TgI*oh8tq?vxr#0*V=k^)8eMei~Ba_Ee288aznGvMu>@yD$VLXXf#QB!IB!gzZZGcvTY!JBy9g6A{Wzgxaq0wJ7&X-er*E)-P{(v`Getr!%kC=5#VRo*iVFjZW1|J6-{_>OqaOPw(5Wt}lQG!(qw|{(^P8dB$!^$X!Pj=>K$TU7SHso5q{j&o#V1Si{@<Y%t+rh<{0x8Y~(~&ulUi)05j!vkSdADzh4q`smDm-1xhj+l&&={wczi+QM~lM2oSY!XL13R9Y4q37sVKnHvO-OUe5XaSIf(9=P}$v2lSwB#QNC0y4i0C0QGc$>+MlrTuu7U+*>dsaq|-D$c$NjRm|q$mdE`|3K?N)J;Q*c%5)%I<C|A-i~SmAfXimzEW<uKozNi;}Or?Y3{^hvZB$=tKybsEy#qG{k2(foF)LnF?mPv@yz!Lw9$+MAS~sg8NXK6hL8%YA(keNUfqk3>7qg-{*vCen>>+y)ai2kUjjC$1jz0Z0`^kY){3nsKi-<JxrYZI<?r_slaawE=>88lE-QS24L6=06hP>`<2`O}D}?1XKAuaU99S-Gq~zISBvG}OVXh?nS%3PS4Ab(iN%$;10Hbu+qN@=5y%iymQbodiALO##r-dUFlHYZOhRO(uz`n{N^1QLm#ez^3aUpN47qO%TpTH3sRfw1WT!l>Yrb-ijm=}p{D8w{61_Iy&onLsz)-}JjWS&v%gyq~{=t@b~1feZ_@7IZyk{B*-l|b0bczV?4BMs$F?Wdl?q;b4HuMHq7Q7jeCZ){tIIt1U-b>i0q)=SFgb1C5-f7$~sug;Q?c9Vy!l63`i<bWGtIgDKjhg0r+b$vy!aw678PP86obxYcU8dI>KJdwD^T~_o@i0GC8c`u!Kn}@TZ;ZTtM%2?z!rj`d#2V2yp>8`gRJCt+z2OCaT#0nvX{$PJL5l>569tL8S@+4Bi6GB>RXzSf07|7*$3}z|Mhm#Lw{}2D4W4NLQ>}PVtGZTTrKx%rl^F4S9=tD3@1?_GWgy4OJe8PE{(}(wix@?4Kgw3Yt=1dxb=-Gt<=|yKS2vqj23+`@+rDEepqhjb8{A5-xI-Vs{41Bz6iTW(n@+$+&JG6sP1qM%;1sa0?EemGEQr1*fMoBEwXsho(3++GJ`B;UYE~x>TM*!f3vz(`7wL=3&EEt!!pPj`7EXT^e=cv2A@mDOS#<DF|2)oQu7}$U%`C($C;29WkYDmQcylvKRBAgz**>8J+w%QAq&Km=pHJI-zql~vP4>v4D54Lt8gx1!jBpzCyR=gp7w+&E#Upm&m<J`Xeq%FLGPOR7~?2_ePKJ7gdtPK|i7H(K{am!JMSv~4=Zhh1rPn)dwn-}7bv1~|44iiab%6wq7K3_zrc9#n<>Qj@)F($3r1m9=jhvziXwP57819VP^T4H66^Z?tTyn8?5%%$U9hbtYA)`N!YXXs6v9(A>2k8pcQs-Mfv|1TvoF-Y@jWMI%X<13)iw%(MMzwIoS9^_jF_A7L9U&V{c2vWfqdivN1n<55|HwjC?H0L237i$y8fFI3ewO>fm27DO1&2`pX@LNguP&p6sb&u1X6q2`py9iZsL9^6G)+s?0d;~wLGd>v>$Ue93ulCmF_}p?gHp*C}ETf?rjbrvVpQc;34j_QteGIPf-G76rv08^0m8Q8psx1FzX3=lW>6m=%Hq1Y@v)?YTgC;6nZs#W*b^;X(EgGMbmpk=|eC~DG(Qv}*fH^HjKnc$zL#!^8$k}zY{=v4Hu6Uw~ufcTe<<M=XH1;ZsoNYjQgE?Z|I1-CtL>5g{UlDvUSt+X6DL)!S%OQ_fz%8Z|-08`@Aigx%!>M$to?J6OW@7oUkUVL;Jq_+=YP<(R_4bqP7WA&mAFLIz&MM-SatQ_&0#PTFbSCd?*{yQNsSJm~JE^Ero<Rt`Z?CaL0Q*}BAGnY-$2m<V=fMsIQPd0(QW>B1ibn5pNrkeGNO*%zvgd9IA7@a~mckp)!50l~&%YD}r?QD}Q5ksJCUF=0aCCwdEP~rJR}2)K#W>dxAxkZfB@YkVQJ$?s+5a+A1LP1s3(Yl=Y|P(Cl&hd#&2z{$P{U0MTf##52ooCcMtu&T8HXZgtsp7FB=jIC+(X?w3IaS>=DYcjpjY^kGsCd(%70u~l!t(`R2{K5rP+OFF@%17<<<?>ba?ctO^-mj&TG4@IWNYKE)k1X7pLZ}wzg|#g%Xo{5zNjQLZtWhWSH~tth*68r?)qZSI?F8#C{v(P?1RdV;XEeDG_$26e~t=g}7lqlv_Lim*mumE0@S^7d)nOIunRc;=ZO`NN|p0DawUbrpF1;wQigqyE7syAcC!I$5z<OUGXdzjNnQh<@M1~ol8&YsF55)1`T?Ym&z9wBk|IwRhM&aDYco^{S>sM3J@AY|7sOrr9+p!M1Vd{gT?V5UDnu!P-8hp{0ci}>YIEX&;jHCK1Y{`@oCAG4aFh8KKdG5FiCZ&2ho;yQb+xQCXHQD>(uWHtZW=P;#x#3n&r69@gaF2>gy2YPCvg=+&t7L6n(c(!yb2Hj=sm?56E2%{Jt(?4LGrZ$wpppE_?(5hK9jl1LzFK)NSSUJT43^9R_bKlbnK`bW;n4I_J}aXNEJhJPk?m!jIpNBE=LrPa#UAa+#-B4QL;BqPyRvbSDNQl%sssqrsUPKYKV_?ETU-mGMD@3d8w7-EN_)2|07vT~(idqttz~IRpFS&NiM41M9AVA_j*Uj*1Wfm(Zo5)Ci`u6s$imsx)H}*<^nQ!szakgqmeUOzt_9ZQM^Fay>`Y1}#(%rcMy6Jx1-~n!YX5A0eIGc$t<Vh<Y@1Rh$*7XacGlctlIX42*vxk^KcNH4n0Kat3dG+$AEE+Wx-kx)}m12Ea{ocnNhIwW(EoQI(Xxf}O1NM|CX^oe$T~8eLMr7pGM}(^r&2N8T*RtE+G6a|5Tt4_m5Nc2*z3eO(dZP$@|IjJfem#BM3us`+5IA?J=*eCS;InYlL04Tz{(m*q_>U^_#hN$GMPer;v=iHkDhM?K)IHk1+@hOE~WXvVi|tU|v7*k{skE@z|S{uRW4sH@wtX-FKDOaM~;p#u<Moc47=IYr`T1@QHYZjpl}`D5OFktMpH9H2G$H88z5ogr=S{bRqhc`~#oX{w<Vyc@7zv<$t3zMH1}dtH?>2tmLZ5SYb1Cb9I$xGiF5f$}K59`&@>VF%*lfKZpTKw#X-)>}J;@80RO9Z;}cUXBG#Hg~%!jA*?V)hUWAxRbbiFOi3k2%VtpA-oENB&`B*HDIN(iJlwrf%)qWby?#0+r1f?gz_>_&yWFZyb);E`H-1(DxD59!<~dHUCA+x#VSm+{BfElD{6~{f*OCNx!379a#8&r_QCRu7M3zPR6f)zUhOBRZrk}{bhHvsYqqOUDJRjIHx?1q^cw`0F)tMmcq6KiXJ!VYN&C=VMwBJMeOwNTpR31fGTRLxg#-ZI&^+QcN1^j@r#=9h)fPY&X(b#Y5uLt^PM?{5J0*{$M<)0Qrmc~Kh^mz{Xk2(&ixq(@SoG#(vufjw<=dsMK+plU_sR|kK)=hjM0vSJ?e;cq3V|R|b*>gxX&n=>Ux!@Zx0MV&NsJbh`zqigRV|*k@KMnF!~C7+sOd07a~ZxQX+FYZ^Ahp96!{&A2UBN)+I~!-o<}B4UXQzK7pajDy}y-EpPX2)YG7rYW3d||QV2opSt9l1A*s&S4)j&z`C3s*!yY2lMS@oJ$f*XvemmOjw<cnzx)HJU--N4z77sGq7KpAR=E!7psKp*j#T^E`k!Nevwfl+@Wh<=sFX#>#)8+1$rw!dj86~)&>L|WdPBrH&RkI~|1b-zu#?j=&3Sc31Q>0guO%yEy0)h656#mCiPMg#z7sTyK2i$d{7K(u``LDo1s?7=LOOI(k$faD*rP8#<0=Ih75oFs^o#nUMe0w>C<S;F)G64Lu%Q5W=OsP5gPoeAS*4-J_@Nx6>%QTNbDsuKpE)2%jS2~(1WD&z{@aVdD#f9!(dJm!S_N_)swU=?Va6%@ymBW4FchdpYiIh9VErilMn=g^=<S2a>z}0)z<T%OKk(5>VPxa82z4<v1)dh}?QW>C|+iX6PM=G7rO%n7G>-13dx~yy;r`Lc`%DqZ#SpynPqOa7B)rK<-kE>dPVEb19v0EB>K`hvtJT>~>2zKXf^SMXy@bxdP9Kubn-7_xJs*XpbY`Ue~UI}d${&^RG&g>;(v137b<4xP6GdJJts-beO>>M3^*~-dPeBusTuwWd5nEe_}5Fixo^;kd48=+@6yLqKFrPgmFvP9pwvO!Z`15!LwjVs~moJHA>C#M{BzH@gRC{(e%#1X3D08_ud=!8;X=8H(8ttNGvl_a~4g%YWzmR=zRP3!dM?Nc753T+oT+q4Ie=)hE3*iE2LdBSs3a_Ob=PQUI#<!`OA(j+j5Y?m`#ff8&tl_)PzV;<6<$J*Nkdxs;)J=j%U(Bl2qS%(?^(Is#uturNZX_){Ch^fERguAQY3HbU-cgdBYDbSmnciMD?MthKHbCssOtnI75QX^@TDr09ClgpTpm5G(j=ThBjl5ntP-lA@`VvXlY;3W38=nwkgZt4bRA?fe%HkTy11?T=_1$Od80er=9kGliWj4tx6xhI^j5IBz?M%c`GK@F*V1B$PZEp$56DM}6q+IF>y;H=WmZO7~L(0OF6P#kXpxz9@B3&kL7XUB1ULugJE&PFZI?#atPCa__iu3O539-ax$;z$Mlh592VX3{BtYdz+BagEoN#`VYg*;W=1Yy*VcZqyH+JXx^gJhx^Y3+X8EJYE8-dl!5+TTNAUy$sGCxo=0Mp(LgHI9<oI3unZ#pF{_j!3{S|?<Z;>kg~?GEe)doF#8<~{^P&EE+8%2jv#>n(BAK=Z>z%CXwx>D+Dp4UA=>Im<|**==`#Ua<@K&aPXNA<eD*>>Jc=F2fuHC{RpX{!%kl)pO6tAaHWJ?^Wm9?NIKQ&+ZLv~F@;y`X&-}3bB1<6^eiiY}?+$YfTlaiFnapK6>c36;NTFjb8Varb>Zb~5c0jmO6hyBtwyqlvm4SQ}*<hRi`2go66(P5YZ%n?QG64vU=+j~PSfW|AMwW-DLB2bNOM3j#x|;!@$?Lzsc~oLpSXmWH%Ifs`tDAc3eN*__z(&~U{mtCWA~{YX$a9h$j3?c!Bngo&86!AmoJ{?N((h3fu{UAM9{a)2oa}yV!+bjL8^>wH?4t<Lg!W9Rs6p46$vONF2F3A5F)6^!*s*FIr2cFLRPe-E${0AsMxa#-P@|*CokBabt-C%fdZ!X{{7(c^2}X2Q2Ae%yB@WZ91ba{xDD$U5$oU_mk>vSjCKzPo{tVZx4`}2&!_Sy-$TQ88lbJ~L)*Uy}BvE2^M9AkI&b-0B!8StZ$+^~>k#PLkYzs>EcW();&SdUPUO-;XQ*9i8yZ}M_?P~_lF&|vE|Jap#Po~b3qJ%z~mldA|Sw2*fj{>ovUbJhfJv-s4S4FvsfZPy$2%Hv*SO4I{FObT*CIFGY0QS0HPhVM}<lZ&N-gIn9+7?Ozg6ym?_IdfTW*sQN$1%I-HW)})DF=nPf;n6ZW2R?jzEn?dCby6jbYlj2r3?1u;8$S-Im`iOtl;`!J-8HT#cOHAj!yvF`S}E%?%bJNf2}h}VZzh`u00JEQ{r#KSTNABDEZ8sD3g_bZGdKVh___1M|H+`>uvSA5_~NWi@JHM;)Ua1H;OEepQk!tij2J?udyP-F$I0M1F5k7G&EQ^+$Nw`!~XG*752}BnI1XCGrOegi4X%DDIz}kKBi@+9pm#8AGKxcTNyIeVh1(nV$NYhVW}z4u!4Pe3iHPO!4K#r6}AtKqfVyMA<isOS!Yd9{4>&$ekZ^R3pE7LyRt)DQuj$M=7MOs>AY1pWy4tKoZHrWms09acCu1tQP*XuQnLD^Rv8_A>l5cTh)_TyXh$PHu)na2M-o={`Y^ZUnUb5qQ;%_P3z53h6Zy7~+y@rthniipYs~u95IOrL%#@-e9{(3=X9>vX-=py=IDQbdnxg|fq|gmREoZ6BRTbU^fCN0Ia7>$Zwj?lR{ne9wh!oLm-w(3$aYi69<W3LtQX4Z>+Afe)-7L%HM8=;tb-^-7Li4>hioocrZnJIBKSI)V(l97g9H5(|Zb5a(H>;11UYA>QuBmhvqa<70=Ub@fqO1NlF3gb|txR=kBGCHEj1;FN4%c<?Ku7l_niykmllj(IOY9Yj7cf1N*LRYvqiDthU*x+%3W!nz1lA--@U}4vEF?d=w7Ju9_YI~~U39(OrUP4B&_iMwh7q85DdF=xpr_cr^n45N-qtIhA0&T~4&*_8a(0`D;0Su5$HzC!FOO-?7`n8U-*t|A1>3Ovxyfd))xK=ATxn6csy(1HDo^R+467#|UvKSc#SOs72AVo~2hO5DpPe}=VDq2eGU0=|Vyv-doKY)j?6v~^U5s{yC<7c-OoN7svY5`NX4rV5>0K;pZ%LICz;Q*wY)MhqTG$17y#$Zk4hkVQ?cbEFwXZ5BH@HE**zJuH=Qutt{Cm*;Z*$X*K2!>M{`(edsSa3sjY?>$N&G~Fqz~6}=Jgfn60pv)F0NVYDTl#r{zE@*-7VM3^2mug|5dw(^woWe*+m`S^36pYCbkeYguS`sRrk{J#15-i)&0a-POP}gs)_QAO@j$XW{3db#|)-pydFy-9gk|yUy(w6XyP1e4B*8hGx#gj7N`Q{Q0wJr_U6_Q6W<skMem>Z_BOM(QxLs^X)OAcSJ}IAwblsCfTFQf_Sgbgdx^1!rWW#En^%2`_vy%Ae;7!^-j*E8kA*O(lQe@&e-GkuWvXX6UnDA}d7YL5)IgGkm|2qglt?Xh;gDlc00000WTn|v+i2Wu00F(f0sgE7W_757vBYQl0ssI200dcD")).decode("utf-8"))
+(TMP / "nb5_lib.py").write_text(NB5_LIB_SRC, encoding="utf-8")
+sys.path.insert(0, str(TMP))
+import nb5_lib as NB5L
+CONFIG["nb5"] = {"kv_dtype": NB5_KV_DTYPE, "kv_bytes": NB5_KV_BYTES, "nb1_capacity": NB5_NB1_CAPACITY,
+                 "pool_placeholder": NB5_POOL_PLACEHOLDER, "f_placeholder": NB5_F_PLACEHOLDER, "gate": NB5_GATE,
+                 "attempt": NB5_ATTEMPT, "reserve": NB5_RESERVE, "admit_mode": NB5_ADMIT_MODE, "think_floor": NB5_THINK_FLOOR,
+                 "smoke_gate_sec": NB5_SMOKE_GATE_SEC, "cap": NB5_CAP, "window": NB5_WINDOW,
+                 "prompt_allow": NB5_PROMPT_ALLOW, "tool_allow": NB5_TOOL_ALLOW, "commit_mode": NB5_COMMIT_MODE,
+                 "extra_args": NB5_EXTRA_ARGS, "base_env": NB5_BASE_ENV, "phases": P["nb5_phases"],
+                 "smoke_tasks": NB5_SMOKE_TASKS, "lib_sha256": hashlib.sha256(NB5_LIB_SRC.encode()).hexdigest(),
+                 "payload_used": Q27X_PAYLOAD_USED,   # filled when CELL 3 loads the Duck package
+                 "f_rule": NB5_F_RULE, "seqs_rule": NB5_SEQS_RULE, "lever_env": NB5_LEVER_ENV,
+                 "pin_ladder": bool(P.get("pin_ladder")), "patch_60490": bool(P.get("patch_60490")),
+                 "equal_windows": bool(P.get("equal_windows")), "quality_ab": NB5_QAB}
+print("NB5:", json.dumps(CONFIG["nb5"], default=str), flush=True)
+
+
+# ==================================================================== E28 W4 W12: the E28 modules (packed, sha256 checked)
+# At the end of CELL 1: CELL 3 applies the scheduler patch before `import arc2_duck`; the engine cell calls e28_readback.
+# e28w4_lib.py (I8 / C12 / 131072 / text-only read-back + boot pool / F, record only) + e28_sched_patch.py (the A/B/C scheduler), packed verbatim
+# (json -> lzma -> base85, the NB6Q Q1 pattern) and exec'd into this namespace. A load failure leaves NB6Q's behaviour and
+# is logged; it never stops the run.
+E28_MOD_SHAS = {"e28_sched_patch.py": "108bb75cab0e3a4499621c0e615299b48ccbc783b1eb59cd630f6ed1f8d16730", "e28w4_lib.py": "6e429757cfa6e665e8e38cf001d28c3950cf676ef6d2366e9e7006006ed2dd00"}
+try:
+    E28_SRC = json.loads(__import__("lzma").decompress(__import__("base64").b85decode(
+        "{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;bG)j)m;ERh=`+9?HCI_#NIBcx$`7r*KjugOHuS5j23|G!y9%>`!&2Zk`vQf-YT+gY|@F1T#$yn&Fhh3Hy}OP>p9*UKr-_B(|h^n1?Et|WgFEkUq8(rwJvh@qz>xxB?%;z+u@+dzX8<eQo{Bt2-DbM=p-27A&MS#u*DYtGfc(BReyUjS%G6)sT+msq3=i*k$P1=p1GHrA;m&A=fzU)T(Cm2gE)KqbopX1v)RUf4P&!DT0}5w=JovZ+dkItX8^blaKI3&3{5t2!s=j1?LmF0H*5iyxlFQ%?y=VAl|79A^vR{b^DiBYpbrbqx3e&Ul|$o<B^GF~wdzcG%_^0Ac*h5N0PXM8PPa5<TF^jtpfX-(U!i8mzQ)?TJMmHk679N`wpha)fgPnfhBfnjgTt#|_Y}Bqxbd!IB@E4;C>ZfP#l$y+3};zzZ1iGBpMyj#-sx1e4Ug(kF2S3EuSTkR;GYsA84m$!epd5Qs#}X97gfs%4JbV{h>0e7aw?NvZG@+l4RtP%rj|8J*hc*<VsvusvRrxy%rJwJ$oASsLVZ3{9!zzB?vJy5@*cUXIsfV*#uq@zDQ-_p!<ZeNlc`_89l4}h5&KjpsWkPx%`S@AwFlAxyT96T<xN(JJ;*$MK#!1Ey`WpFZT9b+<a;vb+SCKHE)Si4=~S-N1-Y4+LK`w<rPc*Emm~4S=-*76c9wKzn0o75!yd1@z5sx9)x~gd8~n4^6--f}ZhF0#qX4={aS6%XE|_viB3n0lF5}p@FLc7UTJhe>aGmR%5M38SVB&hweOPSG8LZHBKjM%#-otCe(^v`{eyc(t?4(x#Z!JEbTwPU5A8*yY7zSj-fs&G<t2BlId#pFK@v#6AaCH!v^YK0%H6M1PQ~2Eo_*{OD5QdsX<_z%=`AYIe1P|vNjrs4rNb$zq<&QNQqv&W2$A7g;%a-)&wEvVX5k;wb=f>2_+GVhwAWDz4{&cd^lb?7izOR&hb4xG(HpSAT!Tic*;v@m1bMBx2d_Yy`8{2}W8S|OaPaL^<;!BMJHG8cd3DV=;g=jziE{sfVN}wErBKwU+KWL)ptDCXHU?$;*rjY*~;#N$G@+c2<cP2@CS*Ftr&4>z$Zm+?!=$u(*v_I0nELs~%L=lLuW@tIU$Te-j5eY*}Nq;;^W_jHi8aw(7Da(a)wGr3FNfjekEl;DVm4C1hH1D&Y@-uBHNjtsK5kj`se~We`_oa%7MO#Vb@q^QF^b${&jV283uC%0hag{5o_hWF51c;@qOr?&KeM!e0TbN1ofibz@@%L=9j8IfdEAld^2a_-W>iHv-v^J`w2HtK662;`L7BU;gp~pI1_OjzCIQ&S-ic1(=aLa~ex>*Po-Qp+qzms3q9!vo6W6cq>jtYc6h?rY_d;CJmcPH-#5zv3+w4G({h5n=Vbv(p`8kQ-sH!D5PgU3tpdh+!y#@>$W5o-0~>3D_300;Za9VhpWKp)tC>?LrZ0Jn8Wd6nReSyP9Fn}mMJuny`8ulo6<94`pW4-J2C>@@(?ntNqmi>nyLCk&Q!bI=_q-ihu9LgKIpEt;8trQ^I{L(974G8<+~NwUsiBH`csZoHz*u>?c4G*!yE*~LGb&U{<?t{gG7ODe;~A**9T)2KHa)i@MW>|Z-pV3)%59^3?Rf@cxuE2PFVwC)yXQQNPXHy4*acd=k7Hx5#|M^1b7+z>YAF@kMlW={LuA57Dd&7H-26q^txo4|SM97bkCJV}Oo4H}w(Al@h{ZLpGg<)+NjFZquPyUc_gI$>lM7dWkI;t9#)Dj=FU_;1Q*bq2BYFm|ItE+p@S3$8rCmE){m3LAG#b47fvTcY2lw#~bBzx%^V=hT5HVZ-6YlMgZ%{<8Ja^p%kyseG;UUH((3)jWew9IILQloVWOfa5tZG8fyb5Yd)%RLJvHD09p&@@wsl$+N6H+o6GP(U>CZ4V;RMm;Ip}J4zRVT>$C3M#cIkq!O<9TD^RJJJH6g*X%VJ&|SO%zy50v_eyQJ{B=3g)gj-o87g%624pb5vH>+;p2=#H@*t$PhGu(Z+Lsws(qNU2=NI^ghEsc;D>AM%ALqG81EGddoL>4U_ZzKu4Xk)s<mV=RXATnKwq56>kDFr!ZtA6ibX;jeJctX~-L^0{1t+n$Q2KXGCejZTe%F08+{sdn*S`_x*WE(S;%*MBzT9NmY-DpdLyqEfU_ea3M#$G_6d9NYHS6}4>}_L%2Kl<gML3{~htXkUs!aZv0OgM)WibkL9dm`K5Yw<y!OVzBQgYQF0mr^BU`1~RSC+4UHpEkhh1s=vl6ZXLz;NZ%?PhnvN9spti}6erDL`I!Dk8m9gJ{E5%V((Jb|E7IbrH{Sn;Rq?%B^1*eCiaqOey;D(_}F!OFt6Es{H%0U^e}f>~3rfZA*T;%*>4VB1kV-n&_;1^EiHT-Xvbdg!aKs-GCqN7(2hHhxW}jpKQ+w!7OH_yH7L&)atgS@Y(`r)LnlSHnb+yin%~A#p|dT9+glW0(k0@%CZGZj&DIUD85s{z$>Q^8khqGO0TOw;$IRBQyProSr_yUR~%E-NvjI?1{4@BGcEHCWdK;qOApuKsU^83FhlK$#=HQNm#)19VFlYqY4>s>+uN{rK9C<Y>$xExDkim*NYJb94JleB*AzJMLDa>K-B6IBEyxco`oEtEX`;)zypvIUkN@9&wbk9ai{}KVneXhs3x>?aC~RTiYg*qLJ1h`m%cKPz^OY#;pz_BA5^pvH$XO<EtTLA5A2^IX=SUM)_cqJ8H^^6a9PK-QRq@{L-WIN1VOdHtB)$8BnN&}ItmhqNXo~Eyk-_;m9S%~{dmz1(yu0<Rog6)gnLJ<=-y||DD37FokIw=Wn6Ys2Wtv`-PA;@N>j&q(e3n$>0O49}C#6@_4D8k1w1i<<LfMbIaJO2#GdTmONs8#68#btV(GhZ1rORdjL>&cE1Bv%sh5UHUi_V-;JI?BRQ(33=Kc)tup@IZz5HAgQ{(qwmCSf2b-&$R-8ONFR5@S5Ux9U(}dzich$76RyI1R#{eumCzgs(3z%>?em`?bZsqNx+B4Kz(;bc<CZinHR|U_=PW0ZQ8TGfNTzRt}6jV~K!uERwc?{wid+#>?Q<Y4U|z58}2d6tp>^B<;ubyYCHM!~|V$Z=pQ^<#sX&N+r^JOyhDpNF}{wtN{~n_wz5@LutxG#^UCQ$?^Nw8;b!k?+qIS3+xTKeD!2$)lkkPWzV{y=TtmFS55M8pYz6zO)GM)r0HpgUQa#1Qck>^Iqe!C%H86uMT_-Tl8vNA`E0dLi-MxGx~sa8H7StMgv@fel*%BmO<u39fdHOAaUQ8il9b`$XeX|s#rhBus_0FuEbBFNJ-J5(Q0c0lEKg)>caHm^f-ol?>D)MD+heIqM}Rsd<nsh<*!R~9_Cb{PgeMcdHTbJsX7WI8<!%|K#tBB0B3L%rwny6Ap;9wF^4S^#DD+bSc8=YZD1_P5e$N1rwiU}zEEdVan>O9Tg*xS9r-5HOUpk)+h(e*VM!UzXkk}kU!F|QEHX79l8jJC$>ir6)3YVD_EcK;;zq}{%DmB4GKrDh`O!_#@QUA>YNZ^t@V@OOSR35m4e%J}rHrinTcw{3q^FFGVdmA!ZRV&rWdAe<b4{S$n%U&_1r5kdMII#9i;_;$J!8F}x)exaA53R^kr-q53Tp#F5;GIGh;y5Hdb_Ve_A<X4jtwTBA%c|HFMv??SV9OL~aoL}c&Ua~qT=%8oxIGMF&D%4*JWiR3cUUp=!^+n@`-=h@5f|2DUuN2qxl~bjH78Wus3~bENX#U=>`0Q<2mb({&v-fPSRXGnk;yMl0cE*!2##(t;fMT|n8VhnG#GKra~h;x5h-doJvLJ*<P1d0*o^<FIR*eFVckvBSf?ubg=5f<fI&7unls+H$B8D4jV5Qh2yffcFJQMp=i6dVm>3kwCP0~s_vWGN*Wj{LE=s@5PQ6uDbsUcvILClklOG-pQ49di*q|-Ue+>*w3aI?+Ky=nbFpq9eNMLXRR(dWSRsAUsLFu!~<6aur#iNw*-}<jS&9=navA;+%&3v2lhB3{lVs-twN#1jb!fi<+2am$8AhnprK&H^`DSG>t^qZ4MBlE1Pc#lVC_Sqj<V!9;&Obr=^ygyYUv#tqI@XC3+ck<*(0ajAeLtSCQsqB;fYMXa*jrW7Z^kp|#LdjSU)^rm6D#(1-ondc!y!yyjryqU6=Wgd52p9d=3#pPj0xaaeWKLO5_M)|jtd+_;QxICmIA4RD1&D|Db(%gTaL_-!$(B|R1mu{bT6`>!y@x4EcGCN_1=1~$9=8K3<~E(eb$BS*UW8YHR3jSAK(CJ*R7JXPdT3gjazw8p5BsS}s6|-NfpBy?`Pi9}$g1M=SOQPoAXdQwA)F`Qa;Yv!P}32}yA)AaMx7z-G~{4Sz$u#}Y4-sp{{DqJ&<sH3?s&ALneeL!r$uO%=0k&W7+#wTx^#1o(=~l^pshhAM)|nM%IKKykkHNzy9?^0d3kM|svv(!<)EO8`)$8<AuX~yfPD|_0YP3HWp~{-lP&WU81!5I;IZ@H*c!g}KYSMAs1MoY(~>tTiuhtNy7@8UU8z~`LM+jcdIBENEfy-y{0IZcdHz}76Z{)ds^YXaeyOu!3tf&a9(lR;E9<q;hON#|c*xaxYv0~gXA|eN$fDW&9a4u?d&USZQ(+b-)D1dR-F2<9G`KtfF|>*T@3FJO#LyboB^=^|UqBoK4hJkxE|Wk`(>2~ILE&ie7nW3!5J6<~HPAvoL8j<UXFvVM^JkZOs(>E<<5H?P_-ekq&9&W+>=ykAAl&^0X3cevvmSaOxq5BpO#<Uz!QmyxRbLPi?Io(|W&)*@+?3(uyPwVpCv%MS$0(<R%1V>7^p)w32j4`HY?*S}{K<S$W(@LKSB#G*WMDgI=rjNMy(AN9_Hk}0uJ4>c!>6gZnCwJRW8gd>B75tY*3qkbO+MMBN0J#92JC)rqTe*tG`6KoNleTE2DeM*2cMvXq%0La&X|)S1lm6X9TO0mHC0FI|3rnF6H(@0Z!zn=YE1LVfGU^nx1^mg%@ZnQxWUK|Y?s2~g*Skn@oi8*sb;(2_nmP2Ktk;~nH>C8QYKm-3^E$xRoBVNCx5!oBZs)al@RU=aVBD<O21B9u*^cO4I0stpW2xDbOQ7kBs3j0^jkJe%FF0x=0w%!ZjymmH3Hko)Y*b6UOQLgcNVCXXxeAOoymOd#7l^-8935XvSt3R`{ZR>sE{FldTKbbmCo)cZlYVCLc1?zAy}w!(chn^*y$wlnKr?YRk#0H<GF^Jo$ptz(EJf_)UPHF#RYTVsK0%k2Rxs8)?Pw5QS-h05deO5g<Bqt!3rwXA7&9RLCU~iHDHnDCdokmFcF~M?YY3{12#L+zG?J^cM8UNBudVmOP~YdF?XtXG7Q)+P_L7H=r!NKJR2qZ>rLw_#Kk+hVco%pZRa_a{dg%i?+zh{rkK-hC<<$~)n@g<W2R5G@j0xkq=m`x<_$E0<gylZ$ViIZ&T#~$)=F>sAT3RP!hG`F9J`3ycRTPsKOu!ygV$uVZAd}`p&IZYtx2hA7ss=yhidL}bY<+Wu(YOxuW%K$4MJI1^tUz%WG`g2N2aFb7uMDn;@!Xl>?OU@Jb9Gv^`Zh@yU~{|S&$lcMMGP=9czOJM|wc>bzjj-yF_pJ>C=6-KGK|rNPK*ckqHVrzQY7d&~1~H_^v4xq3maq<eevb@*mH3Il+T3B9RHtZ3OLGfuaYTgYY@)OmbeFfTA=eSGDpZd{28tq55$Uf0=($xw25;;*n(bVpb7HZ=%UC(RQTHy^WM&Yi2<YTeq(m?i%&%hU+^Xb%49zhh)#PfZ?(G<SJ0i$ZL|x`y4E6EcADH1wBXL{f1venQa>oY23yW<n{&uaqRGwb6YSYl)v|Z)B~~nN`a`%0j$_R7l-E@#@SoYM8fTrJmglEr<?6N_H}dE>y2}yx;9kM^!*Gpg0Uq161y|g$Wj3zP!-&+l$p-jNg-jR@;vK8uMd+>QN6Iiy>v1>kAIdVNRZbl3co(ufysCITDIB7BO9n*w=h)L0dZ+N(<>hMQ$*44yitCU{ei+81g*cqO>NdqUa8+Ry*0t$)Ob6Qz$i3&W_N%eP*Q0p?D-eAV;WdRA>4D08Jizun{<1VGA?U3ih->&umc%@xaMBLj3rAx_mCFoKv@iv1{xPpAPC;jtM6Yb>#}SlYnKU2D1@4gV)%?lX+&z1SQrGPA+Inr3`>jm$M<qa^%!a;<M1|dh}U#u;FsDY)gWDIU4(z?${x`I&zK(y9bY6)Own{jnZ>u5^JVaFid(nFf5BT}Du2|#HD8SE9By+UYjGv>(=w0L$^5Ungp)aTWxYdy)J|Sg+0!%650+2o`=0$|YWTqF5q}J}oL?0==+)n>I^-mhC-WAYZ2h3D3P0vYCi4HiWPW?@mt_UYbcP22w5+tYLIQ5?S@*1<wX$ouNQBAy*bX&W&K#9OaZz}a>0M*&L@F*C%L;}n@Et4VCN1$Y)d9gJAOqn|wYNHx;r{j5?%d#>NEs*Sudu3FO#7`o)#$p%w!&Xa(c4dAT_%W%@ks77b3axkRXRC4k*n}|9G0l+xWl31#tWID0n3_53vzj2UZxjbYey9c9F$2qKwokDUsaCtdc06a`KjtZR*9m6c%q+YFftig>nd0tUlT*taWZJt&+mzPDTs}E)cSh6&_G~Qy>0Iwq9AL)$8{S*l=T#x_H`Y&KBoe`*OQM#g*a-}^RH9`xYU?jT^jg&la&gkgY1&Hd_mx^IVHoXq+cj0lUl-Ut^D&WT21Qi^1fiSLMfAR-^@E{eudnjqy;TN@;3sayu&FNw%5k3(Wa_7DC$t6qc(}RPUZf3m4y!%>)mZH3AYP!dIc_fm>WvTydt~)atCBdT;wTYB4$~DdQ`&m+9BZXeOe`<1oeNJwR68b!VLvbC`oSt)7@xuKN*~^?A5F&kTAe)*F7^pEXTq_u@Y8HFT8!_xjX&oF~Sc~$^wb?p`XE&u$w2!B6PW^qHrs+!Y-ESTFMaQ(l9bK&K=8Y)-_hTUYowtB_wp?&jw@<-WGiM-4dkq>n14VMD)<La9chu*r!V;#!>Et3?D>`6_F@)wwcc45qmPqfNH<sw){@QQ^`GH`T9wyhxB?&X(Wh$2GLN`QZ}~y5mWuO+VNN!_+4Q3;wd){2|1L%FH@LDz5lulgis>$;0%u6f3BQm%aa1vfO^MHJ@g5qN3l~vs#YiOd&Q6SuJe6-n64)O7(5iQ>@Cc8&{@Rq+MfPTOqQ96Ek9DAg22lWXB%YcTjhV=_+wwuVI@)frG0>NpT(e~K^ZrXrsCgjKR-PRW-{3pjiwv?%;UYsE2XHG=*CC0Fb2M}qmET-cW|cJ4@`qO!b+wYPwvwzTQt~LNrT_`vLd)ZA9-&b1QJ|tZylMFeWtD5pneTW1pbZ!%dPo>#PoN9+Ud9$rw}U4mghN`q`jBJ+TH|0b8Gn5pZ9%rpu3N`I6~u#9iY()M6R~*IS*()p20f5p|t$0SX4@L$UN-N?YV5c3eGi*z{`bte%cx~58X@NXcP%m@8ovp{a}Ggds<rkNpu8wNICd~jsss}FG!`*Ue9MUizX{mV8c<{pRg$!{R?RzKsJHH9x7R|!hb)s!<JQ}++uwY&Z*cwnNpzmo##Kveue`ope3V#%84MRz<-};F&6F^M`_tUp|Pg-NcL};YM)3(1xXnKNN$uZ-r}&AwO^t3DB$7G;SE-lz}#-_2zv)f`w1U?IUSA7z5(fysvN$DIvR1|q*3h`H3hH=SEUpWz)qJx6QeR+Sw^vFuF1mA!xa&=VpdIbRDBoPj(fjqi}>sW6fOLDj(}u<G7|NAYaQikY-<)QB@4!?%`=IirT+uuRQ&f%oq*6D7MNIlNn0YUqW@eI^QFZ5YiMU4w&>YOhR9goMDaF)o4@*Xd6!urRS8cz1_h=?XMc+1V7~#o7=bz!J5Gu*b@{k&kFe+YBcAwh4F7w7bPBp+Cb>XVK{E=+RJm^!<{77>g6*?V{<9a;-D9Z6CQ@j>Mer8Ur6cKkfc>qFxQv2&=P}I>(+gK`Q-qWbAZtnyntk}qZg9~b^jVrhH8yAU&SsKY0PU-Qzy$Dq@<}KM0(_LWgU1%a<3aE~Bf7-j0v>D5CBax`x@2Ppi{-YC7568y7s;bUX;OLx9|g~o;Z`oo#)ZasmqN+$3>6zP7dC97<6PlQEhyThXfU6H0_3ru-nf_JO7CqUxISGDLmG7KR<rUY-(7427&-+Z5g-eYXP^J<TI|>Z6}(_<&jLd4zTGmS$#<bT^s+eQTx|$3R}?j~q`Au3`cEsbaB&mf`2XREvRtb7PWzW@Vqbonf#5FdW{^%Fa;$SR=+mMXm&=_yO}jgL5NqO#JXsCG&>*){h?P7xx>Wzesm^XORIFh5#M#Vbz~KZ0bem!l_Z`enI%g0!L?B_yt?k7?rIcH0ncKf@c9EjcV6(iDLt44fg=W1qW2K6O=I}I!6*KcAU;}vF88Xt|1M}tvWEQ?Mz%6FyOA&zSLBp}h>HI|!x`@+`oWQIhALTlAk?2_n?mz^vLd2d8i{~aR?Ef##dVPa@iMSxC$N<Mep2X#fR#P3B0?l?%wTBcY|I9)7r}`n{?LEA>D$6kXRt~?n0V(m_$6}xHyyTCK7McbgaL$0IVbk7ocN?OJ<TA=C8EY}(F`dW|I_cQB&kI7a{g!z$Owb1l)h1GoDoD$sti&p`g|j(i-nEC!FTo(sU;B5jMI^E^R!@(RRX~`QDp}s};89n5X`-e<HMO?A)DBXnwHv6y`w#|4#uo?pgm>k+{<ztmaM5U5SB|0n+SQ)=c&=)bG~|gM)^9V>jqp>MScFMv*o0RL8+&v(ZIzQyoe^Y+HLPlA{}W2LxDov&pOThog)t|lUc^nCcqweO<;HStgW!|u0CMn9UkBTimM+4^mx>uw&LK|japO#8JKi~B@Sk20^o6;>@=M$+Ctov1=Jc6*$~$nv$oayqF$xC5B9cdtR9z)C=%4R3=_44|{ePR`vuF1!a=<4961Pq(fcUNu|03Z}C{l<!X9G$p1iM4c*!By15)lOHSTRpIelN%ZZMB3QpAcl?t>MR^4G*^BSTF?(#TROtE-?MxWhQOAIg|{dlCgsU*huk|iZfMs8FUvUn<qbiFY3~zIvDdrGFq^5$9MJD_txKK--}LTmyq?u7TVUJXk{cA`{v;D=PQNDh#i}u^o!MDW39ww#^zccz^Zs70R3!REZY%MAGw2btx8_j-~gVKYA?#g_*#}E&Wfe4MikvEbt=x#nkm8taRr7SyIeM_pat9ZP0a3SW9nZ}O7sEfOPN(eJXq_hXI^j9<q|zP0Ie>oYzYl=g>!yL5|O!~C4hwj`gg(CI5{akk)9LOScvM^e}=Q&^Y~L0$093KlbR1x71F4;@~jj<ij%h}kwAe}<LvwS!S{`=(UwEAXpUZ?T3aLfKt;*o1t)=lL98X1lhvMzG^%FvXA8-2?ck{<+}__YMm(uo^3|sM20T2b{Iy(FXFv|?&-CBaO+~}vA@8w4Ve-a2VXZBIjad9XdSsDGh-KA1l~+tKt91|W7sx3YpE^SGQ~kXFn{Oy^hJ6u!^(+JWZuVOzyWUvcm_efVE7%A`<3=7(w#?ij_csVVW+y8V&<`0Z8}(d3Djj7>yG7U8{Ol04M%9L@5@S|o_MEaw6kJWAWYlU%!QdcQd$X~R0iPJzM|?p~ZiddzI&S8@WSj&83IdRX7n8}H|9jktqK*=k-Rx@)d3Mmbo_ctWZKZ@2vp~_}iXYtuoauWlV%fxFln(j$RYa-|NI}Sh;QoWN)Er*+h@3*^sscD7yZIk`VO?Wt-c_QQhs-|eF<EQkxvMe)A2rnKVp82CQO`upzAwv-WsZx~(>YYVteARwD!%%eIiNnqS#a-sf8}hL9@}=gy!rG{x6t+X|G9pYmuSsKN~*6Cys%-C#5qW7ciO^s;XRi7-PuMZm!!w04dH`o*@JuFC1$@WG_F}vsd^3Gm=Zw9bFPpdU>`7OWXlniq<RMN!&hZE(qI68o+n_uU>Q-st^>Cg#`31LbgNGB3}MreC<e<MPl*85)6*rofk?WK-c{WOhM4R@cBg$y+EjR5k4`O=;T7VO^*%vI__;u3uqrZYo<nhVX!bYt+XiL~#ZgR|ePCBP^FR<EH~HS#NNXyj5(4z{_-p|KAx`wkg&L$gIg9V-)s!Ak%&`Evd>%aa&Z9H1FI`~63|wgIMjR*;=T1QZ_8v+bf^b9nf8fJiLpX3TuTHfN!VTv)^)$n%@Nr?F(C;n$NsPYW(pWyTHBL*9!uSakx~MaCHdNO$%8^ZXy;ASA%B<_92e~-baID=WMMlk8SP9<WBEcM-@&rEMeRR0n9b}34MiEzUCGv?^BC@Ik+lG`r{`x1yV)qYw+^o7R<W-<lXbqM@uG6i=Zk4hsIdV^uAV%5Ieh?O3L}+##cV30>HNz)oj%h?#fd2(diE}H^_Y6ESIj5b-{4&uCoN{BLq^+ejf4#Ppql#3-_+d9<3srF)&M~(0iA!#UbDZd{NM&1Kg&TQ?M%iQ*qL+gI%CTPzU8}yqs67tWs0`Z)X+(ltd0tn18naa~Cw`)U=U8BKY4AEjKeGzuHty*Tttx5Xc{jv-{f5YM^Cs8`Rke4OH&PS!g}Q-qge*DZaj{{s3aBIs;tz1OX-f%9BN7mDs}0h$b_n-kH0IcPaJ4Bvh*gAyaiu{gKNOo9kG6fH^jQ5XY*NSe()sUn0I9g${BFF=(T`KKc??;(Gj8ykx2|<n;^C_li90PqadfaP=y<5@$CC$a{?dDfp~~Ay&2=+zsRCrZJXTwg#NHw`{)nb&L#IpBQ-$|>YKIDM<tvD>M#ZGt>GRz6cC=}IE7TAThiC}^-HCJ<MdPGj+|01wb=x_#cCf%R<@w3aLcF&Dc3957a9KEL9b5i~At*F!Cz?MsM0<~DGQ~9ZCJCg$%*YDLSF38wgGQJreE8(gpaH|J=8O4er0mmwNOAirJ+}=uWkv9)vM5F)k+-Cihi`fpG%={*db%201|2Ixt($vq;godn;RTlnZ%$e)7<?E*^W%mMO-Lyq)S^bVj6T866)GrjgS!?6n1;2I>8mcll<Dn{FRoevOfO{0un3}M67$51=N&le8m0ONww@+S5!Fp7Ou}fl9DTYRP<c!;V+?&G^;t#h>e%J0fE>$Js|D^$I^v@Mj9_cOfg{gi2FX$adClvH2H(h}?a9CVWjZCd$fx)69)ce;bcF{Tf+ZQd8FH`I5(wIa0P+m8{}e*CGO>T0hpcGDGf`UhL2*?JzG~=T3%=yxf<5+zM0AKj+=k*Zk~F5;G58)ns?|BPD&(sjn0DiN0tx_pZeR{at;qAg&215jjZ+$I&qO39`U64&XWb41s55X^xf?gy<&uYpD%chuW0kMY7jaIcr}3%3@4fj|M#P4le_6O_GwbJ?w4MRS8GUc}2G4x(pM`JSBJcV7DhO{~={*BrcSIit$eb^J5z1*#gw|JEbbv;Hr3p*sXEqsKTO4@$Isyifo}jEh;Uxj9*DJpRX);dRkg$pEfd%13PXW|u;k&~I;Sh2z*#di6itd;5aL7S-6m@*pSUyLVSpv=4=7km}W??Y?N?X-l<FVYN5jGQ&&8CPaWOsL19z}9-UjE)i%gg42n9x8kV`YAOM8<u>^5WR31%hMP^oMfms-c2(p#BE!-1t_Dl0<RWfGm{fdkycZ^@H3u-=n2u^c>x<<|r|xS2%^>pobB;S3pO}*MVaB;On;d;?hECsjOfl-}d_YaQQ}XU#sDpzQe!O!v|RJz+3oEBI^{k!9qj<UE_KYX-XVbK!!h>tY7TEzqeA$Uc7v{LjJErnH$IR^akJLJJ})FIgLl$A#9UApemV2d9_@r{^j&!b^ERK1`jZx*6vA0UaFnZ1VO|nUp4l33||J`j&OJA>a<+%Ft=w!K}dZ^B0Ah-;g7?CAU0h>*Yjn%qIhY1n3)PAH3Phf=^1y&l0U3WwQ<BYetq?4XCXn5_smasP0ogi@Fe+1_;_FJ83x3DveyAY4}dq<>^uht;q6_t%5eMxX5H$7N(NFqF(;^UraAICX3Q4ahkUl5JM-ky9R&d&(Y9C7aT@cfY8e+7UZp57m(Nld>YhZvaBn}OCC~{$eCjmMR~omp4<IwBA^5;2jryb2=@jb^-))XXkLAdtj)|YxCaht$?LAu<X46}6zM=S%pTU~$Yba%n4J12qfCsjwFENMOT*T(>gy4)C=l`{B8KGQrPg8K9sOXlPB{9BpkI^q25kJKJLzR-1xf)&o>>gYO=Cbr0k3Rrs$P<lmVGGgli_xkWZ5Er@7mWR#c9^1`Q|s7rUM_>M18uHN)(`0n&-q_^%9z=BEZ;_}y@c}=Fu_Fr^KL&(mNm_z_a{GL{luc>s?Z8ussoN$r0iw-l+2?!rWCi5W_k0`vrQ2AGO0M4@N|(<Ehr{OJ(+a0Wzst4+@!ScnI@LE?hhCudw7`A1;t^hG78}AZK1I)VeYbN7+JQlH8|C9CF*%TEkGA!y@G1`FhyvVV1}a(w5^23Cm^var@c2+N%^AsmZNyP77Vvba|8iP=!xC60mhhpBZ)*roR7T7DZ^5U^Mtk7d|r;I?e-JvyoQ7$riEPKjLE;QniB(Zk;!kzl&bov^BZjBJetd3P2G?-Q#UfPnEu#GZW22cT}3b=nt!n%DO#Q#F~hKMl`UNFxy5m1*0>Q5T;23i5CcB7)&?0pHg;mNsdg`wk*m7%HFIq+ws9tEXGvhUOPX45ZW9v_1l*3NGycvZ>F(ngi&vY{hiY`saJ8VTa$~%4kfV7}Fva?eZ?RfI@t7tD-`^EVqtSB++E;jLe33vAy9Xa^I`<Sr@ZxLi8pWrP3md<MIMC(GH^g_h@$PrUEfw=694_RcoD-3$oErQ9SOnnw^DMNtSPmr5)bT-a0iK~#Z85{AgbQm8X;@s1P5mN$Sx3}+nT<IhPu;SJ9Xk0Cxj*liOrk*<9F@)n*ZEM1>V9a&8=iZNQ_v8y=n5SUAc#P{0>8AZ3nW2a==sc`;bLs~hB#Yx*R($b*`?hCgSoaxW64+<8v-Khk?iusq%TW}0jB8O+#FuU75y$C+F34pe?vJ4yZg{(K$1vt(D+49(oBI~hV*4Aet?;0t|kgQskaV3pVW{XHRR#SmuaLbtQF<=xd7;3wy;9J^<>2`c&}@3*3ZO?$BEf{q<vF7!3ZX1`KE_fpE3~AScPDALc4CMDQHX*D|QjUz-a-r^=!AYg>2pAO+JeHmNQRJcoZ6}lcXz5)yCzM5moM1d5trW-&SQ<Ei>DS(z=v8)M;p}cW_IfVN60nhI;b&kWcPjd&$&(b37AfHrD#}r$5sdEE|rXChf)}2y()I7!HGb3f%FJc4(RyhWR)69DW7e_9n4hr86J&x%{ElP$iW`SMQ#eJJsQh@uixs1s?Ifu@B)Y{fKSksY@=%n6@m=Ti@JX*s@<I_=lEm*;E{<6#|;K>&D8yc0bz#H45>z4xLsTzR4DCD9vU)bzrmmFTscZLp#(m1J4++y-gHDsQ{nH&V8JUQrSfR1bjlIA%O3_h+P&P3{XN0n{vEh5(Q?Iifh2!DrX&^ub|JawKAbwN>JGw7;#vnq(rPD(7zRH!2)XDd2X)$ooeBvVSWztmAST7L5A*BrEGI-qKOq_ZKiKHFfVK+xIz<5(tTM)W*2N#H+S^CEt$b%X%AyjW{id=hL!tDb>y$g=L8Qt-kGd|A-^}S5%WARrU*S%G#}y{^0{R9!Z=JJb;+2Dl>r9h7F&zNkpi0$VU&yWobQwbjI^M3b6ynemkBk5!K9rd#bd4$t+8o6{%yK4X=~qu1|cXkygXL}<-@UHvjV9n0tj_g|6C7Xf`R!{*c;*#rW27Lg&?n<ar*%czkdpEHPC&T9EBfL&tr=Vzz(#oT`|4h);<>S2jf848A;g9Pk>y_A|PJbN8@kCyv}BM|1Q82mLS%}Hxm``on9CxC@b0UZ&DJz;0~K@v-3^D%`M<3Lvf409wk(R9s+ajP%<oV>L5n3uK66y5o5>v4VsdmX4uDVCLg7|FjnXr=jMa@!JPrA2<A2>0GQKvmff)hNiTJV1iMh+HqX@Vn6%dT4C~D4epl5oVNY#-P30nk1N%0U^8r?c>-7u??S?H56Lk}JEoxlCLd0HL8V<^Ufa3P5v&WfpuiEBe6SMo{bn9il8O+}cQk3Rgvb`M6wWX%4Ee=7gG8*rEOW`)Ex0Z<S;h0Jrg{P}p8GU<pm&&9W%vm#5gp?=kw`a*DY#Lo%Bqd!|(-XTpI}U`c|0_5(!kcr&m^@kK%)VcIL+|uO4Esj|X^)+lfLb@u?1qw))CEJ&Pa@eOcQaO~s%%@QV3Tesj7ibck)qEotoEl(d!xAo{E!`fqg*gBJs5YaH-2Y~R8?!iy!EqhEkhAs6P0HF!euhp4y`J8JR^Vq{L1`RZ$Op&W4o75)f3?Ia{=E6ow)W6j4`r+cUng~qPG&{E{@&S#KxUtw!cn$I~i~$#B$`76C8}r<yU%9!1F2V|IB170{ii%2KUhK%Pw$>HdUHTR++8tt9{V$-lO}Q!k@*WM;mQ=<lc-WKSYQl9~t=e0u`ctQgM+OvX~nRpnV0C?QDaF*ygPk7&*;i&AIAygS~P=Qw;_Te8ep`=mM?iove~EpeAe?aE-A;<Hn;4*spm5COR*asStXyoJvgH2LD`OV~6Kn&q)+N;!zvryqj<uaU)UAQl^P)8vDPDr#=R!h+P#k1V!mmB7S7NUWaI7{|7oYiZTT86NAGpw&}ihG(N^;2Bi>=p8tgG$nW%KT7=#%WQnjhc-q!%TL~3`DmE?(z~>Sn`zB+BT)aM|({Vssh*MbWP24h!^rr289!>!I*+Tf#y+M;<+T-P`q5r49IyKtj`)+U2X`-R)tHUKujWj{7iocR18Z>Z@^wBX$lf&wQPY_}Dpy@A-t4hgW9cQo7$z1wbCy(mbMSodd65xy!*U=<d$#C2vuS1+3eph7wqnD2;k5cTO_E3hmoiBPdOVVy8vd`hD(f%t@DEPB|$||1wE>yYv<RviPguW2*w@LTtCdX36y!?k8ul2@m-`#~A(H<-gA28gZxG|a-&X0g~9&dWc3M0lXg6y~F7w1-qISFxezECBIFS8xW`254>`rvEpbd$Khk2ZUahF<w6|H!r#^?oF*S3Rshcgy^9IrQBka$ad%im-ZKi-m1dNlz8kO`>Q=Wk;JNNLysX|A_h%jgAob92@(PjyYV(>yefTPd-&lkN|nw7E*=~-r^GKp=~L;c^9BVV4G8ek<5QJVe_0qZ<c8T3a~ktraD!+naMJXnCo#%1pvNX9Q@dW$QicW7)U@vNzL%jXW1<Az`$yO)dEZVchB1@OWH_%NsD^zhQq)fo4vnYxHYeRfCmA&pY`+@9+z6cZp6Mqs2SLmNu4EAX_NcfXJ38I2!2KKTr>)^qn*E>l2}sg{>vMlu+n}@b~sNS3eR^SU4>fMCqva1tD#y9bA}2W8(ma1m68{lS8fjI9K_v@$nHVE&&#4`m48G!eF>Jle>FB;YbkQKsazbO!g@F=Sgx1SOyj~$)wf$_q_Ey_ySDA!{ph^{-F6L1!aa)44;_NrZ0<tf`d<JeyX+my!ntn3{Sw!W(2yQ4hikX=4*3)pkk9_EUp$JS>XV?gOikIcAmOW0nSGHtOkD5Vvj8&zxG2#pTKG1&ZrZsscl7QQ-rZ$%uyf|<s&c5b2=ieA4dyc6-p5XnQ9JJ4TQ2YE2)0&`bHZ*A_s_)brA0N?pAe!z$(7E7$bBYNrloj(L$d!oEGA*dC!n$WrOhZ_`6pJo^8@37x>j10`9ik8DvS5XYAxaS1-fxcVkTI~&~r2}9KE)S(-;WY)cQR^RUR#`GzpQE5*Kx&lP_cg^NH*&3iYcet+?y;u_Jd^n+8c4L5c@*9(+}DA+LO=4-T9?CWLD|t}VE~W326Acnv}h|6q<C28&z{KUzNVEU2rmGUA=Dp-)2k&ew<a;u%4;fm!}VX!kR_2}P+5J2-$$06%jAtalEc)1LVuBwntY-F91s+)gyT!P_ByeWk$m`@$a#!-x(IO9Ok#00OUxs|e^%<T@oRvR?0uiL8yc=WkJk66k?7G5uvUjY(hY-5;u6cnw`JVWJK`$vwSYTK%;UF0y5Vh^MRUw90X&_3X^?>25Z=P@dUW6F4IrNL<@>jS!|E5pEHxC^u$gM7EFzu2*vl!&*pW%md%480~4oeuM}1H+miOlx_z2ZZDJ7a#vl`qvXn7$pk-+*vmpgLhvc)!|qHibh|%x7C#GpSSmrwiqi{FV&zM{<dFPX?CH|a)K?y9XlrUbmmPE+?qrOsIgCZ)BMfWjRSUF8JVU-}<=r1tkp?94&=RyrBu~;>n~g|}=LqO8z#6f}cEtmwopwwdEk+*bujfb@r<CT9-zfkk&cp)>D?XTzR4MR~8Xo~rNx6ZSac~gRq%Z(ZTwDXlHZ*n?^*zm*k59qBW>&mGLX>07@Rneq?zhguwk10#q{}2()-~`ZumiX+beZEjcUDAIcb(E6<`-_y6p3nQI8wm?_o-9R->HKMJIZ!!SkfjwTIT3AlAj=l%7!1eTGEcMcslY?_{&DNLOie7B3LhT87uQEp$1frK!s?7%eOdIcRZ!yjH%>6FJb?1PF&bE2xlpvV%~{(s`+hC#a>js#82{#iX3r@GyH_J(n+t8ko|kdE<reQd41f&=X0@JPw49np{D{_>tw$_>Ry6dhcgp`q~A+Ca()HO?E_%RWwU7o%$`tWb~AU6Gv9-VM1zPp#C7l?i(v%ueLq^%>p6>g4=}H&;aSR&rE*hUg>BPG$!KHaZ3wzU0U`@!0?%&emPI<bZLGXIzcqhwV#Gmqlf0!w1*JN>Qz!g9z>fr2YOg5K#u*?~+t$;&`Udtil`Ty9RkNCaZnPZDw}390#fQQ-_7buSFE3;n;WwoPUl3wlXE$L~7v{om8|nsp(@sW;Nhb35`l>C?dy^fWfb8_sEJu%gzks?~V!1zvQ@JMd3?X!I>>Xbf*Uy@tOs|nDC3PbHMDvd$rQd!{TJj!ZJge^q3$Z7qE1auDI_z|N4@&XWrk%C9@F`OUUKh0LTGHQ4JjKayV$4i%jb+HfEEaiRMu-Jl#GpRXBOBxsZ6RA5M#xVTyk*#f#M`*O{3o^`n!@$)VfhPCho?A>W}A>ik;c3}2|g`LG${A>_mIh1a>;1e@PptTTLIKWtnc@l`%Kzwts;l`k_Zt~nkufcOd}CgiiwDCef>j13df_!ORY@M*A+KUm!Rk=;{7^8jZNr=eKgC=064>pPCdr+Mxk&LI_r!Uv#v1ZByVcC_^UMrUL3Ndt95Ob{Y~{>AMWRWa_KSVB93`8Bzl3Mi|9b*vLrDRv<gt^%2d+g*-JOXEKL3bRcBj%mFsUrRk#MMP~N)*i@O0O;5Qi3Up_1#Xv^o2vHD=7hL7&Y>NIG|17P!At+}7Cawqu><FSYnYu;G!sXwF?EK#6sHOuq;bu9)HqUEn`tC}&67*!V)3;)O#$AU>F^f3x>aZv5sGj&V7WYL*Snk~zZY3C#5{e)&Wh_~z2jk*i->EIV{RvpUyKeX`xECfB}x5x2+&t{gX8Klo_C`Vw@zK>v|v~NXhc=VVy<Ez9ljo-#}Ho~5F0L>I`eV)X{KKs|4p4F>?--cp^z46(_!E%;}RHwQud9fzaHw>_IoRnr4{sBU~0>gR|=zU^23jy8BBl+h^6=1F>>?AbDpDUIpaXfO_T6_VUK4*a9Fy7ME`3TC7Ichm#po91Y6}Q+AeIDgm8tym0P%UT7K$_+4%%?5}mCWjwIFQ50Rs{GSUQM!hc}X2DvP(>*df1cMBGqypjz;>G%Q$v=zxa<GefZy<!Xlq0C2cYP<<i#Bd9N+%O&lZr5Z6p{!t<$zAb%To1>+TSb&{M94B=l9)-^xt3BaV!^lT5IJlD}B#sBb4UFys{Z43ia>5ap!`>H)-s3Y9gXHSb3qMso`=_!fF_Hdcgqd&oYLd7NzH0WV}-Eg~~jh=<*WNOG$R+}x}towqH1Q)`>tH}W@E6s&JqzDeylgjekzD1QcA1S?Ds|96A$wf$V1O5ChwXhhV0H~(6Lq(RE#sk-^`LCvP`h0EznNO|OWTn2s!%jeXAO|C;Lw>P|DKrq7#M<@;^bzS0K7LRYjJ*P85u)DJ3lkVTafT~F?b_=9%7!~Nf6z9>-8=P%Ks4FvGD3)-9&#QbWy$Sv)|Fg=X^EHAZiYk4=u-J;!Zid!JycoYu;ef%rqo#7!`%|C*@l?9)BMg*k)}!pD#G6CTke(4nTN~GXc^5z0)eU78iy|xOS-Oh9@L$oJYi%nly(Q9=TMVCn};|TsnVpvsYhd;6O4aWkYvRQ_9^^)GrEqYng9Le^~R<$SC6st?=IOmyXNHGhm^@|%Sp%T7rwHg{QJc%*y^c48J%haXgHK!s7EC?JF8f4M#3ZPD0h>g7q(E;>e^HUQ#8Hm#BU<iCtQ&f9+^RHF7=~o<dnCGqV$Sc)+l$wB_Vs{cS!wV)v)?5da-Mpg2*6#PIg~}5FgI8QizXBh$o@IL(4_ki_IUmhW~F8#V<`Ufw16ym}qMk|5hWa*(Uf!4q%2A&0aQ}EV@U0(XCc|;yR_7JBr3)PwpYp4^L)Q#xq?<_8RoTv*bcV_netDTZe~#J{5bH#X!Iw$|k_y0tmt~>}{rMY8%nGwdn@%Q9<gwbM2&MT4Vj!?Ut{54g;IuMR)^iDt|!?VKEpQjxXLZHMNkQ$Dn+!@;}}@VaEMvd<`k?-So?yE!rrfe;1JYf3mEIYihXjW^PMH0<t6?|Bgc3RM)Xn!)J}y{6Q>3$~8Lxh_{X3AlFv{Z1h9AJ89h*?GebGzgFLVnN)Uo^kkyoJh}Q%`0UUx^oJ3jcGQh{UiBHHKO*_XrU`N;{Ly&C^04iuW=+Vw^O*8XRYOH?Jy_{1m-?1Yt);E_12EIFGI%$fR0cZrTeAqF070RNXQdX7_3&7b$#N>VdR&Uj<(qVP=KI(7gk8i*pw#dxEypFl7QASH-czFB+Cf4lkvc3VCd}#96={3BhPP!5UVA@x*MWxSkDI_kCQ%K%6*S<}^PcZu=#~O^+@%A-2+{+M$@+tH-<uwh)j-AVFqmGvX6Gkz>$%;ezS~Tn0bb@@Ff>0T4JqlV>gQG%a%-&V=CHKLmOxVD$?N{WX{Qt=2R?JLg0bArPzy)sU0oD3<PB~HQe5J>|EoUmQfjIpWIH_YS0A2(U@2ogn>-*f2i{CT{P{(o`xB3v_GBA66=oG#78q3*M)HqMZQ146N9DWbwvoTKb&U8?sn!ATjfW1yNDaE$ffpjB`4jMa=LP8RqC{qnA4?Y|(s|)gQ~Yi}h@ven-_r>g=7?{axRFX-fXL8B%m+jKVX!n70&~oILFHo<L5+zGPAQO52F)mVPa?4oS0NwkI|X%BJ|;z`-;S`?A7HYh(fz-q5VUpGC_@1!BmSY&$7FW5Kx}-cF>L2~z}~xQa{l6{G5r#Rq7(=XqE4Kc&@7bEPR=A=Yp|IHM!Vi~4jGbrAu@e1WY<p~aE)2qiFQziIQLBRSEZgz3uovDXD&&jNgYQ738oGYbFY$Vr^9x6&0SV2jTIB*-e96QbtUrjXEHkVvuQxc_O6(s|9Ga2Mylsx&%&*KYv;n|NEG*;jqbOK=}-h~qlc@)<CW7`?VBs+QWJ5eV*MAP0CBA*<u5vrv$YQ*(D=5(K{dQy-3R6&0T{JfXz(XFP9R>*7BYiLWT-o)gN_Ku-3TYWnSj536RZ%;i$7Ku$8OK=tR7G3fVpi}Dbl~X>n@E$Da4t(<NN;s98)XSSvOm?72eDy!sC(il&hDHk5A@%7H-;m9mEoO`mrUZW*OT-rQG00>`gdc_<}>Y5-;Buq}(`CN9^mdDbOdl+(9hLbN8Z@3oYxW-0%zimt{m?R=E%(|1JMIQk{7DU@j_}grYe*G4LiGjySHS)PqOFnZ9uijfpj{j8~PEVuopib^`sL*v>wmriA03{f_zu>LpLtw9N`Ab|;$-4K`P7&EV&dSBE__0oj3^-i9~v<%T8|b8pM1f;&xtAm&>u<Hua{;A!8!ZXNW%78QF#)3e$GQdJJ*!h5-EA8L;7dTic^uR#@lsokkoBDoq2bygob5DG%f_O<5O=ip(_gA3ktf3I70%RP~r7Y(Cm5g#**8`li!ou}N<f>o+~5ARNVP%`1)5k$<=XmsfIr=<PkvSf=X1fQ9c=u%$Ru%?x>SmKy1Zc9m)^G1v-5p5f-`8en@?&C;0WhD>_x%Iyj0;c;e>yi)t<o`=B^y_BP7NkKdBE6OqVzUZkWHQ1*%KIHZP_hHn|K;Cbs<nlTbnC0K4a+0=8c~)|c0YAUHWlv}tg3t{RuhE8+-f|qGqau3K{><PLX~aJR1Vvpxp_Z<3g=9L#{vOryhWFI-y8@Tojc8fc5xRPWYUZEhGKS*ivi<!rtdFlRqpJ+16e0X^Yr5L-d|FhlFn+Vh@g+7Y0rExsnBO)jKnR@zKy3!=+7?57A)}0O1gzPw|r4UJSYg$?`0#AQ;-LbQu$28bBd+<#T!k}G`Eo@sIUF$!&D&R_!Du&vCTrqsZA-^(AoZ1t;Mpo&N1RdHiklrmJz)fWDa9y9ZPt=7wb^BiVvRVM$36d5gf)YrU~+Z9mv42U++Kic8Sq=U3}kyQyk3SU>^m{PZh|WRc*g+5XZ3|#_#si_T^W$4l5+Iu>Pl+Z>qWRo98Vy8TT*5M$w-J&m_eMH6z*AP!-dEAmCW<jYtj<Oy%#={nU<ix{5-i@sK_u<oAx^U%OZBe<#d+&qs2-q^2FcB|l7r4NM8FZrYIX%ec-tXC1B9WMS~w!imnO;vA03#%54*b`I2uh!+F|tkqox=o8*p9q)BcqcE*BL=SM_l`_Kzn2AdEt>~kK{6B)4*d|c&%WydbTcg+!yD=;HpfZyx9oR3304$F-Jo6AfbtkEsf;f^;f@6w9!`sbJ|I!G~)OSl14IMoT#OND?>!D6Leplssol#_t;ye;7-GQiuG2<XK#$~g=-^RW&;YSEy>^!5$yP3y}#g(vwM3*Si*t@%h0~;!S0NwpGLQKZB+3RRZF*&!=tl?Tr|Idb#S+&}iY&QLHuU>?_;{2US1vj8><=IW7i83d$tXyz`oiDu%+pAuBH_C)8_ASNNFsb+%sV2}|O<D3#&(RR=lXoM)X6{LvALH`N;lm(oiPm#Bo1z+h1XNVC_8HORb@S+}oTdvni-M^rFqn!0OLk#fUid5***dbjq&u^8R29@E_hMeDE{<MSHgmUmvxJMrUb_4Y7PSW?o{fTtiCd4>SN_(heUk$se+up@-bhT>WZL$}K*CBsb{uGS{W-FW8Bb3<s+O`Akb&Nw;6u0N#7=NfgV-4<&f0iD#Q%o^rjSMUoK_jg157eNwz4@0G7{s@wI{N20Gdc+EEn{~{R9%-0D)eq$V8yWUd?6=cbIowp`vnMrhTh5?!V_wD~SO1eMJ(>Mkf+rpxpW%7}l}YHT%sWWJOt*L}?S{-bAbd`7VD>2f1W4!;3ROGxm?J9J#R9eeXDT`PQlvHw_N(b=PPj;$vo!2Pd&1t*r%eDa%Am{yz;YJ?=z(3E(UTd7GT{25DFz%4=SLjFEQqsHn5eSI0x>(trH{qt%}If^M51sVbu;rbJ17`xU^_?fWK<6L}{<-0sLTR}Y~A^uFP*P>T@*osRZyK_#rMoCl7;rFU8G{LT!oD8!#6fF-z8W^qgjo-)Jq79<0gvt`;@(|y-4#aOgG)QQV1kGG|qub%Ahy7P>sK2l=52?wBUH9^u0#o&0=kUtsJgN!@!m;NB%c3iky_la++gTXBw0r(7H=+2krHZOPU^>d`C|12rRx7W5k;k0dm@@j5#1ZJL$S-IKj1k}-sBy{p|;uUm3<Z=YXGF6#bazzhR_&O8tus_MDMJ73s^?L4^t*zZ(C;z;u604`y*p%7^QQ(;MrX0}bMQNgT5O7k6HPpK4utk1R_Vk*)3mDDfnA8&S)_%ul>ldg~ayAc-`HNhIV0pZ|nm$jT&l#(O4+o{GpjV&m@*Be0`zm|9oE2^f_1@~GMp#k(YL?M)kPE)T4gT#5r{r-;lGm*#02AKjjBbgw4nSR1M3`3+^qtPMw&YdY)ZvY~JRYJ46M9GqJW@XAfPTw+g+Q5QvYc0tc06+<GrU@|_lD2tyUFirLm*h>OYH~jjKl>PtAjLMAW!RC?6R5`oaUrC>%sVs+BUKsf!gl<oh$Sl$15B9)W7uL>HTp`2mT1&Atu^%OyWG3pIW6NKGH~uus0AhCp#Kw(msGQ*-N*#Z0WD5rTPb*^%3LS4&ZY92wouaibW}YmNQ||3iR{1RfvO3YCl^kKU^S~_M4x7jERIxF@jOU^$qu8U`W>ogdNxZ(ls4pQAmCbD~~EJD~29FSEHNaUXZmk$N+R`kmJN_m>0{?B#nzw=L~n6V{Mt#>U4zqpU;Yex9I9Vq5IWLBr`ohLK1KN0@Fd`PJo7=&PlV09t*&qQ6!u?*#2k9f)0+$SW~~~q}r`+2sI{9A<4&Nv#R?!>XG4cv+<1OJM#T+3|KZk$UiC1i^k6bWqrw0IAO(StsPM^zdo#ta&*w-@v0wi(`0gYvCSXxZybDeJB#cEggWYp_l5^1u(G!s%a0wd1pgc1Dy%RmQ2H%<`=JMF@6?7O>$C%BW{DY*ba;4mh1#d*G8zvIDd^@tTkaT?E#m}s56NDEe-fS86B(P&&Aq22_F!{kmv3+Ir}P>=P+wbExD|>ve|1#XRiy<-zr*I-+MMG`n3~VIf~r#sN_WZ%#_q$H@;>nhEl32`(*^~~)XJJ*h&|1W0sy=ndEGZh$Hz9gNMJITk;Q(to_DYQx&~KCb!_CSt$G|*<Pf@3tyZ5>A`!qlN0NWLl^}f6I>Oyz0(*r%;16AgaU|ZIL3)-w67n70EmM&S`f2ir<p3r{hJmwAa#C;H%{<9lOCnlmYzo_{go^<ak%}3H$|)fU%n~C+Va1)}me7)-1cIp%oJSh-aH$fd;5}$IjaQ=jJxu?ZP?TT4)S%@Icjd58NKF_cfwF1^j!F||z1d%UH#N34E;MU*k($R>TG5IW&0mD4LkJA<r2^9<&WS|^RE0IYGXw{QutBAH3N=sBr*1H?mSsfQHMhbL`|yNN%9)zNKm2T0vXsTYBxL^r5e=BPV-o=fTQT(N)jRt<D?=mBu0#o@N-$gtfDJM3mSKUn4;H9?@5&K3{N45H|H>3W4cwQdp;1{>jske?QY)yy$CGlloKV3Z7=tv)u=l%sn`f2dl?;+!ZiA{&rhuefP%lpulk5!ar^{`6njd1Xt*#33V^#_zNQ#Tmf?bi1DF4**oVpz{EwsBc&0q%QoIcRl(~T`DJDvgKud`F{<zUIPSdn6YCV$kkpOK8BwOfOXqk!dGG3ntqOY@fygj`VUUw9i309wiB-p;A@AV5ueCitn`Sm3h)0^@=4?ul`Paam2&vOgGUZcR#Dtuz$$iemEV*ynw4Ats=B5=%<B9yZb4+nKtOV(G8q%Shlwv!JP$c<?{${J#^yx4NajFedVuUQwlK#T{)YvgQJ?iHr-W?za-(kEbFDIhN^*ce#Z^8K`<I0SdGoeY89aLGBnsaP>P%CAfmL#Nv|+x0<Z{AR8!U%gR0wc7cik!f)VhUe&I-K$x#<YEC@hNmq-s;sN(OV2xs=x6&^xv(@(8{hu*@8$qXlI<-PQrxX_ca}M25A@hXi!2Gs>=vl3uAQ$=?$Zn#>t(=BUUqTKj;4-X%K8oCvF=9G9$zP2#+?xk}mM2K$q#G4VTnO1Eu@JvEC4g9PNIxF1(_H9o+FSfq;BBrB+iPsuI@wpnf)T0Ccc@_A`KFW0mT?Q3Frv@zA)ekW`L)X=Y|AWnvrj3@)?go?O2-r=Hvi!zfsbS|yz-}w-y>Z960#rU2Y46Y#Rh>RVw#gVT?`lN18P$QWjvnzT>OS&{Qn6}Is%^8e6#Cgc-aG?QHi8mI8`WP;b@k?3zPT_zcAg`v%k|@=8YEhMe37XD+;EQS2W~X-XkgF<z9{u%rK|lW6D*$v%GGM6;+)TEB#8s;lcuc8L4NtSzgdEmSXGurK_|*jY%$6zo=`**km!>py@e$)*Szld@Tp+FQgk{D6Dr>^8Au-&;5F9HSthEAFHU-7(hc0BTLy4Fy$iA3a*1MZ6HbJ?PP`EHFX^#!0B#=hr$ykqn&^qF?`mfmw%*ZXN1zp#J4lzt=nz<GMy2gF2NQ_y&QEOux1$BSuZ22qNPq}B3I@q=d-Jze-CC8qZwdLz>?Cw`(YOgPnNoS><<v~F#9?bi|iFglRW5J$=tD;3pNhAU9d44^G3^5+_-2nuctHJz~*m>=MJm6p@9$#^lj?qcn3gj>uHeVDr8ayh|YD=G;*M6f=Wj+Ku@-XrV4uLj{5JCucLr9Rcj=D^r1u)O(fF^rO7jZ>v)mhj2b>sQ2<bR_$Ju&^#jqU<t*#(kCABVHgt7VUqS$0BooQU^b|mhtW(4y_0W5BBL;WsM)L@{jNwvuCfCX@wMf8dUa-?3ON2*N^wyOZnJEihH~}kJD<iS8-unaR5IkacN~^_Q*@&7-8XuKvdT&OW+(DZL2XjAN=^?<a0pw6Hn9e!5PZ72l)xA;b&&Gouz|liIw97v1aP#0=WuY=fYZQQFQ>{bnYSXR)m%q;_7&Dfd_NX%3QI8o61!UPjNS>{s9k0Q;aapVP3a-~=lq9+DBK!~{)tvi0!8745HXUr)ZfD=GNZ}3#(hThFp?4<r9vpIjLj7ZTB0Kf+bAGIo=!`4_i?^S)+7$Xt)jdE`il(H$up}+AaF7*>Q#Ggn>*W*9|H>PQuDwrxwx|usS76U+X`r9_gIURf*Kr@6NF?`>b4HkOj##<~BV;kLbs1xbf$GTBL$-2lf9uQ;3(RLEUXu6K9XAiqg5^3KD)XbYGh#a)n-$OMRZebTu_nF<C8JOD#0?MhLzfQ$Rq>U|Fa|4g;B%Jll%5iI#mY4EI@G@x+1&9fw<U@v?G7z8Ji&onL@5_w)7PV@;<LVQ{Iu#g$<qGgilz>35c_t`wQakMLmuWiT4#Cvk`g-NAlUlpe!0_rahJimPg*#638t!aa!4G4ufz4J!f4RDnG|0kVck)pM_WLei!q1gUmI<s2LH(|Si=FjcSvl&A&~*x$J@_?U2GQcj)z9@`xV*Xt2Zq2^U^YZplySTBCJ$3D{uuL*}k+F14(bKu(au2)+Qg4%|zHN{h&0R7mpl#qP~7LmS%<a<J&zLoAPxER>-V0qe?@nKaEY3uM~`TG;xvX&WcI!TG2zh6LXVK?)^eXPTnyyl}nylmeW{xy7O3XCtwC8ZP$pt2Yh!X@q@h*d6S_SN5mErjPA&kJn&DM;xrTbNEO0}1SnV(rnsq-jBjKhO4`nLtlJ;wVXNIX^1>s|W+rj5nU2pUDSZJkMbdLg+@H72Pfx<yBdOpUGnnj#PBwWyvjLJCyKU#42Ok^IbaM$J4$7ocaQ=y+S8yCT>QCTxnS=m5t9dKtMILsr?YToJF~-P=L>;1U$;ELR>;6r%$AA^7e}qZd$FaY9jCH~5Ms<M_&`lBlP8No)J+KPjUdV}Md?j+_K~CJCFZ!hZA+#RIlfGKO-8u#51MEEDDl(aDaxB}7-$=%roI)#u3mUqF)4ZcUDMc9i)4#lj)_W#Ww77O(ntb(U*>`y4{kf5BcCQCE#>aLIY*5z`8hVC1jh9Gn`)sA|oa&S_P&5hIkqH(b&PFbQ-RK=9Bzd5FV%16$@;oVcq{C5N^;u8O_n7~xYgDvrlTw{-6>}Mipimz8*0kcKCDl|V@P~b|*<pe_?<OGq@f)FoI0%yuY=i-W2ZZJ@qxno@r`NreUk>5YAoLUKuGKziTJU=@Tk(05tk=ALXx{O5IQp&Q7MM146ohr%jpx=%O-`$#cW%MsKN_Bz(7bImNRx^q_Z6X3WBl|Q<!?O?ZMI$?FcpqmmOjf@WOz8tcvm$*>^)0vZfq@qFld8odB>C=7%>;<|CX<cV}^oly!F{o#cn&vDk?6Ew*9kKSRzB!g+lyu^JrL^DXOW6zzKfXbSI<f2le}19hECM;y8+TNeGwQL&b8)Wod9ZwF7vIK*!uXSgK(t=DIv$>${@k(~q_4|E_O15LObrWOx=|2mRrGiHU8Zu7tYW>+m)7Wd@X3^IOSs+H3u38AnhlIXYtUmxQU7jl0_T^dq=WSNvi5TDG<5V;igxQoGP`gJ|Q)_sYU*CoKQ2{81m}Ed|ZFCQ$F&CG>?dviO8<^)ZH|N+n;jn_hJ|FGzt2K5GB}(wjD4xCf#7Qe&8ot-<H-;(#Se&z7-|`*lbz*}{Xpn{Kj}9NdI`ANLhrD_n^NTNwh)po;gNZN@k*O6Z_s5^;tFLBVA-!<qsK^xeGdPd*>00i`OdVf$tI`x;(pT4|i_eS2hU=mj$a(;;;wg|ObT$vcYe@hi2eCVM!if^6-ZEu}vhAy0Q{grB&z7w_uL(RcqGbJ(eN?X$gsA0jd%wzP_+1DmKXe^8nH1q{ttj5-t`;W6!A;wHJrgu;^4V2Lf=49o{C8o4-tgWJ<QpJf=~5$o5O)Aj#U<)2}`tb`jTkP+pELLDf1A7-#vFu7z}IIibMV)?!Qv5D5yiSOr&>mTBG@*^>($`3LN+JcztTvX*UHe|2o3D3fYpB#Vrz<3+`c+rdTDxKbIWjP;&yt#bhx84p&!Dgo6-uIlHrPLBV1rL&FK^JQtZfOI1wo>H(T=>E08dRNx#kBbEtl!y?C<;v9Y2WfHc7J$w;i4r!)!<mN?ZQYQk$KqAI<#M{LNe(go2shf3LLG7h11*+>i}*GrH@^fQB^E`hOAyty>scml{YD`{521YvTSc9!_=%LWRCWM?bt6f!m*2nuHD}Ja(3-<<4s3k0q8Wf)ZmG~O;+W{&08UspPOzH^BYX79k}qMj#J2rsQebXe_8q{2M_9Jr!#64-A%~I`E4pBLEWMv3p1jSn}Z3q-4J!FXUA{T_lTS)!k1oZ_=b)8-eVrM_<|V`V~<MQUfkJ>2OU|yfBp22@@RR|zj3laOo)D~7-%b0`1aYg?aZ_rHTiRm9sRp^H14%FXQnJy$Cn>g68Q-8jHioCw&u~b!i;9%Rr-+kjdlwH8+-%Ir%b%j@_*J=xRDE@1;1zu@f8MWnPGB~=+eDW;2_)x4|%lJFpd(omN^B<YQ)&q+vvFxqrDm2rxsun_zBV01L_M~Q?VaeuYR1RB9Y~X(>KnMb1QAZmzZuI&4qF1&U#UF&~;py#I)5le1-{oX5Fz9OWd_w?v0UK<^(#`FLU9Z@(ip;j%tF?0Grl}Wke#rv&CwxJdur#XkJVU*l`JP^!<8Dx228sinei1J&X8FTH`B4g7<vDE|td?E3Z6;1l_UlzO(d;3b-Hd5Ul2jSIJyPhz;PVXOdvytIZvgqN=)*-6p}Z-}Pw!K$um!ND=|=!=x}dst^IDQzn^@C_d(r+?x!&%V_ijuR&a`L-)|i3k^*~bdx5Yen7M@9I5zN)$Lg*s{p$D^~sQh&mpjgi2=7uT)2#-r1~YYPZDYQy*y0%<$>U^06;9M&VJx`-SWtl+tYBO;rJ-VFhj~&nGhb(>VFC%y&>hQ84Io7I1l7utH)3#EeeH|Xk%F`R*`P>!=N&M13ZSic-WjhYub4pXAIVtUWz1DbNTN`2vXr9?`4e&TK-^j<ouI<$yC>t?Id{Q<slX@J#uPshI7$|_d>c1JIRfP;7}CVemese)*ku{poobbY;P9oBqoW1o(5JpQ%ypjOFmq)nKg*syU1Wd<-`vRP2)lqxoAVtl?qiBBk%8($=nx+Fn!NBR-jO5eIiAm8t0k)J%e5a3G%jUyvg?Ti;@@UACz|sz`y2~!4$(5@hPNzmxPekuj*K1IgKoCe3WO|M{j~ir}po!oDw=ucPEcbOa#Y+O*gTAx?3+XQPcrCV>s{DnJK7(KTDb{-J4NrESZ%O4~O`T(lp4Sq*=(BW4aK&zATGwVnf(N-_V&8)k_WYiB)s^pBg|c0Ly={153P+zI({r4R27CA|eS;nhW&Yl2)>P0mc3?;6+)=dr&J71?+Ef+FFwICQ?}rX_1>#$@5dPb*Gl)fe#(hHTPIQBHu{#sGD{a7(j}Bvr*`nbYG2N$-|#t9v@h_bMs~#h_tJ+sIn942jTodk=9r(MiUQ%Jg$>fL9=X>$Ba%}RHO-B+l!HEis~SsTl~S`O41I73h&+Fv(2HUy{sviT*Nvvpmpm*#NdsDPBr=-bG)L9T+s&iR~v0XWLT_oVfK{GDydj7`W(nq<qi1znV_?v>GJ(rU_dF=69%hU{oSosZV~)|Kov~mXAeXqGYbPtPX;LWjxS3q?cF~xGI%)a;$`pw8lj`GsV|aFM$q_1&>e*98&NtL#+9RVgu+c0xiIL&QL_e~k)NuZ?Y_QsPfqV^5VjL>t_POY@^uR@NhEmZFq*z9_FaH!GAk8tXX*5k%%$HN&T2iU0|_3a<tKZ$Dak0tiTy_3+)-aMONE~ACW3O4E`Fb%I98jUTHc@}as|gI;z_h%<a{qJ;zU%GLDU_9>jb6T0$Lt|FL_TA79IIg6D)Hqy&J|U^<;w#9sJM9XFG|3Mz=cVMgqLXeAda=J`%fCDc>2qyx@9iIvB8f%~*#E)UL<sxcgpfK+cWEs83EAb(s&;5^zZfMnZ_^2pm%2727oXzDsEZd#cSH;JwK#FKF5d#5@B*lgnzX41?j7|M+I_=OF$mQXCBF@Wj>R1Jw30H^Wu4s6D(K$}nf#`rt++wk=_CN=UJ{i<f=90TrHx^c5$CY!S=4za|Txyx?<n+@%L(ca_SDLH`$vjU)rq)zE%`CFN%OId5fC)K`XI+3?m3ewEVPywQ_+KdMJY93xn4HddK2f|ZzdyH+>D%S(869(|c(47!yUf|W$n>0O-`UXi=(skUdS-u5jw#MF3@Du#0XjbG5Tp{G4RN!`wxm{NZV)m)ag>T*>W4q!Vx*y=4wX=K2F4Oy@D`I^9BIO0fe_GWOpgmI|Dim}<{a$JjJT?>d3`%9Kf_wXTV(lV9uB&)lixxi{ZSVX$Oc)oI&h&HQ0YsAcyUI7#Ho=~+K0*~{%u)k|6g)O68pAe00A<0486MkeH>bkPRo@1CbWe0MI0wK22;hQEG*v8n+#AAfSwD3`V7tAz_k#B3#Hl^mCO<_y8I8*>9)gxeP19Fq5G&V=fBrUg$#D=exODNSe`4b<7nj*lJO*=#DU&>5ifqL$*qQa@P_)CrBsgd0z8QO4wzJA>PnEkau>jdB`CnY!Cio*}+x`AWk4MQVBg+hez^w0rHcKl~b%eJ98Mv-FA`gQVzu#!tR#}>!DP3XGs49#<E{{D8vu2QD$Hc(lzJ~!!~Sn8R=ONt!hj#E##R{+Ei!JbO~4LaR<HO903OfC~gSW4f;$CA_$2=&1t;luHx_aNn>-P=%34vw>n)+*RZbdB5A<jcfLwOBA`ExY5PXN>gSCUOA7T~^l&-nY?U@6E-G;w)cz!mK1)vD<RIgRA@V^uTe)7|%~{&Mgb!H6U_kZ0kNy$_6-FL8s`<0H%T@lPOE94@h5J$J+~<KnnGYxb|0(hOL{jLTcfL6^MF5SonOA&+GJPxb4~d?c_Byr%xZa$oi2i54#k3&6=WT{)dC5{x^6hTZ*j*z7u~?q8!;glr+!3XBN`)e_E55ZYoYiEIQSr0~VoN4)0pdvkU+21>&{`nC;`TI<H^*@=98^WI)QrhNB9{$eRRW6}Bn>00000%8eDgL`r;m00Hr}0p-I5DV&r-vBYQl0ssI200dcD")).decode("utf-8"))
+    for _e28n, _e28h in E28_MOD_SHAS.items():
+        if hashlib.sha256(E28_SRC[_e28n].encode("utf-8")).hexdigest() != _e28h:
+            raise RuntimeError("E28_EMBED_SHA_MISMATCH: " + _e28n)
+    exec(compile(E28_SRC["e28w4_lib.py"], "e28w4_lib.py", "exec"), globals())
+except Exception as _e28_e:
+    E28_LOAD_ERROR = repr(_e28_e)[:600]
+    print("!!!!!!!!!! E28 W4 LOAD FAILED: " + E28_LOAD_ERROR + " -> no E28 read-back !!!!!!!!!!", flush=True)
+
+    def e28_readback(trec, s, stage):
+        trec.setdefault("e28_readback", {})[stage] = {"error": "E28_LOAD_FAILED"}
+
+    def e28_summary():
+        return {"error": "E28_LOAD_FAILED", "why": E28_LOAD_ERROR}
+
+    def e28_sched_report(path=None, sampler_path=None):
+        return {"error": "E28_LOAD_FAILED", "why": E28_LOAD_ERROR}
+
+    def e28_i8_gate(log_text, want="int8"):
+        return False, {"label": "E28_LOAD_FAILED", "verdict": "I8_READBACK_UNVERIFIED"}
+
+
+# ==================================================================== CELL 3 — E12: Duck package (verbatim) + ARC-2 adapter
+# Tufa Labs' Duck harness as forked by Daniel Franzen (da-fr/arc-agi-3-solution @ 10882e332d, Apache-2.0,
+# LICENSE + NOTICE inside). E15B: inference/agent/tool_agent.py (yield after the batch, ARC3_YIELD_AFTER_BATCH) and
+# python_tool_sandbox.py (sys shim / time / import messages, ARC2_SANDBOX_SYS_SHIM) carry two switched-off-by-default
+# patches (Exp 15 src/duck_b); the other 18 files are byte-identical to that commit (sha256 manifest below);
+# arc2_duck.py is the only new code (ARC-2 prompt, prelude with check/submit, host re-verification, driver, selection).
+import base64 as _b64, io as _io, logging as _logging
+E12_DIR = Path(os.environ.get("E12_DIR", "/tmp/e12_duck"))
+_E12_ZIP_BYTES = q27x_payload("q27x_e15b_duck_9e4b89285136.bin", "9e4b89285136616d523028ac042dcca6afe82175081a1481d584c998ab3ee566")   # Notes/21: payload dataset
+# E15B #17: the sandbox self-test task (identity on every pair): fixed, so an unusual first hidden task cannot fail it
+E15B_SELFTEST_TASK = {"train": [{"input": [[1, 0], [0, 2]], "output": [[1, 0], [0, 2]]},
+                                {"input": [[3, 3, 0]], "output": [[3, 3, 0]]}], "test": [{"input": [[4]]}]}
+_E12_MANIFEST = {
+"arc2_duck.py": "b9f67010237becf9a0c2631e14f48acd97f5883b4ef357c93becf4fa16543128",
+"vendor/LICENSE": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+"vendor/NOTICE.txt": "1e2b756570ed5a6d85d06e61e458021c1221a5f72ad33165ea29bb85b9053cf1",
+"vendor/inference/__init__.py": "d92fed573b404870f7c6a1cef8f3e5d696195e2886e9e9183485c304fe5090f8",
+"vendor/inference/agent/__init__.py": "8c561093771390b6f64fc0e87186982cd04045e8b6a2cf8d7f17e494762b4385",
+"vendor/inference/agent/action_names.py": "8dd40e957046977e811eb2c2eb13fce905dbecf77f8dc7f846540f4d48af963d",
+"vendor/inference/agent/noop_repeat_guard.py": "e9172d58687e9043c3445f87e11bdf74c4104d8b0bed5fb6b54745a6aa58655a",
+"vendor/inference/agent/priority_pace_reference.json": "f29c16e336aef6b0dbf73ec056f554bd5192ac02f8deeda70ad152ef1214d0ab",
+"vendor/inference/agent/priority_scheduler.py": "3a13659001458ea1a45ee3a812babe1b0012409eeabb23d681395796941b8e94",
+"vendor/inference/agent/prompts.py": "14965a99bc55a61dad59fb79038f56c0ba1d1368350c8487b5a7b9edef0488ac",
+"vendor/inference/agent/python_tool_sandbox.py": "d29d807eef107a2d9aa60354dc370782739e2b9604a8247f89279ee10ae0bf3c",
+"vendor/inference/agent/runtime_state.py": "b5c55d561a63e2dcf0422ee7fd339923a9fb909c779302bbf02b8ea49ccc607f",
+"vendor/inference/agent/tool_agent.py": "f7454201484f2416b9c9a7d3a365bc048901e4a384a00ce1e1a2e6ec458c7b4c",
+"vendor/inference/agent/vision_context.py": "51d54a7aa9f1cd8e41b3fcc00ffd1a9cd1ada6fcde261d09faa49561fd843466",
+"vendor/inference/utils/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+"vendor/inference/utils/animation.py": "6c14b613b3a7c66ce3373162d6faa1469a1ddb3ca4ab882299998c5cf14add96",
+"vendor/inference/utils/frame_diff.py": "6ac3112773ffa6b1562b1e8f35a8018bd0dec9de7a78b12e7b13c529d4f46af8",
+"vendor/inference/utils/grid_utils.py": "1e43809c9a4a463c65f897c48abb8e6cf4b28a32ac4ec32a07e9adcf06ab0c03",
+"vendor/inference/utils/openai_compat.py": "fea0a75081372769fd854997b99e7826b334dcc5966876f31f587d19ae961165",
+"vendor/inference/utils/retained_functions.py": "0d8b267cb387565c04d4977116020cc04d84ad9d9175d2bf4bc4613703cc5a01",
+"vendor/inference/utils/run_artifacts.py": "789d541b395043379c23f5b0b24044e50fadab02e7f86f64cdd54714f4cab339",
+"vendor/inference/utils/segmentation.py": "0d19669e5a36351e41a6b94b7c68f5b258829de78441a03a8749687c262b452c",
+"vendor/inference/utils/viewer_artifacts.py": "cb5043dab8f5294608cda3675408ced904b849ae4985829b4ffd2d84b8e5d807"
+}
+if E12_DIR.exists():
+    shutil.rmtree(E12_DIR)
+with zipfile.ZipFile(_io.BytesIO(_E12_ZIP_BYTES)) as _z:
+    _z.extractall(E12_DIR)
+_bad = [p for p, h in _E12_MANIFEST.items() if hashlib.sha256((E12_DIR / p).read_bytes()).hexdigest() != h]
+assert not _bad, ("E12 package hash mismatch", _bad)
+# ---- E28 W4 SCHED (Build/E28_SCHED_API.md section 2): the A -> B -> C scheduler patch on the extracted arc2_duck.py, right
+# after the manifest check (it verified the ORIGINAL payload) and before `import arc2_duck`: e28_sched_patch.apply_e28_sched
+# (pre sha, atomic write, post sha + marker + py_compile), then E28_SCHED=1 / E28_T1 / E28_B2_TOKENS / E28_B2_WINDOW in THIS
+# process (Duck reads them at call time; nothing goes to the server env). Any failure: arc2_duck.py back to the payload's
+# original bytes (manifest sha re-checked), a loud log line, E28_SCHED unset; then the COMMIT stops here (NO_GO_E28_SCHED, before
+# any boot: a commit without A / B / C would not measure it; = the K100 notebook) while the hidden RERUN falls back to NB6Q's
+# scheduler (two attempts per task, plain order: W11) so the submission is still written. Recorded in E28_SCHED_REC /
+# nb5_report.json. B2 request timeout: E28_B2_REQUEST_TIMEOUT = the profile's 9,000 s (user 2026-11-01). The B2 window = NB5_WINDOW.
+# A profile without e28_sched touches nothing.
+E28_SCHED_REC = {"state": "NOT_REQUESTED", "requested": bool(P.get("e28_sched"))}
+for _k in ("E28_SCHED", "E28_T1", "E28_B2_TOKENS", "E28_B2_WINDOW", "E28_B2_REQUEST_TIMEOUT"):
+    os.environ.pop(_k, None)                     # only this notebook's own decision below turns the scheduler on
+if P.get("e28_sched"):
+    try:
+        if "e28_sched_patch.py" not in (globals().get("E28_SRC") or {}):
+            raise RuntimeError("E28_SCHED_NOT_EMBEDDED: " + str(globals().get("E28_LOAD_ERROR")))
+        E28S = __import__("types").ModuleType("e28_sched_patch")
+        exec(compile(E28_SRC["e28_sched_patch.py"], "e28_sched_patch.py", "exec"), E28S.__dict__)
+        E28_SCHED_REC.update(E28S.apply_e28_sched(E12_DIR))
+        _ok, _why = E28S.verify_e28_sched(E12_DIR)
+        if not _ok:
+            raise RuntimeError("E28_SCHED_NOT_VERIFIED: " + _why)
+        _e28_env = dict(E28S.server_env(), E28_T1=str(NB5_ATTEMPT["b0"]), E28_B2_TOKENS=str(E28_B2_ATTEMPT),
+                        E28_B2_WINDOW=str(NB5_WINDOW))
+        if P.get("b2_request_timeout"):
+            _e28_env["E28_B2_REQUEST_TIMEOUT"] = str(int(P["b2_request_timeout"]))
+        if not E11_HARNESS and {k: v for k, v in _e28_env.items() if k != "E28_B2_REQUEST_TIMEOUT"} != E28S.server_env():
+            raise RuntimeError("E28_SCHED_ENV_MISMATCH: " + json.dumps({"notebook": _e28_env, "module": E28S.server_env()}))
+        os.environ.update(_e28_env)
+        E28_SCHED_REC.update(state="APPLIED", verify=_why, env=_e28_env, sched_sha=E28S.E28_SCHED_SHA,
+                             module_sha256=E28_MOD_SHAS.get("e28_sched_patch.py"))
+        print("E28 W4 SCHED: A -> B -> C scheduler APPLIED |", _why, "| env", json.dumps(_e28_env), flush=True)
+    except Exception as _e:
+        E28_SCHED_REC.update(state="FAILED", error=f"{type(_e).__name__}: {_e}"[:800])
+        for _k in ("E28_SCHED", "E28_T1", "E28_B2_TOKENS", "E28_B2_WINDOW", "E28_B2_REQUEST_TIMEOUT"):
+            os.environ.pop(_k, None)
+        try:                                     # the payload's original arc2_duck.py, manifest sha re-checked
+            with zipfile.ZipFile(_io.BytesIO(_E12_ZIP_BYTES)) as _z:
+                _z.extract("arc2_duck.py", E12_DIR)
+            for _pyc in (E12_DIR / "__pycache__").glob("arc2_duck.*.pyc"):
+                _pyc.unlink()
+            E28_SCHED_REC["restored"] = hashlib.sha256((E12_DIR / "arc2_duck.py").read_bytes()).hexdigest() == _E12_MANIFEST["arc2_duck.py"]
+        except Exception as _e2:
+            E28_SCHED_REC["restored"] = False
+            E28_SCHED_REC["restore_error"] = repr(_e2)[:300]
+        assert E28_SCHED_REC["restored"] is True, ("E28 SCHED: arc2_duck.py could not be restored", E28_SCHED_REC)
+        if not RERUN:                            # the commit: no run without the scheduler (lead 2026-11-01, = the K100 notebook)
+            print("!!!!!!!!!! E28 W4 SCHED FAILED: " + E28_SCHED_REC["error"] + " -> NO_GO_E28_SCHED (commit stops before any boot; "
+                  "CELL 0's fallback submission stays) !!!!!!!!!!", flush=True)
+            raise RuntimeError("NO_GO_E28_SCHED: " + E28_SCHED_REC["error"])
+        print("!!!!!!!!!! E28 W4 SCHED FAILED: " + E28_SCHED_REC["error"] + " -> hidden rerun: NB6Q's scheduler (original "
+              "arc2_duck.py restored) !!!!!!!!!!", flush=True)
+sys.path[:0] = [str(E12_DIR), str(E12_DIR / "vendor")]
+import arc2_duck as E12A
+# Duck reads its settings at import: set them first. The base URL is the engine cell's (same port); the stream count is
+# set again from the engine's concurrency before the gate is first used (read at call time).
+os.environ.update(E12A.duck_env(f"http://127.0.0.1:{int(os.environ.get('E11_PORT', 30000))}/v1", "pending", SGL_MAX_RUNNING))
+# E21: vLLM 0.19 / 0.32 read only message["reasoning"] of an assistant history message (vllm/entrypoints/chat_utils.py
+# 1512 in v0.19.0; vllm/renderers/chat_utils.py 2083 in v0.32.0); "reasoning_content" (DUCK_ENV, read by SGLang) would
+# be dropped from the prompt. E12-V run 2 sent "reasoning" and its prompts grew by the generated tokens (6,882 + 12,288
+# -> 19,215). Duck reads the key at call time (tool_agent._reasoning_history_keys).
+os.environ["ARC3_REASONING_HISTORY_KEY"] = "reasoning"
+_E12_TA, _E12_DP, _e12_run_sandboxed, _ = E12A._import_duck()
+# E21 rev 2 (VAL_api_D1 F1, verified in the vLLM source): vLLM 0.19 / 0.32 report finish_reason "tool_calls" whenever
+# the parser found a call, also for a reply cut at max_tokens (chat_completion/serving.py 0.19 L1550-1560, 0.32
+# L1099-1116); SGLang 0.5.21 kept "length", which arc2_duck's cut-call handling (rev 5 B6 / R5-2, the cut-code harvest,
+# the R6 "cut" opener) keys on. Restore "length" from the token count (Duck's package files stay byte-identical).
+_E21_CC_ORIG = _E12_TA.ToolAgent._chat_completion
+E21_LENGTH_RESTORED = {"n": 0}
+E21_CALL_WITH_CONTENT = {"n": 0}     # rev 2b (VAL_api_D1 F4): a tool call + visible text
+
+
+def _e21_chat_completion(self, messages, **kw):
+    res = _E21_CC_ORIG(self, messages, **kw)
+    try:
+        u = res.usage if isinstance(res.usage, dict) else {}
+        cap = kw.get("max_tokens")
+        cap = self._max_output_tokens if cap is None else cap
+        ct, pt = u.get("completion_tokens"), u.get("prompt_tokens")
+        _m = res.message if isinstance(res.message, dict) else {}
+        if _m.get("tool_calls") and str(_m.get("content") or "").strip():
+            E21_CALL_WITH_CONTENT["n"] += 1
+        if str(res.finish_reason or "") == "tool_calls" and cap and isinstance(ct, int):
+            lim = int(cap) if not isinstance(pt, int) else min(int(cap), E21_VLLM_MAX_MODEL_LEN - int(pt))   # 0.32 clamps
+            if ct >= lim:
+                res.finish_reason = "length"
+                E21_LENGTH_RESTORED["n"] += 1
+    except Exception:
+        pass
+    return res
+
+
+_E12_TA.ToolAgent._chat_completion = _e21_chat_completion
+E12_SANDBOX_LIMIT = E12A.install_sandbox_memory_limit(E12_SANDBOX_MEM_MB)   # rev 2: every sandbox child, before its code
+
+
+class _E12LevelCountFilter(_logging.Filter):   # Duck's per-game level-count warning has no ARC-2 meaning (priority uses 10)
+    def filter(self, record):
+        return "total level count unavailable" not in record.getMessage()
+
+
+_logging.getLogger(_E12_TA.__name__).addFilter(_E12LevelCountFilter())
+
+# sandbox self-test with our own scripted code (the engine cell runs only if it passes)
+_t = time.perf_counter()
+try:
+    _st_task = E15B_SELFTEST_TASK      # E15B #17 (code audit M4): a fixed task, never the first hidden task
+    _st = _e12_run_sandboxed(
+        code=E12A.task_prelude(_st_task) + "def _e12_ident(g):\n    return g\nres = check(_e12_ident, verbose=False)\nprint(len(res), sum(1 for r in res if 'ok' in r))",
+        timeout_seconds=30, initial_state={"current_frame": None, "history": [], "valid_actions": [], "last_action_call_result": {}},
+        action_handler=lambda a, stale_after=None: {"action_result": {}, "state": {}}, kept_functions=[], retain_imports=True)
+    _n = len(_st_task["train"])
+    E10_SANDBOX_SELFTEST = {"ok": (_st.get("stdout") or "").strip() == f"{_n} {_n}" and not _st.get("error"),
+                            "stdout": (_st.get("stdout") or "")[:200], "error": (_st.get("error") or "")[:500],
+                            "sec": round(time.perf_counter() - _t, 2), "python": sys.version.split()[0]}
+except Exception as _e:
+    E10_SANDBOX_SELFTEST = {"ok": False, "error": f"{type(_e).__name__}: {_e}"[:500]}
+# rev 2: memory limit evidence (reported; the run continues without it rather than not at all). The 5 GiB request is
+# made only after the read-back confirmed the limit, so it can never really allocate.
+_mem = {"limit": dict(E12_SANDBOX_LIMIT)}
+try:
+    _st_kw = dict(timeout_seconds=30, initial_state={"current_frame": None, "history": [], "valid_actions": [],
+                                                     "last_action_call_result": {}},
+                  action_handler=lambda a, stale_after=None: {"action_result": {}, "state": {}}, kept_functions=[],
+                  retain_imports=True)
+    if E12_SANDBOX_LIMIT.get("readback_ok"):
+        _big = _e12_run_sandboxed(code="x = bytearray(5 * 1024 ** 3)\nprint(len(x))", **_st_kw)
+        _small = _e12_run_sandboxed(code="x = bytearray(128 * 1024 ** 2)\nprint(len(x))", **_st_kw)
+        _mem.update(over_limit_rejected="MemoryError" in (_big.get("error") or ""),
+                    small_ok=(_small.get("stdout") or "").strip() == str(128 * 1024 ** 2))
+        _mem["ok"] = bool(_mem["over_limit_rejected"] and _mem["small_ok"])
+    else:
+        _mem["ok"] = False
+except Exception as _e:
+    _mem.update(ok=False, error=f"{type(_e).__name__}: {_e}"[:300])
+_mem["limit"] = dict(E12_SANDBOX_LIMIT)
+E10_SANDBOX_SELFTEST["memory_limit"] = _mem
+if E12_SANDBOX_MEM_MB > 0 and not _mem.get("ok"):
+    print("E12 WARNING: sandbox memory limit NOT verified:", json.dumps(_mem), flush=True)
+    if os.name == "posix":   # rev 3 (GPT re-audit): on Kaggle (Linux) never run model code without the limit
+        E10_SANDBOX_SELFTEST["ok"] = False
+        E10_SANDBOX_SELFTEST["error"] = "memory limit not verified (fail closed): " + json.dumps(_mem)[:300]
+        print("E12: solver disabled (fail closed); CELL 0 fallback submission stays", flush=True)
+CONFIG["e12"]["sandbox_selftest"] = E10_SANDBOX_SELFTEST
+if _E12_REV5:   # rev 5 R5-4: is B3 counting reasoning with the tokenizer (else a fallback ratio)? recorded, never fatal
+    CONFIG["e12"]["rev5_tokenizer"] = E12A.tokenizer_status()
+    print("E12 rev 5 reasoning tokenizer:", json.dumps(CONFIG["e12"]["rev5_tokenizer"]), flush=True)
+print("E12 package OK:", len(_E12_MANIFEST), "files | sandbox self-test:", json.dumps(E10_SANDBOX_SELFTEST), flush=True)
+
+
+# ==================================================================== NB5 (E25): commit-turn variant C, request trace, admission
+# _E21_CC_ORIG is the name E21's wrapper (installed above as ToolAgent._chat_completion) calls: NB5 rebinds it to a
+# dispatcher, so E21's finish_reason restore stays around BOTH paths. A commit request (E15B #48: after the commit text)
+# goes as variant C (CONFIG nb5 commit mode; 'split' = a stable (task, branch) hash, the paired SMOKE comparison).
+_NB5_CC_BASE = _E21_CC_ORIG                      # Duck's own ToolAgent._chat_completion
+NB5_GUARD = {"requests": 0, "tokenized": 0, "estimated": 0, "clamps": 0, "clamped_tokens": 0, "floor_events": 0,
+             "events": [], "tokenize_retries": 0, "local_tokenizer": 0, "no_request": {}, "estimates": []}
+NB5_LOCAL_TOK = {"verified": False, "why": "not loaded yet"}     # A-14: set in CELL 8 from RC2's pinned-hash check
+NB5_LOCAL_MARGIN = 256                           # A-14: + tokens on a local count (the server render is the reference)
+
+
+class NB5NoRequest(Exception):
+    """A request that must not be sent (A-13 / A-14 / C-7); carries the attempt verdict."""
+    def __init__(self, verdict, info=None):
+        super().__init__(verdict)
+        self.verdict, self.info = verdict, info or {}
+
+
+def _nb5_peak_len(self):
+    """C-9: the attempt's own projected peak tokens min(131072, prompt_allow + budget + tool_allow) (CELL 5 capacity)."""
+    _e28p = getattr(self, "_e28_plan", None)         # E28 SCHED N1: the attempt's own plan budget (B2 = 120k)
+    pk = ((NB5_PROMPT_ALLOW + int(_e28p["budget"]) + NB5_TOOL_ALLOW) if _e28p
+          else NB5_BLOCKS.get("peak_b0" if int(getattr(self, "arc2_branch", 0) or 0) == 0 else "peak_b1"))
+    return int(min(MAX_LEN, pk)) if pk else MAX_LEN
+
+
+def _nb5_guard(self, messages, kw):
+    """Revision 3 + A-13 / A-14 / C-9, on EVERY request (first turn and every tool turn): the server's own render length
+    (/tokenize, 2 retries; + 2 for variant C's longer tail); if /tokenize still fails, the LOCAL Flash-Next tokenizer +
+    template only when their pinned hashes were verified at load (+ NB5_LOCAL_MARGIN), else NO request
+    (INCONCLUSIVE_CONTEXT_LENGTH); every estimate is recorded. max_tokens <= the attempt's projected peak (C-9: so the
+    reservation is a true upper bound) - prompt - margin; no room -> NO request (CONTEXT_EXHAUSTED, A-13). The 60k
+    thinking floor (nb5_lib.context_guard): an attempt that can no longer reach it ends its thinking path through Duck's
+    own budget-exhaustion route."""
+    ids, how, tries = None, None, []
+    payload = NB5L.chat_payload(_E12_TA, self, messages, kw)
+    for _k in range(3):                              # A-14: /tokenize + 2 retries
+        try:
+            ids = NB5L.tokenize_chat(SGL_URL + "/v1", payload, timeout=120)
+            how = "tokenize"
+            break
+        except Exception as _e:
+            tries.append(f"{type(_e).__name__}: {_e}"[:160])
+            if _k < 2:
+                NB5_GUARD["tokenize_retries"] += 1
+                time.sleep(0.25 * (_k + 1))
+    NB5_GUARD["requests"] += 1
+    est = None
+    if ids is not None:
+        plen = len(ids) + 2
+        NB5_GUARD["tokenized"] += 1
+    else:
+        try:
+            est = int(self._estimate_request_input_tokens(messages, tools=kw.get("tools")))
+        except Exception:
+            est = None
+        local = None
+        if NB5_LOCAL_TOK.get("verified"):
+            try:
+                local = len(NB5L.local_chat_ids(payload, NB5_LOCAL_TOK["hf"], NB5_LOCAL_TOK["template"], NB5_LOCAL_TOK["encode"],
+                                                NB5_LOCAL_TOK.get("default_kwargs")))
+            except Exception as _e:
+                tries.append(f"local render: {type(_e).__name__}: {_e}"[:160])
+        NB5_GUARD["estimated"] += 1
+        if len(NB5_GUARD["estimates"]) < 500:
+            NB5_GUARD["estimates"].append({"task": self.arc2_task_id, "branch": self.arc2_branch, "duck_estimate": est,
+                                           "local_tokens": local, "verified": bool(NB5_LOCAL_TOK.get("verified")),
+                                           "tries": tries, "t": round(time.time(), 1)})
+        if local is None:
+            raise NB5NoRequest("INCONCLUSIVE_CONTEXT_LENGTH", {"tries": tries, "duck_estimate": est,
+                                                               "local_why": NB5_LOCAL_TOK.get("why")})
+        plen, how = local + 2 + NB5_LOCAL_MARGIN, "local_tokenizer"
+        NB5_GUARD["local_tokenizer"] += 1
+    req = int(kw.get("max_tokens") or self._max_output_tokens)
+    inc = bool(getattr(self, "_arc2_b", False) and self._arc2_b_in_commit()) or NB5L.is_commit(self)
+    g = NB5L.context_guard(plen, req, int(self.generated_tokens), int(getattr(self, "_arc2_b_budget", 10 ** 9)),
+                           int(getattr(self, "_arc2_b_reserve", NB5_RESERVE)), inc, _nb5_peak_len(self), NB5_THINK_FLOOR,
+                           NB5_CTX_MARGIN)
+    g["how"] = how
+    if g["no_room"]:
+        raise NB5NoRequest("CONTEXT_EXHAUSTED", dict(g, task=self.arc2_task_id, branch=self.arc2_branch))
+    if g["clamped"]:
+        kw["max_tokens"] = g["cap"]
+        NB5_GUARD["clamps"] += 1
+        NB5_GUARD["clamped_tokens"] += g["requested"] - g["cap"]
+    if g["floor_event"]:
+        NB5_GUARD["floor_events"] += 1
+        self._arc2_b_budget = g["new_budget"]          # Duck's own route: last thinking request, then the commit turn
+        self._nb5_budget_limited = True                # the attempt's verdict (record + report): BUDGET_LIMITED
+    if (g["clamped"] or g["floor_event"]) and len(NB5_GUARD["events"]) < 500:
+        NB5_GUARD["events"].append(dict(g, task=self.arc2_task_id, branch=self.arc2_branch, generated=int(self.generated_tokens),
+                                        t=round(time.time(), 1)))
+    return (ids if how == "tokenize" else None), g
+
+
+def _nb5_no_request(self, verdict, info):
+    """The request is NOT sent. The attempt ends through Duck's own route without a request: its budget is set to what it
+    generated and the commit flag is raised, so Duck's done_now() is true at the next should_stop() check (Duck checks it
+    before every request); the session cap follows. A synthetic empty reply (0 tokens) goes back to Duck. The verdict is
+    the attempt's record verdict; the tracer counts it apart from the requests."""
+    NB5_GUARD["no_request"][verdict] = NB5_GUARD["no_request"].get(verdict, 0) + 1
+    self._nb5_verdict = getattr(self, "_nb5_verdict", None) or verdict
+    self._nb5_budget_limited = True
+    n = getattr(self, "_nb5_no_request_n", 0) + 1
+    self._nb5_no_request_n = n
+    try:
+        self._arc2_b_budget = int(self.generated_tokens)
+        self._arc2_b_commit_sent = True
+        s_ = NB5_ACTIVE.get((self.arc2_task_id, self.arc2_branch))
+        if s_ is not None:
+            s_.max_generated_tokens = max(1, int(self.generated_tokens))
+    except Exception:
+        pass
+    try:
+        NB5_TRACE.note_no_request(self, verdict, info)
+    except Exception:
+        pass
+    if n > 3:                                        # never a silent loop: the attempt ends through Duck's failure path
+        raise RuntimeError(f"nb5: {verdict}: no request sent ({n} times)")
+    return _E12_TA._ChatCompletionResult(message={"role": "assistant", "content": "", "reasoning": None}, finish_reason="stop",
+                                         usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                                         served_by="nb5_no_request")
+
+
+NB5_TRACE = NB5L.Tracer()
+NB5_C = {"enabled": True, "mode": "C", "n": 0, "probe": None}
+NB5_TAILS = None                                 # (TAIL_A, TAIL_C) from the Flash-Next tokenizer (CELL 5)
+NB5_RES = None                                   # the phase's Reservation (CELL 5)
+NB5_BLOCKS = {"b0": None, "b1": None, "start": None, "f": None, "block": 4096, "peak_b0": None, "peak_b1": None}
+NB5_ACTIVE = {}                                  # (task, branch) -> the running BranchSession (SMOKE early exit)
+NB5_EARLY = {"armed": False, "fired": None}
+NB5_POOL_CAP = {"blocks": None}                  # 'slots' (R2): the boot's gate x pool, for the C-7 check
+
+
+def _nb5_cc(self, messages, **kw):
+    t0, res, err, info, kind = time.time(), None, None, None, "chat"
+    try:
+        _ids, _g = _nb5_guard(self, messages, kw)
+    except NB5NoRequest as _nr:
+        return _nb5_no_request(self, _nr.verdict, _nr.info)
+    NB5_TRACE.enter()
+    try:
+        info = {"guard": _g}
+        if NB5L.is_commit(self):
+            v = NB5L.commit_variant(NB5_C["mode"], self)
+            kind = "commit_A"
+            try:
+                NB5_TRACE.keep_commit_sample(v, NB5L.chat_payload(_E12_TA, self, messages, kw), self)
+            except Exception:
+                pass
+            if v == "C" and NB5_C["enabled"] and NB5_TAILS:
+                NB5_C["n"] += 1
+                res, info = NB5L.commit_c_call(_E12_TA, self, messages, kw, SGL_URL + "/v1", NB5_TAILS[0], NB5_TAILS[1],
+                                               kw.get("request_timeout_seconds") or self._timeout, NB5_C["n"], ids=_ids)
+                info["guard"] = _g
+                kind = "commit_C" if res is not None else "commit_A_fallback"
+        if res is None:
+            res = _NB5_CC_BASE(self, messages, **kw)
+        return res
+    except BaseException as _e:
+        err = _e
+        raise
+    finally:
+        NB5_TRACE.exit()
+        try:
+            NB5_TRACE.record(self, kind, kw, res, t0, time.time(), error=err, info=info, messages=messages)
+            if NB5_ADMIT_MODE == "live" and NB5_RES is not None and res is not None:
+                _u = res.usage if isinstance(res.usage, dict) else {}
+                _ctx = int(_u.get("prompt_tokens") or 0) + int(_u.get("completion_tokens") or 0)
+                NB5_RES.update((self.arc2_task_id, self.arc2_branch),
+                               NB5L.cdiv(max(1, _ctx), NB5_BLOCKS["block"]) + NB5_BLOCKS["f"])
+        except Exception:
+            pass
+
+
+_E21_CC_ORIG = _nb5_cc
+_NB5_RUN0 = E12A.BranchSession.run
+
+
+def _nb5_session_run(self, pause_at_tokens=None, tag=None):
+    """C2: an attempt starts only when its projected peak blocks fit the reservation (deadline = the solve end minus
+    the min-admit time); running attempts are never touched; the blocks are released when the attempt's run ends.
+    C-7: a projected need above the whole capacity never starts (KV_NEED_ABOVE_POOL, no request). 'slots' (R2): the
+    engine schedules; the reservation only caps the attempts in flight at `workers` (1 slot each), C-7 checks the
+    projected blocks against NB5_POOL_CAP (the boot's gate x pool)."""
+    res = NB5_RES
+    if res is None or self.status == "done":
+        return _NB5_RUN0(self, pause_at_tokens=pause_at_tokens, tag=tag)
+    key = (self.task_id, self.branch)
+    if NB5_EARLY.get("fired"):                     # PLAN v3.6: SMOKE passed its gates -> no new attempt
+        self.status = "done"
+        self.record.update(note="nb5: SMOKE early exit (gates passed)", nb5_reservation="early_exit")
+        self.write()
+        return self.status
+    slots = NB5_ADMIT_MODE == "slots"
+    _e28p = getattr(self, "e28_plan", None)          # E28 SCHED N2: an E28 attempt reserves its own projected peak
+    need = (int(NB5L.cdiv(min(MAX_LEN, NB5_PROMPT_ALLOW + int(_e28p["budget"]) + NB5_TOOL_ALLOW), NB5_BLOCKS["block"])
+                + int(NB5_BLOCKS["f"] or 0)) if (_e28p and NB5_ADMIT_MODE != "live" and NB5_BLOCKS.get("f") is not None)
+            else int(NB5_BLOCKS["b0" if self.branch == 0 else "b1"] or 1) if NB5_ADMIT_MODE != "live"
+            else int(NB5_BLOCKS["start"] or 1))
+    if (need > int(NB5_POOL_CAP["blocks"] or 0)) if slots else res.above_pool(need):
+        self.status = "done"
+        self.record.update(note="nb5: KV_NEED_ABOVE_POOL (projected need above the whole pool)", nb5_reservation="denied",
+                           nb5_verdict="KV_NEED_ABOVE_POOL")
+        self.write()
+        return self.status
+    if not res.acquire(key, 1 if slots else need, self.deadline - float(E12_R6["E12_R6_MIN_ADMIT_SEC"])):
+        self.status = "done"
+        self.record.update(note="nb5: no KV reservation before the admit deadline", nb5_reservation="denied")
+        self.write()
+        return self.status
+    self.record["nb5_reservation"] = {"blocks": need, "slots": slots, "used_after_grant": res.used}
+    NB5_ACTIVE[key] = self
+    try:
+        return _NB5_RUN0(self, pause_at_tokens=pause_at_tokens, tag=tag)
+    finally:
+        NB5_ACTIVE.pop(key, None)
+        res.release(key)
+        _v = getattr(self.agent, "_nb5_verdict", None)
+        if _v:
+            self.record["nb5_verdict"] = _v                    # CONTEXT_EXHAUSTED / INCONCLUSIVE_CONTEXT_LENGTH / KV_...
+        elif getattr(self.agent, "_nb5_budget_limited", False):
+            self.record["nb5_verdict"] = "BUDGET_LIMITED"     # published by the scheduler right after this returns
+
+
+E12A.BranchSession.run = _nb5_session_run
+
+
+def _e28_try_reserve(key, plan):
+    """E28 SCHED N4: the scheduler's non-blocking fit check = a reservation taken NOW or refused NOW (never waits), so a
+    free worker can backfill a smaller attempt when the head (a B2) does not fit. The blocks are N2's; the
+    attempt's own acquire in _nb5_session_run then finds its key held. Same grant rules as NB5L.Reservation.acquire
+    (idle grant; live hold; C-7 = a need above the capacity is left to _nb5_session_run, which denies it)."""
+    res = NB5_RES
+    if res is None:
+        return True
+    if NB5_ADMIT_MODE == "slots":
+        need = 1
+    elif NB5_ADMIT_MODE == "live":
+        need = int(NB5_BLOCKS["start"] or 1)
+    elif NB5_BLOCKS.get("f") is not None:
+        need = int(NB5L.cdiv(min(MAX_LEN, NB5_PROMPT_ALLOW + int(plan["budget"]) + NB5_TOOL_ALLOW), NB5_BLOCKS["block"])
+                   + int(NB5_BLOCKS["f"] or 0))
+    else:
+        need = int(NB5_BLOCKS["b0" if int(plan.get("branch") or 0) == 0 else "b1"] or 1)
+    with res.cond:
+        if key in res.held:
+            return True
+        n = need + int(res.f_extra)
+        if n > res.cap:
+            return True
+        if res.held and (res.live_hold or res.used + n > res.cap):
+            return False
+        if not res.held:
+            res.stats["idle_grants"] += 1
+        res.held[key] = n
+        res.used += n
+        res.stats["grants"] += 1
+        res.stats["e28_try_grants"] = res.stats.get("e28_try_grants", 0) + 1
+        res.stats["max_used"] = max(res.stats["max_used"], res.used)
+        res.stats["max_held"] = max(res.stats["max_held"], len(res.held))
+        return True
+
+
+def _e28_release(key):
+    """E28 SCHED N4: frees a reservation taken by _e28_try_reserve (idempotent; the attempt's own finally also frees)."""
+    if NB5_RES is not None:
+        NB5_RES.release(key)
+
+
+E12A.E28_TRY_RESERVE, E12A.E28_RELEASE = _e28_try_reserve, _e28_release   # read by the E28 scheduler (E28_SCHED=1)
+print("NB5: commit dispatcher + request trace + reservation hook installed", flush=True)
+
+
+# E10: original task-order and evaluation profiles, but one Poetiq program per task/expert/iteration.
+if P['source']=='eval':
+    _ch=_load_json(ARC_ROOT/'arc-agi_evaluation_challenges.json')
+    _sol=_load_json(ARC_ROOT/'arc-agi_evaluation_solutions.json')
+    if P.get('task_list'):
+        assert all(t in _ch for t in P['task_list']), 'Evaluation task ID missing'
+        TASK_IDS=sorted(P['task_list'])
+    else:
+        TASK_IDS=sorted(random.Random(TASK_SAMPLE_SEED).sample(sorted(_ch),P['n_tasks']))
+    CHALLENGES={t:_ch[t] for t in TASK_IDS}
+    SOLUTIONS={t:_sol[t] for t in TASK_IDS}
+else:
+    CHALLENGES=dict(test_challenges)
+    TASK_IDS=sorted(CHALLENGES) # no Codex ordering
+    SOLUTIONS=None
+N_HIDDEN_UNITS=sum(len(t['test']) for t in test_challenges.values())
+print('E10 Poetiq:',len(TASK_IDS),'tasks,',sum(len(CHALLENGES[t]['test']) for t in TASK_IDS),
+      'queries | experts',POETIQ_NUM_EXPERTS,'iterations per expert',POETIQ_MAX_ITERATIONS)
+
+
+# ==================================================================== CELL 5 — NB5 engine: Merlin Flash-Next (RC2 FP8 boot path)
+# Verbatim donors (build_e25_nb5.py cuts and asserts them): RC2 builder (e23_lab, CELL 1 LAB load + inputs, CELL 2 to the
+# stock fallback, CELL 3 prompts, E23 step runner, kv_census / sampled_check / prefill_probe); E21 (metrics, stats
+# lines, counters, content / contract / cache probes). New: the NB5 glue at the end of this cell.
+import urllib.request as _urlreq, signal as _signal, statistics as _statistics
+import tarfile                                   # NB5-FATAL-1: RC2's merlin_install opens the Merlin payload tar
+MODE = "FULL"                                   # E23 step runner (NTOK 128); RC2's MODE
+FAKE = os.environ.get("E23_FAKE_SERVER") if E11_HARNESS else None
+T_START = time.time() - (time.perf_counter() - NOTEBOOK_T0)      # RC2's epoch clock on the Duck notebook's origin
+HARD_STOP_EPOCH = T_START + TOTAL_BUDGET_SEC                      # 11:50: the e23 watchdog kills every live server
+BUDGET = int(TOTAL_BUDGET_SEC)                                   # RC2's name (its input log line)
+MAX_LEN = 131072
+ENG_OUT = OUT / "engine"
+ENG_OUT.mkdir(parents=True, exist_ok=True)
+LOGS = ENG_OUT / "logs"
+LOGS.mkdir(exist_ok=True)
+TRACES = ENG_OUT / "traces"
+TRACES.mkdir(exist_ok=True)
+R = {"what": "E25 NB5 FN-Duck engine", "max_len": MAX_LEN, "setup": {}, "sections": {}, "errors": [], "order": []}
+_SAVE_LOCK = threading.Lock()
+
+
+def save():
+    with _SAVE_LOCK:
+        tmp = ENG_OUT / "nb5_engine.json.tmp"
+        tmp.write_text(json.dumps(R, indent=1, default=str))
+        tmp.replace(ENG_OUT / "nb5_engine.json")
+
+
+def left():
+    return HARD_STOP_EPOCH - time.time()
+
+
+def log(*a):
+    print(f"[{(time.time() - T_START) / 60:6.1f} min]", *a, flush=True)
+
+
+COMP = INP / "competitions" / "arc-prize-2026-arc-agi-2"
+ENGINE_READY = False; llm = None; engine = None; CONCURRENCY = 0; E11_SERVER = None; E12_VLLM_CONCURRENCY = 0
+ENGINE_INFO = {"backend": None}
+HELP = {}
+# ---- RC2 CELL 1: the lab module + every request traced (verbatim)
+LAB_SRC = (lambda _t: _t if __import__("hashlib").sha256(_t.encode()).hexdigest() == "ef393fbb2ff7669ee4c2c99ee841b60da66514a3b86b7c0ce81fd5f64689ab5e" else (_ for _ in ()).throw(RuntimeError("e23_lab: embedded source sha256 mismatch")))(__import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;K_bFNnHRDXbna~F$u0Pgj)JG27#5$Z?y(-4y`r~GNitw^S8-9YLUa|c(I<zlpY<#1Ng|!{;sE_(y@QAm{+XUC0$9Wo_B4PIC3RK!O+U5`<kC926s2nq?Cuejv$rZzjOYWPz;7sm6LeHL>>ku(i)C6zVWq&QZ3++F01hkKCjG3Y8Qr>u+$I?;|RzAz_a-*#*=T%cj*&N(f=+mO5{RzcHUwwXtH=6@r*#gO@*DKa(MoOAUs<xf9vRT?dRmlvaz0K`rv?kh@g!*yL6F-Ja$;&(Z%oqX~JE!VX^ld5QUSE*gCLD$b04(iit-UTcBL{IQ3l5aRaC7<-RR)cBN>$vI06t4@J!7PON?87C+1OQEa`Xe4@|HS->F*k)^on>Zx_ByK{buu+>$saj~O2fg2Cm@PI8w1Tt>}7#1=WTte>?bewTyEcssU4oWzrpT6sUZ4y)-C89dPUMvk|JGq`oKlPm<l@LJ9NAsnNpgVWO8#i)*p1?{i(%zFqP>h@%XCf$ebF}%~wUtM4HLJ|zZ)dWj*NnDzG3*%HqwrqwX2oc2H|{xcmmt<pNgzTLs_nfh$Aw_{Gfv8jKUw7!Qy!SsFMJzG)iL2c*j<*Bj4G>-cATvvR0yl8VOJVrH`d+0vgRzT#8QA)P#(L9iy7;1oyNXvk@7=lgXPq(fiSeKw|~thn)lr|R(I)q33SEMq4P~Xj*$r&Nf>>cJEX8YU+pYagqtbSWUHpm%GPQx;}$c=U)heFNl`MSsqaU284+ZuNRQZwXBFAVdjimY=EYI1<iuv5xep-WNIE-(qd%$>|89+iAX<uUY(?7wm-;*lr`ZbJe_q!It}{QvQlbsNsx3SJ@~g1+sjutCRNM`qzeV_D?|pLC8AcPxf>7}cZSRx~DdZI*Z%NO!`;o<3Y=d9XguJ&C_q#6yMwirL2L@L}QW&*oAPU+$d`SF#f=F?nJ;KcnhR&nrFEV9L*0^hS_oambm3rZq*pA4#-PV&+I{^DUh{mT)G}r@bbd%o-MnUTv5w;pDnAFPN5Ofn&gaL7GSZqxm@GP==7f}r3bXRK9rpQ`YB)t<cK+&S&oBFy{B4i5`grOo>yKT@PP>itj%Sb(@kO4gx-J+}k&9;@J#`R;7R&zO`T&)#AjW1Y3``zKf0wfnIv01x#+f{rMa)<$W&BJ1f*L_VkUmfJej9xZw{aewieJ=$bh!kG8iP${~jOVJs`wCsd^*w4O{iiDol)#s(OtQi4P8@Z_p{o5{_<wS&z4f2Rk4>3qlv_z)Xg5x$LOAK7{}tO>;|8f!AWi){?+9lxwd3Ua%GQPuE?wUN;?5;oHXG?;-V<CVwFJPpiv~<NRYDKEDtD}$Y?*axa;gB0#%%+_O?j8y<;@5Rde7G<x__0}oE?sb`qfXH4VoJ4C(lKTmh{mK4U1s@>#S<sW9k4=--gP(<3A+Bn`JD}>ay!~8rW*FNyoqfIWM<&2Hq)4Py|Eir4uqr;|j_vFW@2e#OLmD%$oOL5R5!Z1uwd`f)%4xNoDZ#vpezDD)Uup=HAJg>_;7<qW=18W-F1*%Of8OO(e;ZoTF<%**})bMDQF%AMp`)Rzx*6jaPg*1X1F#Gy%^$(^K9mA+=GG8|$t8I$R7?TQ%`ijcll=9wI4C?zavWu=h9}GB2kVXqm$rN=5*IlRL#L=lwz*vSB5)8S+uu_SO2goBZ4Wr6xze)iBC`Y|5JM4)yN=!Cx<m>CUSRh%y0`9<~e+5q^SEP{7vb-IHc*5P?kWkzkFBD}vt613H)T2YSpFIcxZrJ`<H+Jl^;LVkTb)bK$&OFKL<`m)knW0e*$5IX~$vjiFUkySY?dzscY~z5R-x>fAoe9b)^xK#3sQ2eH<F57nrrlRaLFG$N71k|rdNp~5Ie-%0|WI;@>1JisN%3r^kLR*jjkD7h=uhi=Xs*R^lr5PDq{wb6v^vKnz4gMUlkTQrTr=S2Lr5Qo~t|7{#tMh`9lqXYgn*k&!y?wDiKX!tSaaT{OCfEa`<GJd?ArEw`*vyQT~lxAR&n3pi${8z!j%I$urV8#q<)%)aU-|(IKShVmZvznf3#wRWkiif`|M>zb}WS%X%q*38Y^0<pf`wO6!3#Zmf3JLjN!4`oD^aY>9l*uK%7nDA7;F%s91M)pMp#-8KKFwTa6#4!HQ`h8z)<1j0r&DsxYX@>%2G+=eYnoj17<0CjDF`vjGMa?MQVdKGA<H&Uj_-a|<mdHx2@{UUa5EU1gbAGLUP2(hB3WoHQk+lXu!AWybN?|An+x^nBP*-gKqTi!-n)sBh~zH)6oeU?9Qzt~fxP|K&V?pDi$3EYFA|`2yZ3mn9h<!_-Es!%4)jpU#3Vg1E?-z)WRzTa#X~@mlidY=^EGW3X0HgE7U{1V)9hx`a+kw1`1!Mu>Y`o_M9MwKp~zOaNoHD@jNpj|fH*ScDCke>;7A+jo-sR5iFSqjuXWV#V!qs0<<*KJ3iMz_j|cu~+0TE$`Kv4f-q-0Hk$D0ux5;(>JFK!tCg<!1MA`FUXbA$A0O`vh5js1?hkfI?Y(q|!6ZMg-d^yb4J4JFwtfAI9@R3~goZ5nMVMC0cBYbp&RTA#pjm>HhQ+Y+p(*V+Qv`V^}nO=2N47>nIe;l$CQ&w-a2J;$|IVAvG4GJa@sh=}*EWw8;wwP!bP6gI@4hCLqJn++;(9yVL0);C-REaGVW>*S=&6$fQzIj+XeyUi4wLA%1tG(|JVONJT%(l_j723*r5TR%0%tc=1X2*0HBP8u5a8#S%iq&0hMizvp8V>t#h%OW|S-*4@R9tjx?>_2OtPAMBjDMD}=y|w<vkv$w$IuURamGvBXLOnImP2}!&T#Y)10er_NX-|^RS_6cvac+sD&P1@HS^!Vp6_>tWBwz|7MhffTCK|48Hz!ObuU8KcW2maa`XRd3Lc}#{af^kJk^4^m6TfFFA_Fd_QmQcDP>LnmocihCX?x4$^;re6SY}^LKdoy>q()ubWDk~`yd15wpOn0)h1q?mqa-=34aU6g5`-gun>1huM8EiHZgxdKlV1eGfY=c95(G94Zs7~X3n(^EmnJgD0vSNQ}CSBM{xeV+uG)IcH0AxmB)S2^VT||ELDo%s;x|`aW_g;9;Bi6p~&;^ij99OXj9I6?8ZFVcnJEFc&km~H3OOf{RR%Tpyo~h>y&%!P_%5fS~45&p-2Oa^B?1=#kpU*<BB;_FsWniNv4tzOEyaCXRBXxH&3(G<>9C6LbQ>kmQ*?K<t5X4H8)2=i^^CuR=}>h&k=1pVnUd|b?~cJj$%W%LH1{Aii8wyjIxQ>FaNhNpe&ytZSZ!h)S>#HXWaT5tu2RigG_V#XO2CSP2b)pmVz@0Ik|{7?VHl_IAVdEY(I_{GhC-J=%jmC+bZt*dRj{8`N;2AjhY+i+(svJ8;le8$#Hf$8xLOU9K6&c;<)LeoA#W?PDO+_dzkagRki<jEn9bEUrGa1Xqi%eG3oa7dU9>Z$NJdT)@(qq;o(}#J&GwwYm`R^r$$Dw_h)_uJJHgv^UwNGpkP6Y%e$gutnNcH;I8N03ZU(OHZ5>J_tHj>H;}||>Y@c!D+dA~O#BZSMg<1>@GyvL6WXck%=y!yS~#?*kYj{_FO=N-a7KwTB%#w;G^$zZ_-QSLlgtp86Cipp>OI9MC}J=(M3lsW6|($~2e#0jK*T7~5KAdDGkNNB>8vR6D?U3k5rBSwjx5rgJ2@zluB~I79AulhZdc_bw_FSuQC!;Na|oX7@S_E%mBpohG4GbL?3LPgUo(ke6IkOk4GUNGO}BKYmk~O#<>479Fyh1S5>E#^7@o(gVNwOQm9hnFL%X-WWKjgm^<PJWV(b5KM1(sMfr0xVnI99ct$xh0wS6F7ajbN;Enx`#{6j;wGRa1}^z+gW|8jIIK|2*inANVw@t(1EeJ(CmR5R-V!b?-dl%}2+)tQ$chy*W0&%y|2&5?j;pw==6+ATb*>CkZHWSyRjAjH*qr`I=$xG{!)3iOKMyxh9^YEEaBQJg}K`hD>+>ILHTD(;*(<VH5<LMO=x`mfr~5wQK*e)ji-jx{A6B+0&)P3Qua8F=)ADff>0dn6T@VMSF0Iznz3iQnLGa$#^m6tez)-pFVYx^AeZx*<l?`}xt7jGE%_(Ih5`FuqL1ci|6DpsjV0^#XdRn;#-mjj+AesK5*cwx45MW?Lr~r)aS&@b8zsV3!-tj27CekGv)?ss@b)(ZB^kF0yj!h~UHJyl}z>bOMbi&=y+}Q(Avj%c%i8Z4|sb5CX4@^JEf=1fd^0Wd<7Fv#(XT3U<lmlQ>t<CM3AGISf=roM|_x*$mwXDEf8OPzB*QaqH=Hnt0_rjVR<1uCD{5M%lkAIGP3tVn+UU-V|s7f07kwJ_4s6JuCU)#kp={>jr*{bP2tzl7-1f;(cB8ixjvm2bY23&Rk$GV`VvMgipxAAMZtTdz9H8*$@8@x>_!_H}~h*I~*xJILj|g5!`fUG*Bf^-=qc!4%*8BPd87}@$idnxAYe-jk+zmgFHPBGFn`7z6WhbwSUK0dpdl}5O?j5b&;J3?#~k{pA&8)|0K9f7Cmofs3@8e-})9iJfE6mQ?n_I#4t@mFI0vF8VBj7=QY8I?0`XXTXoGV_!;RX2>d<pf5$K?;4A_ZbUn)1DvoV02D8l_3@=K~j6(7O|B#A>J3l^YWYU{<xfT`ScJVwq@h@!pP<M=+y?08hWlU!e+fL2@tio)R)!CDKnReI&A9CyW|I}9O-NsKZOoth{M<c`u3seaOA-G>s7Ihx~bYcHEv+CQP6G<1O<<(Z1p)UWhPOEg4jbCp+)*7x2E#ieD`XfgkGBRzFra8fD)fe(~m8_T7{B&iBK!?c@2&?65qw#(SRVF%3R3~$scAxA@M6OlMLp;oS|Lv(X<-m{qoTS3n_S}3(DPdLL;DYs*DXq-dxP^{(h*88gVPafyW6kE~N03()BXO6wEygYMB7OW$jT$FD7h3`^Xm$qA5;<pP*;`6ieC`^D#p~euNgOXZ)uF_^eKIEy1dkS00rmR!^o9{F)b{R3r`#2cWj1|e3N@{g7?NFjxwhZ!{76cHa%M1_L;!U%eyn?`PKSqYOiit+mna+k${g)Ukwmx4;}{hZQpMQlNk3aj|J$L#<d_4nCMG*DS~oqJFh276ITDX&?Kp{<S>!EGiwDK?6_|Hvg)@FF)#BB90$%Gk<Jdha3sPsDN43Ds=~MG&JFnSpw(xg?@9x=HNW0TroYIGGxP(dn0U#S3VD!v5_q0WZ@hlAo?I~Wu-~o&7LG$KVjV+P;e?w;vEn-bNyqf*B<p<mJz5j-BHnylp#$G(eiST`3j;XjJpm+}e0&<XBR|Mb+*DtRGp^`=}D@iqlc_<hIXOEI#Ja5iS%?VbK%OvRIof+L$=nw&JB~ADxC^4<|*XJB+|6~ZidkJvqDL#woWN2f^aYaiesokhI!~Uqy;K!cE$kqytBI;R{av8T)R4A6xduK;GTyuFOob~8Ip(a);b9iZ>4yCG~nK)06PVNzw#9x=Q1UH2<YNf>He0No*07PlCyT$`EQ&!utV^FUK_+ig$2cPWa;XF38m<hVWHK+rI7-+10cE0Xq7Bvw>M&!hd&o@aCv`eqw$pZ5~OaOIQvEq^!;)R1>N3giNO5pRa%*vP`L_BkUa(j(OxF^p(B~I}~;x^~*m|ZjlO)rRtM7TH}!Uc^Az(u&}+!s~6qY``(5U-;xw_n=GnTQOlTwwhr*M|w&!XEPyt)<7)znrK3q~FA!&GP68uyQdA17M{%r+c+JbvV|r7mKsz;S+=+9MoABuFoVqy;X8$*TY?rE>rL#22f15pls#uwqJ6qDR;Z^JJitI3?^taXZTT3?}hfh6CUvwW@U<`gn<U&#hs)N;h(Mw?gc%5s`#Z>H7kL`8SGZsivXLr`$DIr-RCULbd{OMat1s%Ae5jWiOL(>`tEp4cS=EFrs6CiZ-E=9#gM6g{x;8mRy|$-H5^Iq6(eOl{Q8(b6`L-H$hciA*rj!DJ1!zD*!&U|tzk4rO8(pY#HG5(Af=X9uaXDmBaMC?Oxk3PMVk!$$-`yAf_j267T4nGoK8GWL$TncCq*JQ*c{VOpS#6|rTj|S;cbYq*9_~|5fsS8=m1OMfnln}>$9N%-{vVPgH!pK>w-o<l_2`zj$F_r2ZQHO{RHII?v1|I5D3JSr;<?ra;^L9-LFI(nJA;fI}m*`$J0m}D%|coZA-p+f1Jg)ioBFU4k$4#1@-p}%Bta4-?DQQ?=GMSnH|d}V*#w0e90^WA2)^c+0JnU@l-{s^33VZgqzkN#JBRQD5z?v-$@YA?z?JBus0h}gHz9)qFW3uw2`~15(RppFuCj9XZIQ<E`@4;8nk6rY+CA8lL)*paOp)&V=Hv~FZ^WXW?A8D0N?{M54e;M%?7oNXGJ1r0|iI)QuZ>h%rx8&Hrg`G46Zm!Q~{ROElO*P^A86UtFSWr=kIz2&iU<u;y^uJ`bnBhILN4(U}d}m7RpKFz={fL`jxKNS+)a5xjthG*Qh9NzB#+J+cH4x*#r1U!TK%)1_tO5P!oSeg1~mU6)>VVpdsmMazLD9WcHiD#b2hmvQ;`|XQS+#CHUDDnTTo_6agX11NExo*AMN=SfT63uq``cA;boP)NT(0c^nsUNAWY%)I-QkOq2T68f~<tF_;*gThh{8k#BLEhe6_FR${E*(zHMSUN|YmLEt7hugyI0Zp)*g+K}ZnjK+ljmYEH)p-rfZU7p4k4KTk`;u(iLGTjI57oy!(`%|tZ*^v{?V{uG6NzDXuqja!8DdIe)_U}1{n-h7(Q{aIf!sTwoY^|V<{MPi*KkgE`5srPrQ7$o7aCZ0Y-t^S3aSWnhS1Y!nk|Y~ay`n+tSr|*5V7w}D{j{sCtJq;^g!{#QM||N%mgt|MT@O8w4ruN%^iqoD&W}nRJNxL&RVY*mI-<v9!lP$_4U=ylK2>BR{cnwW&T!|mL*URKcq+c&o*DpC?i&+_@;Ng_lx;-L3vfY&6W5oWCm5k>d!_v`%Uf>}A-vPM?7xkZE<e69>?UCgeF*KN^r=F?d3UbGVhW{yeZfKBhQ;rz#EDM+w2&5!-m)4Coybx}uyH?!1vT(-2`He-n38Z&2Fr!sX8mRx8@UeHt!OS0X(j&|ME*>&O6VYTo7$sGtXW2vsA@!3m?&OZ(2og9?I+YW0)*j7qw~AE^=^q~z;tBf_GzzvO0o}IX7o?G@ro?JG82H4UeARHx`_;f(R&(F?73s+>*c)N&BJiWD=OPK4d`tY^K!CBL#k8ApNALF3Gy2gpuScpT!sYIE}Z845gl+X>l+C-Sg`t>;0cUDlEC`D=qZ~>Y?=w>{V63F2b{jLJQ{qc4Dz2Q(INfQA?z!({jC0d;KyaB9piCe$+)QCgY4v7GfpR~0=pjk*DZEvOS!SaSrqhf-1i!HzQ>AA6)U2r8&87qOZp_H-h(>33D7S*SIYQpQm+i9=Fd3-l8oFH!IB=!P4A__4aviR#nKl~u+7cXI@>ZGEK7X*r*W=sUUySU%#<EtZLxn8`nYWMg4z*Jv8-H)Ty_I_!(HIIA*^^)e{#_#kl?Dl@+DKc9Q3*oDU*Tl1>W>k!0;6Kh=7S%v8Q*_Ha7S$R|#?)W1he%%hy$Ff@vD4C%gRFpiL_QWGabH<>4#$0{TXZecGhguava>bb_U~gN^6Itq3Kc`;Vz!A7gUd#Y>ZlwBz2JX0!L4?b|*fOSx)4Gv+rCn=F>%0ZYDlOl=}}w)Qovlx^y&lRB{6BdG5fu+Pjng$`9Qy2_Z#T61Hsf0w?K1s}ZWkhm<e%ASyc@Q)XHr1JIBAm$*)A+Q3fkqD<_z^J0~+yfAcnoB-M`)a>X@LsgSA0uGnN+R3usA#Z7=1e;!@9>KA;u300I!5OfRhx+N!BkT!ky7Z|DNVG_2OOf7iU^ZJ@j!bdLx+=JXw4G51<u`hOcOw_8mLiVjzmL8obM&4*Kpqh3J;_bp6}G11)_-kqMUgQ`$W5n7@3R}jl$13kq>Cuh2c==9yGU6U#c^d&nJIe4SkoR>;du{07dOgLQVNU8OQ6bn7ON<vK9&Zeyb*(KrE=jg+wel?v~VSIM@?qaCj`ejQIMuw=42GC-i>|{WK<^tk|ESK`>J>O0jpN0TLRMx92yg4hx43>1|?6F{J|4f84nd@53h<w@D%ye^L$k!*GjAGss39o{C1Cenuj7-A`?9Jc~9rG4`b6HhYbT1Cl08gddUG6;If$68o%(__NsW-k0o=1dcorJDYDh#$FY7ysq7iswU>u#v#Lvron8RhUW}5UOYp@!BbPD18-_rwy1s+gXYl``}JG9;>T+fd1o24CBmR1PW@E$N6~&{``5t}IM9!^(Wr*W8t-l@9L7Z`pCwuv`2`~pqeE{*JB9L<*l8Wu;0e-Z#S_q;=+|$NU}kP(T&2ICcTgQ91PTNf7LM1=RuC{mEzoWUg^RwVXvhoy!Fb)264VJA8N_d5Vwz1{eH)bFjz}7PRqOR#iLRe#O>@$%ei*A!Y~Hb7_1VxV4wre5zKM&FGiV7l*}{A_y=~Z^s;|ZJPXYEKx(2usR92kb6-{mYRPsbPu|B<)KmK+dfzz7a1Oi9B0!b=DIpi5kx24rDyE4x?&_AUI!l&2F0ch&R4K+=~A5l0b-lz1kSUgR#YqAP3!0s6&E;{QDd+)M!M)zR(*EG27GcSSQNhVKq$y^l0xJ(v~GuMnQIvuMhG5&B+GruxKs`#f$UsuxLqrea#9D<Bz+(Wz@O6iqferE;^nKIx7ud*9`V*|pz^{4ix6AyJ4){4O=t_L4paV3Ienw(=}GuZA&sm@bvoPbarGy<Y)Ri?fG%x|?_8k&aVo#8k+3WR~m5$YL&Wo1K11IEKG>Cb)SJIQ|;ZjxBmze(5J7vdfU+!d4}J5vquXHQ*O47oO>rFQX7PXxpOY=RRpR5V7CR0tXKfnPzSmX&IC#4dE!^kgT>`M$bFZ#<iHkDMhql(tohQzllI%6e_+*Imdb$_pv%@~mD;M<j3YF=0=R^|D}W`Gl_4fL<cwk@M2<;MBMoTFCsuHpzg5>EHZ8LScU1c#+*|20f5OUD%a$Jq(H&hkpmA#$kul3|{2b*HiFwQ$XvdlYDzL&hy^n=~!s)*l1sI5`YVFHb|~A?-_orp1;wq<Qv*M+v`q`5Y|tRb=-lQJ6F<?k>3@>9fu7nPv5=RUt9YxZ&Vzt^lcYn@e*4>%Wzr7ddyz+PW*);MW09QH6F8W`Po1DiPn?~K3%QKD`6mxN*!PTHkD52wO=74zxvf0v01i+5w4NPP*I`4F#puHY;KVk!wIVD<t|V&KrYFQ_fiAnftY5X?Di(5ed3gl=w;mTYQZk(Kt0NSx!5#~EaApY2);R0;0<p;uNY9a2OI1|PRBP4*7oRQ%|~vwq=5$E4yn}!0bw4xF|^3B$#f8N`pOw25f$3p#}H7K<Z%2?!?(gs4m2>@Xtl%UL#&)3FHC7V{?~!p_`uu`*^0ZIz1Z$U;&x-Bl~9=JKc#xdA9qWM%r)g0iBGv??j*)uG)zEq95B&@4fawLYHrrh=!{)vJutH{JmpWmV&5he{9!8jnc^!3(;R*K7n^a4-Elw0GbW7?c>RmTkLkETu3)!T60E|Sj@|aA7bEncEp5nMC2{DAi?Ceoc%I7VPZ_Ntq;jJ4pxQ9g#dKxt$(H&<njy@5y9v3uk@eP{ZXzadBFH$LjP)Ge>%vb}Dwvi+p`n|5g7<@V;7HAIt-@g9gyz3Ha^a%93R0lQWXb?`@&%O)8vC6btJ|S`L`S4el~>>68E0GfYd4U=#drmXO`}L}9X@fX2=8_&Tptph$dV0S(cpeiPWB8?N_2(%0$xCP={2s^52X1nc6<H4>)^DCcfF8kYG;C7_aqNx0z<;(wHf0)>;i2T)fq0Ly>LYB8hQy2QB{5*Z@Qn4S#o5pgQ?)xu^HV^j${-YcCHvJGm&x9R!7xN7-P(`8ufHztj<}&y-$sd9!Zy@w|Qobx_5kae1yXf0)<e_J<2{}OXoujSn_2YeL(KsbSbyGDBjZB!f7stz0EN@YPf{4t~V2vy#nB)-^9vtPP{o-cum$u<uWu#l?#!|QEwgX^veX6C1?6F_;5%>e*5O{z2nHm-{#hrkvl31<LOi1Bq^@&PUf=iBKke(xlmbZG6ufAJIOT(`y>vUoauvzRqN<%>t`=@r`g178dag0eC&bRQ~l7_Eb*XR$@xx_oo?kSJ5Aoh2sqkx_%KGY0$0{jlp-R`XI#{5M1|i4l>#bQj!^N5#pucdh7Q{{yOkoPtu#XeCpuhy+DmXBvoc=JC1RRnpixzN4Ohv#pD4hFyw~hmfmnj`-gw7g3s<>cpyWy)f*-4~$QkiUqs_^58z1r@FqX&bf>LRRM1Z>t@<ta1L7@s^{4obnqU|sZg7p5}h^{p%Znu9>F@UR=K#O&Y-O&0wH?F%U+5*TcWmZ1rjX$^p_`(5!rkwm$Dncmt>iENT?Sb!a$uG6!3^Us3<6~s@6#4sR8h90fHyfu+FMjpFikO6vrea7TpL#}m#K`Nbp?cm_SMCBa#ysm5)T`sazg6>KXHF3Y^wF?i>3#`D4Ozqj0henm+TI!P^GBU28EXXlsDS0Y<X`q^09|btkrrnWgX#yJtE!3JvjQUi=|<LKmwK`D|JFaeePpRIb07Ww5^sW$7w@F^&uXp#a)v1<dP^}(DK3aSLYLf-ILI4L`C5z@@<;^5@tt>ObXF0Wv!~#^XA{};ahvP5?*=?+uGxSY1KGI|8*J?PZw3tDB)42A5ScD~s^jmG+82wO<dNkiMC5Qzjyr4sX<q-dLEUL*W!m}OE_h4adm}{#?^zg{p3bbZZsimvU6Od@@qO|lJFiX|W3>b3kYXHg&`#;4=66FSDB~+s`+GI@D|cIZ=HnP9J*SUG>VoY_M!ZaT_(6M@)m29OTq0H6npN%VC8{eCmA#3KD0-m2SKyPhVGvOH(WRTt%kyUWit4wFN*;#v(SZZXQ&_Hxzl|rg)&8U2xlw0kO4w2_b?A;K26WR>Bv=juoDwNkmVGUN(O?W72mJ)z#XqMhCc`=wf9pMt%7oO5Mh+R8n(QK2%|BHz)ZL$hhx$w$Pl-X})F6%fq_KN1Drc*}Lq~jqBN$wqO4_N~x}^7o%4Kb^&isEd=Gwb4yON(zvmKNvgVaEWVwI8-b0F_we7(n!f|N`MWiuZ}`I4L&{=0Y#k|kYmINiqlj(MYu#-GAs_RGBef9aC)lmpA-L$ab|pIdP?>PAlF)?#E~?bi!sfR2o?26X}fHt2UB1gujnN#VM#b_kpwG9+(7l2~kto`4`Hk&dsuuw^X4u#vX@1TZe1C;PrtDa?~w=Y$n!?>>7Hl;<CedCV78^Ky53JpapYroR}!r#v-d*4LQ}T1S9`lK=>_G_{o&oK}M4fO$s<oA=k29NUIK={h$4*XI$9NS<Z8!G}W3yRW@YXY}vN{_ykSj&zwJf2Bwr%lM7CNn2dgigNt>e)zN?-P%47gV(V?tsgzdR3Q0Pk>T1yUJm^NzR|$&WF8P(CzK2P{E^=g@tgz|@%Ps0apXf;P-vLOt{}_3S#Ad4lBrP%rRNHhV7G#}-F9p}`~pyp66GTrY1g3Dhm%1P8lI{$CJGJZO|5W{xmmxMN$2x*!ca!Jpa3$WB|Y1mIu^mwFO(()SBUebGl6>~NC=%AZdF<nfX+t;vtNUqCRC)eHqoCb0mQr;Hi8gos{x*C#AbY3pz#6|bP0p`8Eb9j4aX_9JW9hyaQs1z%|UB=5n6d0-Unt5un(+3G-6h`breyCIb<tf1mCBJ61?vBL^=^Ejo;#K{H@PjmZ8v=%Y0jI2(p-9RmGZI2=|L<J3>T^pIN|}_A3`7Bt}v=$D2Wst*GxShKSg~s;byA_Ax8x=!`m?hW|c+Z&kt_N<xfyf|>CAaDRSE0%ZiuRagBP{Y`oYP(E;5P@?KtOh-f<y2Y7J(x&+JvL!h$CexVfzKJG1&C?}R=~D*Ds{*u1%V#@A82Pym;ZNG?rXc%U_TO^snkC4`x(+YEkt>Y=4UY%S(p)EexRa}U_2<-S*YUgh=`KqW!`dHsI_7MDpl;7_$RgZN772Qp@VgkZx$_?ir!b){n=Xl{j#SNb&;W2CVttGIAZe3nGv(S{M4m2q;R)=C{ZU$<Vdg?Zk<1Nva8-Agwu;aZT@iPG+wM08h&$u<`*>e-rmM3Z!++#QL+O*}?ScwtIVA?H*Zg7HV-(^jC3m*a<+mP#ch5J=tsG!jj{IXq1NGtp3WvDnscr$QuEa1^iWNt>#z;w5$VpK@Rnx;6IPyOwC_fW+=OzB<asj&TR_k;1L-CkCVKx(Ns1r^&jiT8aTvIVOs_<VtKmVvvbIuo0w9I!ObBVlt-Az@9{4>?ew*uVS<Yq|tKfCo1jt%p>ytt6NcM8wdLG@>rVRb1l!xm7HUu3}9)`R(!YWT2!fg?hGS8(Z6jjdmZ3>jkacE9ZJ@@6Uj%cegpd-&Yhf5u{GArgt=shJ2le=?P&?u^Eqf~G9_+wRx64@i9A(V2Ie;#i@I`v**53r11()2fKE22Mh}xq1dAlbOI-xdNuNF7ZToAHfEmphb;YiA9$m(~;9WGyF*ImtxnsygEw4)CUk>rT0?qxM!G_Jl78*(|v7gyWj0hl@9&Y2@Zr`-Ku?Ck=hMq9<wg{m)AFAOQ_{mi<t(T2=|9f;4N861d*H>wrJw1MK!~)B?ZJMGUVcOYUTk5@Fr7cpDYklM>p&Ex7D+_SQaC^(pgLfr)sIF0?fH01knm%%Tub`S+VHr2zD<ktcD?7K?1#7=53*1IV_R%Q)ZB1^Q%`}$7XSci1HI0ObzMI@Mku-fQn#e`zRW`l*{kABxRCbB^9Ire<b<WVNKHx9FL#TaI<fia1W%O^=CIR=a4W}RmS46M+UXJ%of4<qb-f*fbsXD<{>e1)A#jq_5^5##g}6i*&5e+mmbzP)TKM_A#K$yqBpyn^)FAMxy*@7N*fVjZD_Yb6l-SdHETH|t2rjA@l_@krb|~87Ptx)y>T<u5fgxohLm)sCE4a<80Khgpm=JHK@Y+M{30reJ&yi~rt+?jB2e+BzbQ27K2nt%PJyfSd`9XIBU%L|_>5rDlQX2>$(dmMJ^+{J0rLX4Gbj0jNvKo_=d9S;NAGH#PdJv1{MlI#g1oZ^KdHx`i;0G?V4IZE?`8Q>Iaz$G>?&e&IbDmG45@x9JDvV)D*_hIz0V5F<)^#lkvuSQjSpB$$b};~rCM`Ln*4+|Y?S8X!x1wEyhU7H|HB;E#Mu)w*&vg8`xgO>B6T^3dLesy0%8;fw2li&I$|KAeb@$$q>>SZ(SVoBY2{K&ywxOyC8`*p$@kKqiw$}R3%8+s{S|3E3(;j1k~D0dayki80;j|*E#S4=W#iGyf|9r%C&AawTqn`Ki_VSK&p?5_k1j5Xx7zz?Gl}*jVpT5oXOmq=>XZb9E47ALkrN`C95c1sq9W$jF@1j@%rujuKFTw$qtj*S7IDa^O1X3VIl;eg!32)k{eD9<Yv7ad7gonS=+*p$HX#f}B-a*`jlm^x<9+Si80>IZc6P_rf6{XM2Dj$wclWtx<QE%|{$CzYfmg6rOg}NCrF&eAvSFHerI>5w7wmaeNv|7uYsUX<>2d8SF?(ofFlr<<>hktcqw{qEl9#Svjd0~AS?##BI`e#b=lwDB(8qAc?snCG!jTO_<gHfE7ZGPJmDofCc{H#gSTBngKC4{h*N$xvz{88Nl2z7~+&b-FvW`n+CX#?>NIEUJql7|htB3fR<pRH%l0Pyw4103)*m9KnI5_slLVQeO>_8FhfIiY7|7d11(Nc<P<PPn2gbfua$0`a8(vWNb=5%9vZ!5Jfn76D+03^JdY3#YF-hpo){690n7M@0Z3NDDaCB7%sF@}8B2*I1@2t1soGR%b>)28PH({EXmVre`2B3$zG<M&<=-IOU*O8q-KV|$BH?Vw8AYNXRe8eV67Xyn^Cc=R!Q7nUP@$1S}URrMK6f^D5&?jD@`+xsYm+d}zWl}9%Sb2YJ}FTYG6liM6c?W#R|w@ixESkp^7^bS-(%HAxqmn&z=HzGfky8|V;^&mlWmSa-zk!5dM&K^i+sEtZp*y=CLoFRsHRyLsZlSRtUDHg#iSm#6^Usp&T#z`1kxxfpjycH7V3{ykk;Q^n3Y6jIfDVn?`{m(<E;7Q{L!rfTJ@PQwYJYqg4hxDwuMnAGcn!ff!V*h@@SDFieQxTBDS;0FE7sa;9A%Eq-W_(u7ET%SYb&?(Xtami)$0+yteYa|V%)pX(l^OYL2#VmYY`I*FEM|!!BaUFsXfhtX)(KQGE&H+F5^Dhyy306bt&;#ltw>LgjfYld95Nsa*u3fp5OmKFj394kCFP5b`3UO*(nmofld`x3;MzoAnbxL@dGf=zpEJe#$i$-6DD@AZrr3N>dfEDbFCYzj4`Cz}b5^1Z(+n&3p0%Q()W?fO+b%)AKbyhZbmg>(58JO3Ql^|aQ_bQ$IrqA*1O}6B9!n=%88&EUMjf{l4Xh!qTkDYmAL6l#2$ic+;)RsWc-r^I)f<#J7jukWvoQtkH5UGC$SQd+JkBV9faGv_ekV<#TKB#?NH1Rl9CQ4u3zOs}3Rie(EmV4DM*AleM?_ztcIS45zk>T7?}@HRFby_a=~T<h46TaHCO_EWI57OgUMA!!LgDw@(-{r{1ai5ewccbnzZ$<ReGc{D1OUP9${*n^1|2M;PUvYJrX2wz`-aQ~p++0Rwo>(z8qyDx8za`a=^mVunyFE!mn-_p5(*|YN0M@ek2MC|5u;GP7u$$yYx5vsCDkH!P9W{ml)~o{Ho2)0#mbcQ-Q6o-KvXL)JO<to&Z>4mEZ<s#5mh8bvI92t+m+wmy8154_MM0G*9^TFAB1!vtOFoMHF9riK$-B)Z=7-7O-HEA1mz~3gLR3|{Mj_jCv6M}Z5;8O2qxDM2&(VU0G%qo^CDNcKcY7?>PZ^sjP1CoY2)GZ+me(1&o;75T&FXJqr}sk>)CIm2y`-tf!&TTOVBC6wZYg4o*@R)yG)?3LTKcqPD|<MEyfLm74x2;@N0$DB#+4um2+99a6%DY9B<ru$`KPf=-VKaLv=~|Q2TJwH1r*(#rC@WGrjeZ*h|6(=Ovi}D^PVuCfperrr3QC4dIRW`IYGX{m@Jhn+mgp_y<*6_jHh-32bh51Mi9UCMz1$6QfZAtKi_GiSAxAZbW?>0~;TVmw}_-UX8Wp=z11(KODk=GeK|42r2*udxZu}F*>^xi$z+^?s8xK`AA_@w@R0&Fj<JfJ+VPwM!Wu4#F^?xL`BZ-9KJm+vhG<7hQwC2qxuTYg0xS*2z=zRjWuG#M+l#7F3w~A`E=>e=B6s%m^Vm6BrQgDH$<4H+(yYseep9E8re1`r!%)hU*2csUz792R>d<13MSF8kp|#PnYYj|8hD}*YS<2%?BerlA|bLzRyGyv?e@fq(l^|+n};6=PqYIP*==&^nJc$cB*d$z0+`tVvis@I){nI-;5x>hLL`t(>F6M11aBoBb}(_IbQoMiN!{g@cJ?ThcyN~ik2IH7=fm(V+fV=h_ata&g3`PG84;-~na36)x5gPoOcG*LxBs8+XY8OrGPHdrj#lj8`|*N46Da|`y-}h7W|wPor|meAIT7jwyyoC-8HB*5V4a6&_ug_0vBGUN+5MK374*=Q(n6!$y+S?ZNP9ickry|y%+8DN8c|gBV}sr!B0T(zIgf3sj_;tgI49<!(3*l}Hmo-U={Cl=GedB^Uef26&7@IYThx*Az*6zgflhDH_!we2Oy{BnEtKk|30<dw0?v5$z*$n;O1L#z{d+3hzMqJ+s3mPAC|HHK+@d(r9kLVVDe=tLlro%YPhjQpd^z)f1I~|R^%P{lG>gJABH7m(R8(vcs~Xmw-Cb81?IJ%hRU6MI$r75fLLz804oOUT?H(8kkyx{Ot=Z_|U%#Ylx1Tcd%Ba_*oNCu0cyBUrE9oVo$97Gw1K>sOLt}70U@CaiRAPbNV^d%P3DM<R_y4lVO0J{Vpg-8>g0p)bT#aK}OLW<w@6dPEt-Jlh2bLb1UD2pAwQEz&Bx^ws7oZ$XFFBM{zTjnG3nf=rVR(qa4=aF7pIhU(YMTpLZ2p+A^=!HxB*>%6xB<a9Iq;ndHO30S=__^JHv&V3FV*z*Ie;ka=7Ev=nUG9WXK5E$RkKICwKXS_4e|65Jq+R?L>9H1AE_dI+s0xgr6DhMqZ<RFB1oB7tp_QppA6EI_M>VsZw(~DX9g>S9&_p`e!<bzpXx7jFMq?VC&MHeYbsNK<V}q_?xS-v+QQ7A;t!A<7vnDkRXO!KKRYYq63`T8_y!<hxF(#pJ;m`Qn#-LF?!3%Ae;GJP15A#%z+j8bXwpu-+6Y$mI0<@=j|v`OS5#h6Ms_qVBM7~d$fO(RSWHA!W@`8mmsm;zl?1<jgS{|1#MRS8ej*rv*-9#skIgB|RRD97(00&~Op8T7cChl~npkE}h`E)lx-$R|P6ipP;&SX^4Y1wq{XNVnBdoO&^eZe4x}v;{$(8yYQHsTEDY_%jxYwl_2K-MlFP9zP<m!KS*~pE1W-5ET10|sAV)MMn=}=c(d>zD0T6klxDL^jcwn%lrypMhau4&>LqZC<q@kC8zKkw}wMZe1Zr8#9%NA5y3Sa6{3C&axA5P>KmvU^Wm2E66&TP92sux8CXL;zR5qO^~l!&=3nF*sZJlvYk<)~!2kc)j@8woPj%%6{Y|v^arz2z`I9FEK3{2Iv8ZqVxJ*8g38Eu&i_CrACBKCt|wY8x%jS+1caI00yn5fEgF>EhqXi$pP-&;V363(+-4wOCX9tllH#Yzaj)9O<gRld=NBTk)WOiZviNB0K|K`D+oAO%0GQq^j8~!6w^@DatzK6Kj9CTF5{!{3i#6Q1~&_`xMfuxGGM}0qu}tOzJ0gZnzlOmBQ9u(=K2V+hVn_r9ixkADB<vPCQ1;O;I{s|s)OOxzZ$ef8Q<j6v8ka7Pcc;p`$1(vr6GM8vamrJ;659&`l#5;9b$gjN~mRU%dz^?{rTDBW_rC+S23Rzc*%~3{mN(B!?2`B8!Q0w^Ywi09t=O+r{Pq-ZX%Wo8+~Y+l2={}w)bVe|3(a?$&ON_vc;p6-5uy`Y62n057i8sisx3YD<de(55!lTpy`xxr+E{6bPArhwFAPyY4`NvZjFMno`-6S74z%?K!lMReR=6B(lv9etVJgkubuj{55k9>xoS5A604ju4-OqbmAdMipipB!!>J4qV7QXdw_m#tjB*%9x{qp-)@_pU;Bj~#F=<bz+!(eiweuw&a4_s5;E~;CjI5QroesdB;<D5}<=!7fPT=qc!qeaMnt31rbfYFsSdN+<w%?d)Y|T!Q&5h#Uf(bkeo!jAdFqtvyhp(`=TY@n;?!|<k*gIYO-Cs7rwI=+jLS%k{(6_P`dO^;T1P1>4T9`(j267|m6!Tu@J0(I)t$RC!MEl0U&n%dwi{;24SRfOxvE$z_XzN^-ai?fbaBap`!?`_4k+{dTLhrbqePe-iT|YxH>w6*MLnKyg0qJr#%D9np9BQa>nCfohgGaonxV)~@Z}z}W-C)3OZb$u<mT-G`=3IX_1-^s)dnQTr0*)D-5S(7j#~xYdb*;JPfLl3O?#%K9r{c;kLIg>S8Uh3wzdcxKXK)!!|0C0M7ta(nBNTfYhe$5_=`AqVOsAvhftp?)emzjAPN^QLyH0>R5<*Kid_K}V=%vrtRw4QzNn=G~k3(%K69kXuttdbo&2egi9M6@T@I-l5qUHqaH#Bd4v0aA;%qR8Rex1cK_KyB>W#Kt@G0%LsNKGjRZATErTU%;+!02Eguk7$5BEPBbDQ7a=*WiGJ{gX#Z=P52454UL)SE$(P^t_F{c~YYeZN-e+S(DVCQGK_7g-L;rwZRvR#@fK|8n0WG%1J&eA)h^f&0vjfh42skY3a;fnG#BDTsUoJ!1-YLrB}qQN*AIMkp)w(f#*N1VFG<*Xq<6t8&`72bD>io+WGV{{M^`Bka{bza)(-|wsySW-OByPJqEI&RY6rlc~ap)X;aS$Lcz!~rk{q7#rW=ddL3X~l4P^NdR&U!rWVKm2?M?6P}F-ucS0w3fxEIC;mHaehqHwbXQ-~OCajKz_H{eXFhS=HrC;gFBB~jtD#iJjiE50YWw%59T0;W-PiY_qTN&P6PgJm72(d^mFe$0PbL6!lSJzhvB{A4KKM*hZyg@4r&aCvE{)C>0HiJ5N@D5(=ZUwNpLbYoXbTo1jbsIaG=#%2_Nr46NNe$x>dR}vGeN1G*s2$N>dCYOms<LW&4_6C^+t7>Rgpci}Td}g+BtJr;yn;Vyl?g>7WUtuxOYqa)!OT9IneoK01@kNxKnD7L_=+WZ$;ZmYsZkkwV4>Zq$-a6(kIRszu*yz=fO6}UqTe!)Fzdr=IV1By>m5@|A!KEA^oP=|h6-2N8gc1hL#2sk#>e-Wh>OSyv-lEY=_|DB8!F!i(wVFZv*?20Az>`ERQIYS@pV~gC!i`0<Z(emSf;lkfO;kA`afo?JR|=hn^_#X00UAvRg4Ls9TO<qt(?41#<}{;=xm+}Md<YCG}9!kf*IloK`C87-$)_}vCQmDteQI-*OV&68D5{dvGuLdNX&~Y$tg1&6`DX^ZwC)w&jhC%b^C;A7|Pa8P+PXqU>4mEx)f$(!t>>!Y4q<hqj?50;*g|Itx^enpuUMJGzZ3H6>ZLdmeHt>$8mYCXEU@L%v>?3^)*Ri{<nqKB|XTgOBg+3&l(o<Zw^U7U6~L~V04HXM5)OA^;GUxRGpzB!jdG6Y6pn&pV&&n1|7g10gGQrpt98&Bk17Dmtx+-DDr`h)G$4y3?14HPmK!xIgHn31u}o6AhM|S>D_cOU}8U9BdNJtf0~8I4gw%_8E~0Z5wn8%VXL3)>IVW2Gqgj-@;Au-{VnZjKA~ko+M%jXR+C#F*Djij5^vw+;D!YD{^WG)Ii`m_*#7XgK@$V`;OaW_bvb1fqJxAEC2Zlcz@5UUxvm^jB2fOf2cPjDN>K2}&EGasMUww^u)IgKG4)fScy$^{jp{nIoa9{a%@g<|Q8R3B>&s{RaWxqMc-AYL9@dZ`v9h)~tYXw5u;f#{>9br&T-6$Dvj`}xmP_6wqE_L#)d*&ZJ8ylw90Wqin<3S1=>|ldwxBjx_)eH%@<^XSU7e5s_qT<FX#f5jJQ3)!yKt)#LnefcAT1%l4~8e@3?iuiZThR}A2!kM*l-<-L@>RkiZXaKsI^>ER}Mq<d4?qhN2(Y#ohI^PgmZd<(a!*eQ+C;^>)rPce+g^~J+{_(fC@mfX2W!Lq*;Ky*HPj#xPZ1UDN&HLAIE3Q{*|66w{HYK*$SgKxrGAiKAqmRQ|>`mC;*?ffOn&R!;lwiD^eh_g*#nbk4<fPvr<%k000004Y*qbx|kS100HH8|B?d$FLLqtvBYQl0ssI200dcD")).decode("utf-8"))
+(TMP / "e23_lab.py").write_text(LAB_SRC)
+sys.path.insert(0, str(TMP))
+import e23_lab as L
+REQ_LOG = TRACES / "requests.jsonl"                           # memory rule: the full text of EVERY request
+_stream_run = L.Stream.run
+
+def _traced_run(self):
+    try:
+        _stream_run(self)
+    finally:
+        if not self.err and any(m is not None and not (isinstance(m, (int, float)) and math.isfinite(m))
+                                for m in self.margins):
+            self.err = "NONFINITE_LOGPROB"           # final audit H2: NaN / Inf logprobs are never data
+        try:
+            r = self.row()
+            pr = self.body.get("prompt") or []
+            r.update(port=self.port, sampling={k: v for k, v in self.body.items() if k != "prompt"}, prompt_len=len(pr),
+                     prompt_sha=hashlib.sha256(json.dumps(pr).encode()).hexdigest()[:16],
+                     ttft=round(self.t_first - self.t_start, 2) if self.t_first and self.t_start else None,
+                     sec=round(self.t_end - self.t_start, 2) if self.t_end and self.t_start else None, t=time.time())
+            with _SAVE_LOCK, open(REQ_LOG, "a") as fh:
+                fh.write(json.dumps(r) + "\n")
+        except Exception:
+            pass
+L.Stream.run = _traced_run
+
+# ---- RC2 CELL 2 (verbatim to the stock fallback)
+def run(name, cmd, timeout=3600, env=None):
+    t = time.time()
+    try:
+        with open(LOGS / f"{name}.log", "w") as f:
+            r = subprocess.run(["bash", "-c", "set -o pipefail; " + cmd], stdout=f, stderr=subprocess.STDOUT, timeout=timeout,
+                               env={**os.environ, **(env or {})})
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        rc = -9
+    txt = (LOGS / f"{name}.log").read_text(errors="replace")
+    R["setup"][name] = {"rc": rc, "sec": round(time.time() - t, 1), "tail": txt[-1500:]}
+    log(name, "rc", rc, f"{time.time() - t:.0f}s")
+    save()
+    return rc, txt
+
+
+SHIM = TMP / "e23_libcuda"          # FlashInfer JIT links -lcuda; Kaggle has only libcuda.so.1
+SHIM.mkdir(exist_ok=True)
+for d in ("/usr/local/nvidia/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/cuda/compat", "/usr/lib64"):
+    c = sorted(Path(d).glob("libcuda.so.1")) if Path(d).is_dir() else []
+    if c and not (SHIM / "libcuda.so").exists():
+        (SHIM / "libcuda.so").symlink_to(c[0])
+
+
+def host_facts():
+    """A0: what the Kaggle box gives us (glibc, driver, GPUs, PCIe, peer access, cgroup memory, /dev/shm, disk)."""
+    f = {}
+    for k, cmd in (("glibc", "ldd --version | head -1"), ("uname", "uname -a"),
+                   ("nvidia_smi", "nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,pcie.link.gen.max,pcie.link.width.max --format=csv,noheader"),
+                   ("cuda_version", "nvidia-smi | grep -o 'CUDA Version: [0-9.]*'"), ("shm", "df -h /dev/shm | tail -1"),
+                   ("tmp_disk", f"df -h {TMP} | tail -1"), ("nproc", "nproc"),
+                   ("cgroup_max", "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes"),
+                   ("cgroup_cur", "cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes"),
+                   ("meminfo", "grep -E 'MemTotal|MemAvailable' /proc/meminfo"), ("ulimit_l", "ulimit -l"),
+                   ("omp", "echo OMP_NUM_THREADS=$OMP_NUM_THREADS"), ("topo", "nvidia-smi topo -m; nvidia-smi topo -p2p r"),
+                   ("pcie_now", "nvidia-smi --query-gpu=index,pcie.link.gen.current,pcie.link.width.current,power.limit --format=csv,noheader")):
+        try:
+            f[k] = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=60).stdout.strip()[:600]
+        except Exception as e:
+            f[k] = repr(e)[:200]
+    try:
+        import torch
+        n = torch.cuda.device_count()
+        f["peer_access"] = [[torch.cuda.can_device_access_peer(i, j) if i != j else None for j in range(n)] for i in range(n)]
+    except Exception as e:
+        f["peer_access"] = repr(e)[:200]
+    return f
+
+
+def host_mem():
+    """MiB. avail_mib = max - (current - inactive_file), Merlin's own rule (RC1's guard counted page cache as used and
+    skipped arm 3 with MemAvailable 55 GB); /dev/shm counts against the cgroup."""
+    out = {}
+    try:
+        cur = int(Path("/sys/fs/cgroup/memory.current").read_text())
+        mx = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        st = dict(l.split() for l in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines() if len(l.split()) == 2)
+        out.update(cgroup_cur_mib=cur >> 20, cgroup_max_mib=None if mx == "max" else int(mx) >> 20,
+                   **{k + "_mib": int(st[k]) >> 20 for k in ("anon", "file", "shmem", "inactive_file") if k in st})
+        if mx != "max":
+            out["avail_mib"] = (int(mx) - (cur - int(st.get("inactive_file", 0)))) >> 20
+    except Exception:
+        pass
+    try:
+        for l in open("/proc/meminfo"):
+            if l.startswith(("MemAvailable", "MemTotal")):
+                out[l.split(":")[0] + "_mib"] = int(l.split()[1]) >> 10
+    except Exception:
+        pass
+    try:
+        out["dev_shm_used_mib"] = shutil.disk_usage("/dev/shm").used >> 20
+    except Exception:
+        pass
+    return out
+
+
+TELEMETRY = ENG_OUT / "telemetry.jsonl"   # NB5: engine folder
+
+
+def _telemetry():
+    """Host RAM + GPU memory every 10 s for the whole run (Merlin's floor ~69 GiB inside a ~173 GiB cgroup)."""
+    while True:
+        try:
+            with open(TELEMETRY, "a") as fh:
+                fh.write(json.dumps({"t": round(time.time() - T_START, 1), "host": host_mem(), "gpu": L.gpu_mem()}) + "\n")
+        except Exception:
+            pass
+        time.sleep(10)
+
+
+threading.Thread(target=_telemetry, daemon=True).start()
+
+
+SHM = Path(os.environ.get("RC2_SHM", "/dev/shm"))
+
+
+def shm_names():
+    try:
+        return {p.name for p in SHM.iterdir()}
+    except Exception:
+        return set()
+
+
+def shm_cleanup(before):
+    """After a boot's server is dead: only /dev/shm entries that appeared during THIS boot (absent from `before`) and
+    match the engine's prefixes are unlinked; everything else is recorded, never touched."""
+    out = {"host_before": host_mem(), "removed": [], "kept": []}
+    try:
+        for p in sorted(SHM.iterdir()):
+            try:
+                sz = p.stat().st_size >> 20
+            except Exception:
+                sz = None
+            if p.name not in before and re.match(r"(torch_|psm_|vllm|ple|nccl|sem\.mp-|cuda\.shm)", p.name, re.I):
+                try:
+                    p.unlink() if not p.is_dir() else shutil.rmtree(p)
+                    out["removed"].append([p.name, sz])
+                except Exception as e:
+                    out["kept"].append([p.name, sz, repr(e)[:80]])
+            else:
+                out["kept"].append([p.name, sz])
+    except Exception as e:
+        out["error"] = repr(e)[:200]
+    out["host_after"] = host_mem()
+    out["removed"], out["kept"] = out["removed"][:60], out["kept"][:60]
+    return out
+
+
+E18_SILENCE_SEC = float(os.environ.get("E18_SILENCE_SEC", 600))   # NB6 P1: E18 R2 cell 6 (B-M3)
+
+
+class MServer(L.Server):
+    """Merlin passes --shutdown-timeout 60 and the PLE transport unlinks its /dev/shm storages only on a graceful
+    teardown: SIGTERM, wait 75 s, then E23's kill (SIGTERM + 40 s + SIGKILL of the whole session)."""
+    def wait_ready(self, timeout, silence=E18_SILENCE_SEC):
+        """NB6 P1 = E18 R2 E18Server.wait_ready: ready = /health answers AND this server's own "GPU KV cache size"
+        line is in its log (B-L8); a launch whose log stops growing for `silence` seconds is a stall (B-M3)."""
+        last, last_t = -1, time.perf_counter()
+        while time.perf_counter() - self.t0 < timeout:
+            if not self.alive():
+                return False, f"exited rc={self.proc.returncode}"
+            try:
+                _urlreq.urlopen(self.url + "/health", timeout=10).read()
+                if "GPU KV cache size" in self.log():
+                    self.ready_sec = round(time.perf_counter() - self.t0, 1)
+                    return True, f"ready in {time.perf_counter() - self.t0:.0f}s"
+            except Exception:
+                pass
+            sz = self.log_path.stat().st_size if self.log_path.exists() else 0
+            if sz != last:
+                last, last_t = sz, time.perf_counter()
+            elif time.perf_counter() - last_t > silence:
+                return False, f"stall ({silence:.0f} s of log silence)"
+            time.sleep(1 if FAKE else 5)
+        return False, "timeout"
+
+    def kill(self, fast=False):
+        if fast and self.proc is not None:     # NB6 P1 = E18 R2 E18Server.kill(fast=True): at once after the rerun's solve
+            try:
+                os.killpg(self.proc.pid, 15) if hasattr(os, "killpg") else self.proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=0.1)
+            except Exception:
+                pass
+            try:
+                os.killpg(self.proc.pid, 9) if hasattr(os, "killpg") else self.proc.kill()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=30)
+            except Exception:
+                pass
+            return
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, 15) if hasattr(os, "killpg") else self.proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=75)
+            except Exception:
+                pass
+        super().kill()
+
+
+def boot_gate():
+    """Merlin's pin leaves ~0.9 GiB free per card: every boot needs near-empty GPUs (< 150 MiB, not E23's 1024)."""
+    g = L.wait_gpu_release(300, fake=bool(FAKE), gpus="0,1,2,3", free_mib=150)
+    return {"ok": g, "gpus": L.gpu_mem(), "host": host_mem()}       # callers launch only on ok is True
+
+
+CKPT = TMP / "fn_merlin"
+SHA = {"thread": None, "ok": None, "bad": [], "sec": None}
+
+
+def merge_ckpt():
+    """Symlink the 5 parts + 10 PLE shards into one directory; names and sizes now, sha256 in a background thread."""
+    SHA.update(thread=None, ok=None, bad=[], sec=None)        # a stale result never gates a new merge
+    shutil.rmtree(CKPT, ignore_errors=True)
+    CKPT.mkdir(parents=True)
+    expected = {}
+    for k, (d, man) in PARTS.items():
+        for n, (size, sha) in man["files"].items():
+            expected[n] = (d / man.get("model_subdir", ".") / n, size, sha)
+    for n, (size, sha) in PLE_EXPECTED.items():
+        expected[n] = (PLE_DIR / n, size, sha)
+    bad = []
+    for n, (src, size, sha) in sorted(expected.items()):
+        if not src.is_file():
+            bad.append(f"missing {n}")
+            continue
+        if not FAKE and src.stat().st_size != size:
+            bad.append(f"{n}: {src.stat().st_size} bytes, expected {size}")
+        try:
+            (CKPT / n).symlink_to(src)
+        except OSError:
+            if not FAKE:
+                raise
+            shutil.copyfile(src, CKPT / n)               # local Windows harness only (no symlink privilege)
+    idx = json.loads((CKPT / "model.safetensors.index.json").read_text())
+    need = set(idx["weight_map"].values())
+    bad += [f"index needs {n}, not merged" for n in sorted(need - set(expected))]
+    cfg = json.loads((CKPT / "config.json").read_text())
+    if (cfg.get("text_config") or {}).get("ple_embedding_dtype") != "float8_e4m3fn":
+        bad.append("config.json: text_config.ple_embedding_dtype is not float8_e4m3fn")
+    rec = {"files": len(expected), "index_files": len(need), "bad": bad[:20], "ok": not bad}
+
+    def hash_all():
+        t = time.time()
+        import concurrent.futures as CF
+
+        def one(item):
+            n, (src, size, sha) = item
+            if FAKE:
+                return n, True
+            with open(src, "rb") as fh:
+                return n, hashlib.file_digest(fh, "sha256").hexdigest() == sha
+        with CF.ThreadPoolExecutor(6) as ex:
+            res = list(ex.map(one, sorted(expected.items())))
+        SHA.update(ok=all(ok for _, ok in res), bad=[n for n, ok in res if not ok], sec=round(time.time() - t, 1))
+        R["setup"]["sha256"] = {k: SHA[k] for k in ("ok", "bad", "sec")}
+        save()
+    if rec["ok"]:
+        SHA["thread"] = threading.Thread(target=hash_all, daemon=True)
+        SHA["thread"].start()
+    return rec
+
+
+def sha_gate(timeout):
+    """The first launch waits for the full sha256 check (Merlin itself never hashes shards)."""
+    th = SHA["thread"]
+    if th is not None:
+        th.join(max(1, timeout))
+    if th is None or th.is_alive():
+        return False, "sha256 check not finished"
+    return bool(SHA["ok"]), ("ok" if SHA["ok"] else f"sha256 mismatch: {SHA['bad'][:5]}")
+
+
+def prefetch_bg(paths, tag):
+    """rev 3: warm the page cache of a cold 17-30 GB /kaggle/input checkpoint in the background (many readers)."""
+    def go():
+        R["setup"]["prefetch_" + tag] = L.prefetch([p for p in paths if p]) if not FAKE else {"fake": True}
+        save()
+    th = threading.Thread(target=go, daemon=True)
+    th.start()
+    return th
+
+
+MERLIN_ENG = None
+
+
+def merlin_install():
+    """P2 payload (.bin = a tar Kaggle does not unpack) -> install_merlin_offline.sh (UV_OFFLINE); payload deleted after;
+    a failure is cached so later Merlin steps fail fast (rev 3)."""
+    global MERLIN_ENG
+    if MERLIN_ENG is not None:
+        if MERLIN_ENG.get("failed"):
+            raise RuntimeError("Merlin install failed earlier: " + MERLIN_ENG["failed"])
+        return MERLIN_ENG
+    if not MERLIN_OK or MERLIN_PAY is None:
+        MERLIN_ENG = {"failed": "Merlin checkpoint / env not attached or incomplete"}
+        raise RuntimeError(MERLIN_ENG["failed"])
+    if FAKE:
+        MERLIN_ENG = {"fake": True}
+        return MERLIN_ENG
+    try:
+        pay_root = TMP / "merlin_pay"
+        shutil.rmtree(pay_root, ignore_errors=True)
+        pay_root.mkdir()
+        t = time.time()
+        with tarfile.open(MERLIN_PAY) as tf:
+            tf.extractall(pay_root, filter="data")
+        R["setup"]["merlin_extract_sec"] = round(time.time() - t, 1)
+        pay = pay_root / "merlin_offline"
+        shutil.rmtree(TMP / "merlin_off", ignore_errors=True)
+        rc, txt = run("install_merlin", f"bash {pay}/install_merlin_offline.sh {pay} {TMP}/merlin_off", timeout=5400)
+        kv = dict(re.findall(r"^(MERLIN_[A-Z]+)=(.*)$", txt, re.M))
+        shutil.rmtree(pay_root, ignore_errors=True)
+        if rc or "INSTALL OK" not in txt:
+            raise RuntimeError("Merlin offline install failed (logs/install_merlin.log)")
+        sys.path.insert(0, kv["MERLIN_TREE"] + "/tools/merlin")
+        import launch as ML
+        site = subprocess.run([kv["MERLIN_VENV"] + "/bin/python", "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
+                              capture_output=True, text=True).stdout.strip()
+        MERLIN_ENG = {"kv": kv, "ML": ML, "cuda_home": site + "/nvidia/cu13"}
+        return MERLIN_ENG
+    except Exception as e:
+        MERLIN_ENG = {"failed": f"{type(e).__name__}: {e}"[:300]}
+        raise
+
+
+MERLIN_CC = {"mode": "gcc13"}       # rev 3c: Merlin README:229 / install-env.sh: FlashInfer JIT at first start needs GCC >= 13
+
+
+
+KV_FP8, KV_BF16 = 2479838700, 2464415744      # Merlin's own L4 pins (23,034 MiB cards; preflight.kv_bytes_for_vram, 150 / 79 blocks)
+MERLIN_PROFILE = "fn-quad-24g-sm89"   # NB5: PROFILE is the Duck profile name
+XHIGH = json.dumps({"enable_thinking": True, "reasoning_effort": "xhigh"})
+HOST_PHASE = {}
+
+
+def merlin_fn_server(name, kv, port, kv_bytes):
+    """Merlin's launch.build() for Flash-Next on the L4 profile: KV pin lowered for 22.49 GiB cards, the checkpoint's own
+    chat template at xhigh (Merlin passes medium otherwise), Merlin's host_phase checks recorded, E23's env overrides."""
+    eng = merlin_install()
+    extra = ["--served-model-name", "q27", "--max-model-len", str(MAX_LEN), "--port", str(port),
+             "--default-chat-template-kwargs", XHIGH] + list(NB5_BOOT_EXTRA)   # NB5: NB1/NB2 levers, MTP off
+    if FAKE:
+        return MServer(name, [sys.executable, FAKE, str(CKPT) + "-w4a16", "--tensor-parallel-size", "2", "--max-num-seqs",
+                              "8" if kv == "fp8" else "3", "--port", str(port), "--max-model-len", str(MAX_LEN),
+                              "--kv-cache-dtype", NB5L.KV_DTYPE_NAME[kv], "--kv-cache-memory-bytes", str(kv_bytes)] + list(NB5_BOOT_EXTRA),   # NB5: the fake reports dtype / pin (C-11 read-back, the ladder)
+                       dict(os.environ, **NB5_BASE_ENV, **NB5_BOOT_LEVERS, **E28_BUILD_ENV), port, LOGS)   # E28 W4 W6: FAKE only
+    kvv = eng["kv"]
+    gcc_bin = str(Path(kvv["MERLIN_CC"]).parent) if kvv.get("MERLIN_CC") else ""
+    base = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "CUDA_PATH", "CUDA_HOME", "LD_PRELOAD", "CC", "CXX")}
+    base.update(GPUS="0,1,2,3", PORT=str(port), KV_BYTES=str(kv_bytes), P2P="off",
+                VENV=kvv["MERLIN_VENV"], TREE=kvv["MERLIN_TREE"], CHAT_TEMPLATE="", WARM="0", CACHE_ROOT=f"{TMP}/merlin-cache",
+                PATH=f"{kvv['MERLIN_VENV']}/bin:{gcc_bin}:{eng['cuda_home']}/bin:{os.environ.get('PATH', '')}",
+                CUDA_HOME=eng["cuda_home"])
+    base.update(NB5_BASE_ENV)                          # NB5: Merlin knobs from NB1 / NB2 (build() reads DRAFT_HEAD etc.)
+    base.update(NB5_BOOT_LEVERS)                       # NB5 R2: this boot try's lever env (lever b)
+    base.update(E28_BUILD_ENV)                         # E28 W4 W6: I8 DRAFT_HEAD=int8 into build() only (= NB4T CELL 2)
+    if kv == "fp8":
+        base["SCALES"] = str(CKPT / "qsa_kv_scales_262k.json")
+    plan = eng["ML"].build("flash-next", MERLIN_PROFILE, str(CKPT), base, extra=extra, kv=kv, checkpoint="flash-next", status="untested")
+    try:                                               # audits: tree products, venv, checkpoint marker, PLE dtype, toolchain,
+        eng["ML"].host_phase(plan)                     # scales file: a failure stops this boot before any server starts
+        HOST_PHASE[name] = "ok"
+    except BaseException as e:
+        HOST_PHASE[name] = f"{type(e).__name__}: {e}"[:600]
+        R["setup"].setdefault("host_phase_error", {})[name] = HOST_PHASE[name]
+        save()
+        raise RuntimeError("MERLIN_HOST_PHASE_FAILED: " + HOST_PHASE[name])
+    env = dict(plan.env)
+    env.update(LD_PRELOAD=kvv["MERLIN_SHIM"], CUDA_HOME=eng["cuda_home"], VLLM_USE_RUST_FRONTEND="0", HF_HUB_OFFLINE="1",
+               TRANSFORMERS_OFFLINE="1", LIBRARY_PATH=f"{SHIM}:{os.environ.get('LIBRARY_PATH', '')}",
+               PATH=base["PATH"], VLLM_CACHE_ROOT=f"{TMP}/merlin-cache", TRITON_CACHE_DIR=f"{TMP}/merlin-triton",
+               FLASHINFER_WORKSPACE_BASE=f"{TMP}/merlin-fi", CUDA_DEVICE_ORDER="PCI_BUS_ID", VLLM_PLE_OFFLOAD_READY_TIMEOUT="3600")
+    for k in ("CC", "CXX", "CUDAHOSTCXX"):
+        env.pop(k, None)
+    if MERLIN_CC["mode"] == "gcc13" and kvv.get("MERLIN_CC") and kvv.get("MERLIN_CXX"):
+        env.update(CC=kvv["MERLIN_CC"], CXX=kvv["MERLIN_CXX"], CUDAHOSTCXX=kvv["MERLIN_CXX"])
+        lib13 = Path(kvv["MERLIN_CC"]).parents[1] / "lib"
+        if (lib13 / "libstdc++.so.6").exists():
+            env["LD_LIBRARY_PATH"] = f"{lib13}:{env.get('LD_LIBRARY_PATH', '')}"
+    try:                                               # Merlin's own scheme: PORT 8000..8355 -> 29500+d / 30000+100d
+        mp, vp = eng["ML"].distributed_ports(str(port))
+        env.update(MASTER_PORT=str(mp), VLLM_PORT=str(vp))
+    except Exception:
+        env.update(MASTER_PORT=str(29500 + port - 8000), VLLM_PORT=str(30000 + 100 * (port - 8000)))
+    env.update(NB5_BASE_ENV)                           # NB5Q-ENV-1: after build(), which strips every MERLIN_* variable (= NB1)
+    env.update(NB5_BOOT_LEVERS)                        # NB5Q-ENV-1: lever b reaches the server env
+    argv = plan.argv()
+    HELP[name] = L.help_check("merlin", argv[:argv.index("serve") + 1], env, argv)
+    R["setup"].setdefault("merlin_plans", {})[name] = {"argv_tail": argv[-60:], "status": plan.status, "host_phase": HOST_PHASE[name],
+                                                       "env_keys": {k: env[k] for k in sorted(env) if k.startswith(("VLLM_", "NCCL_", "KV_", "P2P", "SCALES"))},
+                                                       "lever_env": {k: env.get(k) for k in sorted({**NB5_BASE_ENV, **NB5_BOOT_LEVERS})},
+                                                       "build_env": dict(E28_BUILD_ENV)}   # NB5Q-ENV-1 / E28 W4 W6
+    save()
+    return MServer(name, argv, env, port, LOGS)
+
+
+
+# ---- E28 W4 W18 (the Kaggle 400-kB commit limit): NB6Q's engine-cell text from "RC2 CELL 1 input block" to the NB5
+# glue (nb5_rc2_inputs, nb5_rc2_prompts, the E23 step runner, RC2's checks, the E21 donors), verbatim, packed (lzma +
+# base85, sha256 checked) and exec'd here into the notebook namespace (E27 NBDF technique). No E28 edit inside.
+E28_ENG_SHA = "8ba88bde0ff745ff958eefadd324cabf3d1cb7cad532f13882e7307fadf069f0"
+_e28_eng = __import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;E&la@?8KChyoRQbYkZVA5%2~4%>v99u{{8WSac8-n4q!TikmzR_NV0(BxVo5lE1?s~5Pd<*sS^u7eH_;q`KUa;Hsb;@YB1E5sr|(1?^y^%Rqs;dsa64Mk_lh@VBAa#HU0g7!#c+r;t{+irfZKo0h|TF~h;g?D{>!3%uQX){eW2O$1C&;Ut~8W+BHk^TpHbduKHE20m&w7}MmV-TGX5C`Z6P)xiwv}^U)0!Hb6Fz1)$Gw_7k25+VQUrW+m0?M%|mB(O6{njk%T0Q${BBvaqz~*2HJ-B@?e151&6=Z3^F>U!A3Ia+cakbE+KL$~=#2w5A#rSMAsNKiaeRWCx|1vK$qLQr}n)47yN)FJa0y!Qdcq1C7aOPa|0JZX)wVQ1Hl+Gvbttrc0p;>OLN2hLc8I)EMWBjm>1jmURkm)3FFuP)X@4MVpVkMT;AN1i9tDCS#UEdzAbIG0@UxhXYP>dSg|1mDG<2B^WOATwJl66hu;ws6IY={84eA^anOE{AErCVo_;g>LJWTZ*fM7&3q1(E6Qi4^Kmpy|ALP4oJ1S}6{38;{U)9j3HJGTcjpr$n}UvNR`HD$E#F1jm*HR+zd`x~LQL6d`o()iRn*2(V#x-TFQsMP+Xk+t8*2wg+25vM&c+s5R@G;b=CL0c7V<Zz!up;6dR4YmiPL3<XkEng~g_H--Fb(}%VUwTqHv@6nx}b{l!NGT@M}?(d$5I36f7W7#s_luw>i=zy1Y5p@x6+I5wydAn!@M?MVlp6j#BOSHR><MfUek(4oHS!Hb#itpZw&PjKQx&t6Y_aXq4ExmrO+2nd6KZw~F-*LH!v#E%5vYpH<qtOmT>hOW)B1ss(nlm7JV{%GRqJ5Kmrh**B*tk2O=i`m}BZO#ej}#v8KjEAKgXT5Ui2yZ2wea?4|L%!4^dfD}(=<7|^P_P-n|j7DfA_niyIWGh&X@y@4T4JvT1i|)Z$U8JRL|}W|8u0YtQLE9&SJ^`y740M)P8;CdQ0*5tA+^^RORy<B?2EHT(#aYC(_BPx0#sVtNKO_f2JB3J#=a4oha+$W?4%wkjP9S))dXmRxSs=3=5J3zVFEf0?l4a-unn)C83W?E*9Xc_W~+Lt=}3JRu1`34_>*+umJU{8Yi%5-25DKw6Mvvc5kYReoBfRBJ;S|_>^4ReJ?49>?{x1bzWtmh?E^ne{c?B(Y<<zgW5W}ukF#E<(Zj#!k=kmfnp_R^G;RfUFRmvkw5;cC329Or@X<$W+N6rxn76KM|30-BY%Z&iIo=|jD;CPw{SFfXGU5#+=39NPcU}b)-`MBHwhA3RoHR>vnP2pxxn)vyy4Y6h1TB~>d5en>JB&5spj65QKS@;Z?o3?ox<6$On26b-1g;%0&0Gi7|Kv8AVk*!5YZqQd-M-FYZp^kTC}VwwDZ&b$-lJEQXAfNfyI;t;|+m6ef4hqXQh}kCeut#$P&}KJeeNs65Aug2E1R)WWg-XZL7JX?5A%p?dI{RLi~{k%Xj<8oCqoQ4`P68rVN#VzItc$Z%Hj7eX=;+R}^hlsUR^y79~wV-n<5TLiEK*`miAw;CA^-80vWe>SdlWy}X@Udspf<;`Bj|tCo3)+4MI~_;*|86sHezYc4g4AZqRlDq@06l8}3XZ+AR(0)7T+^WLt<gPeh1j7<cfsd=0H3Z|FhaNN*(IpN_Si)OK6LBj_q+^C(v5o)Hmd`jdFt>4sjTwAPe6u-N0Rpx{ZX#4PV3$e|4ct<Ar_ds|^+fGrioS*Io{Puk<%S%HThe!t2WM94PE7vgU)mmP5Q#K3?eM@@ak0%sRNPYid+%i(%T}!)g;IT6{J4s0%Vb8e^rq<!YUOei8LDEcS`iW|GN_eqFCBANnYL`)_Sq9T64vQ+`eMm(ZH(}cxOShQ>x@H}L=Bhi?Gh{rIuTRcQY%W8OU0Uf*xX$E%d@DPLmEl7QZdgpSir)Xc2(Nkl($0=9H3~~u^5tG-08@b!H#H_9!`$Lpm1wihFB$#;i0?7dyPJg=*idG1LSiPh@bA$<YME3;2bg?8<-VY#bxp6@s>p<eJJFXa-~d-hnd6MKS1$z~@t_L!IicB!At7Gntfa_TygzsKNFn?nBP9t=I~As+UB=(1SB|Y5s5;tdlaldj4vLiSUnqHZ0U!?!*ge}BC9g0T7YRWBNo0}{evP~)sH;#>VS%a^;B!C+@_tA}X(X}oT9v`y*mBxgi8abmnp-BH<A$zcD@KiMOsQd|>-bVC85}X+&$|e)IcuIS24X=psj1`ApOXX~`jDqpikE~t1}o?OhN{4-SVdb5dgu#`iZ-pd^$tw(1tvXGrRZoZ;*0l@agN7x7S!a=Xo#WX00G}PXnz_M@UE|TsS4T}2p;jB-JJCo=j{wC@tqSGmf-58M-(bjnIX$2CN9oYtj0Q=6jt)z{{d9d`L18&cL_g<J%UAe?Sm$<wYRa9?bR@0>$ArH$;uZtv`JlNsN<(==AEqs4(n7i%1^t`!%q~eoL`d-K;ks`C^gNXsrR2v3HTnB<<!2Uj5E@vhr++3J6pNA;CjSazxuIP!rjZhU_WC*kJn;&USE+aJaUl%D!jqL11p8)ffM+Jc#(W149&^~(D-0trQ}ybvj{Y8{GOKj|8fq_`6XFT{lH$Gh2h&Stm4r6J92ObCoXhsN(PCml_l_t0XAmo0$!3e*aqAQZr75~r4!xsJoQ~=mN8?}ounGyjR$O+Lw!Lu!6y7cOQ!1A4lbviuyWs39EWU}%&KVK?XZPg>SLeI?w#Rsn63tgS<G&scry&ozP6p$^JDMTBh^f1{OT?NM;(HH7M$N=-7@Wpi=LTs%cB|*cb<m+n^!dW@Ksv1?o|q0kQocyisPnRvFd&drWVHaIQWGb4%YG#-h@!fymk63$O}VR>BijQMEdMVM74#X#jlvM9}fu&1Q7L5pd&wq{z6==9gxaRhX#gY#ES7B;SooeY{xKlTS+#%rIBE0>OF=2m7ZC3>YW{(Na>kRv^2SPTpy^tPO-_mo&cI8$VTJ9pLDMzdoM2F%0j*|=tT(1#Z!c}t^Y>zu@a1#3cEm?84h?aNB22zPK^>Qn;qxBtpZ8uDdO69o}><I&_82Zs(l6N`7KrYw5yE?YEqdON)G%ZOKCw$K}W}WEe)g<T^D|Ebr^2cJLvWK*MYdADujy{nL+2xd?&$PM)awfV1!Xi`4{8ANRG^NvEN4;y>HY?W`0Pqk51k*KOsD=u&=z(^!QNUj1!*3_~@(ImQ&Ke9=BucSCd6ms&q0HU22G_zh(FPRnnK__)}<-7BG?4dgUkbtmx^|z+0-v_l_b+DDb!w*wN5;%woV2UJ&gYL+z|iJAG6DKir3`N!{*;R^wolpjsF@c~;4WN{NiB4EgN#LCVY4Nym)NCe5GADn{dj5sb2!zxjN&uVSDQimSwkm)#a`g%J_?8GO#+dVA)NZJp{Ky;CdJmnzvfDqz?$NNsa}dU16U`{!(}H4KLHwnzIttoPPLoAvrP+-yi{Jno*d)h)vcIQEnS-q+8m_4lGkDu!W3T_wEl-ZugGf;P;o2!|!;BuO~RX|DRZXET>3WkzqBX331@YF(ZWAA%!4^=%d<Love(ihw9r6%{5*$UNc{@1Dmg;&4Wb%+>Ld1#)c!2}-Ji&Y8tBesb-EZlZKP5~VdOpNGcrGK<Fa$aWF@4C&$ng8FR@3F$T``T}VF(_-|eYeU8??Zx{3V4-@U1MFK;k<TmwDYux-Q<G~7bs!>xb5leP_r%+e7_LJ3m?If(GZX!-U)5~1%deS&<?ZS-uqr2wc{x9LMNOUBbkzEu8O`6*GYb>^AVw67hF;I56{rYY;fK(yV+qqB{gv2i^bZh5=+m54)f?D;afl|C&>S}%1PAv8LFIw(pIQ(_3`y4c)y3D)8P_|;j`sA>kY?*ZpM+17q-Yq?`vD|nHR0xFr^hSt+{CkqSgPDK(U-m$2Yp+T?|Bu*VnM427L&lTh<|b(ptq3s8*meuB)$$v>5Xfj%#zl6Qz^dYX!FXSAOGu<LfY)KzTv!`>Ox&RwMzKlt!Kv=$^L~}9%-u4zM;u1MQw4_46;_a;FkJ-LN1{iA2-t03G?*ALEKGvnM21;d8Y%4F>?)j261o@u9yXGLcx!W{-aKHrNh$aq`9hu*1)JQRbK{hR-(D0WDLL!{|%nV^#>6Wxco9eR{3CA5qMY6?Ql^u65lilnKG|lag+$=r0SpkT7Dx|;+6G;ha0lX=|~cElh6<Akm2PbQwUZ*fP+=9jHIonIBcxX`YI-1BU0dDGMp2nmQyrwGd;$3uk~&-D{#5BR4P$iVS#e_yI3P!iEpKTYW+dda-5Z(@HA^P;M%h|DoEEw#v$|?^4&JKS1r3tR)c|R{eFIyU;c^2Ox~uh&Ol9uI~f4rTZ}zgltZpdvU>QlI7v~P*qiXdSiyfaZ)6%aB%CFwLB_vdkjSLf!z6sa9PqPkWK(YsF2zKHsKH$m81>8FS%spcNG)q3X>sw!ZEm6eLHB2-R-R~K*LsSg4`&+N;P7Xgd=UvlS@_zXP=e&jhj=O%nyp=NASzg5wd`s6Z8hKNo4UA<CZEzr`0j=d0!1MDME!*GVPIMjj=_zJA(!@Uk`-Ak5-d{&*sD(vk?)?3*9~0FLX0hgHJ)`IPOUrR6$X}#X=0KEXt*GS#Nfy4kCW<ewAH25`W{Z*lw$wTb{a_$>q4Bo$f>rYgO}N5ByVJjkipRL`a=R?qyg=x%=Wo8QMGVr;;}{Ac6ndrT(l?*Ik4RHIhZ3w+itTlbYvy4%8VuL*#!2k$JTJzgNixVeAp|eiF9F+*z+MJJGg5;FT?}EeDqNC@R-tsT>NpL<vb?&lFcjfp<BGJr*9Bxg)40QYwN1R^J_EOljCeN8qe>VQVy5cNJ9Wko}y?@T~a{>v?UEvaeA*O$<x~w>;bb2NwG#@KR)*dmbCg{isy{R*#h3Tgb@;@LZf4b|0E*9IGMPkybV->a;RapJu^*yfzBy4S2~rf*oPjs&)QG=`vVG6I){7bduMYb0e}eWiILJr0x~yW;}V&ghwDRnS4rc|Aqa!qHeHkJ^*tAyndSqudf&Ph4i;uD8CyI`9=Zn0Da{HGERz9AX=@0aq*hyi3H6oL)TD#W<?1X`z@p`F)t}ketIhO_PAo$NzwyOJ7jDM&1@t0I0_8h{O^~q}!Evb8eF}tU?hmdX<M!~_mY|W&t0E!wpms2CR{aye4**?8gP$Lv1p*j0KvL|IGKMVQt}TE&nQHvO@lX2nU;<>PH(z!h!6rt%f6IYpAjpLUEEPtvORT(H2hHf)YAYLin-p*ha#wJeOTR<2^$l-r1gyt1M7`krFZ<N(`hQ+T2gpE-b4*Ar{cSlUbxp!>(^q&GbfV~lj6AEBm{w9pLjY436);JQU?F#5c?G0Qme;YtayC<ljBN8#L>@Gl9$SMs+TqNka8g!d`lV7999T1Hh76A$^l<zT10W$#%0eMT9V4FmTqIO>2Z6Oh?T!u3>6_kA>U)v-*5!#iQzTN;_7v?--oC>BJ4rekJ&QBFnVaL~x`I`Ec@E`Mvp>{+uCW)i9W9bg?Dw1KBOa!lG*(~4#+v7$>F3s=3AchsZmh=glK*Qbz?DhU*5WDrPR}_G+3CMw?~?<>ZUQ=YlPRF@JQvMHu~DqgELVYCTc3_d_*e_G13&NCy=ou~PwJw*Z1GM+)|MZ$H3#wFQE6(pni#kKK=!8>&Z|FJ^-SUP-WkW9iSeqE3XCIF8V)HMhJ9zQ$(dlLjdrl+20%Kh8uIvCL7t>n?wY0LxBhM7A>Ay0g-FN}aP03JCrolr;B6L44Kltdf1hG^OvAi3_KmA@fxx0TGN#5C0qOuELG$v+eA=(ev2NQ}NRAP9G1D5hd21xj--S#I&X+{8B_B0~Hj*FB{k#yij}jQMpnohT_X;e;ZeAg><!=A1Mt-wOO?R%Ds1_3-@h%T>ZpELf=iP>js?Lcau-6>OyT?i+XP-nht<K=FvDv9taoHexUd2U$glb0~wuUa0{}7~?A%mQ*)GF`qOZgnY`IXlXybIWyjj)mO<p&s3`CI7``JRa5Ac&(Yg@H2GKhA4wdX*XYUrJ{~MT@kJez8E?_R=2MPP<rmpxJqW9oNLH#?Ke!Owi>@Z$c79j|JuDPV4>wylldMJMrIWGgz@D$?bEyVVoiw5>3#>gm7g{5)>^~M_URqE)6Oa_@VuMakSlAkh?T;6n1L)P61Ev2INX^dBrR4%AcTCd0|Q$JLI?jnFF#CN+=i_PY_EQ+S_0(Vu|*n3QUen7B6vKez2?P(rfaS(#qgg^JYPXi5Q9TIi)gV9M8WoyB))Y_Yg73Z7>502r{uRD=?)MbE25HDXGM0G2L+7(+0WKOn9H{E$bP-8i4ExzVKB?0d+}b%FalN^l6?S!m|$>Te(T9(Qd#=4w$i;1AC6AXE)pJsg%U+vrwAl#R;S=oIXRn)v=7YzE!>YzD7!(tJ~G{&#QBX&IKTB&z~Tk_D0}!$y6$ozOB`PF$CwUYvEYGGt#-B?C$-`N9vwjA)T&y0%?KWL`w0%(H!BRI7U3iTSt3{_+#6rF^@U!N(L%IChohNiY%km9*SGVpxn%36igpqX5lU**G0P#?(v_akp9@Z#FEMxajb0N_DjnK7m74!e{M3X3hUQCbJ4{!QoAewmg*m{RGV%5R0(4mu>8|#(yp_?pPO#Q68H!gEKh?I;YPrXx~IuT0OF;0hSJuiA^FO=qV9(-?h-f4(<U9>;><!}F4{UjFkEtaucX`F&c*{hxV|*Qki2tXx^AY4Nuy@&DRm4?BUy4~uu<GCoRJsoS;+33YF2l;SuECAhnIq_1rwAVVYRZ%Wk;9Dwa?b?V8o{UP8T9epBH4AI&MV0bs`~TO-4O%!NLG@m}T1CuauJ}+*6UitUb!E{ui+i^e7<@GV{(+j*KamE_%OU#R8$0b2wgB@noA<jjB&5FRhiVeNnu-LlBOD2GfEGdE5z<4arD7VY=5*NXFggmMfL@C7y<*z-J#feBs&3<%(e!2KF5=scV<=t*IZICA7?1g{uOT#mi<MT#6F^un#Q1r=ThToahn5CfS7$3y~v&%gW;8Uw!s%-Gt;}r`tMg7HXU}qFMO~J4qs8rW%hyAxS6FPGmU`;gJuGBn(2`s<7H()RlrD^{3;ewnWp55mqBEBnAlk2g7dB%P&TIi~<;je20^m_ic9za!Y~%3>Ee2+A4953;zJXrcx4Mv4JH(_(3)iIj{3umu6h=!vF9Hf~b!w@*(lX+0S8Z2z?ETm=)nN%!827A^xO}OaNTX-AlG*nSMr-tFpN+JdTeUJ^~@qj39`C)><BemQ}-Lw1ihA8km0o-Y7_<D+1&0$hbqXq>g6wt{#d^j4jWxzIkhHFoboAXtM;WVJiJ)|3~7QXO5F7<-DdmiQt6}f|s%$1nxWziRm!T*2v~jJI%sM#kf%8&cz(_57+$v$Q<=-l*=}o*g`m02XrN`#e><Yk2|l34A~%3sxxB(AAu?s5%DmWK8y<k#qhE{52kD_F(>qSo8k$HGu~Yy7t*Puo5dAtc{xhW5MAP;(n=ltAKpK^=p1z``<$&ak{0h&_7=_1D?Q9E!@@9=zcRnk5N~!4%*ryB>vn2~ff+g;G%p^jRi=y9c-U;Rm!=msI>cS3(ShCwDiC$cjh~<(o99iy8AItBKRyAT;8lO8-8tIQ+lTJ^t*5G)s@XJ3EN7Zd6~CoCc;<%9X^{uz_^cL692q@&60Uxz%ILpi%BT2~`n2~zNh8n9aBN%?H6lu?(e9LxgZ$R^;g!2eO5hnn1QX<C$?6mo6BA4>ivF9%hQ5u69+hF$T)J!J&|j=2_|k4AdTH$e4I&wG5HKW0_;*b$IXsa|_p<8Yc*Uiw@zPpv^s?_j87(_4NLqOq&aqE^_qgP)TYnaEExGz)*$`qncmAsg(V(C^L5jln$-2zQM~5#OrH$&_qMu)N1Hk4>mQ_-faYf-N@+*nl7U+?XVL?76a_fIlx$^|vmAr;F+d=fR24YGqurDJ;?qjH?+F_K++18Tzg*kU6!UYzA+Wizl@5QoVypxma4IoF}^m&i`8tP}voALkSLEGr^ar~(AKr0^UPwc~e&?~goauU;=oFUq0NP*5vxa*QgO|P}Hj;2Z~nglDJl=(d_4&#`zM^R=Yn;04foX~iZIA;$?8>0a?0sZ5js>8QJneRYWSV^ky)}FmB=)Z~6_N{A{)Xxfr*1N(fnd&aYv6$!`qw<N3*UTuObAwQ8;v#?(8spX&p$PQ_7bF+Ov_cc&;ywstGvDh_YkKpahy&&%^N!<NS1+bAhw;4R$QAJ?CZ+xT1H59$F2Mr&aO`r$qXM)9;2AKJADFw_XT+|2qRuPHeOD#DWt+hYAgAoN$$_1Dm(!&n80}5P8^YZX`rCDXgmE`2?kGtiiiOlVDWXjLh?ugPvJapRzpN<`mcr>YqYj~_){gJandq~sEkDKYy+%z^T9XaOh?U<Z&?Ipwxk8_Qm7F<6exz5-#q@sdpxeUzXZ1$TfbA&bH+{4AG2(q`MwivX2OYRzMH0lwojs$HM1?dqv2XJnXa<dK3fSIx$S7DO8Vr19j><(ZHw`^I%SsH3cHsNe_e%c{8x~T6G1l7C-&c!1Qzm?R{syGh*-`5$IJy!m*ReYxxwxGP)J5@ta=1IEu-1$_tq{?-_P917A=<CJpTOxFZ=g+f=59;DR>Q?zdpthNTwe2ycFdT$wXQz2cGgn1;Y4dFelloYFc{@5e|b5xR&qKC5ij%RXkupT_hDJC9P2%~py;(iEUo*>RQ$@JJ`6bx7WdM=ipU}V{v1si=o*XqHK1_!(hX}qih|(++Y!}h9LY8}o6*n+VMG$~l<^GKgOCT81@a!s*p-Q<pQu5pP_W;HBtt6NOd(_a*av<ev^guLmIX_$`<2W`E4Id({aLCX8ik5&yk1iG-8m0i=aH5(eap&ffS+uO8YSE|rRKfxacKhIegwo9aR%N{c-qkIDR7evn`dsG?a2k>kgb0c>XloS<MZ74x7a}57ouQ@#@iEle=#U}qFic?ebzHUC%OPo+je5(wJ!sVEA?Ms{ysmY&@4TLY2}!7od)}i_ZgFSX8{I=8w&#E>3=He3rAjqvf`0pmqVy8Yn%J&71^z_@-nP_@a`>BoPjO^oEi59)i1R|GGW@wX#?Y`5xO@u&4EpI<=Id~)S4;snZ;FeM!kWf_;Qij!cDlH*lpB6K!j<|*iFo=4d(U%7crkM(&A|X-q3^6QR&tCNiij96(?-YtayFB1wK_+_2@ikIn+Yxp!(KBC70Fx;J<%#gc5{pQ~K2@t9w#}vW`@$4DNsC#b<}U2W<H8D%O0*(44?*)K=0x>>j09N@CkO?+?Q_QNE|79EskHk>pELR?~)hIC6ZcKBUc!^ds!t_%ubXH##jibm;<#jHt&oHt0$kr#+lPFZhMbnhG@z*R~uZ*|BXTA;@x0Ft3nGJSl4h4pRw#Nz{$?LSd0w!8aymgDrZ^u@!hz@M3q5P`Ib&Rmx~bP<pRy{iWlLwND=++vYq0_4^2|<|e|XE|qfkGIG-_S3IF12NdLhQJsS03iL$b3A8rrON_miaW9D(3k1*)7tf*RBSv6#h|s_-I&F&54YJ3>X;CqBt0Up1*Npm_bos+f0Yxkvf&qFeBmGC`hk3u(K?up{Q}OqqZ;ox@S4VIjnf<@-qJJ7RxoySt=CA<%C(CNCrnoa8dHuJHr0}UtZ23wY5SzDrcFj!Df;?2POiwsTLG$n)vX^*p5iZDI=iT22d7bxnh$*JuFv}N1aw0&M+=t=yQ)o?A?eWpzB5wmP2Lo1}2X37;$H5bLH(~V$jv^1F^*gJg2h0k2H*9?oeLdM@23|AMMz;d(dnbOfMoTB8`3Lyyai6TwC$(6`@6@^0uTO+u`chKH#3f3n6Kh=+mD;6R>dp7TK9(@B=HARlUybmbc9mb!jfG#?1<#-mbyH_CN!iwpRu}#Wfn>}=Qgx~T8T(JCe)T(O2rpX4-~(D+FzdyZnv~IqO@RzbG;NBVg~0m<N^j6VQa33rBzF&td>$7DT)_Blh+&=M^x*mYyomC{GRcbRhYjork*$*Rhcvbb>oBtd7FS>RNU?SoZnv~oH^BfzeK-;>RB?gumi4*n;@yy9OU}b=;}wZgeSHOv!)oN6BssO@*l_LJc%`Kr;^fCpzpigQko+4^5Plx5nwPQeFoF|zLnjIKWEVq?1<1=FD&T*x^)SpjdzM(|2Q@392HGMAu0DvGaK?V3=ZVc0h0+u<ZJD+y2%w8an&uSPOP?WypE$10<iqQ+RXaQE@fACY8Ud8(s9n0!;L}qe=T&)}f61NJWx-*!pGATfaKJTGIetx4+e)fBRrwBDa2w4m0JcX`cyQHM7Ze4ic|uwQ7$IKi3SEp1+Eq;4Kjkj2CQrdhPz_-x{5VG`uQ4@|XU$T~$X|=k#eYxCg>_xg-ai=TBpj#K^5h2h-@o@CAHB$bDc(MH4n&@5@;VMl-N#>_Lzjzou(HIVLC4Jmgg57`)WbrCQ<~y1Jl)<7sC5})MER=|QlJde!a=PEsD3E$Oqy8Fsd`Pmb#G+DxmBQ6ulHjJ1|gxswh4nj#*W?&(M=*HXNo>nH`>k55`@cY9L4Vr`><!dguAkvtp!i3($gx&fv!IiT;8c`98_}%r98W>6<Gi)uK#E9<~B)Ez)b@UGU*B5ak|iBA!i;+H+o+dUuaW(t#=9C^1xmnHIEnrTRo}1j%!0dXSJIntt!IIt|pRE!!=ri`h6UMbmwHhZy^awIWCv3))<Je{|?r#R%=SpG883V5;am)8$w=!o~^mwCg}LFa@_@qxDgjRtLI0(s`5H8M(_f}B8C{qR4#1u1-TJp0O{cbk9h@Q)RLa5*)EwDLgmkCf%9bPXj%zI=>qR>jnI>B`^cyCqZDEWIl`b4BWvsBew0ogUGLs1&qAaG1Dd?2WkrQ%u)#BdmW>+b*vcSViUDHAyKg9>#0X~^FKgaH=(g9bZJJBOo0>)-D~wX5Y{k%DwqZL>@tK4qo48J<>_w(y0|X@TsE1}Q^zP0?Q5-C8!Jbp~N#qXX=;^V47NjTrfx^!x3y4}=Op#tU5l+aW5>p3tq?8EnYzo7@P53MJZz7bLu+vk3B^@?t*punGguWeRFRKk9bfbGn1HIDa01AsUL1J~*Rt^n6@xX&GHvQdRw^ea6#oEZ2K`VN4A#DUl(?RK9;+pP^2J{dwFp(3Nd|Z*m9O#p({&^Pur*IUG)dkaJ>FXW-{7BF;#N0y-F<MA8CgmECU}L#TAHC*4DZr8CL>T)FiJ>B{#kL+kAKJL0jfGf>>U9kPaaps8FL(^cpLm7CMS8tOu3UxS;LST*1)kM*(AZ&zJM&>aa0njT@qW#KBLpdYYAT#UN9^64PKOY7C5oEBW9SAv!-Lp?DLZ`EZ*)pkf;@xOEQ`xdymB6KRBKspae?2cRsU+k)&*{82Yi6Oll<bq={nuNEjLaVPE4w{4+Eb$^>rYg?R{ht=`#A}N0htyT9SAA^92G!zSyp(cVFV!Rj3d`5qXt3TwD45!Zn_zaiIthy}U|aAkya2Jb&|w6O^VLu9=jk7&k$CZ;z!jVq9rS)}BZzWMg8yH=1I|#5hz30*Xmes7rxr!}1t;jB9nD%4NJ~>5EOtT?Abao{`us9-6uw4c`@)proVP^P}2(o`k?z%3;C5cc&5cV#LU#^({UOPVH(Nl@I27N*2$`xoG<}8cg%IEI&({18U3jmU}twi;Q09FING>WMdTG-Z$%YM)m2&&-`RPbt{XEu=svr*5<P#8CMQq_Q|-we1I+~aC)knvlI<F{F&sRN(B8l>V#<Plg!-&&SpLN%l{XL_$J(!@U-qMK?S!e{T9WsU7glF0$I^vy_ik{8^+$bwIH=D1oYgQt4eI}<eC0+j(=jrjx=T~p|vtdq6Mwpe=|MvhDM}%3>q+!47o3?KBP<rP7&{NzwjW6QVe5%mrNQnEp<<9KnV`pA7kg>px(*kwd$~RLlk`5LDU1Im9Vw%=qC+{;RTfS?H0Z|1KJZ@{Ju7WJRNK&*&1}FL-j&YQOXYwgVi+?EBgKaR$g1G{gM(?|JqnDDy?w|g%+$&*vbxJr13h_2;6wQf_m>dhRyMvkEhiG>!4fY5#)L`8XIWZS{dqlU_y8z0*z%M$%v_fo0f!ft@A5-r}v_iI4t0vRa9;2SeQNwn@*A3h0&!!bCwaP70b}YjM(&s5b>w0p_UY}2*ZFux%pdwCcQv|)jQ+W-vCToQj`%OJ-OkWUM6N5@lH%qKMU6-b)`A8s~jX&rAmj=^-x7dAZz^MKwJ4JjBf*roCsMOxw7x@JSj10k_4|KfGf{l1He5w|I=bnToSfT0mWUvzk4Tfw|tfa4yh2|_a2Nl5TS}nq7;u4vksUV5J(*#(AyWWwPLOHZ$dBwXZ3Y#JaF`5CF@KtcsPhB$R)Iurg^@y<S`pXQ2rpT*OTRO2-VPC!TOf|;M)byVUQT1D*S2zfAeeG3@XgD;3O3_e5TVBClfHNk*jBE?X?nHwztuaaji7rdtMQ6Qi$p7{Y=9!U9momm)#k$8zfPH)Gy49k*|t9|6CIXU~c@liBlZpsd*dYZ}L4Qq@^2Z?6wNl`<3A6R-z08sEbySJ$QwJSxnjck!9kZu;~zxctC|>`kEv)`+Oh9yl9;x^&rzz)N%*m{N=yH6ii=9JztlnD(LRVYJXDJ8RUXqtaxf3y>bgScL~x8cyfsZr;<qu8a*Q|8YfyMvi26;bGn-+WERiv|0ni4grL@mh6i`F-?Op>={e$W_1^}ZrEp>IX;1U~{C5Z|?dsj;rxl!>&orp`5i(Xi&7*SWy*D%&Fd@SZ8JF{eY(kBq30~I*AAasO4NqZ>a%W_M-t5xiqHH6*_I=`R=HHH+U}DfKfh%Bc%GGQcFaBN}x|m0Wc~H{p_4HKaRltlF=>xXwm5DH&I55&Dt>b$=D#VbN*o*6YV>Ob!_}QE#2al5#vubtCZ#<$0{EX}T_ufb8vs4E_NA8p_nXlq(Cf==QY-8tpT_z+-YG7?InBeW$q-aQ>@QcpC;d)h`Nz~o1>)B>G@;kk+oVO@PN|XS2?rW{Rk0Bzq&)kSzsKt8WDllu7B`AiFq0Zu>ockh1yV|886t|;2Xcel3_(Gxdje>gxe_G*mevvF_iS_eRkPc<v%tO?W!7$@Xm7vF;`(pMbVN`>-g>lkhA?&ZXdfqTv1y((fI5m2RmEmgXfY~L!rQ(+H)3BQX*L8l<7>6se!QHV}&Gfn?f6Y<2MzQ2q0spIhiJCVpSsILKI^#vtnZhssGCsvY9xWGixVcvZKi~s`#%cBtwL`ZEnHp52U#L=)2P3jNHXIp|$xwd3LvMlgGBA*BJ|JK>+Fm14_<Z4`<vPC)-ajTwMdYdU@g992|B#URm|R@!fI7OQqhr1B`0fc2azX~rEx9c)!M^q8w08H7kZ~^Z(^RdUF`|#}A+yDQA?-ub$vI`7;FW|aq>et=W~yCtBsYL(?8}-1^<jAZH)u4Y8xeZMI*|>l2cdswYtn{BvzYB-?&AhP*>XL)rAO6ZXQLSBo?$-UH~(`#@HJtFYX%V!7+w*>zqY{`nB4{Th~!rU(d#QJVX8__u=G#C)_X+V&t)nnhQt#!vOu&(ZfZQIfI;HREf<B1#h#wdS$#(vmR$s3>uWog!KD>l;>QTwIuG74n|JTAnOyw1gXED11|W2eoizg2qC6=M4K>w5qzzTfcnFu8_rJ;|C`IdWqr0tV6-Y!=0}9|%<o*HiE#XHm$O?s(F)uay=<b(Q!ufZ2UR`)uFg?#x@Avy{UPI#9KXUC-<n5`q`O1UFVpv-L!Ey!pCMe*56`CeugX_@@G6Pel3BF;c`mze!)jErs<f^@Q;3PsMO~BK0oXsd!$McQAs`PQ_9Q$<>tamz;PRhXbA+P;5Rc><hR&2YU#UNW^C?sbQ!wR#5I30t-oh#YiEj>=u{0Z>((}pynrw6Y3t_dO=FXLJUlL;#fe5CbehOBjy{t3^M$B50V*y)tl<R`aj)fsx<tD5qa4$jR2Bxh){)sZY<I{*zE8giA;Y{?k9w7yabM}9a-ZbQM#w`87CQFlW%yYjiQ;4lhSmB>|;aGRkM7?U8`*au&4IMEfnq)<3Rj-C2!<eQS632pm|pN$+LkCRS{<#(+inKcWeYjS?ugM@$-(%kN7L8U!>$TZFMOT?W>3TQsH|1lnA5CJOYO7gmT*BbyY^_lckiI??N0{9So@!>l7Vq2>iig>vi90<?rR)$pI$GgT+H}}c8jAIz9kRbP(a=i=zgbfv7o!QV(J4m<i=@Mh}ZfjBSu}Q5|L{ruaI%`N1@Rt*hAZ1(}U&<=#F7Vc<smhJpaPLnnG1!uybV;5=JZTDpDF$;3{&P@*xPGNUBQJaDIUW}8VWp%k>t4h!7zC&|j6d@hZ2s$-jP`>WdCN-!L+lfWjV>V!<EvGFQTmYDVT&FQiG?acnY%V2vNBc3sY#=-UX<!4UE^US1rFK`b%;MGr#A<ay7r89+167NOe4OXTzmtEEYG(4nWX4#w5B}&>XDMav9b2#Lb|#1)+buTL^>OD{MWi799fmEbH2p&^y=Vr3FyK`97){9w@@AV<;wrGVHiGTf;r*4s>YUgDaBE9i@~7{WF&b=*ntxrAQe+A!z-?0S90QCJ;r)_=(%vfh6GK>pMwY+Wu;t4`%_~+%psu=rKD`O?}Bb~oNn$o!N(vN`Y%Z7*j9&K+nQUA*|u0G&b{Sl{v*aYf9;0DNgVF0c)$==-&pql*`2GM?hHwy*7CYa)gA^q5S<(&8t3h}wOtl;GQaUl0fAHo$k&kSv>%zuZXp(oBUmZy_X_yuH)Fm%N@*{GO#^|BuQCw?8iadTXoVJ(7rQC2oVJDBcsPG(ECLt>y9WSUq=~#|g%gF^ZQzHH$z+bTtYW$?p0+t$<)d~~0~3c39>fNXaD4k3Uy*Vq&kwItT|b>*DAfYPL*MywcQWPgl`lty0_;et?WA5^QuJVu!7*@?k8RifM-GQrpjEbyV~aahr&YI6#ilY0MLmQ(rzX@Pg=Z)N2jis|ul<yd9u=hYPug79$ay~w&@FU1zwCtf&9jxB5}k12WE|k2`=TTPbf!P@E74$R<#Rcj$7oGFZ?Yw^ejBV|Ym<wgd8l_z4ZZpmqQ@nLlBHf8WfWo!MV9fRXxQ0h@f*nA5vT&nZ%QsGFgSY3@42=RBc;c>UNf#UHurBz5~iN}P>oIldnF4XgCDt00w|5miu@^h*G&-tN7%gd66gT%%pAlMhwt|;3#*4jLg4bapA2e*lHTxLoSTepOV&_=*;;dE^ZJM@!IOVBEgjQ+u$QL4RoK(3=^wq65RRDz4F;aZG2|M$BCK9Ctu;|J<u=so%nLecRxR-o0};(ljf*Mwl4|y!kWK5b9zAhniB^WMxn<<NT$DEY9a{l^uFs|~PQ%S6Pg%^H4G$B5>03i{*<{_EEi2D(6W|Ta4c`k~5$^HejuP|#mPVy|Ff-HJlJSWu^N%*GamvKuNhj5+U35^4`xVeR;Gnj9HO>r9fJ9F1=p!MP3u1hOnF?JqVPyGjyq21sZY~{TfRp8<-A8fLEOpG6KXKkaHH>zC3-@@r<}@}A<g}qHVSG6elqDzY3V3^WxJ6}QcnU<rfIs7jdTO=%u$ojRtqGFikS_L@X0us6p6Ooxm9J5vCIqFOu9t&kcpf`Lsj=GbKyP_Fg~?MqGynhq+lGDgjY@M(00E9*+MfadiV{upvBYQl0ssI200dcD")).decode("utf-8")
+if hashlib.sha256(_e28_eng.encode("utf-8")).hexdigest() != E28_ENG_SHA:
+    raise RuntimeError("E28_ENG_EMBED_SHA_MISMATCH: engine donors")
+exec(compile(_e28_eng, "engine donors (NB6Q verbatim, packed)", "exec"), globals())
+
+
+# ==================================================================== NB5 glue (new)
+TEMP = 0.6                                       # RC2's sampled-check temperature (the Duck itself runs at T 1.0)
+PREFILL = {"tok_s": 700.0, "measured": False}
+NB5_SERVERS = []                                 # with_servers' list; a relaunch replaces the element (same name)
+NB5_BOOTS = []
+NB5_RC2_FP8_ARGV_TAIL = json.loads(r"""["127.0.0.1", "--port", "8001", "--tensor-parallel-size", "2", "--pipeline-parallel-size", "2", "--enable-expert-parallel", "--disable-custom-all-reduce", "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"probabilistic\"}", "--max-model-len", "262144", "--max-num-seqs", "8", "--max-num-batched-tokens", "1024", "--gpu-memory-utilization", "0.96", "--kv-cache-memory-bytes", "2479838700", "--kv-cache-dtype", "fp8_e4m3", "--limit-mm-per-prompt", "{\"image\":42,\"video\":0}", "--mm-processor-cache-gb", "0", "--mm-processor-kwargs", "{\"size\":{\"longest_edge\":8388608,\"shortest_edge\":65536}}", "--compilation-config", "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,24,32]}", "--enable-prefix-caching", "--mamba-cache-mode", "align", "--enable-prompt-tokens-details", "--no-enable-flashinfer-autotune", "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3", "--override-generation-config", "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}", "--default-chat-template-kwargs", "{\"enable_thinking\": true, \"reasoning_effort\": \"medium\"}", "--shutdown-timeout", "60", "--block-size", "4096", "--use-replayssm", "--prefix-match-unit", "64", "--served-model-name", "q27", "--max-model-len", "131072", "--port", "8001", "--default-chat-template-kwargs", "{\"enable_thinking\": true, \"reasoning_effort\": \"xhigh\"}"]""")
+NB5_CAPACITY = {}
+NB5_FINAL_KILL = False
+NB5_BOOT_KV = NB5_KV_DTYPE
+NB5_BOOT_DECODE = {"tok_s": None}               # this boot's pure decode rate (the token-weighted duty factor)
+NB5_F_MARGIN = 0                                 # PLAN v3.6: + blocks per admission after a real preemption (carried)
+
+
+class NB5Server(MServer):
+    """The E21 cells call log_text() and kill(fast=...); RC2's MServer has log() and kill()."""
+    def log_text(self):
+        return self.log()
+
+    def kill(self, fast=False, wait=None):
+        super().kill()
+
+
+MServer = NB5Server
+
+
+def E11Server(*_a, **_k):
+    """NB5-2: E21 CELL 6/7's E12 DFlash parity relaunch (P['parity']) names E11Server; no NB5 profile sets 'parity'
+    (asserted in CELL 1), so that path is unreachable. Defined explicitly so it can never become a NameError."""
+    raise RuntimeError("NB5-2: the E12 DFlash parity relaunch (E11Server) is not part of NB5")
+
+
+# ---- vLLM #60490 backport (R2 lever a; NB1's strict applier + the sha-pinned patch, verified before and after)
+P60490 = "# vLLM PR #60490 (issue #60489) rebased onto Merlin v3.0.0 (commit ad42e37feb7611c4ffd24017bf20a7e2dc94c6e5,\n# tree 07c16a79d077f1e06c19d0eea84efd64f0b63540 = the tree the Kaggle payload installs, install_merlin.log).\n# Same code as upstream; only the import context differs (Merlin's import block). One marker comment added.\n# pre-patch sha256  a23d5f90507ad5185f8b8e8d6ba13ae0cb53b2506264fdfbbf6a60b1171dc653\n# post-patch sha256 88fe0a8f4dd2ef90fc6aefb5771b5b48e40c0b1d575039283c52aeca19b8bd6b\n--- a/vllm/models/qwen4_exp/nvidia/qsa.py\n+++ b/vllm/models/qwen4_exp/nvidia/qsa.py\n@@ -18,8 +18,9 @@\n from torch import nn\n from transformers import Qwen4ExpTextConfig\n \n+import vllm.envs as envs\n from vllm.compilation.breakable_cudagraph import eager_break_during_capture\n-from vllm.config import VllmConfig\n+from vllm.config import VllmConfig, get_current_vllm_config_or_none\n from vllm.config.cache import CacheConfig, CacheDType\n from vllm.distributed import get_tensor_model_parallel_world_size\n from vllm.forward_context import get_forward_context\n@@ -45,6 +46,7 @@\n )\n from vllm.platforms import current_platform\n from vllm.platforms.interface import DeviceCapability\n+from vllm.utils.math_utils import cdiv\n from vllm.utils.torch_utils import (\n     LayerNameType,\n     _encode_layer_name,\n@@ -75,6 +77,7 @@\n from . import model\n from .indexer_qsa import QSAIndexer\n from .ops.qsa import qsa_e4m3_uses_native_cast\n+from .ops.qsa_indexer import _TOPK_WORKSPACE_BYTES\n \n logger = init_logger(__name__)\n \n@@ -782,6 +785,31 @@\n         if isinstance(metadata, list):\n             metadata = metadata[0]\n         if not isinstance(metadata, dict):\n+            # E25 NB1: backport of vLLM PR #60490 (issue #60489).\n+            # Profiling/dummy run: the indexer allocates its selection scratch\n+            # on demand, so touch its peak here for the memory profiler (as\n+            # sparse_attn_indexer does): the prefill logits budget or the\n+            # worst-case decode logits [decode tokens, compressed columns],\n+            # plus the top-k workspace.\n+            logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024\n+            cfg = get_current_vllm_config_or_none()\n+            if cfg is not None:\n+                spec = cfg.speculative_config\n+                num_spec = spec.num_speculative_tokens if spec is not None else 0\n+                decode_tokens = min(\n+                    cfg.scheduler_config.max_num_seqs * (num_spec + 1),\n+                    cfg.scheduler_config.max_num_batched_tokens,\n+                )\n+                block_size = cfg.cache_config.block_size\n+                columns = cdiv(cfg.model_config.max_model_len, block_size) * cdiv(\n+                    block_size, self.indexer.compress_ratio\n+                )\n+                logits_bytes = max(logits_bytes, decode_tokens * columns * 4)\n+            _ = torch.empty(\n+                logits_bytes + _TOPK_WORKSPACE_BYTES,\n+                dtype=torch.uint8,\n+                device=output.device,\n+            )\n             output.zero_()\n             return\n         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])\n"
+P60490_REL = "vllm/models/qwen4_exp/nvidia/qsa.py"
+P60490_PRE, P60490_POST = "a23d5f90507ad5185f8b8e8d6ba13ae0cb53b2506264fdfbbf6a60b1171dc653", "88fe0a8f4dd2ef90fc6aefb5771b5b48e40c0b1d575039283c52aeca19b8bd6b"
+P60490_MARKER = "# E25 NB1: backport of vLLM PR #60490 (issue #60489)."
+def apply_unified(text, patch):
+    """Strict unified-diff applier (no fuzz, no offset): every context / removed line must match at its stated line,
+    else ValueError. Lines before the first hunk (comments, ---/+++ headers) are ignored."""
+    src = text.splitlines(True)
+    hunks, cur = [], None
+    for ln in patch.splitlines(True):
+        if ln.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", ln)
+            if not m:
+                raise ValueError("bad hunk header: " + ln[:80])
+            cur = [int(m.group(1)), int(m.group(2) or 1), []]
+            hunks.append(cur)
+        elif cur is not None and ln[:1] in (" ", "-", "+"):
+            cur[2].append(ln)
+        elif cur is not None and ln.startswith("\\"):
+            raise ValueError("'No newline at end of file' hunks are not supported")
+    if not hunks:
+        raise ValueError("patch has no hunks")
+    out, pos = [], 0
+    for start, n_old, body in hunks:
+        i = start - 1
+        if i < pos:
+            raise ValueError(f"overlapping hunk at line {start}")
+        out += src[pos:i]
+        old_seen = 0
+        for ln in body:
+            tag, s = ln[0], ln[1:]
+            if tag in " -":
+                if i >= len(src) or src[i] != s:
+                    raise ValueError(f"context mismatch at line {i + 1}: {s[:60]!r}")
+                i += 1
+                old_seen += 1
+            if tag in " +":
+                out.append(s)
+        if old_seen != n_old:
+            raise ValueError(f"hunk at line {start}: {old_seen} old lines, header says {n_old}")
+        pos = i
+    return "".join(out + src[pos:])
+
+
+def nb5_apply_60490():
+    """After merlin_install, before the first boot (NB1 apply_60490 without the worker extension): the installed tree's
+    qsa.py must have Merlin ad42e37's pre-sha; the strict applier's result must have the post-sha; atomic replace; marker,
+    py_compile with the Merlin venv and the vllm origin in the tree are checked. Any miss raises (the file is untouched
+    unless the post-sha matched): the caller then keeps the RC2 pin (no ladder above it)."""
+    if FAKE:
+        return {"ok": None, "fake": True, "why": "local harness: no Merlin tree"}
+    eng = merlin_install()
+    tree, py = Path(eng["kv"]["MERLIN_TREE"]), eng["kv"]["MERLIN_VENV"] + "/bin/python"
+    f = tree / P60490_REL
+    raw = f.read_bytes()
+    h0 = hashlib.sha256(raw).hexdigest()
+    rec = {"file": str(f), "sha_before": h0, "pre_expected": P60490_PRE, "post_expected": P60490_POST}
+    if h0 == P60490_POST:
+        rec["applied"] = "already_applied"
+    elif h0 != P60490_PRE:
+        raise RuntimeError(f"PATCH_60490_PRE_SHA_MISMATCH: {h0} (expected Merlin ad42e37 {P60490_PRE})")
+    else:
+        new = apply_unified(raw.decode("utf-8"), P60490).encode("utf-8")
+        if hashlib.sha256(new).hexdigest() != P60490_POST:
+            raise RuntimeError("PATCH_60490_POST_SHA_MISMATCH: " + hashlib.sha256(new).hexdigest())
+        tmp = f.with_name(f.name + ".nb5tmp")
+        tmp.write_bytes(new)
+        os.replace(tmp, f)
+        rec["applied"] = "applied"
+    for pyc in (f.parent / "__pycache__").glob("qsa.*.pyc"):
+        pyc.unlink()
+    data = f.read_bytes()
+    rec.update(sha_after=hashlib.sha256(data).hexdigest(), marker=P60490_MARKER.encode() in data)
+    cp = subprocess.run([py, "-c", "import py_compile, sys\nfor f in sys.argv[1:]: py_compile.compile(f, doraise=True)", str(f)],
+                        capture_output=True, text=True, timeout=300)
+    rec["py_compile"] = {"rc": cp.returncode, "err": cp.stderr[-400:]}
+    envp = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    envp["PYTHONPATH"] = str(tree)
+    cp2 = subprocess.run([py, "-c", "import importlib.util as u; print(u.find_spec('vllm').origin)"], capture_output=True,
+                         text=True, timeout=300, env=envp)
+    rec["vllm_origin"] = cp2.stdout.strip()[-400:]
+    origin_ok = rec["vllm_origin"].startswith(str(tree))
+    if rec["sha_after"] != P60490_POST or not rec["marker"] or cp.returncode or not origin_ok:
+        raise RuntimeError("PATCH_60490_VERIFY_FAILED: " + json.dumps({k: rec.get(k) for k in ("sha_after", "marker", "py_compile",
+                                                                                              "vllm_origin")})[:600])
+    rec["ok"] = True
+    return rec
+
+
+def nb5_host_floor():
+    """KIT-6: the host RAM floor. Real runs: always Merlin's 69 GiB + 4 GiB. FAKE mode only (the CPU-kit fake server;
+    the Kaggle CPU kit has a 30 GiB cgroup): NB5_FAKE_HOST_FLOOR_MIB overrides it. Ignored without FAKE."""
+    v = os.environ.get("NB5_FAKE_HOST_FLOOR_MIB")
+    if FAKE and v:
+        try:
+            return int(v), "NB5_FAKE_HOST_FLOOR_MIB (fake server only)"
+        except ValueError:
+            pass
+    return NB5_RAM_NEED_MIB, "Merlin 69 GiB + 4 GiB margin"
+
+
+def e11_kill_server(wait=True):
+    """NB5: CELL 7 calls this after every phase; the server must live on for the next phase (the boot's with_servers
+    kills it). Counters are snapshot first (E21)."""
+    e21_snapshot_counters()
+    if NB5_FINAL_KILL and E11_SERVER is not None:
+        E11_SERVER.kill(fast=not wait)
+
+
+def nb5_gate_kv(kv_server):
+    """Duck's KV gate value (E15B G4-1): the reservation's projected fraction. Merlin's raw usage gauge also counts the
+    retained prefixes of finished turns (RC2: 0.30 with one 47k request; 0.97 at 8k x 8 with 0 preemptions), so the
+    raw gauge would hold admissions that fit; it is recorded (kv_usage_server) and drives the live hold instead."""
+    return NB5_RES.frac() if NB5_RES is not None else kv_server
+
+
+def nb5_metrics_text():
+    try:
+        return _urlreq.urlopen(SGL_URL + "/metrics", timeout=15).read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def nb5_host_gate(tag):
+    """Spec section 2: drop the page cache of the checkpoint files (merged symlinks -> Model mounts), then Merlin's
+    floor (max - (current - inactive_file) >= 69 + 4 GiB). Fail closed on a measured shortfall; recorded either way."""
+    roots = [CKPT] + [d for d, _ in [v for v in (PARTS or {}).values() if v]] + ([PLE_DIR] if PLE_DIR else [])
+    _need, _src = nb5_host_floor()
+    rec = NB5L.ram_gate(host_mem, _need, drop_fn=lambda: NB5L.drop_page_cache(roots),
+                        wait_sec=0 if FAKE else 120)
+    rec.update(tag=tag, floor_source=_src)
+    R["setup"].setdefault("host_gates", []).append(rec)
+    save()
+    return rec
+
+
+def nb5_capacity(srv, kv):
+    """Capacity from measured inputs (addendum 2): the server's caps (max_num_seqs, block, max-concurrency line), the
+    usable pool from cache_config_info (live) -> NB1's table -> the gauge quantization -> the PLACEHOLDER; F = max(NB1's F
+    or the PLACEHOLDER, F_log). Every source is recorded."""
+    caps = NB5L.server_caps(srv.log())
+    mt = nb5_metrics_text()
+    live = NB5L.pool_from_metrics(mt)
+    nb1 = (NB5_NB1_CAPACITY or {}).get(kv) or {}
+    if live:
+        pool, src = live["usable"], "cache_config_info"
+    elif nb1.get("pool_blocks"):
+        pool, src = int(nb1["pool_blocks"]), "nb1_table"
+    else:
+        pool, src = NB5_POOL_PLACEHOLDER[kv], "PLACEHOLDER_rc2"
+    f_par = int(nb1.get("f_blocks") or NB5_F_PLACEHOLDER)
+    f_src = "nb1_table" if nb1.get("f_blocks") else "PLACEHOLDER_rc2_measured_6"
+    block = caps.get("block_size") or 4096
+    plan = NB5L.capacity_plan(pool, block, NB5_ATTEMPT, NB5_PROMPT_ALLOW, NB5_TOOL_ALLOW, MAX_LEN, f_par, NB5_GATE,
+                              seqs=caps.get("max_num_seqs"), conc_tokens=caps.get("conc_tokens"), conc_x=caps.get("conc_x"),
+                              f_rule=NB5_F_RULE)
+    plan.update(pool_source=src, f_source=("f_log (server max-concurrency line)" if NB5_F_RULE == "measured" and plan.get("f_log")
+                                           is not None else f_src), caps=caps, kv_dtype=kv, live_pool=live, nb1=nb1)
+    if NB5_ADMIT_MODE == "slots":                  # R2 (user decision): workers = max_num_seqs = the 64k-context rule
+        _wr = NB5L.workers_rule(pool, block, plan["f_eff"])
+        _seq = caps.get("max_num_seqs")
+        _w = min(_wr, int(_seq)) if _seq else _wr
+        plan["r2_workers"] = {"rule": _wr, "rule_text": "max(1, floor(pool / (ceil(65536 / B) + F)))", "pool": pool,
+                              "f_eff": plan["f_eff"], "launch_max_num_seqs": _seq, "workers": _w,
+                              "rule_vs_launch": None if not _seq else ("EQUAL" if _wr == int(_seq) else
+                                                                       ("RULE_BELOW_LAUNCH" if _wr < int(_seq) else "RULE_ABOVE_LAUNCH")),
+                              "projected_120k_workers": plan["workers"],
+                              "captures_cover_workers": NB5L.captures_cover(NB5_CAPS16 if P.get("caps16") else [32], _w)}
+        if plan["workers"] >= 1:                   # C-8 stays: no attempt kind fits the pool -> NO_GO (workers 0)
+            plan["workers"] = _w
+    if P.get("workers_fixed"):                       # E28 W4 W7: workers 12 ONLY on the C12 rung (the I8 start pin + its
+        _e28c12 = bool(E28_RUNG.get("c12"))           # same-pin BF16 retry); lower rungs keep NB6Q's slots rule above
+        plan["e28_workers"] = {"rung_kv_bytes": E28_RUNG.get("kv_bytes"), "rung_gib": E28_RUNG.get("gib"), "c12_rung": _e28c12,
+                               "launch_seqs": E28_RUNG.get("seqs"), "rule_workers": plan["workers"],
+                               "workers_fixed": int(P["workers_fixed"]) if _e28c12 else None}
+        if _e28c12 and plan["workers"] >= 1:          # C-8 NO_GO kept (0 workers stays 0)
+            plan["workers"] = int(P["workers_fixed"])
+        plan["e28_workers"]["workers"] = E28_RUNG["workers"] = plan["workers"]
+    if caps.get("max_num_seqs") is None:
+        plan["warning"] = "max_num_seqs not found in the server log: workers = pool streams"
+    plan["other_dtype_plan"] = {k: NB5L.capacity_plan(NB5_POOL_PLACEHOLDER[k] if not (NB5_NB1_CAPACITY.get(k) or {}).get("pool_blocks")
+                                                      else int(NB5_NB1_CAPACITY[k]["pool_blocks"]), block, NB5_ATTEMPT,
+                                                      NB5_PROMPT_ALLOW, NB5_TOOL_ALLOW, MAX_LEN, f_par, NB5_GATE,
+                                                      seqs=8 if k == "fp8" else 3)["per_attempt"]
+                                for k in ("fp8", "bf16")}
+    return plan
+
+
+def nb5_chat(body, timeout=600):
+    return _e12v_request_json(SGL_URL + "/v1/chat/completions", payload=body, timeout=timeout)
+
+
+def nb5_complete(ids, max_tokens, timeout=600, **extra):
+    body = dict({"model": E21_SERVED[NB5_KV_DTYPE], "prompt": list(ids), "max_tokens": int(max_tokens), "temperature": 0.0,
+                 "stream": False}, **extra)
+    return _e12v_request_json(SGL_URL + "/v1/completions", payload=body, timeout=timeout)
+
+
+def nb5_commit_probe(served):
+    """W3 GPU check before the Duck (addendum 1 + 2): a real tool turn, then the commit request rendered by the server
+    (/tokenize) -> tail check -> render parity with the chat path (prompt_tokens) -> variant C via /v1/completions (cache
+    hit, tool call, think markup, finish stop with a closed think block) -> the SAME ids through the chat path with
+    continue_final_message (the server's qwen3 reasoning + qwen3_coder tool parsers) -> parser agreement -> the same C
+    ids with a cache_salt (cold prefix) vs warm: recurrent-state correctness under prefix reuse (greedy)."""
+    out = {"c_usable": False}
+    kw = {"enable_thinking": True, "reasoning_effort": "low"}
+    sys_ = {"role": "system", "content": "You are a careful assistant. When asked, use the python tool."}
+    u1 = {"role": "user", "content": "NB5 commit probe: use the python tool exactly once to run print(6 * 7). Keep your thinking very short."}
+    r1 = nb5_chat({"model": served, "messages": [sys_, u1], "tools": E21_PROBE_TOOLS, "tool_choice": "auto",
+                   "temperature": 0.0, "max_tokens": 3072, "chat_template_kwargs": kw})
+    m1 = r1["choices"][0]["message"]
+    calls = m1.get("tool_calls") or []
+    out["turn1"] = {"tool_calls": len(calls), "finish": r1["choices"][0].get("finish_reason"),
+                    "usage": r1.get("usage")}
+    if not calls:          # thinking ran long: our own scripted turn (the render / cache / parser checks still apply)
+        calls = [{"id": "chatcmpl-tool-nb5probe", "type": "function",
+                  "function": {"name": "python", "arguments": json.dumps({"code": "print(6 * 7)"})}}]
+        m1 = {"content": "", "reasoning": "I will run print(6 * 7) with the python tool."}
+        out["turn1"]["scripted"] = True
+    hist = [sys_, u1, {"role": "assistant", "content": m1.get("content") or "", "reasoning": m1.get("reasoning") or "",
+                       "tool_calls": calls},
+            {"role": "tool", "tool_call_id": calls[0].get("id", "call_0"), "content": "42"},
+            {"role": "user", "content": "Your budget is almost spent. In this reply, call python once with print(7 * 6) and nothing else."}]
+    payload = {"model": served, "messages": hist, "tools": E21_PROBE_TOOLS, "chat_template_kwargs": kw}
+    ids = NB5L.tokenize_chat(SGL_URL + "/v1", payload)
+    ids_c = NB5L.variant_c_ids(ids, NB5_TAILS[0], NB5_TAILS[1])
+    out.update(render_tokens=len(ids), tail=ids[-4:], tail_ok=ids_c is not None)
+    r2 = nb5_chat({"model": served, "messages": hist, "tools": E21_PROBE_TOOLS, "temperature": 0.0, "max_tokens": 1,
+                   "chat_template_kwargs": kw})
+    out["render_parity"] = (r2.get("usage") or {}).get("prompt_tokens") == len(ids)
+    out["chat_prompt_tokens"] = (r2.get("usage") or {}).get("prompt_tokens")
+    if ids_c is None:
+        return out
+    r3 = nb5_complete(ids_c, 512)
+    c3, u3 = r3["choices"][0], r3.get("usage") or {}
+    msg3, n3, leak3 = NB5L.parse_c_reply(_E12_TA, c3.get("text") or "")
+    out["variant_c"] = {"tool_calls": n3, "finish": c3.get("finish_reason"), "think_markup_in_reply": leak3,
+                        "cached": ((u3.get("prompt_tokens_details") or {}).get("cached_tokens")),
+                        "prompt": u3.get("prompt_tokens"), "completion": u3.get("completion_tokens"),
+                        "args": [(c["function"] or {}).get("arguments") for c in (msg3.get("tool_calls") or [])],
+                        "natural_finish": c3.get("finish_reason") == "stop" and not leak3, "text_head": (c3.get("text") or "")[:300]}
+    try:          # the server's own parsers on the hand-closed think: continue_final_message with a fixed prefill renders
+        # C + the prefill (HF / vLLM trim only the end of a NON-empty final message); the SAME ids go to /v1/completions
+        # (Duck's markup parser) and to chat (the server's qwen3 reasoning + qwen3_coder tool parsers), greedy
+        pre = {"role": "assistant", "content": "I will call the tool now.", "reasoning": ""}
+        tb = {"model": served, "messages": hist + [pre], "tools": E21_PROBE_TOOLS, "chat_template_kwargs": kw,
+              "add_generation_prompt": False, "continue_final_message": True}
+        ids_cfm = list(_e12v_request_json(SGL_URL + "/tokenize", payload=tb, timeout=120).get("tokens") or [])
+        out["cfm_starts_with_c"] = ids_cfm[:len(ids_c)] == ids_c
+        if out["cfm_starts_with_c"]:
+            r4 = nb5_chat(dict(tb, temperature=0.0, max_tokens=512))
+            m4 = r4["choices"][0]["message"]
+            a4 = [(c.get("function") or {}).get("arguments") for c in (m4.get("tool_calls") or [])]
+            r4c = nb5_complete(ids_cfm, 512)
+            m4c, n4c, _ = NB5L.parse_c_reply(_E12_TA, r4c["choices"][0].get("text") or "")
+            a4c = [(c.get("function") or {}).get("arguments") for c in (m4c.get("tool_calls") or [])]
+            norm_ = lambda xs: [json.loads(x) if isinstance(x, str) and x.strip().startswith("{") else x for x in xs]
+            out["server_parsers"] = {"tool_calls": len(a4), "client_tool_calls": n4c, "reasoning_chars": len(m4.get("reasoning") or ""),
+                                     "content_head": (m4.get("content") or "")[:200], "finish": r4["choices"][0].get("finish_reason"),
+                                     "args_equal_client_parse": norm_(a4) == norm_(a4c)}
+    except Exception as _e:
+        out["server_parsers"] = {"error": repr(_e)[:300]}
+    try:          # recurrent-state correctness under prefix reuse: a cold prefix (cache_salt) vs the warm one, greedy
+        r5 = nb5_complete(ids_c, 128, cache_salt=f"nb5-cold-{time.time_ns()}")
+        r6 = nb5_complete(ids_c, 128)
+        t5, t6 = r5["choices"][0].get("text") or "", r6["choices"][0].get("text") or ""
+        cw = ((r6.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens")
+        cc = ((r5.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens")
+        k = next((i for i, (a, b) in enumerate(zip(t5, t6)) if a != b), None)
+        out["cold_vs_warm"] = {"cold_cached": cc, "warm_cached": cw, "equal": t5 == t6, "first_diff_char": k,
+                               "verdict": ("INCONCLUSIVE_NO_COLD" if cc else ("EQUAL" if t5 == t6 else "DIFFER"))}
+    except Exception as _e:
+        out["cold_vs_warm"] = {"error": repr(_e)[:300], "verdict": "INCONCLUSIVE_ERROR"}
+    out["c_usable"] = bool(out["tail_ok"] and out["render_parity"])
+    return out
+
+
+def nb5_paired_commit_replay(tag, deadline_pc=None):
+    """Addendum 2: the first REAL Duck commit request of the phase (kept by the tracer), replayed greedily as variant A
+    (chat, thinking on) and variant C (ids): cache hit, generated tokens, tool call and code validity of each; with an
+    MTP-off boot the same C replay is compared later (target-only parity)."""
+    samp = NB5_TRACE.commit_samples.get("C") or NB5_TRACE.commit_samples.get("A")
+    if not samp:
+        return {"skipped": "no commit request in this phase"}
+    pl = json.loads(json.dumps(samp["payload"]))
+    _left = lambda: (deadline_pc - time.perf_counter()) if deadline_pc else 1200.0
+    if _left() < 60:
+        return {"skipped": "less than 60 s before the SMOKE gate", "task": samp["task"]}
+    out = {"task": samp["task"], "branch": samp["branch"]}
+    import ast as _ast
+
+    def _code_ok(args):
+        try:
+            a = json.loads(args) if isinstance(args, str) else (args or {})
+            _ast.parse(a.get("code") or "")
+            return bool(a.get("code"))
+        except Exception:
+            return False
+    try:
+        ids = NB5L.tokenize_chat(SGL_URL + "/v1", pl)
+        ids_c = NB5L.variant_c_ids(ids, NB5_TAILS[0], NB5_TAILS[1])
+        if ids_c is not None:
+            r = nb5_complete(ids_c, min(int(pl.get("max_tokens") or 2048), 2048), timeout=max(10, _left() / 2))
+            c = r["choices"][0]
+            m, n, lk = NB5L.parse_c_reply(_E12_TA, c.get("text") or "")
+            u = r.get("usage") or {}
+            out["C"] = {"cached": (u.get("prompt_tokens_details") or {}).get("cached_tokens"), "prompt": u.get("prompt_tokens"),
+                        "completion": u.get("completion_tokens"), "tool_calls": n, "finish": c.get("finish_reason"),
+                        "code_valid": any(_code_ok(x["function"].get("arguments")) for x in (m.get("tool_calls") or [])),
+                        "text": (c.get("text") or "")[:4000]}
+        ra = nb5_chat(dict(pl, temperature=0.0, max_tokens=min(int(pl.get("max_tokens") or 4096), 4096)), timeout=max(10, _left()))
+        ca, ua = ra["choices"][0], ra.get("usage") or {}
+        ma = ca.get("message") or {}
+        out["A"] = {"cached": (ua.get("prompt_tokens_details") or {}).get("cached_tokens"), "prompt": ua.get("prompt_tokens"),
+                    "completion": ua.get("completion_tokens"), "tool_calls": len(ma.get("tool_calls") or []),
+                    "finish": ca.get("finish_reason"),
+                    "code_valid": any(_code_ok((x.get("function") or {}).get("arguments")) for x in (ma.get("tool_calls") or [])),
+                    "reasoning_chars": len(ma.get("reasoning") or "")}
+        if "C" in out:
+            out["same_tool_call_presence"] = bool(out["A"]["tool_calls"]) == bool(out["C"]["tool_calls"])
+    except Exception as _e:
+        out["error"] = repr(_e)[:400]
+    return out
+
+
+def nb5_warmup(port, W):
+    """Addendum 1.3: the JIT-during-inference kernels (RC2: _fill_num_accepted, causal_conv1d_update, gdn_recoverssm
+    verify, ple_conv, ple_conv_writeback) compile at the first sampled decode / first concurrent verify. Every metric
+    window starts after this warm-up; JIT lines inside a later window are reported per phase."""
+    j0 = len(NB5L.jit_kernels(E11_SERVER.log()))
+    t0 = time.time()
+    rows = []
+    for level, band, n_new in ((1, "2k", 256), (W, "8k", 384), (min(W, 2), "40k", 64), (W, "2k", 256)):
+        ss = [L.Stream(port, PROMPTS[band][i % len(PROMPTS[band])], n_new, temperature=1.0, seed=900 + i) for i in range(level)]
+        for g in ss:
+            g.start()
+        for g in ss:
+            g.join(max(30, min(900, left() - 600)))
+        for g in ss:
+            if g.is_alive():
+                g.stop()
+                g.join(10)
+        rows.append({"level": level, "band": band, "tokens": [len(g.tokens) for g in ss], "errors": [g.err for g in ss if g.err]})
+    ks = NB5L.jit_kernels(E11_SERVER.log())
+    return {"sec": round(time.time() - t0, 1), "rows": rows, "jit_before": j0, "jit_after": len(ks), "jit_kernels": ks,
+            "log_offset_after": len(E11_SERVER.log())}
+
+
+def nb5_pure_decode(port, W, plan):
+    """Pure decode: L.steady (the window starts only after prefill settled; STEADY needs running == level the whole
+    window) at the Duck's own sampling (T 1.0) and level = workers, 40k prompts when they fit, else 8k."""
+    band = "40k" if W * (NB5L.cdiv(40000 + 8192, plan["block_size"]) + plan["f_eff"]) <= plan["capacity_blocks"] else "8k"
+    r = L.steady(port, PROMPTS[band], W, secs=WIN, max_new=MAX_NEW[band], temperature=1.0, prefill_tok_s=PREFILL["tok_s"])
+    r["band"] = band
+    r["engine_rates"] = NB5L.engine_rates(r, pp=2)
+    r["note"] = ("decode-rate window on RC2's ARC-text prompts (concatenated real tasks): a rate, never an acceptance / K "
+                 "decision input (PLAN never-do: synthetic prompts for acceptance)")
+    return r
+
+
+def nb5_probes(srv):
+    """The short correctness gates before any Duck work (RC2 + E21): census, thinking-off arithmetic, a sampled request,
+    content probes, the tool contract (history 'reasoning' key, turn-2 growth, cache probe), the commit probe.
+    Returns (ok, record); garbage / dead is fatal everywhere, a tool-contract issue only outside the rerun."""
+    o = {"census": kv_census(srv), "probes": L.chat_probes(srv.port), "sampled": sampled_check(srv)}
+    o["fatal"] = None
+    if (not FAKE and o["probes"].get("ok") is not True) or o["sampled"].get("ok") is not True or o["sampled"].get("garbage"):
+        o["fatal"] = "SHORT_CORRECTNESS_GATE_FAILED"
+        return False, o
+    served = E21_SERVED[NB5_KV_DTYPE]
+    try:
+        o["content_probes"] = e21_content_probes(served)
+    except Exception as _e:
+        o["content_probes"] = {"error": repr(_e)[:600]}
+        o["fatal"] = "CONTENT_PROBES_FAILED"
+        return False, o
+    try:
+        o["contract"] = e21_contract_probe(served)
+    except Exception as _e:
+        o["contract"] = {"error": repr(_e)[:600]}
+        if not RERUN:
+            o["fatal"] = "CONTRACT_PROBE_FAILED"
+            return False, o
+    try:
+        o["commit_probe"] = nb5_commit_probe(served)
+    except Exception as _e:
+        o["commit_probe"] = {"error": repr(_e)[:600], "c_usable": False}
+    NB5_C["enabled"] = bool((o["commit_probe"] or {}).get("c_usable"))
+    NB5_C["probe"] = o["commit_probe"]
+    if not PREFILL["measured"]:
+        o["prefill"] = prefill_probe(srv.port)
+    return True, o
+
+
+def nb5_reset_duck_state():
+    """E21 gotchas: Duck's priority gate is a process-wide singleton built with ARC3_MAX_ACTIVE_STREAMS (fresh per
+    phase); the scheduler / server-down globals of arc2_duck are cleared."""
+    with _E12_TA._PRIORITY_GATE_LOCK:
+        _E12_TA._PRIORITY_GATE = None
+    _E12_TA._GATE_STATS.update(enqueued=0, blocked=0, blocked_ms=0, handover_ms=0)
+    E12A.SERVER_DOWN.clear(); E12A.SERVER_WAITS.update(waits=0, sec=0.0); E12A.SERVER_LAST.clear(); E12A.SCHED_LAST.clear()
+    os.environ["ARC3_REASONING_HISTORY_KEY"] = "reasoning"
+    os.environ["LOCAL_ANALYZER_BASE_URL"] = os.environ["OPENAI_BASE_URL"] = SGL_URL + "/v1"
+    os.environ["ARC3_MAX_ACTIVE_STREAMS"] = str(int(CONCURRENCY))
+
+
+def nb5_sampler(stop, rows, path, workers):
+    """Every 15 s during a phase: server running / waiting / raw KV gauge / generated / preemptions, the client's
+    in-flight requests and the reservation. Live observation (addendum 2): server waiting > 0 while the client has no
+    more requests in flight than run -> the reservation holds new grants (two samples in a row); a real preemption ->
+    F + 1 for later admissions. Never touches running work."""
+    last_pre, bad = None, 0
+    while not stop.wait(float(os.environ.get("NB5_SAMPLER_SEC", "15"))):
+        try:
+            rr = e21_prom()
+            g = lambda n: sum(float(x.value) for x in rr if x.name == n)
+            s = {"t": round(time.time(), 1), "running": int(g("vllm:num_requests_running")), "waiting": int(g("vllm:num_requests_waiting")),
+                 "kv_server": round(max([float(x.value) for x in rr if x.name == "vllm:kv_cache_usage_perc"] or [0.0]), 4),
+                 "gen": g("vllm:generation_tokens_total"), "preempt": g("vllm:num_preemptions_total")}
+        except Exception as _e:
+            s = {"t": round(time.time(), 1), "error": repr(_e)[:120]}
+        s["inflight"] = NB5_TRACE.inflight
+        s["workers"] = workers
+        if NB5_RES is not None:                   # PLAN v3.6: does Merlin's defer and Duck's projected gate restrict each other?
+            _need = min(int(NB5_BLOCKS["b0"] or 1), int(NB5_BLOCKS["b1"] or 1))
+            _done = sum(1 for v in (globals().get("E12_RECORDS") or {}).values() for r in v if r.get("status") == "done")
+            s.update(duck_waiting=NB5_RES.waiting, duck_held=len(NB5_RES.held), free_blocks=NB5_RES.cap - NB5_RES.used,
+                     work_left=(_done + len(NB5_RES.held)) < 2 * len(TASK_IDS))
+            s["free_not_admitted"] = bool(s["free_blocks"] >= _need and s["duck_held"] < workers and s["work_left"]
+                                          and not NB5_EARLY.get("fired") and not NB5_RES.waiting)
+        if NB5_EARLY.get("armed") and not NB5_EARLY.get("fired"):
+            try:
+                if nb5_smoke_ready(s):
+                    nb5_smoke_early_exit()
+            except Exception as _e:
+                NB5_EARLY["error"] = repr(_e)[:200]
+        if NB5_RES is not None:
+            s["reserved"] = NB5_RES.used
+            if "waiting" in s and NB5_ADMIT_MODE != "slots":     # R2 'slots': the engine schedules (no client hold)
+                bad = bad + 1 if (s["waiting"] > 0 and s["inflight"] <= s["running"] + s["waiting"] and s["running"] < s["inflight"]) else 0
+                NB5_RES.set_live_hold(f"server waiting {s['waiting']} running {s['running']} in-flight {s['inflight']}" if bad >= 2 else None)
+            if "preempt" in s:
+                if last_pre is not None and s["preempt"] > last_pre and NB5_ADMIT_MODE == "slots":
+                    NB5_EARLY["preempted"] = True          # R2: preemptions allowed (counted, speed only); no F correction
+                elif last_pre is not None and s["preempt"] > last_pre:
+                    NB5_RES.correct(1, f"server preemptions {last_pre} -> {s['preempt']}")
+                    NB5_EARLY["preempted"] = True
+                last_pre = s["preempt"]
+        rows.append(s)
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(s) + "\n")
+        except Exception:
+            pass
+
+
+def nb5_smoke_ready(sample):
+    """PLAN v3.6 SMOKE early exit: the functional checks already passed before the phase (probes, render parity, one
+    short tool turn); the task-level gates: requests served without errors, >= 1 attempt finished, >= 1 variant-C
+    commit turn with a tool call (unless C is disabled), no preemption, the server alive."""
+    tr = NB5_TRACE.summary()
+    done = [r for v in (globals().get("E12_RECORDS") or {}).values() for r in v if r.get("status") == "done"]
+    cv = (tr.get("commit_by_variant") or {}).get("C") or {}
+    return bool(tr.get("requests") and not tr.get("errors") and done and (cv.get("with_tool_call") or not NB5_C["enabled"])
+                and not NB5_EARLY.get("preempted") and E11_SERVER is not None and E11_SERVER.alive())
+
+
+def nb5_smoke_early_exit():
+    """No new attempt (the reservation hook refuses), and every running attempt ends at its next request boundary
+    (Duck's own done_now: generated >= the session cap; later requests clamped to now). In-flight requests finish."""
+    NB5_EARLY["fired"] = round(time.perf_counter() - NOTEBOOK_T0, 1)
+    for s_ in list(NB5_ACTIVE.values()):
+        try:
+            s_.max_generated_tokens = max(1, int(getattr(s_.agent, "generated_tokens", 0) or 0))
+            if s_.agent is not None:
+                s_.agent._arc2_deadline = time.monotonic()
+        except Exception:
+            pass
+    log("NB5 SMOKE early exit: gates passed at", NB5_EARLY["fired"], "s")
+
+
+def nb5_interaction(rows, interval):
+    """Per phase (PLAN v3.6): the server waiting while Duck holds attempts, free projected capacity with work left but no
+    admission, Duck holding with the server idle-able; in samples and seconds."""
+    rr = [r for r in rows if "duck_waiting" in r and "waiting" in r]
+    f = lambda c: sum(1 for r in rr if c(r))
+    out = {"samples": len(rr), "interval_sec": interval,
+           "server_waiting": f(lambda r: r["waiting"] > 0),
+           "duck_holding": f(lambda r: r["duck_waiting"] > 0),
+           "server_waiting_while_duck_holds": f(lambda r: r["waiting"] > 0 and r["duck_waiting"] > 0),
+           "free_projected_capacity_no_admission": f(lambda r: r.get("free_not_admitted"))}
+    out.update({k + "_sec": round(v * interval, 1) for k, v in list(out.items()) if k not in ("samples", "interval_sec")})
+    return out
+
+
+def nb5_qab_phase_record(name, rep, rows, preemptions):
+    """R2 per phase: the actual solve window, the capacity levers of this boot (pool blocks, pin, F, workers, max_num_seqs,
+    the lever env), speed (max streams reached, mean running, preemptions -> speed PREEMPTED, accuracy untouched,
+    tok/s), the per-task accuracy table (nb5_lib.qab_tasks) and its per-group summary, the FP8 label."""
+    run = dict(E12_RUN or {})
+    ws = (run.get("window_shift") or {}).get("window_start_sec") or run.get("started_sec")
+    we_pc = E15B_SOLVE_END_PC if E15B_SOLVE_END_PC != float("inf") else None
+    to_epoch = lambda pc: time.time() - (time.perf_counter() - pc)
+    ws_ep = to_epoch(NOTEBOOK_T0 + float(ws)) if ws is not None else None
+    we_ep = to_epoch(we_pc) if we_pc else None
+    win = {"start_sec": ws, "end_sec": round(we_pc - NOTEBOOK_T0) if we_pc else None,
+           "actual_sec": round(we_pc - NOTEBOOK_T0 - float(ws), 1) if (we_pc and ws is not None) else None,
+           "planned_sec": (NB5_REPORT["phases"].get(name, {}).get("window_plan") or {}).get("planned_sec"),
+           "solver_returned_sec": run.get("finished_sec")}
+    b = NB5_BOOTS[-1] if NB5_BOOTS else {}
+    tr = (b.get("tries") or [{}])[-1]
+    cap = NB5_CAPACITY or {}
+    busy = [r_ for r_ in rows if isinstance(r_.get("running"), int) and (r_.get("inflight") or 0) > 0]
+    tasks = NB5L.qab_tasks(E12_RECORDS, SOLUTIONS, rep.get("eval_unit_records"), NB5_QAB_GROUP_OF, P["task_list"],
+                           {"b0": E15B["E12_B_ATTEMPT_TOKENS"], "b1": E15B["E12_B_ATTEMPT_TOKENS_B1"]}, ws_ep, we_ep,
+                           (NB5_TRACE.summary() or {}).get("by_attempt"))
+    return {"window": win, "order": rep.get("order"),
+            "fp8_status": NB5_QAB_FP8_LABEL if NB5_BOOT_KV == "fp8" else "BF16_REFERENCE",
+            "capacity_levers": {"pool_blocks": cap.get("pool_blocks"), "pool_source": cap.get("pool_source"),
+                                "capacity_blocks": cap.get("capacity_blocks"), "f_eff": cap.get("f_eff"), "f_log": cap.get("f_log"),
+                                "f_source": cap.get("f_source"), "pin_gib": tr.get("pin_gib"), "kv_bytes": tr.get("kv_bytes"),
+                                "lever_env": tr.get("levers"), "max_num_seqs_launch": tr.get("max_num_seqs_launch"),
+                                "workers": int(CONCURRENCY), "r2_workers": cap.get("r2_workers"),
+                                "captures": NB5_CAPS16 if P.get("caps16") else None,
+                                "ladder_tries": [{"name": t_.get("name"), "status": t_.get("status"),
+                                                  "failed": (t_.get("ladder") or {}).get("failed")} for t_ in b.get("tries") or []],
+                                "levers_dropped": b.get("levers_dropped"), "config_readback": (tr.get("config_readback") or {}).get("ok")},
+            "speed": {"max_running": max([r_["running"] for r_ in rows if isinstance(r_.get("running"), int)] or [0]),
+                      "max_inflight": max([int(r_.get("inflight") or 0) for r_ in rows] or [0]),
+                      "mean_running_busy": round(sum(r_["running"] for r_ in busy) / len(busy), 2) if busy else None,
+                      "preemptions": int(preemptions or 0), "speed_status": "PREEMPTED" if preemptions else "CLEAN",
+                      "accuracy_affected_by_preemption": False,
+                      "solver_tok_s": (NB5_REPORT["phases"].get(name, {}).get("solver_window") or {}).get("tok_s"),
+                      "phase_tok_s": (NB5_REPORT["phases"].get(name, {}).get("phase_window") or {}).get("tok_s")},
+            "qab": {"tasks": tasks, "summary": NB5L.qab_summary(tasks)}}
+
+
+def nb5_phase(spec, mtp_tag):
+    """One Duck run on the live server: fresh Duck state (workload reset), counters / log offset at the start
+    (timestamp-delta metric reset), E15B CELL 6 + 7 (E21's wrapped functions), the NB5 phase record."""
+    global TASK_IDS, CHALLENGES, SOLUTIONS, OUT, E21_HALF, E21_HALF_END_PC, E12_SOLVE_WINDOW_SEC, E15B_SOLVE_END_PC, NB5_RES
+    global NB5_F_MARGIN, E12_MAX_GEN_PER_BRANCH, CONCURRENCY, E12_STREAMS, E12_VLLM_CONCURRENCY, E12_RECORDS
+    name, sel, window, _mtp, cmode = spec[:5]
+    opts = (spec[6] if len(spec) > 6 else None) or {}
+    rec = NB5_REPORT["phases"].setdefault(name, {"spec": spec, "boot": mtp_tag})
+    ids = [t for t in NB5_SMOKE_TASKS if t in NB5_EVAL_CH] if sel == "smoke" else list(NB5_ALL_IDS)
+    if not ids:
+        rec["status"] = "SKIPPED_NO_TASKS"
+        return rec
+    if P.get("equal_windows") and sel != "smoke":
+        # R2: equal solve windows, fixed when the FIRST paired phase starts (after its boot: a slow first boot shortens
+        # every window equally); a later phase gets the same window unless the hard stop leaves less (recorded UNEQUAL)
+        if NB5_EQ["window_sec"] is None:
+            _left_ph = [s_[0] for s_ in P["nb5_phases"] if s_[0] == name or s_[0] not in NB5_REPORT["phases"]]
+            NB5_EQ["plan"] = NB5L.equal_windows(time.perf_counter(), HARD_STOP - E12_STOP_BEFORE_HARD_SEC,
+                                                time.perf_counter() - float(NB5_EQ["try_t0_pc"] or time.perf_counter()),
+                                                float(os.environ.get("NB5_PHASE_TAIL_SEC", 300)) if E11_HARNESS else 300.0,
+                                                max(1, len(_left_ph)))
+            NB5_EQ["window_sec"] = NB5_EQ["plan"]["window_sec"]
+        window = float(NB5_EQ["window_sec"])
+        _room = (HARD_STOP - E12_STOP_BEFORE_HARD_SEC) - time.perf_counter() - 60.0
+        rec["window_plan"] = {"planned_sec": window, "room_sec": round(_room, 1), "plan": NB5_EQ["plan"], "unequal": False}
+        if _room < window:
+            rec["window_plan"].update(unequal=True, short_by_sec=round(window - _room, 1))
+            window = max(0.0, _room)
+        if window < (60 if E11_HARNESS else 5 * 60):
+            rec.update(status="SKIPPED_BUDGET", left_min=round(left() / 60, 1), window_sec=round(window, 1))
+            return rec
+    else:
+        need = (window or 0) + 10 * 60
+        if left() < need + 5 * 60:
+            rec.update(status="SKIPPED_BUDGET", left_min=round(left() / 60, 1), need_min=round(need / 60, 1))
+            return rec
+    src_ch, src_sol = (NB5_EVAL_CH, NB5_EVAL_SOL) if sel == "smoke" else (NB5_ALL_CH, NB5_ALL_SOL)
+    TASK_IDS = sorted(ids)
+    CHALLENGES = {t: src_ch[t] for t in TASK_IDS}
+    SOLUTIONS = {t: src_sol[t] for t in TASK_IDS} if src_sol is not None else None
+    OUT = BASE_OUT / f"phase_{name}"
+    OUT.mkdir(parents=True, exist_ok=True)
+    E21_HALF, E21_HALF_END_PC, E12_SOLVE_WINDOW_SEC = name, HARD_STOP - E12_STOP_BEFORE_HARD_SEC, window
+    E15B_SOLVE_END_PC = float("inf")
+    nb5_reset_duck_state()
+    NB5_C["mode"] = NB5_COMMIT_MODE or cmode
+    _base = (dict(E15B), E12_MAX_GEN_PER_BRANCH, dict(NB5_BLOCKS), CONCURRENCY)
+    if opts.get("budget"):                         # PLAN v3.6 NB5BUDGET: this phase's attempt budget (both attempts)
+        _bud = int(opts["budget"])
+        assert E11_HARNESS or _bud >= 60000, _bud
+        E15B["E12_B_ATTEMPT_TOKENS"] = E15B["E12_B_ATTEMPT_TOKENS_B1"] = E12_MAX_GEN_PER_BRANCH = _bud
+        os.environ["E12_B_ATTEMPT_TOKENS"] = os.environ["E12_B_ATTEMPT_TOKENS_B1"] = str(_bud)
+        _pl = NB5L.capacity_plan(NB5_CAPACITY["pool_blocks"], NB5_CAPACITY["block_size"], {"b0": _bud, "b1": _bud},
+                                 NB5_PROMPT_ALLOW, NB5_TOOL_ALLOW, MAX_LEN, NB5_CAPACITY["f_eff"], NB5_GATE,
+                                 seqs=(NB5_CAPACITY.get("caps") or {}).get("max_num_seqs"))
+        NB5_BLOCKS.update(b0=_pl["per_attempt"]["b0"]["blocks"], b1=_pl["per_attempt"]["b1"]["blocks"])
+        CONCURRENCY = E12_STREAMS = E12_VLLM_CONCURRENCY = int(_pl["workers"])
+        rec["budget_plan"] = {"budget": _bud, "workers": _pl["workers"], "blocks": _pl["per_attempt"]["b0"]["blocks"]}
+        if int(_pl["workers"]) < 1:                # C-8: this budget fits no stream -> no solver for this phase
+            rec.update(status="NO_GO_INSUFFICIENT_KV", budget_plan=dict(rec["budget_plan"], verdict=_pl.get("verdict")))
+            E15B.update(_base[0])
+            E12_MAX_GEN_PER_BRANCH = _base[1]
+            NB5_BLOCKS.update(_base[2])
+            CONCURRENCY = E12_STREAMS = E12_VLLM_CONCURRENCY = _base[3]
+            os.environ["E12_B_ATTEMPT_TOKENS"] = str(_base[0]["E12_B_ATTEMPT_TOKENS"])
+            os.environ["E12_B_ATTEMPT_TOKENS_B1"] = str(_base[0]["E12_B_ATTEMPT_TOKENS_B1"])
+            return rec
+        nb5_reset_duck_state()
+    # 'slots' (R2): the reservation is only a safety cap of `workers` attempts in flight (the engine schedules)
+    NB5_RES = NB5L.Reservation(int(CONCURRENCY) if NB5_ADMIT_MODE == "slots" else NB5_CAPACITY["capacity_blocks"])
+    NB5_RES.f_extra = NB5_F_MARGIN                 # PLAN v3.6: a preemption margin carries into later phases
+    NB5_EARLY.update(armed=bool(opts.get("early_exit")), fired=None, preempted=False)
+    NB5_TRACE.new_phase(name, OUT / "duck")
+    c0, off0, t0 = e21_counters(), len(E11_SERVER.log()), time.time()
+    h0 = NB5L.hist_sums(e21_prom())
+    g0 = dict(NB5_GUARD, events=[])
+    _pc0 = time.perf_counter()
+    # revision 4: SMOKE's solve window ends >= 3 min before its 40-min gate (the replay fits in between); never past the
+    # notebook's own solve end
+    _gate_pc = min(_pc0 + NB5_SMOKE_GATE_SEC, HARD_STOP - E12_STOP_BEFORE_HARD_SEC) if name == "SMOKE" else None
+    if name == "SMOKE":
+        window = max(60.0, min(float(window or NB5_SMOKE_GATE_SEC), _gate_pc - _pc0 - 180.0))
+        E12_SOLVE_WINDOW_SEC = window
+        rec["smoke_gate_deadline_min"] = round((_gate_pc - _pc0) / 60, 1)
+    E12_RECORDS = {}                               # the sampler never reads the previous phase's records
+    rows, stop = [], threading.Event()
+    th = threading.Thread(target=nb5_sampler, args=(stop, rows, OUT / "nb5_sampler.jsonl", int(CONCURRENCY)), daemon=True,
+                          name="nb5_sampler")
+    th.start()
+    rec.update(status="RUNNING", tasks=len(TASK_IDS), start_sec=round(time.perf_counter() - NOTEBOOK_T0), commit_mode=NB5_C["mode"],
+               commit_c_enabled=NB5_C["enabled"], workers=int(CONCURRENCY))
+    try:
+        e21_cell6()
+        e21_cell7()
+        rec["status"] = "DONE"
+    except BaseException:
+        rec.update(status="ERROR", error=traceback.format_exc()[-3000:])
+    finally:
+        stop.set()
+        th.join(timeout=30)
+        c1, t1 = e21_counters(), time.time()
+        txt = E11_SERVER.log()
+        sl = txt[off0:]
+        run = dict(E12_RUN or {})
+        solve_sec = (run.get("finished_sec") or 0) - (run.get("started_sec") or 0)
+        bs = run.get("b_summary") or {}
+        rep = {}
+        try:
+            rep = json.loads((OUT / "e12_run_report.json").read_text(encoding="utf-8"))
+        except Exception as _e:
+            rep = {"error": repr(_e)[:200]}
+        rec.update(end_sec=round(time.perf_counter() - NOTEBOOK_T0), counters=NB5L.counter_delta(c0, c1),
+                   tracer=NB5_TRACE.summary(), reservation=NB5_RES.snapshot(),
+                   running_check=NB5L.running_check(rows, int(CONCURRENCY)),
+                   steady_mixed=NB5L.steady_mixed(e21_stat_rows(sl), int(CONCURRENCY)),
+                   jit_kernels_in_phase=NB5L.jit_kernels(sl), deferred=NB5L.deferred_lines(sl),
+                   latency_means=NB5L.hist_delta(h0, NB5L.hist_sums(e21_prom())),
+                   solver_window={"solve_sec": solve_sec, "server_gen_tokens": bs.get("server_gen_tokens"),
+                                  "tok_s": NB5L.rate(bs.get("server_gen_tokens"), solve_sec)},
+                   phase_window={"sec": round(t1 - t0, 1), "gen_tokens": NB5L.counter_delta(c0, c1).get("vllm:generation_tokens_total"),
+                                 "tok_s": NB5L.rate(NB5L.counter_delta(c0, c1).get("vllm:generation_tokens_total"), t1 - t0)},
+                   bands=NB5L.solve_bands(E12_RECORDS, SOLUTIONS),
+                   task_solve=NB5L.task_solve_times(E12_RECORDS, SOLUTIONS), kv_dtype=NB5_BOOT_KV,
+                   quality=(NB5L.quality_table(E12_RECORDS, SOLUTIONS, NB5_TRACE.summary().get("turns"),
+                                               ((NB5L.hist_delta(h0, NB5L.hist_sums(e21_prom())).get("time_to_first_token_seconds") or {})
+                                                .get("mean_sec"))) if name.startswith("Q_") else None),
+                   score={k: rep.get(k) for k in ("eval_query_hits", "eval_query_total", "eval_pass1_hits", "eval_pass2_hits",
+                                                  "eval_task_norm_pct")},
+                   b_summary={k: bs.get(k) for k in ("attempts", "attempt2_started", "accepted", "at_budget", "commit_turns",
+                                                     "commit_with_tool_call", "weak_accepts", "server_running_mean",
+                                                     "server_gen_tokens", "counted_gen_tokens", "extra_started")},
+                   rev6_workers=run.get("rev6_workers"), streams=run.get("streams"), solver_error=run.get("error"),
+                   samples=len(rows),
+                   guard={k: NB5_GUARD[k] - g0[k] for k in ("requests", "tokenized", "estimated", "clamps", "clamped_tokens",
+                                                            "floor_events")} | {"events": NB5_GUARD["events"][-50:]},
+                   duty=NB5L.duty_factor(sl, t1 - t0, NB5L.counter_delta(c0, c1).get("vllm:generation_tokens_total"),
+                                         NB5_BOOT_DECODE.get("tok_s")),
+                   interaction=nb5_interaction(rows, float(os.environ.get("NB5_SAMPLER_SEC", "15"))),
+                   budget_limited_attempts=sum(1 for v in (E12_RECORDS or {}).values() for r in v
+                                               if r.get("nb5_verdict") == "BUDGET_LIMITED"),
+                   early_exit={k: NB5_EARLY.get(k) for k in ("armed", "fired", "preempted", "error")},
+                   paired_split=(NB5L.variant_outcomes(E12_RECORDS, SOLUTIONS, NB5_C["mode"]) if NB5_C["mode"] == "split" else None))
+        _pre = int(rec["counters"].get("vllm:num_preemptions_total") or 0)
+        if _pre and name == "SMOKE":
+            NB5_F_MARGIN += 1                          # PLAN v3.6 gate: any SMOKE preemption -> +1 F for every later admission
+        NB5_F_MARGIN = max(NB5_F_MARGIN, NB5_RES.f_extra)
+        rec["preemption_gate"] = {"preemptions": _pre, "verdict": "PREEMPTED" if _pre else "PASS",
+                                  "f_margin_after": NB5_F_MARGIN}
+        if P.get("quality_ab") and name.startswith("Q_"):
+            try:
+                rec.update(nb5_qab_phase_record(name, rep, rows, _pre))
+            except Exception as _e:
+                rec["qab_error"] = traceback.format_exc()[-1500:]
+        if opts.get("budget"):                     # restore the base budgets / capacity for any later phase
+            E15B.update(_base[0])
+            E12_MAX_GEN_PER_BRANCH = _base[1]
+            NB5_BLOCKS.update(_base[2])
+            CONCURRENCY = E12_STREAMS = E12_VLLM_CONCURRENCY = _base[3]
+            os.environ["E12_B_ATTEMPT_TOKENS"] = str(_base[0]["E12_B_ATTEMPT_TOKENS"])
+            os.environ["E12_B_ATTEMPT_TOKENS_B1"] = str(_base[0]["E12_B_ATTEMPT_TOKENS_B1"])
+        NB5_EARLY.update(armed=False)
+        try:
+            rec["paired_commit_replay"] = (nb5_paired_commit_replay(name, _gate_pc) if name == "SMOKE" or mtp_tag.endswith("nomtp")
+                                           else None)
+        except Exception as _e:
+            rec["paired_commit_replay"] = {"error": repr(_e)[:300]}
+        NB5_RES = None
+        if name == "SMOKE":
+            rec["smoke_gate_at_min"] = round((time.perf_counter() - _pc0) / 60, 1)
+            rec["smoke_gate_within_bound"] = time.perf_counter() <= _gate_pc + 30
+        nb5_write_report()
+    return rec
+
+
+def nb5_smoke_gate(rec):
+    """SMOKE -> EVAL (fail closed): the phase ran, requests were served, the server lived, no preemption, the request
+    error share < 50 %. A broken commit variant C (>= 4 C commits, none with a tool call) switches EVAL to variant A."""
+    tr = rec.get("tracer") or {}
+    why = []
+    if rec.get("status") != "DONE":
+        why.append(f"status {rec.get('status')}")
+    if not tr.get("requests"):
+        why.append("no request served")
+    elif tr.get("errors", 0) / max(1, tr["requests"]) >= 0.5:
+        why.append(f"errors {tr['errors']} of {tr['requests']}")
+    if (rec.get("preemption_gate") or {}).get("verdict") == "PREEMPTED":
+        rec["preemption_action"] = f"+1 F margin for every later admission (now {NB5_F_MARGIN})"   # reported, not an abort
+    if E11_SERVER is None or not E11_SERVER.alive():
+        why.append("server not alive")
+    cv = (tr.get("commit_by_variant") or {}).get("C") or {}
+    av = (tr.get("commit_by_variant") or {}).get("A") or {}
+    sp = rec.get("paired_split") or {}
+    # PLAN v3.6: the C -> A decision = the >= 4-commits-without-a-call safety trigger, OR corruption only under C
+    # (unparsable code / think markup in a closed-think reply / non-grid candidates), OR >= 2 fewer exact-match attempts
+    # under C with >= 3 commit-turn attempts in each variant (small samples: recorded either way)
+    reasons = []
+    if cv.get("requests", 0) >= 4 and not cv.get("with_tool_call"):
+        reasons.append("no tool call in any of >= 4 variant-C commit requests")
+    c_bad = cv.get("corrupt", 0) + (sp.get("C") or {}).get("invalid_grid_candidates", 0)
+    a_bad = av.get("corrupt", 0) + (sp.get("A") or {}).get("invalid_grid_candidates", 0)
+    if c_bad and not a_bad:
+        reasons.append(f"corruption under C only ({c_bad})")
+    if ((sp.get("C") or {}).get("attempts", 0) >= 3 and (sp.get("A") or {}).get("attempts", 0) >= 3
+            and sp["C"]["exact"] <= sp["A"]["exact"] - 2):       # a 1-attempt difference on 3 + 3 is noise
+        reasons.append(f"exact-match C {sp['C']['exact']}/{sp['C']['attempts']} vs A {sp['A']['exact']}/{sp['A']['attempts']}")
+    rec["variant_decision"] = {"C": {"commit": cv, "split": sp.get("C"), "corrupt": c_bad},
+                               "A": {"commit": av, "split": sp.get("A"), "corrupt": a_bad}, "switch_reasons": reasons}
+    if reasons:
+        NB5_C["enabled"] = False
+        rec["commit_c_disabled_for_eval"] = "; ".join(reasons)
+    if rec.get("smoke_gate_within_bound") is False:
+        why.append("SMOKE gate passed its 40-min bound")
+    rec["gate_decision"] = "ABORT" if why else ("EVAL_SWITCH_TO_A" if rec.get("commit_c_disabled_for_eval") else "EVAL")
+    return why
+
+
+def e21_relaunch():
+    """E15B's watchdog relaunch on Merlin (NB5): the dead / hung server is killed, the GPUs released, the host gate
+    passed, the same plan booted under the same name (its old log is copied first), at most once per boot, only with
+    >= NB5_RELAUNCH_MIN_SEC before the solve end. The new server replaces the element of with_servers' list."""
+    global E11_SERVER, SGL_URL
+    t = globals().get("E15B_SOLVE_END_PC", float("inf")) - time.perf_counter() - 5 * 60
+    if t < NB5_RELAUNCH_MIN_SEC:
+        return False, f"only {round(t)} s left for a relaunch"
+    e21_snapshot_counters()
+    old = E11_SERVER
+    n = len(NB5_REPORT.setdefault("relaunches", []))
+    try:
+        cp = old.log_path.with_name(old.log_path.stem + f"_dead{n}.log")
+        shutil.copyfile(old.log_path, cp)
+        wd = (E12_RUN or {}).get("watchdog") or {}
+        if wd.get("old_logs"):
+            wd["old_logs"][-1] = str(cp)
+        old.kill()
+        rel = L.wait_gpu_release(300, fake=bool(FAKE), gpus="0,1,2,3", free_mib=150)
+        gate = nb5_host_gate(f"relaunch{n}")
+        if rel is False or gate.get("ok") is False:
+            NB5_REPORT["relaunches"].append({"ok": False, "gpu_release": rel, "host_gate": gate.get("ok")})
+            return False, "GPU release / host RAM gate failed"
+        global NB5_BOOT_EXTRA, NB5_BOOT_LEVERS
+        _ab = dict(NB5_ACTIVE_BOOT)                       # E26 K100: the exact booted config (kv bytes, seqs, captures, levers)
+        if _ab:
+            NB5_BOOT_EXTRA, NB5_BOOT_LEVERS = list(_ab["extra"]), dict(_ab["levers"])
+            E28_BUILD_ENV.clear()                         # E28 W4 W23: the booted try's I8 state (DRAFT_HEAD only if it used it)
+            E28_BUILD_ENV.update(_ab.get("build_env") or {})
+        _kvb = int(_ab["kv_bytes"]) if _ab else NB5_KV_BYTES[NB5_BOOT_KV]
+        srv = merlin_fn_server(old.name, _ab.get("kv") or NB5_BOOT_KV, old.port, _kvb)
+        srv.env.update(_ab.get("env_keep") or {})           # E26 K100 Q-defer: the relaunch keeps NB4_PPDEFER
+        NB5_REPORT.setdefault("relaunch_boot", []).append({"kv_bytes": _kvb, "max_num_seqs": _ab.get("max_num_seqs"),
+                                                       "pin_gib": _ab.get("pin_gib"), "from": _ab.get("name"),
+                                                       "draft_head": E28_BUILD_ENV.get("DRAFT_HEAD"),   # E28 W4 W23
+                                                       "c12": (_ab.get("rung") or {}).get("c12"),
+                                                       "workers": (globals().get("NB5_CAPACITY") or {}).get("workers")})
+        srv.start()
+        NB5_SERVERS[NB5_SERVERS.index(old)] = srv
+        ok, why = srv.wait_ready(max(60.0, min(20 * 60, t)))   # NB6 P5: E18 R2 relaunch wait_ready(20 * 60)
+        sc = sampled_check(srv) if ok else None
+        ok = bool(ok and sc and sc.get("ok"))
+        NB5_REPORT["relaunches"].append({"ok": ok, "why": why, "sampled": sc, "old_log": str(cp)})
+        if ok:
+            E11_SERVER, SGL_URL = srv, srv.url
+        return ok, why
+    except Exception as _e:
+        NB5_REPORT["relaunches"].append({"ok": False, "error": repr(_e)[:400]})
+        return False, repr(_e)[:300]
+
+
+NB5_ACTIVE_BOOT = {}   # E26 K100 (E28 W4 W23): the booted try (kv_bytes, extra = seqs + captures, levers, name); e21_relaunch re-uses it
+NB5_PIN = {"start_gib": None, "levers": None, "patch_60490": None}   # R2: the next boot starts at this boot's working step
+NB5_EQ = {"window_sec": None, "plan": None, "try_t0_pc": None}        # R2: the equal solve window (set at the first phase)
+
+
+def nb5_boot_try(trec, name, kv_bytes, phases, mtp_on):
+    """One launch of one boot (fail closed): GPU release < 150 MiB, page-cache drop + Merlin RAM floor, ready <= 30 min,
+    the C-11 config read-back, the short gates, capacity (C-8: 0 workers = NO_GO), warm-up, the pure decode window
+    (commit only, not R2), then the phases of this boot (A-12: a phase that is not DONE or has a solver error ends the
+    boot as PHASE_FAILED, the partial submission / report stay). Everything is recorded in trec."""
+    global E11_SERVER, SGL_URL, ENGINE_READY, CONCURRENCY, E12_STREAMS, E12_VLLM_CONCURRENCY, ENGINE_INFO, NB5_CAPACITY
+    trec["t0_sec"] = round(time.perf_counter() - NOTEBOOK_T0)
+    NB5_EQ["try_t0_pc"] = time.perf_counter()
+    trec["boot_gate"] = boot_gate()
+    if trec["boot_gate"]["ok"] is not True:
+        trec["status"] = "GPU_NOT_EMPTY"
+        return trec
+    trec["host_gate"] = nb5_host_gate(name)
+    if trec["host_gate"].get("ok") is False:
+        trec["status"] = "HOST_RAM_GATE_FAILED"
+        return trec
+    shm0 = shm_names()
+    srv = merlin_fn_server(name, NB5_BOOT_KV, NB5_PORT, kv_bytes)
+    trec["argv_tail"] = srv.argv[-60:]
+    trec["server_env_levers"] = {k: srv.env.get(k) for k in sorted({**NB5_BASE_ENV, **NB5_BOOT_LEVERS})}   # NB5Q-ENV-1: final server env
+    trec["diff_vs_rc2_fp8"] = NB5L.argv_diff(NB5_RC2_FP8_ARGV_TAIL, srv.argv[-60:])
+    NB5_SERVERS[:] = [srv]
+
+    def body(ss):
+        global E11_SERVER, SGL_URL, ENGINE_READY, CONCURRENCY, E12_STREAMS, E12_VLLM_CONCURRENCY, ENGINE_INFO, NB5_CAPACITY
+        s = ss[0]
+        E11_SERVER, SGL_URL = s, s.url
+        trec["ready_sec"] = round(time.perf_counter() - NOTEBOOK_T0)
+        NB5_ACTIVE_BOOT.clear()                               # E26 K100: this try booted: its exact config for a relaunch
+        NB5_ACTIVE_BOOT.update(name=name, kv=NB5_BOOT_KV, kv_bytes=int(kv_bytes), extra=list(NB5_BOOT_EXTRA),
+                               levers=dict(NB5_BOOT_LEVERS), max_num_seqs=trec.get("max_num_seqs_launch"),
+                               pin_gib=trec.get("pin_gib"), env_keep={k_: v_ for k_, v_ in (getattr(s, "env", None) or {}).items()
+                                                                       if k_ == "NB4_PPDEFER"})
+        NB5_ACTIVE_BOOT.update(build_env=dict(E28_BUILD_ENV), rung=trec.get("e28_rung"))   # E28 W4 W23: + the I8 state
+        trec["config_readback"] = NB5L.config_readback(s.log(), s.argv, NB5_BOOT_KV, mtp_on)    # C-11
+        if not trec["config_readback"]["ok"] and not RERUN:
+            trec["status"] = "INCONCLUSIVE_CONFIG_MISMATCH"
+            for sp in phases:
+                NB5_REPORT["phases"].setdefault(sp[0], {"spec": sp, "boot": name}).update(
+                    status="INCONCLUSIVE_CONFIG_MISMATCH", config_readback=trec["config_readback"]["checks"])
+            return {}
+        if (E28_BUILD_ENV.get("DRAFT_HEAD") == "int8"                     # E28 W4 W21: the I8 gate (NB4T read-back ENGAGED)
+                and (not FAKE or os.environ.get("E28_I8_GATE_IN_FAKE") == "1")):   # (FAKE: the kit e2e only)
+            _i8ok, trec["i8_gate"] = e28_i8_gate(s.log() or "", "int8")
+            if not _i8ok:                                             # stop this server cleanly (with_servers kills it);
+                trec["status"] = "I8_READBACK_UNVERIFIED"             # nb5_boot retries the SAME pin with the BF16 head
+                log("!!!!!!!!!! E28 W4 I8 gate:", json.dumps(trec["i8_gate"]), "-> I8_READBACK_UNVERIFIED: the same pin, BF16 head")
+                return {}
+        ok, pr = nb5_probes(s)
+        trec["probes"] = pr
+        if not ok:
+            trec["status"] = "NO_GO_" + str(pr.get("fatal"))
+            return {}
+        NB5_CAPACITY = nb5_capacity(s, NB5_BOOT_KV)
+        trec["capacity"] = NB5_CAPACITY
+        W = int(NB5_CAPACITY["workers"])
+        if W < 1 or NB5_CAPACITY.get("verdict") == "NO_GO_INSUFFICIENT_KV":                     # C-8
+            trec["status"] = "NO_GO_INSUFFICIENT_KV"
+            return {}
+        NB5_BLOCKS["b0"] = NB5_CAPACITY["per_attempt"]["b0"]["blocks"]
+        NB5_BLOCKS["b1"] = NB5_CAPACITY["per_attempt"]["b1"]["blocks"]
+        NB5_BLOCKS.update(f=NB5_CAPACITY["f_eff"], block=NB5_CAPACITY["block_size"],
+                          start=NB5L.cdiv(NB5_PROMPT_ALLOW, NB5_CAPACITY["block_size"]) + NB5_CAPACITY["f_eff"],
+                          peak_b0=NB5_CAPACITY["per_attempt"]["b0"]["projected_peak_tokens"],          # C-9
+                          peak_b1=NB5_CAPACITY["per_attempt"]["b1"]["projected_peak_tokens"])
+        NB5_POOL_CAP["blocks"] = NB5_CAPACITY["capacity_blocks"]
+        CONCURRENCY = E12_STREAMS = E12_VLLM_CONCURRENCY = W
+        ENGINE_INFO = {"backend": f"merlin-{NB5_BOOT_KV}-{'mtp3' if mtp_on else 'nomtp'}", "kv_tokens": (NB5_CAPACITY.get("caps") or {}).get("kv_tokens"),
+                       "concurrency": W, "capacity": NB5_CAPACITY, "max_model_len": MAX_LEN, "cfg": {"weights": NB5_BOOT_KV}}
+        ENGINE_READY = True
+        log("NB5 boot", name, "| workers", W, "| capacity", json.dumps({k: NB5_CAPACITY.get(k) for k in
+                                                                         ("pool_blocks", "pool_source", "f_eff", "f_source", "capacity_blocks",
+                                                                          "r2_workers")}))
+        trec["admission"] = {"mode": NB5_ADMIT_MODE, "future_hook": NB5L.future_admission_blocks(None, None),
+                             "note": ("future = placeholder, behaves as projected" if NB5_ADMIT_MODE == "future" else
+                                      "slots = a safety cap of workers attempts in flight; the engine schedules (preemptions "
+                                      "allowed, counted)" if NB5_ADMIT_MODE == "slots" else None)}
+        trec["warmup"] = nb5_warmup(s.port, W)
+        if not RERUN and not P.get("no_pure_decode"):
+            try:
+                trec["pure_decode"] = nb5_pure_decode(s.port, W, NB5_CAPACITY)
+                if trec["pure_decode"].get("status") == "STEADY":
+                    NB5_BOOT_DECODE["tok_s"] = trec["pure_decode"].get("tok_s")
+            except Exception as _e:
+                trec["pure_decode"] = {"error": repr(_e)[:300]}
+        trec["counters_after_warmup"] = e21_counters()
+        nb6q_readback(trec, s, "after_warmup")   # NB6Q Q2: Q-defer read-back after the warm-up (record only)
+        e28_readback(trec, s, "after_warmup")    # E28 W4 W10: I8 / C12 / 131072 / text-only + pool / F (record only)
+        trec["phases_started"] = True
+        for spec in phases:
+            r = nb5_phase(spec, name)
+            if spec[0] == "SMOKE":
+                why = nb5_smoke_gate(r)
+                r["gate"] = why or "PASS"
+                if why and not RERUN:
+                    log("NB5 SMOKE gate failed:", why)
+                    trec["status"] = "SMOKE_GATE_FAILED"
+                    break
+            elif r.get("status") != "DONE" or r.get("solver_error"):                                # A-12
+                trec.update(status="PHASE_FAILED", failed_phase=spec[0],
+                            phase_error=str(r.get("error") or r.get("solver_error") or r.get("status"))[-2000:])
+                log("NB5 PHASE_FAILED:", spec[0], trec["phase_error"][-300:])
+                break
+            if not s.alive() and E11_SERVER is s:
+                break
+        trec["counters_end"] = e21_counters()
+        return {}
+    o = with_servers(NB5_SERVERS, globals().get("NB6_READY_SEC", NB5_READY_TIMEOUT), body)   # NB6 P3
+    ENGINE_READY = False
+    trec.update(servers=o.get("servers"), gpu_released=o.get("gpu_released"), shm_cleanup=shm_cleanup(shm0))
+    trec["log_text_for_ladder"] = srv.log() or ""
+    nb6q_readback(trec, srv, "final")           # NB6Q Q3: Q-defer read-back, whole log after the server stopped (record only)
+    e28_readback(trec, srv, "final")            # E28 W4 W10: the same on the whole log (record only)
+    trec["status"] = trec.get("status") or o.get("status") or "DONE"
+    return trec
+
+
+def nb5_boot(tag, phases, mtp_on, kv=None):
+    """One Merlin boot. R2 lever a (KV pin ladder, NB1's descending rule): kv_cache_memory_bytes = the RC2 pin + 1.0 /
+    0.75 / 0.5 / 0 GiB per card, highest first (the second boot starts at the first boot's working step: the same
+    settings in both phases); a step down only on a launch failure or an OOM line before any phase. Lever b: the
+    non-numeric lever env (MERLIN_SHARE_DRAFT_WORKSPACE=1) is dropped when an error line names it, or once all steps
+    failed with it (then the RC2 pin without it). The launch --max-num-seqs follows SEQS_TABLE[kv][pin]. Every try is
+    recorded (pin, pool, F, failure); the working try's record is merged into the boot record."""
+    global NB5_BOOT_EXTRA, NB5_BOOT_KV, NB5_BOOT_LEVERS
+    NB5_BOOT_KV = kv or NB5_KV_DTYPE
+    brec = {"tag": tag, "mtp": mtp_on, "kv_dtype": NB5_BOOT_KV, "kv_bytes": NB5_KV_BYTES[NB5_BOOT_KV], "tries": []}
+    NB5_BOOTS.append(brec)
+    base_extra = list(NB5_EXTRA_ARGS) + ([] if mtp_on else list(NB5_MTP_OFF_ARGS))
+    if P.get("pin_ladder"):
+        start = NB5_PIN["start_gib"]
+        if start is None and P.get("pin_start_gib") is not None:   # E28 W4 W8: the I8 pin first (NB4T: RC2 + 0.75 GiB);
+            start = (float(P["pin_start_gib"]) if (FAKE or not P.get("patch_60490")      # #60490 not verified -> the RC2
+                                                   or (NB5_PIN.get("patch_60490") or {}).get("ok")) else 0.0)   # pin (NB5)
+        if start is None and P.get("patch_60490") and not (NB5_PIN.get("patch_60490") or {}).get("ok") and not FAKE:
+            start = 0.0                            # #60490 not verified: no step above the RC2 pin (fail safe)
+        tries = NB5L.pin_tries(NB5_KV_BYTES[NB5_BOOT_KV], start)
+    else:
+        tries = [{"gib": 0.0, "kv_bytes": NB5_KV_BYTES[NB5_BOOT_KV]}]
+    levers = dict(NB5_PIN["levers"] if NB5_PIN["levers"] is not None else NB5_LEVER_ENV)
+    nolever_left = bool(levers)
+    i, trec = 0, {}
+    while i < len(tries):
+        tr = tries[i]
+        if brec["tries"] and left() < 25 * 60:
+            brec["ladder_stop"] = f"only {round(left() / 60, 1)} min left: no further boot try"
+            break
+        NB5_BOOT_LEVERS = dict(levers)
+        globals()["E28_RUNG"] = {"kv_bytes": int(tr["kv_bytes"]), "gib": tr["gib"],   # E28 W4 W9 (a new dict per try):
+                                 "c12": bool(P.get("seqs_fixed"))      # C12 (seqs 12, workers 12) ONLY on the I8 start pin
+                                 and int(tr["kv_bytes"]) == int(P.get("seqs_fixed_kv_bytes") or -1)}   # (+ its BF16 retry)
+        seqs = (int(P["seqs_fixed"]) if E28_RUNG["c12"] else   # = NB6Q's SEQS_TABLE + slots rule (coordinator 2026-11-01)
+                NB5L.seqs_for(NB5_BOOT_KV, tr["gib"]) if NB5_SEQS_RULE == "table" else None)
+        E28_RUNG["seqs"] = seqs
+        NB5_BOOT_EXTRA = base_extra + (["--max-num-seqs", str(seqs)] if seqs else [])
+        name = (tag if not P.get("pin_ladder") else f"{tag}_pin{int(round(tr['gib'] * 100))}" + ("" if levers or not NB5_LEVER_ENV else "_nolever"))
+        if (P.get("build_env") or {}).get("DRAFT_HEAD") and not E28_BUILD_ENV.get("DRAFT_HEAD"):   # E28 W4 W20
+            name += "_bf16head"
+        trec = {"name": name, "pin_gib": tr["gib"], "kv_bytes": tr["kv_bytes"], "max_num_seqs_launch": seqs, "levers": dict(levers)}
+        trec["e28_rung"] = E28_RUNG                   # E28 W4 W9: this try's rung (+ its workers, set by nb5_capacity W7)
+        brec["tries"].append(trec)
+        globals()["NB6_READY_SEC"] = ((30 if len(brec["tries"]) == 1 else 15) * 60 if P.get("e18_ladder")
+                                      else NB5_READY_TIMEOUT)          # NB6 P3: E18 R2 cell 6 L485
+        nb5_boot_try(trec, name, tr["kv_bytes"], phases, mtp_on)
+        fail = NB5L.boot_failure(trec.get("status"), trec.pop("log_text_for_ladder", ""), levers, trec.get("phases_started", False))
+        if P.get("e18_ladder"):   # NB6 P3: E18 R2 retries on ANY failed attempt (not ready, stall, smoke) before solving
+            fail["failed"] = trec.get("status") != "DONE" and not trec.get("phases_started", False)
+        trec["ladder"] = fail
+        log("NB5 boot try", name, trec.get("status"), "| ladder", json.dumps({k: fail[k] for k in ("failed", "lever_suspect")}))
+        nb5_write_report()
+        if (trec.get("status") == "I8_READBACK_UNVERIFIED" and E28_BUILD_ENV.get("DRAFT_HEAD") and not ABORT.get("why")
+                and not (P.get("e18_ladder") and len(brec["tries"]) >= 3)):   # E28 W4 W22: the same pin, BF16 head
+            brec.setdefault("i8_fallback", []).append({"try": name, "pin_gib": tr["gib"], "kv_bytes": tr["kv_bytes"],
+                                                       "seqs": seqs, "i8_gate": trec.get("i8_gate")})
+            E28_BUILD_ENV.pop("DRAFT_HEAD", None)                        # every later launch (relaunch too) = BF16 head
+            log("E28 W4: I8 unverified at pin", tr["gib"], "-> the same pin with the BF16 draft head")
+            continue                                                     # the same rung (i unchanged)
+        if not fail["failed"] or not P.get("pin_ladder") or ABORT.get("why") or (P.get("e18_ladder") and len(brec["tries"]) >= 3):
+            break                                  # NB6 P3: E18 R2 ladder = at most 3 engine attempts
+        if fail["lever_suspect"]:
+            for k_ in fail["lever_suspect"]:
+                levers.pop(k_, None)
+            brec.setdefault("levers_dropped", []).append({"keys": fail["lever_suspect"], "why": "named in an error line", "try": name})
+            continue                               # the same pin step without that lever
+        if i == len(tries) - 1 and nolever_left and levers:
+            brec.setdefault("levers_dropped", []).append({"keys": sorted(levers), "why": "every pin step failed with the lever env",
+                                                          "try": name})
+            levers, nolever_left = {}, False
+            continue                               # the RC2 pin without the levers
+        i += 1
+    for k_ in ("boot_gate", "host_gate", "argv_tail", "server_env_levers", "diff_vs_rc2_fp8", "config_readback", "probes", "capacity", "admission",
+               "warmup", "pure_decode", "counters_after_warmup", "counters_end", "servers", "gpu_released", "shm_cleanup",
+               "failed_phase", "phase_error", "phases_started", "ready_sec", "t0_sec"):
+        if k_ in trec:
+            brec[k_] = trec[k_]
+    brec["pin_used"] = {"gib": trec.get("pin_gib"), "kv_bytes": trec.get("kv_bytes"), "levers": trec.get("levers"),
+                        "server_env_levers": trec.get("server_env_levers"),
+                        "max_num_seqs_launch": trec.get("max_num_seqs_launch"),
+                        "pool_blocks": (trec.get("capacity") or {}).get("pool_blocks"), "f_eff": (trec.get("capacity") or {}).get("f_eff"),
+                        "failures": [{"name": t_["name"], "status": t_.get("status"), "oom_lines": (t_.get("ladder") or {}).get("oom_lines")}
+                                     for t_ in brec["tries"] if (t_.get("ladder") or {}).get("failed")]}
+    if trec and not (trec.get("ladder") or {}).get("failed") and trec.get("status") not in ("GPU_NOT_EMPTY", "HOST_RAM_GATE_FAILED"):
+        NB5_PIN.update(start_gib=trec.get("pin_gib"), levers=dict(trec.get("levers") or {}))
+    brec["status"] = trec.get("status") or brec.get("ladder_stop") and "SKIPPED_BUDGET" or "NO_TRY"
+    return brec
+
+
+def nb5_write_report():
+    try:
+        NB5_REPORT["minutes"] = round((time.perf_counter() - NOTEBOOK_T0) / 60, 1)
+        write_json_atomic(BASE_OUT / "nb5_report.json", NB5_REPORT)
+    except Exception as _e:
+        print("NB5 report write failed:", repr(_e)[:200], flush=True)
+
+
+# ==================================================================== NB6Q: the Q-defer patch (deferred PP receive)
+# NB6Q Q1 (lead 2026-11-01): the ONE change over NB6 SUBMIT (sha 87afcc84) = nb4_ppack.py rev 2 Q-defer, the winner of the
+# NB4S GPU test (fa9f35ca: +21.1 % at 8k@8, +19.8 % at 40k@8, oracle EXACT, stage-0 stall 19.81 -> 0.035 ms, read-back
+# ENGAGED). nb4_ppack.py and nb6q_lib.py (the NB6Q functions: apply once right after merlin_install with pre / post shas,
+# byte-for-byte restore + loud log + no NB4_PPDEFER on any failure, NB4_PPDEFER=1 in the server env only when verified,
+# record-only read-back) are packed verbatim below (sha256 checked) and exec'd into this namespace. A load failure leaves
+# NB6 unchanged (no patch, no env) and is logged; it never stops the run.
+NB6Q_PPACK_SHA = "8dadf0763d43d22966603745198ad327ed6ed36001cc60a79925ea18818f2dea"   # = the module NB4S fa9f35ca ran
+NB6Q_LIB_SHA = "366ed68f53792e3038f0cdd86503d51dfcf345b5044b41e2429ee6379845008c"
+try:
+    NB6Q_SRC = json.loads(__import__("lzma").decompress(__import__("base64").b85decode(
+        "{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;NAZ_f?WVTh>6BxKt|6#|Es`EROzaKy>HXq$LUKIvt>*;RyxQM{ib1A=aW`~y~J8&SP1k^jg97?T<M2)1!`_|rrO3~d}UH>T8VsU@-l3wW${2L%k^w+1|_B^c-u6z^`N9tq!=0nZ+YGeI|Ug4uHYaEeP$*uZ)v5*&XtXc;E|qM8R7G>j%B`yu4^CfBtmF)-Y-|UAgvnV6Wf2XolHE21}{<c{%$X1Y7s~wONw$-k!J5{f-yyU|EeL>by{b(lO2)p24D9O@(GA1h!_B@8$N*kq)L+?Je^YfzOTMx9WG9Gyq!lSe4^~_b_lzo+_kIZO5jA)T+f(>*<Yes;9}LpviVMNm$2%ivH)D%=Z&g*9~aF3-%Is$^|(~~&)wPE!%;-2R7qd~F-1PxMST5H0)Z-&Q2I=034{EI{kvXV20vFQh^t_m|8(1NDg~Ti2K7w(THVq~CCUJpPRRiyF(ccT9u+&%nJ1~nN``2>_xHcXq@|5jPbUq?m-}&0m-6wX_2Enb0IrmHa9hoKeVttjJlPt8T(1DbEldlajYvJI#f%$ktc{tUK^VI|6^v}ov#gBq79^0L7+=H$2XO&+1r^VQS-QfB++)6=xPA7IfOBF2+mau0&B`#T=6r5IJGKH|E53^cO<)eD;F$u*wqBcKgkBeYdToUyXV2+r35Gsc21=+a|5lHbJ)hmabte}X$TA(WT~B`HDaJxA-&VqD?v`s%=fh>SeaG`g@0JF9Yi%p+vF*#4!G%rH9z<Az(qoRRf14&92WUVf!hJN{Tgxpv=xaWF7Y63BGvfGB^4FyIU}(9Y%-){>DxjN%3F123P2TN2{j)RVsFpIGNp|~}Wv{Wej0)|@JCsTqArd3|`leV{DIG~Je+dP`WL?`0WeboAV$L~FBqx*`y5u0f%=1D$L}F@_X+n6vouB)4*~U<m7PrY8G)2(P;&(#?pV~2UgRy6Kfp9lxK1E=e_j!=jC<M2<MNOoK1)n%~tPEUnA+RUs&g*=4piMS+X=CDm>|qUsr)wa^wKZj`jy0$F(&R-r?A-DxH&l3m91C66Snpf#O)|`~3jJPV<8#*;pA4}1pZ1bT1J{=<%r1t@0{WPpb}i&h>Xtn~L`kRPjLleP#C($;+MbM=JOoL<%$XQcxiXLW(%Q_oRp9W+@yXo)Y(px2LrNU={F_3E9BAAMJzm~I>>a3&J2?0()_Mf97RdoXCtG8$C4^Fdt@72^_V4L`-M|vOGYR*9eo~eN%2!7s7n>E795_c*vBO>7hivjWTU7C~4$!j$+fTHduJBHwn(QR;qSc6LD})xE>7LZAzo;sXu1%z{u{^`g+&{<BJC>n#r9i_$XOYkISIGFBids1R4K_&9hfr<f6pfI)uz>Rlcg0;I#mgy`*6;wCFKTj+pqdbWPAUETc9uuec#17Z)~=3YXLVr=P2^Y#Rp-*C@)P9UB3*fg*<2K?7@!I053DAo(htp2m1hWt*s9WB>9@U>p*s`)Gqo!96qgV;;QP&*wEw{4h4PE6Xf#qDJJzpU8VTevPi+_d#RkZ;8gvP~a`U}L3R`)KL`G)YZF#cnF-uq%s;6fpg|9rTN9W%-y)sqwUTP5yPM^iE&kQO}*sOeI<QHE5$?HSv#jVClG4GlLixS_1Qg;z-u-Zl;GN1mhkz#tyA=6N7x-xRNIC&e2@B&sLlQZEjWa3hprovWsLxuM6Iqd|KEvth*5@yu?l+9ekT6^Pr*l!FMUBC7=NaIv?mM7T(3BOZBDoL>7QySI?5V9e9g(0-@w<rF8&Thj|vtgch#)X=g)}U5W>?*>WBjae*8stM%+wo;XStM7ZMjINT-)Dyg+LZr|O)A#b{SqMn1mr<WdQO4JagLR3idqG4Xh@@yq#NN~rUcLfPPA&;b29K<&>Ebl?q9+(m&Mq$-i|f(L)YEcA+yiQCA%MnT^viFzxsWb3SS<7kK$mv+(D#1X&8g4jiJQon{W$(6kC|AV1!#WjYR1g9`BEhv?#$dk~W@3E@2-L3eNl(t)Uo0r2{Khq_Hh>(rLmQ@6;CA`nOOX!=QGYb@dWAZ`!`><`QTda&)@SiGQQKdm1KMi=;C4{E0Oc05RkoaiIp=kIKR;rtp8;Gg$;!uL`jTQyO0+G465LZJrhDefH!}PzE=biw=69ukyQ)ARdlC3hE3q6l`%*Jj_Bek25xE(O-a1bhViQkP-hJlz%I{h{2DavV#<kWAeTuN?DI({p#ME$fC#Kx;n;3B-yXv|MoT9vcq7{yw36`8jJ6qGgoYP&;8WqmMs_1jHuZ{=HBdv4Np54SkHacM?j(w+O{@NnJQ#RgU`u=22FZ?JYkD{NWd2$?f#7LP%a@&8^SCRyhYzLaF8-Ga3=b{Q32fdGP`ZCq^1cf(L<Ms*?5uz{>T?VU2!g6_I8q&Ggu*4ik~3br&lj7t}<=!5kZCBJ%0x|uDL}q$z8OaM};!l$r3y$6u@4Mv+}C0PZ*?^i@LLDT7(4&pYYcm_67N>jJ*9rHI2#NthS`dx~f=Mm`_vQs&)?b#xkPkSM~QK95x~gz=fTqS|TLTsiOk0*1}bDcoH1PAFlP<s6W-}v@$4ZP9fMH_-lItS6q5-<7ZDmqg3qwyJH0`PZ*ZMbM%jLwnkQ$6~QDRy7{kM39Lbag<Bi}K7s68HA(oAcn;0>eR`UkQ)VR|8qDC=rW+jo>-`sHmOceDj6i5)i2mIEpS&4`5|>h?td%UeLe)Y@zcVYD4Lfyj?dXm$jv6EzfI-<Nre<z4>zD&k^R$$tjTUn7v1)m1vbF>eNg!MJ!Eg_C3eV0!1xq^gnm-x^EyOv2t|58)Rj~4ZDZq;;1o69wFw_-9(5=DlCHY9AcvnKe=}0eiq;V8`Io$_ZLlAj?k2*o-M?KCN*f&oO{8}6{ZRgw$94zO62c#d~rORMl{MiMW&1?h>$*$x+ILxBph<10pejz4`H;s^JX`Q*Y=kBG7vRS8qB-Nd|OmOvD4Ai-QnVk3r)2Qd(!vbAiXqzI;BALsB2C6A@EDULU5qPymLR6#j=%~;p6tHcJs>=jVN9IWoRqQx7cU&hA81mNdf9b!&bZ_VSRcIX>k8z*eKVb<5Rc3|dtuFW?zCLoKd6BrQ^K{6oe?Y5w2fxsJX^^xjI_3ormeoJZbkdfjXBj(LdN<Q6=G2$9UKn?+^p-d{9aB(SBJc$QHJb5#kYFniYDcPHyw<Uc61b)p^Bt2WYXdu?v>;cE-Rd71${TLM8okVAVb1RJ2KTN9mrga+(Nf{L=?T(y<`Cb9a^ZcNgZMISTNw>9+5%t+SP3QVave0jg2PXDK0D%y#p-_&9t=Z(BE^l5T;{qqsdIg61I62NZ-Ud(pZ3eEz_X*h-c{+WFnSZKR}+Dmq}KN*aDT)>@&?5TE;wy!4^PVrn(qxbCko=9p@uxHeGK&w>3ggXxcZY4a0g7xn%)I~=Xt)1m|7^e=tIurfOGNGpQQ$bBn2i5(9N_|+q?RK;e#!{tctP^WiC^{P}KEX?{Y@xA_s-0{5fKO1J_x@Pm1azFHeonb7&lxc`0ZipMgR@x6a`RkWznpy=krUJ0hB`{0`!7t0=lD;QtnD%iMJ7DWU-;f=eNVJyqqVUtYp!1@(K6BCs_};PJqsR>AjTx;bPuxSnUK+>kx62jQ>oG>xMwyHC*Z$kn46w+ZEei|dBsY;O+c7r%_4U56jCE97E8;9QDTt=Jd=Jhf9*0Kp)YDn6!V)7@NKqTC`18Nsq8u(xP&6m2)7eJfWD?)#Ua0Chm7V2O{p%@`1gZ#Z9VsmC~yxIha7p|0W~6^W=R=At$-f5R83iTf)c3zA{zN#3(~iJ>~){L)6yyp!9zsSqPVUDJ6)u_^<xaeK#F2$8=VI~OOjj!NMef5myTxzV)xx6In!6xDU(mv_F;`5p@cSXa>r%|?-|lI@e|!#`^s^?!tKbMhr&F|5WTEOE0bv?Yn*3`e(A<xm5qb1rI4vpLx`<Xb#KBj1>WJjb3jm<ApCvB5MTA3(4Pi5{QI{SQwWp5SS11zG`Mx6QdOjl_Y%Wn*pXF<X=w|G(>L)5q^NiHdRcBoc=^+KHaQ8!;!CS~A8(K~QDBdr%2#I9}a#sHo`EQ-6N&rT#21as4T{VW7G{A`m6N)#B0bEC_}YS_O{iPS~*r-{Ds3`IXj6AjRxKQqRrfdYu7QfOuP{onqMaL66)sgOn?i%hpE+C}wH;o|auII36UsCiNJw`;%vX6V-gjfTf`sy&Y;dch?HfP!vih0Uz;2P@V>(JC?oM$}2gg48^l`WT?pmEKql5@U&)9M42h)J{cdw#>A1K_NkFruz_Rz^D$zqLDCb#HiUTYcXzRgH9~F3R+kR9a)cD?RnzdPV_h=YzxPr?ctNBdsnlUGc<hL3Ngi;jG&N>;eXi!__x%1{gTN-Q0HF{$AYTMX+^A)F@cY3vkT?*B5Xh4)8}ui~nN4&O%0QB6v~Q12TU^Od9!JA|Tex9<A*m%9Q(?QY>Hu$d?#IBpAPgr;TUHev^6Fz!`i5H;7Bcz@jA?&IYNM~0E7fKPhbqf@PCNP&pAFGCG?<khZA+^8DvQz6fE^A`@T-PE&t+OY2(6&rNd8<&NNLdyH$-J;+ld<@r{s8nEF~>0<H8_<7pF~FW+J8b;W5(=G{P)QUvdX#oZiCx$>YqVCY~78$6lAY6ESypr!s~lShz_&o{?iVh<yZQs05+09LB=9EN0kRsI2@jf*PGzvk|SAb<gE<KCfS4sRGBO5@_ucVvN;VT0!=Wxi1$+MB3vH?G-cK3~W|(+`5?aTMjf08u=H@<5mR1U78_{05z31&+U|%Sj5*#lu{uZT6aW5neREH?6lWT4};J00J>T!63r#CE#LWf#lg%`YORd;j)^gXLcO}uLZ~?zPR+AcfAXbz!jzwG&$(Y1$6K}DNh=7#cs<X#RqpY?pHRlwXTOpP3n0!K09Dv$_rViC1Dfu8VRrGqFjJ!Ot)RE>9Iay0>qG@TZ}1T`ZU(dI<rG?cRY73&UX_T*1QDQG)uBS`sOtAnTv2{LNR)BTZ{>*NopyG9cM%tE>S45y!>fB00PUW8J;EdJfks++m%!#O5i&0Uj2LNp#SDA9xn!(gRQ+W>gYwI!5Xc6c{Mbu_^<z;=uULntHCZk{LoB!ba)&Jvb%t<ssEk$w3-7pQ?-jYV^(w~P-`}xTT-el%jhR)*9TG3=G_21v@hzY^FfFuORc`v0jrYqjGU|wmzZ>k^|4tuoyATzMx(z8{3G8PPNE;AhLKzCw<E&IYJ87k+5$D?@@qwxA2%Z_@Eq%k9=psdud0Yz7iDA;WKEd3HfWsQeJYu!BhVeCakWh!4R(D;y$jgi#O)q=1KVvR=Z?k3Eq8lX&qKE$td~>}Q{=7YsSeCQfclU^8Z47e&*kdFBU4`xI&1?`Is~Dh1Ewd@Y(`r@lODPFYRxXh%)x!ZIsfL@|(w!j1JSuV^&~Z&4{W5jOj)`>w9O?${vl3`EiUtn_O*m*^E6;Art>7pPabFJwB~J!q5}$EBeGTgZZqSBofWWg8q&BtIo8CLoMYyNrC<c_}Yl#>Ytl7fJtedsq-}kJB_q$;EZv2k=d`s0S_^I=`c7mtZ6|ACyEZ%Thx6NR&aY@oKMhgb+AssBqoMOaouMB@U71=A`6Q1?rC#<t--b=$=cgx_9MhjA<Km49UKDktMtYXOoIL~J|5vRDg@f3penP!T*zoPV$Zz+diA9f$V{rJUbh<(@*sHPS@QRWIRi~V=GNWz=!ny0xJFqgx~7nuhDrQaDB?3^`ye5awbUABqfU9GJE;0fa;YjNpXK<zz*j{oyVfQ|7y!4EQtslIZdZmvkw=X-qv%#b?VHJmsi4<PWnrY4ULb2YXzmzF7gu!3rPOuuQ!@qoDpb&S+rD}-ww!3NIKxin(<)wIH@kf4EYV6v<r!WxEhWd1W--#cymzBQwm8sxo~o}B>D|EpARGt_D10CjnSv5eL<MXH1WD%JZXv)(0(LuSxHUZ~r%CMQ@IPdA{y&s-hJ%MXsbpZGYN9sxCD@va4%^7=wnoca7Q^qC>$c-0h@kH4YTv^{bW<gsrNS>0a(;e>-8KZ&0SPbq)4%*L)QzK`>3vD+UAWe$!g!ti%5B0q}`i8)8PiDm!o68F_SoJvR$p^+jVoDr@kr7EuQ444lssDYp55_f%cP&$nBw&8V(=z`cG=Z_N9+i^z<_4f+Afe)rMNX+#>kIOx7?WVf(OIt;75)i1bjrpUIn^>EL880e_tg(L0(elR&7;`zRu?`~!HKO<9WHwbsoCwc^w`PI|54~D2refJrx;)&QENh08bQ^LqEm*Bq-f&Id-CH0nMJkdDU)9faYUev<GG5i28kriC6yrmSOJsh<)7sZ|bhUX1Z7-I4%?x3@Ps_>aP81vI_c`g>bmh!1n5~{i0m-0lBx?nZA(l$o>-g#kK_LjC$)T;3A(<%2O03iKK%D8Y`IN?J>HoDw)fr1Su);YYDc-*<5U-hCMm@b!X*r*0^UX~nUF<Fz^7D@8hz8J<N7{D@6v5HwAFT69AWv$ml0YBMBPFkSM%-I)kvMi{s@-P48_0+;X}MH7*R>;!_mmM1saF=E7=hk#>hX(IsbFD*iK*=Y@|h|5>An09+J1tIwtp2lH){LhL+cJB6jo4U=Z3<)m^m+?mprhDB^2+pHq2#={Bx)G)4FQ!{pX2-lRr5V?1!TA@OZINs>2mn1*>_>I#wm{rPv94o%>HGwj<Y~5jwpcr02GEQK-@oX#6ZPt<K(b4g{=8957Cs3IQfP4XV9r&3KL`ND1S}_6PQ7Qq~14+BJ!4N3;7ub2O<0NlK%)DiV=f&NQ5&5lI{ufi>tEvg5cF*&~S!#=z=?Vk7C_n(;SwyLxDl9A2l_Jw9Q70XqMy9l&eFnBn~jXlrt`Gm(W;#Ws&Y--Oj3BH7X6lWQ)hl$GEROy|l6`!OvwUWo02sP`?i^MW66FPu<XLNpcfvTzV}1j(%p0;z+<5f4gcjrKsF0cW}%dEPiBw3jKmjXy&05Slx%71OY^V1V9FthOQsyei@5Mo8mAl5DNj^2V+cUgK3Xt?^j#v)eRfONqCgMR2j0qdrIF@9jr+n<EdKW-=53S~=y3$M%Gw1rs<ZE@Y<$11LQQZ4>`|iEe)~d0@KaW|bZ_AuFaq&}79BWGOOy;(EfPsdt2wSRk;F`x2W@XuVPgJ^hG6G+jH1P}5mt!&&cFnmGbfQ1N_)6BgImemQasAuffpiN3LuR4wL{r8D3O(|$tC2|=m1;Ax4t>z9AB)w7vW&l=+(V}!9mr7r&{_@1WxNXCCY{dXB-UfiiQsQGj*fIpRUT4ta%J4G)#Lk0pHPn3a^@YptEoR6H~TEIqSf$9&u)zdB^XKS=z6*k;Q_d1{M>V90&ZUln8wj}t_m%4rk+J=xdjD$y-iMu{c>N9L)CE9d3wv#^uxY3O?V4t_v%&T*vlny;LQ--`riycuE{EXbl27k#)p1Vw<$=Iv*lIwZS7ex}i1i~hqTlh!na48Ebo-fiTU_OGvz^ys442D8(9NVyb&^=SxziN8o92c*COc8hnnhRQGutKR(la3M}t;alnXwM0Cr;SQu#cTdd55~nQK&s!2y!Ni^jivf>{^{wECl*%O>31XrYv3l<okmS|J2CRr+>N2}bqqr~+l_r7*inmoI>o}^qm>2$rNj3nlvX8m!x%rZi7+>?Ad9dNqJ6iAG@yK^hw7$AEHC}lua-yN`OkvpYxD$)s|0ppZHXEv*X6ZxAo8k_O{lI^Z1|{QR=VcP`WEL#D8VVNdQnQ#PGMyIg&YBq+*nH0G=ILsh>BXAcrav=RPUk;P%+S$qsdV*Ru+)qj3rbHdzhg%&<1<j_i;cNxJ~cU8NNd(GnhK~DAkO9+j2F&q9^H0^Kjn8XDB8x`;X<Q;U=He9E3)HW4?Oosp&gGFZje<)TQ&iJUBn0x={=47RUi)g(G!F&@_GpDTFe!m_FVQEbtGLOD%1Je%96elPm<hG+oGNPwGJv+<W6Ql3I39({oWRu>k4{S9jm=M2BiOo_lK<vs9N|BRzBf0BF~UF2X?HFP$XFL2KldM}UgtQ_imFG4E`Mpfq^7B$ZP|0g)Pim$R|u+{GiwxhHacpeK5n5Onjg-iW0>(zVQ~1-+A$p>+Abg~wUkXt*ave$#&oMZjQgzg)s?gb7-iChWp59eHhs^H^91Gq(!|8emh>q+n=<Ins;l!;&#-(#f%L!H}}I0~_T;nG<h(c52GTT#m<GR?e=K$xpEe978)8$vW)-)dm2~wLM*zB{vh!Lb9G;eslKu+|gbxG=t>5rao|_rSP~NWZafV^*{WM?bI(O6(I2H2Fm7QhUT=x>Gx_<8QBGE>x2LIMWrRu0OK5t1Gz(=r1ngjNArG9-#_*;j1t7giw2rPytrik`b=4$Ps00co_Umu%KMYIDu4Qo%|D5O!mA$Vytz^<cHE5Fuq0CLM5&8{hHH(?cN*+ooTdBbVfh8&)SqYHi%fi3skWw3h}zhR>6J{6%#(CieI6Z}YW(rVi!2*sMYCkGK2+mIL#0$5?R^WDms3x3bWKN!?WoK`md5P@vrW{Oh}164ON<{S>J)m~xJM*EF9VOusM!26*z?8j4(2)si@8pFP1U(SYsYj_Y4E#tXDxZqL<9-6{w6=1QGK?|bt(27vZ9L<3v>6UcW($X{V&l9_H`M%xL9VKXGb-jpG_!(V&j4~nN;{;R+gc@no046(2wgt^Mui#=NOYst^#6|bfk58^){unY<~FRj(%XU6oEWWBnuAFd;=79`HR2p%RmwE+AZpcu$I#NLjkEoA>n>P$!M^VB3D<h4(C!RGCD?hl|-~ZLSf8)J!%B;ED~R~mK<f`!jq0YI&eYbUkD|l_&WTWyA3hvS8q>SSCm<BNS>GhCb7;1VAMxyzwi+=Te^LO(NUglSDuG74jtwaV2*FCX?T$xb=iWCXyMV8uZzyik9D5JO&T~Z*LFdwRm4+pd=mwu?|fZCE`d5BNfFX>BXl3lewfbirKT0Z2i68#_{tlZFEx|@>5cyw17(~%znv-QNdn~yXmZn2`sG`3%b4=|`t-#M+&IJX%<jvq1?i2>vH(wM0a1O9tytI_eo?=!ds$iTs!x>5sne?Oa$w<+b<QDjtoIhSixUwb*D0?`rGWM!wO(-GkFalNIks-Fj(Upd1}DZm<dxIIhz*2WDgRBRVN{W=ixf_{wU-Kxk~DGUJE(m|7Mb4D3ZgI+lQVcgQs>t~eOm{VLv(`PySYrn6yHlmKLdlwKdE|M*U0&3(v??a#TAzye318X^CkB0X7@~DZ6)#Oq%2KEbRSo&k8t2N4O?ohH6Ng>cZ9q}AbvdD$zG`PK3h>3LJwda$(zRJeQhnvgBLgMdnhjTRRR=%hCxNvH?9_W%-ecOT8BX(#8hjJEc>BG?wY7q7dUjk!&E^>@arRuNrsFSHTCgg+NV%VROk8G_WvNLrX2SvtYJQIWncA()pY_OVK{1+O*!0r&f>#>vHc4N$J`<-PLo5e+hpL>_uCt{q>Oa(YoQ4@t`A)LJHwO+)6b?L?S1q*!bUv@3eh<*V0G9{7D}VEXGyDvEK^YIxCJ__;O5zIxg}wqMKz>N##;b7ashC4%7tDGzTO=JtB#W1zAo+}TXed?dziJwJBvvy=eaM~J3_2b$@6)q|497%mu(X^gTT#}QUh#&N#)M9hR4uGF7t!09hZO_`zHDqz%TG0Rs6{BRuM)IgA-Lz1AYcgV64f2+Y?=U8#^tOTqz(>$#>@c-4;^xjL|QMC~LeRck2%?h<_J&*bfimtK0rSkMpni#nsU}$l~unerGMB%wwTDQ%+Cj3?~t8GrHwDy?Fs<(!Rgd0UdR&46SOsxRLP5M(&z`N9J)xy`Nzs-aIxm`i-9B86qDhlQh@Amd%)TXV^JaRq!KecIptlwNhY3xDA=1Kbi$}^7MKxdx%d)W;`Vnm4bLgD(A9X+`o5QNz%d!B1AH2i`v1wMGJW>YEdj<BO3hs(?FrupR;icM;b2Wok%oBKIriW(149a2W&h3As6aM`$!Xtxmn_@{5%kxl66m7?y~IwKmjYJlA+mGE~^TQVKkT>*re*f7*S7g`<puHsJ#k|!kwR;#^|j@pZ%6qIXv>zo&$rhi=tg_ATA2i(CgGUy}!|t=gBb}FgDv%ou<&D5nK%M@~=qg_(20_LwA5Bc3411=fJOS*a(!3LN{wFp4*!&&G!`r5dRfTU|A1zu;2|7G(vOgPK!EEUc^XuO$&vGT`8FtOmx#g7Q(6&!^X;Z#u+vJmj&2DUdK@*A++2;H8U>G%C?Wfl}X`7-xz45p0fA+uV8#Ikjtn{b;eNRG=pBuUKLbpqZrEFoR3<&xLtb1;4#QnN!u$u7JuDM8q^T!hq$Qm!fH)S4zS|Z>=(E-E#cssmDK=5FKVHP>wn&F(M(Ee6giZD7BOMdmD7F}q41>*#25q=32(N>LcGPyndk+^uh=)hed4CTY4fa_mw4}Ud%;u_-SRI8dz|El`)z}eYxq+Xi@hj*gIN$rt2q&l#tL%)T$tv1_6c7qNwOQ#p#>RviD6`H?A!TXJR@sg1yQvQ?*4^6MCA-S9rwaPJzeD0S2{mce|%I;b#{sIxDykhOC--I8!)f7aI7M06PabkdZwZPsfI9$*rWcc$M(e(8lZ#j9Zj59rm;$rWmLiUY=SyPs~AKy8wCp)dk62HE0&jhh97i2D%bp$m0ZoBaCeyRicV3n{zoDfUT2zzU|>K|BxqjJVTW@~mt(KLKVNsh<k*TO+%xn?@F&HB0_v)anI^1@0Di{E5~Wg^zclO&VjovxVt<QT06is9)1f3R#ty<+w^$p2KyTi9iLilp)k5gwQ-VpIG?do3X-it59^gkK*sMVBl&<IaJ`7{8Yqb=>J8BKAQUQ-O6)mg-x^@$Vo})~g_uctsF6IWeSRiH%9<A-sd*kwL_T{{RmyTo@5?LYQEYX}aN51{6#w&Z?=@|$Nj%jYRZ6><fI6z9pZ9CgdBL=l!d)7GQpsg$czG7Qa2q~t?0h0&fGqxBb@kVGkk2hI&*gQZznPlR>!>{I$Y#oPv`5i!qNr08eQLufNVP|<?`6|xzB0KfP?)QTbQI9;;wn<QT0GNu97Sx{+Tag4ahDUVF8()F!S?|Q(XgYvacN5EUF+5ZYTD?shI<yotoDzFWB_k}A?+jV3>2fO(LVZq)mdZqxH39AxaMSGHT$#<*;y5;HVXcY`C}_?V=W*j(d)1w}zkWmm`%M%;QY%hSci@Wgepsq+kF^fn>zQ3#C(kTYji3{F%l8;B2>`E~U=_jkR#yVbUoEB|B-zuDqBK0)$J`keK;Er=hmtVQmP`eftCTG1?Ugs(kVMbSgB!*uNnyHEtk&|(-zML6cWN}p?A+8PFe94l4j&<e00G*!e~?J$AgmfsxD$%BQ~$Ud8ARlMmfw)y8aT!!F0|3Fs^s!1PkX;Xw83`sfKnXF#jI`ZF^k%y%eJ1>?G6sMt^tcFsEO)SsH26%quKn><F2PWdWt@S7Sj)^F}%XAr}agK?{al#3_Xa&=R66pK*^iW;(7|GK*4ys?sQ2`HAYK$_Ecqg><AhR6!cXV@>J3~cx>p170ad$lf{^(EwZU?>LsSW6oWvz)R5dv3;T!q8!w&J*3x!hpl!$h>`nJa23)NTJPGrkW<ZtWPoa2ltT}(#4OK6#0RDN}Nr?K<PWGLRHJc6EJj0ndSNnijiJl;&8T-1zlS;!@{HNgNHlP&j3~%zV>gfW!9M7J(gy7YP5qy{+j5IuNs`#_N=%~MVG@FS7UuKjgAeM5>!dv#?N*rOd03WXUcUKUub=@F-X;&Ce2zz1yrr}>qo`PH_A`m+m-Q~oVPwz4Lh9~~5KQ!V~L0sh?Mjyq+nHr+fu3NFtqt5%D>r)|g%3E6e(+MI-c(jBUW!LIFyq{Si4Zsv)O#`Bmzm**0%B)S?nceCfPGN@qe$OWZL=izgts-textMddJndF7^Yjl)HRcB?da?ZFFVfX|E6#=C-`!wtZTKD|8rW@Z6toS~6Dt0(tU?{vXYLw&CI%H{BN7O~HGM97;gs7^Fxf^XJ?7%P8W?t@%M1y^TUGq?&Qkwg;Ot9K*SY#XLh;!_O83nbO)UZS){iV*8_m!GJXSNhM7c@CSRfXTgr-VuhmYEFL_1{TI*+Kl>=MSnPT<)NLk~9~1Keat=8(j{4iw!@?jo%}c^8k6#Ur%eQBc^X(_22o`rYy6GL8FLf?j*6GFOhyLuT%6RVi0FoBjh(p5BeycYT8$C;YutyNZ-qk;nowe|=daIM-bs13u%+LTrtlaV=|?pG>86L{*0Lc)WaQokgTwqf{S~qe0^Y*jUW>{1Bsk<QeNgzlcdDLG#q1V<zoD(o-XYR=Qe3N|uT(w4dJ}G68ghhT5RZfJHB6xn;9=)|i8{)&n54S<lqFI$t3nmn!LepGOn3D|4Imk6DIy`_obPxVSnDQjKa{Ija2vt8VfqaTr1FmmcoSH;6{tvI>0t1U7hsqwKDtoaBn7OGYV>*Q?B}TQaT!>}xd_e89EC(br%K72?tJNKreUG$MTk61ORDu>gy0(-J(&|I&{gn{6gcNU4xHKb#S^2QO@a*7?Ki%qVxoI>hyukkJiMMayYro);O^B7>plN9kTm((hKyekhw$uac{MpcsK&?gvna2np*$lfTAn7eGItK7p&vJzF^3gcpCFBwQ%8A6o3q5?D3x6K;F|LlAr~U~}BGF*f|iLQYPZQIF~`XqwZK`WwFvGmYK5aYiwIa2hMUeR&WHb0MWUvDaAwej{8#9|nz(7Zs_Yw&KV*4p;p8Z|z~^gbHp>NQ2kG4gjst5<6;YBMni`xMA^;OO^ZDg{<OwHkK3fp^q9@o|+!F(`%K^m>VEDq%{EsnIWWPn>pRM9j|BY^Af3nHQK0JJ<e2!ZfGVuTI%z*QH#posebIVdIwlR$ehAy6i2z+NWs6);4?PxL|+fkAMrt^Nzt&WbUrTPQNhy3d3%G((1^Gce@a(|)u+V3le0A3t5}np1a5zAHPWZKcF<5fsUmWT0ygBeW^PWPicRifk)Jt=oC}(&p;BOEZfrVTH^xCCXx5kbw@K(qZ7m*&yB++sIQ%h~$`LA4w;u#LJZMoWK6iifXbf*KpZ1A-w6hs{MRSpBF!i**6L3yK8@O6|tx?+?ZJj_$uBwnZ|D3~Djd83y;ngJhQ-Pyb4#!EhzD>aNtTcVSdyyJ-74$jvrVz@o01c0{!RgbI^^rfwKTI-kmj?8lzBZ+0BW_d2&<DwI_Z8{Fu5zCiv_se|J@V_5bM~_Kp!u5V2V~EmHV=1pYZgII?3QyvaiUNq%GU6jy;#Eqm-rM_RC$bN=*Mlui1rUMXNP$C?`g$}CG(?eS_;s@tf`=Xsn=G!_f$w)j5>yxSBhFy^?UafdQ{XGMcxFs&cS<xk)n@NhFII{eWM{)ULfr&KyFs8L`qz1*Zc_vl9*gTdbvqexJZL-bRVFz%q+1FydNe^5NwL0d8-hsG*MJL>I%~KUEvG6%UMAPiS%19KNL1utMT-6I%lHz$F7k(#x#`_@mR~h5(8#IBN6oliqJ3XIop4sc6!yR98R~I-ga~k^+ciS%nkFDygXvn<~c1;hu2vH*4i^A*fdPO`;O$QE_J;oY(&Fqluv2|g@_n&$|#1|NyN0xZ-bGhrdRA`Q{!7w=m}vKIeycRpYz6)-HJ*j5<=F=vTaFjhWgX4Zo$8GVQ3PckSS{R^vno*r7w1<45UiwQyw|<m|?q&_IxP4#*$g`0S1Vf7XOr&YR%O4c(|ZI96Tvc?wk~129sW6oPT;k2#TurCw{20-be@Xb<0@M(18La3hj5XAraDcJuS&xG^Rfky%@OKp-#mImvrcVgJB)uxi%kl>9&SHN0MM)2e+<1wJkOmb6qR%>PP$b-z#Q(jo+x??PEJBhqeH(_|l-b;}`E+#JGJgm<Ml9F|fO$k=8{L!T7eTfVAaR8>)r)joE9Z17W=_zAj&7qV;Zx3faH7E(oLU&l))#*GzXsVt7Dt`42{!gBWHl6cq}pQY^|M=GAUYw7|t8CugVe%#6plN_HLZ(00FVCasXc3p=93#hbU>)?(s1W!dpWK0Q-ia?$TjAz7kBb#I7AsE_9A3@Y>toA<xgf{#cHpg0n7#G$F*607ZyC^CCp7bNIJZZqg?i{7Jg+dxo|3;%m1g(L2VvP`%AWaXznd&T`0UNLB<@KTO#{TjzR(%r&{)uJn2i$p=)pE8RU&W_{Z&$5IxO3s_~R{}=Ky!t7(P*dk<)`bm#eag%Suh~SE$0()$C=c~f(W{)E^j&`AG}?UbdYK+1jxO5&1XEL6jwy=aqQ*wNb6qUFhiTz>bJMtDx`KL^cB05>#YLKIl_p?41d-ya-1l{s_Ryo!L#{_ojL89N*Dz@(BaF3%{MGVcX@mA)tMErU(Vg~SNxK$JoCS>;S}9enRdhWk@<mhwZ8ys3&*@!_@aMXj1@mM)L=Jf^y{$eKAn7l1AnoydT{yloKpySFssrb}DP&BLH?QVIa-g|g_O?5_G|Ke>*bzsqq9SSZ-J6F5Z5SAf=q{ipOj9LBqr5@&lMa|yo+E{Efff%;WD{03>Rple@%AvWes~c$k8?P1a|B*cP91cAPtw~^*2qQ1mID_3+<N%l4_GJvIXdy6NdW?t13ToiNJe3h?zyO!`V+_{(SpsRnMDJ{2E|>GM#mgq>8RP~O)ZmuQsPXrS(i=2&i0X<le-Hl7#dYer}ZVu5M4k%$Aa8kn~mW&JT{5Du<Knom^9Yp5Zv1*CD!6(*qPdgr+Xa;p-yLk|ADp))YkEfrzNv+%)_rLBWUNOz>i|-JTIh0hl($4A)#CO<i<+QL#&{laRyeD4s_Bp!QYVn@=wrpBGmnSEGS{Jo*G@(iE<=6*NSX}Oe+s&?S52k7t?2SAYF@;AJ1yc&<L+j`2r4CY6#HP-~swzFt!179eW?|lRfMpWC9#cIk5SC8hnZqgj>0iXyGTLmiO`2AnD|TtKepl+u0%*Mk8}+f6$5dy+``V?heBBM|k*O@%AZ7WoGRlWu2(YMcI~zu)@d}-FN2*_x*Q-T)WVRlKv~2T1+9gtpf_#h2SfKj%s7B>1deD1Qw{KDWmf9P;>3xWtRqb5CpdE4J?$t7qP9y)zbKALc^&iRf+s7Mb#e=Pi=)fNA!&<;-f!IY{5Y<#Y6*QuTGHa;S`-Fe&&c#%f5bNuL_;{lfO~d-9W$HMRaeWAe1(n%*((<wfEMoK$MFDK^5Z;)R}@LGzY*Ex>E8SSR-RNCVHOsP)^@-alSbh)u1UgCG38CV@^xU9kBs?sctGDAx@{5ddILU<p4y;WSflvE<-32rUNiUw}hD`^>RSmp&NRge|}vxc$37j+NwwR&G>IjAXLNJ+5wXb-d<0!oxFVCp$U;7zgEq|H((<?AA^S2H2~nzF!_#xf0IMI&=bx3F4chug~?;XWs?3iL{U*)n2JMVs%$EQGdp(?69QS}glmOyMTS$S^pTlQ*eUp<^TqX;=&QUPU)2x?m?aU30s+R<c+A?-^R8%~If(YCwYhH)byeC*F>1BMG#%E6BC2|VPk*JrpGaumtSwr?vE3^0msm{@KSC*^A9sVc5SiFEv7J-@%ixQ>*z^EN?&T0sUOk~)spM5@jU?i<OM`pe?|yqFb(i_dqWXuUL|WrwZMuWs4eq7!ke{nxNXQWaO3U+1b1Zk+C`h!cRy!Vrke)siaV2WZw}ku~B!uTLU>f3>+idOYUFeh>f7n}=_Zd>>tv;A=i<G)v>e8d_J%HD>LfN71ZAGT%Ssn_2o}i>sX^Fl~N8ZGH-4mJSOg%`{SSZ<5wNF+Y%qdh35b|3OR*-6$rt_Dz^N^s5V2h0vs%@&e`lA)2H-{bmw9Xe?UJ0=T?Dm$!Gih=@P4qS!1|`GiQO@A%4~vEHsYDr!$w>Hwy6!6M%sqTStviHoM!sRt(wq*UV%APTzZ3ZEZKwe{tBXk6p00FrMlQD?2-&Tdd{=Vz7dAPx4RVeWG*xi&9lQ}aV&8k1_`fr%-mmw-t~jo(|M&%e<7eM{-p?qPKP$oWDDC0xW`N&Zu_D{Cuw~HiKq>}m9hb^!&BG`w&V!5qr#X9HDs<igDk%0OYc|Zo(LBK~Sa0sVDucS6V1YV6bnAxt%X$0TwbTd65oPzbys<AV6;FAG5VhxP>rSmQN@(R+&?P`ez<mj2dn8@_S{H=%2bQV88xh0PO$-9Pk~7JfVq)2vDM?E)-42?A8SB+6!<BZyBu;><BqbQ@@A?=G_(qDwTE;_{NF=`YhWf%+JE6_5bz)<(isRxe&+7QdRH!!C=O^AV@X80r5b>}g3*n`I(N)*?B!ocrR~vv!uTf6PY&u~oyobHWIU0iJeEo*wB!dxDEnm%<#dO~2Mk9r35HjaK$owqHvZ)byd`@y<6Izm>4FS+45~@mpl7l#=>g-i>@x}&2FSrQ;oTX^jsa%IA9W%qs<SG6R*iZE@fGL<IPbLbw0*{)?=mL@36kFYa)^3C(!=9rH<8}zUHOA5u(Pz=YBEWraKFbvJLu5GnzpZ{Wq5--Q>CC9WMj>7{mz(O;TnDi`4b$~|%nYAut&5b|9r$x7KZdwbeCIMd+P2S?j0Wip-JQ}u(kVmY?1u9R&mih5B4hCO-zjk4H4yo?lsZt}GKftfQNjf4)tJl24e)BJY*v{fSXvNSMy8r0dXMxx{6%?{rej}+QhR(fdnY`2sk!+&y_f^h5F6lIDtl>|!B$dM-0nQ9v5okR&9FMl+ZL1nk!Rz!4R5YMG<AkYn;-w3XuxVRj+0+!T*timVg6U#tT$pHmp_b=^YV&K?kQofN{sC}*Aq3mQJ=Ju6+(QJl|JCrPF4JRNhca(^AiPdRo(vM_5u;7s$Hi0kmL&VvfNB4KD*o~<c~1QdJ<m;x`5LXg<=u%?6O7Ho?Anwx%6yo(MYa1m&_ImYq<gh-ROwSOLQKSTo>GSUeSi`b5~YH*+hD(C_cn<q9;jVaF>93GU(p^f4p`c2GgwRXx^hqq1zhe08XZRw@6F0;`Kt!*7;Hr;!17wT@4w4>C7jK^B-Z_TOgdj=>GZ<l^poj-PQY8Ac$v@b`S};?PR0E<(3lgP@cwE?k*6kLCwu)Ka$U(#2@%fnelvsd}fZ&&FR5lK1v{7c0=d5@)C14rrDRom^X@NV8`&EKYLIhJpjPB8{Ag~A}uTW{c}x8=cqS?B$J!UVh%Rj_{lT?7iAFy=iT_EkB&S@v<-bS^=>%8hq9E>HToCWb;?zC;>ZnhKeB>L_Zjl0#xRUll$5#c+ZA%-UZ<?;9*_cY6im>P<_O(kRWlTC=m|3&A3sXcyHuIWiO))S#@0Xry>(S<sA8z}kGXvcHT{{r3>8ZVE@pfGkDF$`l58odaNkPs)PJeh-M^eW`omv{(rfAUe@Zn;X;Ww6FUN2DzNWEDu2SIO|I8&ok3mY-Sd3lodd?=C040CPg1r2RQZQ^7EQG`fFWOQm?Dx)=(sk-BD7cak<W=GApb>dTWjNa1;V01S9N3`8Qu4QQMt$iTx?_$g;p|dJ?P6o${E7E|kk)G*L}i~pH;jaI$Kq^9;>5;`=92}HLJ?O+y~c@?#qcW}>8Q8vV$A={ZAr*{8hA@B!2)b6JlE@0gg>zt9>(zZM>ZIyz{&xp@2~7VT4nYS5KF%t8D(759kbs9NzQGDt#Ql<fNDU6rGxAr&rYl}{wzYINFd^ylb79tm=2%rz_;G^pii^R)g3wi+?u0@R(xhM3K?)AWMgTRB7b-7=iO(!TkK&3x%dax(4iv>6X12SQz}5@YOZ%Tz4sL%q<Smi4sX-ug`fYx{z>5BX_0t`Dv;nv8k&IrY#8*-RaT<yAS3`rTDKimgOJNINW?Zys1oYNTYdl<4ZIRQ+h@4er-q+hz<h@iwF08bp^}`nKcX4ZTaQc#z#j0Ku&+L?M__O32qyPMu@GelX}*|v4R86}+KBcFiHH{Z)DWn<9y22TMZ0JG3r5GlLr~)43wKqSax%>V?tTNWYUKE6i2Q*%ge3h((GGRRXkXK(>eB?x5|Dh3?#EFhKc4(#KyZ|&E@dOSKBmXNCG=Fj6Dn26>vUnRsicoaP1D7F!M2p64!{syal_M8eHFXGqWev&B-mcONP0tiy=ko6YEyh<bmyt^{W6twAKKrjYv}hk1c!k{)@<;heT9(8ON}hUQ4+?}oAQ@9$!UuG;DjBHvGX`2>@0FwE#6-gFSFZnlo~*Stk0FSeXsr!G8<BDpXFsvzPEv)G8*v6x&Y*MCDQN1z1nQYGl?3UjWwp7x@q;uLY1RmfKz=?HwpG2*-}?FME(l2M`4oC5+g;>Wv$4GKB_L<EPv?AN?95sY&E;#O1Tq`eJU!;hh?GkA!0czsg7|BH3+`_L#rydt_G!KlWLSA&@RR>85ia1K4SC|Cbt(qdlT%eYc8JTMHVtfJD#|zdfYjs*n*GkoA|0chI&$Nd+?Wj5otL7k5Cgu{Sb}-JxlIy-ZxGpUz53o?BH8d4$xgXYofHjXc+Ie=?d8sxlK?W6r42?hOi<oE0)}+plZs{mAh6=-;i%1_I9|PQqZZoK&ukrw<BzYeZaIFzXuKdI@<F8eIe9z`M7LKOM~4;_?UJkthvIPU;Tl>hu7Qx%b+_!(e*Z|$Bf)$hVlYAWvL8Er=Zt44&nD9a8|Z?o5693Ycw6ak!=fkL*V$Wr{PjY<hO$3Xmb=c(%fJhR7QV>I?rKak><&>CKvfMznjf;YZ3E>y(g7)T#nEzh)Bze^h-7lElTQXu;J?5q}I7%IL5Y)%}9LYh43{QrNf)as488<0B|7Dt%6zh)4wM;enmpU^%ulHficaCm$Yk(h(^Az^pxZX74O`?Pl@@v`svARRPXY7AeP|hoVDTq+Rz-ueg-zt&HT4Xj1bkUq(1SzI#mMqYj-XvHrjVS%Dv>}=;tT``j1h*mfkUbj)Cp?=VC!$$%6lK-fsvS{q$8|;q)XzKJ(8FuZZs#zDj^KutMiuq%+z_u`9Ntr(w(Vvqp$aF~VRCTFv6Bn$Hd*rP$L3fC26$wWvz7B~;er%kO32!!B>XJXLyq-$tk$1AryQt>t3C-Rriq!jLy<Gm&UUiBqG<cfH(He+Wq?Q2uWwf>H%wu3(MM`OW^d7?GCL)!CwiicK)>w!N~-?SB@F66W~vecEQr!`Z?=>`|{rRUWS=2=^WAOW8jN?ZT3e12Waf9qN#fW|Itf(X5v)rA&=<5#S;WyyhtcfuUjaV=1^z{W9H71YNZP3!g8F&aBTSoc@ajV~<0x{B(uew->r(&P8|XJGVHDYseI8xyw+^QCB30(6M;9<}Nhn2(2^<y|>CfJU`XNv4#*6+hyLIJWZm9x*?B6h|&;u8{6vpY~Q7mVZ0Iiad6+#5+%Va!tGDVPt>~5eK6@xm{9l2iW)zuv}>L3gZZ(8_l!<qTYA@&%ClOeiHRC<lKc8vOl%im=yzYYd$9ELg4}0uNkUDL4{tThhMCNfs`Z7=Bwpk%PItQkCjbBdpvoE96fqt300EwNfV=|$y?y(ovBYQl0ssI200dcD")).decode("utf-8"))
+    if hashlib.sha256(NB6Q_SRC["nb6q_lib.py"].encode("utf-8")).hexdigest() != NB6Q_LIB_SHA:
+        raise RuntimeError("NB6Q_EMBED_SHA_MISMATCH: nb6q_lib.py")
+    exec(compile(NB6Q_SRC["nb6q_lib.py"], "nb6q_lib.py", "exec"), globals())
+except Exception as _nb6q_e:
+    NB6Q = {"state": "FAILED_LOAD", "applied": False, "attempted": True, "error": repr(_nb6q_e)[:600], "readbacks": []}
+    print("!!!!!!!!!! NB6Q LOAD FAILED: " + NB6Q["error"] + " -> NB6 behaviour (no patch, no NB4_PPDEFER) !!!!!!!!!!", flush=True)
+
+    def nb6q_readback(trec, s, stage):
+        trec.setdefault("nb6q_readback", {})[stage] = {"label": "NOT_APPLIED", "state": NB6Q["state"], "stage": stage}
+
+
+# ==================================================================== CELL 6/7 — E21: the Duck run and its report as functions
+# Both are E15B R3K2's cells (build_e21.py: the changed lines are listed in the Experiment 21 README),
+# wrapped so each half runs them once (every module-level name is declared global: same behaviour).
+def e21_cell6():
+    # E15B CELL 6 (R3K2) with the vLLM probes / watchdog (build_e21.py), run once per half
+    global _E12_INDEX, _e12_order2_score, _e12_total_cells, E12_ORDER, E12_RECORDS, E12_RUN, _E12_LOCK, E12_OUT, _tempfile, _E12_WRITE_LOCK, _e12_write_json_atomic, e12_write_submission, _e12_branch_done_r6, _e12_g4b_window, _e12_shifted_end, _e21_progress, _e15b_gen_tokens_total, _e15b_all_server_logs, _e15b_server_log_summary, _e12_capacity_probe, _e12_cache_diag, _e12_no_spec, _e12_parity, _e12_r6_preflight, _e12_branch_done, _E12_STOP, _e12_heartbeat, _e, _end, _ra, _hid_end, _start, _per, _, _kv, _first, _workers, _shift, _e15b_solve_end, E15B_SOLVE_END_PC, _e15b_tok0, _WD_POLL, _WD_STALL, _WD_FAIL, _WD_MIN_LEFT, _e15b_watchdog, _att, _ev, _bud, _g, _run, _q, _S, _full, _left
+    # ==================================================================== CELL 6 — E12: Duck REPL agent, every task, E12_BRANCHES branches
+    # Every branch is admitted at once; Duck's priority gate keeps ARC3_MAX_ACTIVE_STREAMS conversations active (first
+    # branches in ORDER2 order before any second branch). A branch ends when the host verifies a submitted program on every
+    # train pair, at the deadline, or at the optional token cap. Full thinking: Duck's transcript.txt per branch.
+    _E12_INDEX = {t: i for i, t in enumerate(TASK_IDS)}
+
+
+    def _e12_order2_score(tid):   # = S49 ORDER2 ([>=3 train] + [1 test]) with the cells tie-break, sorted-id order last
+        _t = CHALLENGES[tid]
+        return int(len(_t["train"]) >= 3) + int(len(_t["test"]) == 1)
+
+
+    def _e12_total_cells(tid):
+        _t = CHALLENGES[tid]
+        _c = lambda g: len(g) * len(g[0]) if g and g[0] else 0
+        return sum(_c(p["input"]) + _c(p["output"]) for p in _t["train"]) + sum(_c(p["input"]) for p in _t["test"])
+
+
+    E12_ORDER = (list(TASK_IDS) if (P.get("no_order2") or os.environ.get("E28_SCHED", "").strip() == "1")   # E28 SCHED N3 +
+                 # E28 W4 W11: no ORDER2 (user 2026-11-01), also when the scheduler did not load: plain task order
+                 else sorted(TASK_IDS, key=lambda t: (-_e12_order2_score(t), _e12_total_cells(t), _E12_INDEX[t])))
+    if P.get("task_order"):      # NB5 R2: the lead's fixed task order (the same in both paired phases)
+        E12_ORDER = [t for t in P["task_order"] if t in TASK_IDS] + [t for t in E12_ORDER if t not in P["task_order"]]
+    E12_RECORDS = {t: [] for t in TASK_IDS}
+    E12_RUN = {"started_sec": None, "model_id": None, "streams": None, "deadline_in_sec": None, "error": None,
+               "branches_done": 0, "branches_accepted": 0, "finished_sec": None}
+    _E12_LOCK = threading.Lock()
+    E12_OUT = OUT / "duck"
+    E12_OUT.mkdir(parents=True, exist_ok=True)
+
+
+    import tempfile as _tempfile
+    _E12_WRITE_LOCK = threading.Lock()   # rev 2 (GPT audits, reproduced): branches finish concurrently
+
+
+    def _e12_write_json_atomic(path, obj):
+        """A unique temp file per write + os.replace (CELL 0's helper reuses one '<name>.tmp' for every writer)."""
+        fd, tmp = _tempfile.mkstemp(prefix=Path(path).name + ".", suffix=".tmp", dir=str(Path(path).parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+    def e12_write_submission():
+        with _E12_WRITE_LOCK:                          # one writer at a time; the snapshot is taken inside, so it is fresh
+            sub = identity_submission(test_challenges)
+            if RERUN:
+                with _E12_LOCK:
+                    recs = {t: list(v) for t, v in E12_RECORDS.items() if v}
+                for t, rows in E12A.build_submission({t: CHALLENGES[t] for t in recs}, recs).items():
+                    if t in sub and len(sub[t]) == len(rows):
+                        sub[t] = rows
+            _e12_write_json_atomic(SUBMISSION_PATH, sub)   # evaluation: keeps the competition-format test fallback
+
+
+    def _e12_branch_done_r6(rec, _recs=E12_RECORDS, _run=E12_RUN, _lock=_E12_LOCK, _half=E21_HALF):
+        # rev 6: a branch reports every pause and its finish; keep the latest per branch.
+        # E21 rev 2c (GPT audits 1-3, CRITICAL, reproduced on this source): the callback is bound to ITS half's records, run
+        # state and lock (default arguments, evaluated when this half's CELL 6 defines it). A half-A worker that is still
+        # alive (a straggler past join grace) can never write into half B's records, and never writes half B's submission.
+        with _lock:
+            rows = _recs.setdefault(rec["task_id"], [])
+            # rev 6g H7-1 (GPT rev 6f audits): callbacks can finish out of order; never let an older record replace a newer one
+            _old = next((r for r in rows if r.get("branch") == rec.get("branch")), None)
+            if _old is not None and int(rec.get("publish_seq") or 0) <= int(_old.get("publish_seq") or 0):
+                _run["stale_callbacks_dropped"] = _run.get("stale_callbacks_dropped", 0) + 1
+                return
+            new = rec.get("branch") not in {r.get("branch") for r in rows}
+            rows[:] = [r for r in rows if r.get("branch") != rec.get("branch")] + [rec]
+            _run["branches_started"] = _run.get("branches_started", 0) + int(new)
+            _run["branches_done"] = sum(1 for v in _recs.values() for r in v if r.get("status") == "done")
+            _run["branches_accepted"] = sum(1 for v in _recs.values() for r in v if r.get("accepted"))
+        if _half != E21_HALF:
+            _run["late_cross_half_callbacks"] = _run.get("late_cross_half_callbacks", 0) + 1
+            return
+        if time.perf_counter() >= globals().get("E15B_SOLVE_END_PC", float("inf")):
+            _run["late_writes_skipped"] = _run.get("late_writes_skipped", 0) + 1     # E15B B1
+            return
+        try:
+            e12_write_submission()
+        except Exception as _e:
+            print("E12 submission write failed:", repr(_e)[:200], flush=True)
+
+
+    def _e12_g4b_window(hidden_solve_end_sec, solve_start_sec, n_tasks, hidden_tasks=240):
+        # gate 4b (user 2026-10-21): this run gets the hidden run's compute per task. H6-16: a function so the real
+        # values (42,720 / 1,463 / 12 -> 2,063 s) are unit-tested, not only under the harness's 300 s cap
+        per = max(0.0, float(hidden_solve_end_sec) - float(solve_start_sec)) / float(hidden_tasks)
+        return per, per * int(n_tasks)
+
+
+    def _e12_shifted_end(end, setup_sec, hard_end):
+        # SA-1 / H6-6: a commit window starts after the preflight (and nothing else runs before solving since H6-3); the end
+        # moves by the setup time, never past the hard stop
+        return min(float(hard_end), float(end) + max(0.0, float(setup_sec)))
+
+
+    def _e21_progress():
+        # E21 rev 2h (GPT v3 HIGH-1, VAL2_dryrun F1): (requests running or waiting, prompt + generated tokens) from /metrics; None when
+        # /metrics fails or lacks a field (then the stall rule never acts)
+        try:
+            _r = e21_prom()
+        except Exception:
+            return None
+        _run = [x.value for x in _r if x.name in ("vllm:num_requests_running", "vllm:num_requests_waiting")]
+        _tok = [x.value for x in _r if x.name in ("vllm:prompt_tokens_total", "vllm:generation_tokens_total")]
+        return (sum(_run), sum(_tok)) if (_run and _tok) else None      # running + waiting on the server
+
+
+    def _e15b_gen_tokens_total():
+        # E15B #32 on vLLM (E21): the server's own generated-token counter (vllm:generation_tokens_total, summed over rows)
+        try:
+            _v = [float(r.value) for r in e21_prom() if getattr(r, "name", "") == "vllm:generation_tokens_total"
+                  and getattr(r, "value", None) is not None]
+            return sum(_v) if _v else None
+        except Exception:
+            return None
+
+
+    def _e15b_all_server_logs():
+        # B6 (auditor 2 F6, auditor 3 L85 / L125): every server log of the solve (the crashed ones first), not only the last
+        _t = []
+        for _p in ((E12_RUN.get("watchdog") or {}).get("old_logs") or []):
+            try:
+                _t.append(Path(_p).read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                pass
+        try:
+            _t.append(E11_SERVER.log_text())
+        except Exception:
+            pass
+        return "\n".join(_t)
+
+
+    def _e15b_server_log_summary(text):
+        # E15B #42 / #53 on vLLM (E21): vLLM's 10-s engine stats lines (rev 2: e21_stat_rows, every optional field incl.
+        # Preemptions / Deferred) instead of SGLang decode lines: running-level histogram (lines with work), queue > 0 share,
+        # generation throughput, prefix-cache hit rate (rolling), KV usage, MTP acceptance, preemptions, the startup KV line
+        import re as _re
+        rows = e21_stat_rows(text)
+        work = [r for r in rows if r["running"] > 0 or r["waiting"] > 0]
+        _hist, _hq, _tpl = {}, {}, {}
+        for r in work:
+            k = r["running"]
+            _hist[k] = _hist.get(k, 0) + 1
+            if r["waiting"] > 0:
+                _hq[k] = _hq.get(k, 0) + 1
+            _tpl.setdefault(k, []).append(r["gen_tps"])
+        _tp = sorted(r["gen_tps"] for r in work)
+        _acc = sorted(float(a) for a in _re.findall(r"Mean acceptance length: ([\d.]+)", text))
+        _kv = _re.findall(r"GPU KV cache size: ([\d,]+) tokens", text)
+        _pre = [r["prefix_pct"] for r in rows if r["prefix_pct"] is not None]
+        _n = len(work)
+        return {"decode_lines": _n, "running_hist": dict(sorted(_hist.items())),
+                "running_hist_queue_gt0": dict(sorted(_hq.items())),
+                "startup": {"kv_tokens_logged": int(_kv[0].replace(",", "")) if _kv else None},
+                "accept_len_p50": _acc[len(_acc) // 2] if _acc else None,
+                "gen_tok_s_p50_by_running": {k: sorted(v)[len(v) // 2] for k, v in sorted(_tpl.items())},
+                "running_mean_lines": round(sum(k * v for k, v in _hist.items()) / _n, 2) if _n else None,
+                "queue_gt0_line_share": round(sum(_hq.values()) / _n, 3) if _n else None,
+                "gen_tok_s_p50": _tp[len(_tp) // 2] if _tp else None,
+                "gen_tok_s_mean": round(sum(_tp) / len(_tp), 1) if _tp else None,
+                "prefix_cache_hit_pct_last_rolling": _pre[-1] if _pre else None,
+                "kv_usage_pct_max": max((r["kv_pct"] for r in rows), default=None),
+                "preemptions_in_stats_lines": sum(r["preempt"] for r in rows),
+                "preempt_lines": sum(1 for r in rows if r["preempt"]),
+                "oom_lines": sum(1 for _l in text.splitlines() if "out of memory" in _l.lower()),
+                "traceback_lines": sum(1 for _l in text.splitlines() if "Traceback" in _l)}
+
+
+    def _e12_capacity_probe():   # E21: vLLM 0.19 / 0.32 gauges (the max over label rows); vLLM has no separate Mamba gauge
+        try:
+            rows = [r for r in e21_prom() if getattr(r, "value", None) is not None]
+        except Exception:
+            rows = None
+        if not rows:
+            # E21 rev 2c (GPT audit 1 HIGH-4): Duck's KV gate admits on a missing sample (fail-open). On vLLM a failed
+            # /metrics read while requests run means "unknown", so report a full pool: admissions wait; with nothing
+            # running Duck's idle override still admits (no deadlock); the watchdog handles a dead server.
+            E21_STATE["probe_failures"] = E21_STATE.get("probe_failures", 0) + 1
+            _t0 = E21_STATE.setdefault("probe_fail_since", time.monotonic())
+            if time.monotonic() - _t0 > 120:     # rev 2d: a long outage -> Duck's own fail-open (counted), not 1 stream forever
+                E21_STATE["probe_fail_open"] = E21_STATE.get("probe_fail_open", 0) + 1
+                return {"kv_usage": None, "running": None, "queue": None, "mamba_usage": None, "probe_failed": True}
+            return {"kv_usage": 1.0, "running": None, "queue": None, "mamba_usage": None, "probe_failed": True}
+        E21_STATE.pop("probe_fail_since", None)
+        pick = lambda name: [float(r.value) for r in rows if r.name == name]
+        out = {}
+        for key, name in (("kv_usage", "vllm:kv_cache_usage_perc"), ("running", "vllm:num_requests_running"),
+                          ("queue", "vllm:num_requests_waiting")):
+            v = pick(name)
+            out[key] = max(v) if v else None
+        out["mamba_usage"] = None
+        out["kv_usage_server"] = out.get("kv_usage")      # NB5: recorded
+        out["kv_usage"] = nb5_gate_kv(out.get("kv_usage"))  # NB5: the live-block reservation fraction
+        return out
+
+
+    def _e12_cache_diag(budget_sec=240.0):
+        # rev 6e G4-8 (GPT G4B audits): a bounded exact-prompt replay for the prefix-cache misses (G4B: 20/180 requests with
+        # 0 cached tokens while KV <= 0.44; suspects SGLang #22935 split 0-hit and #36935 mamba checkpoint eviction).
+        # Prompt A (about 9k tokens) warm -> exact replay -> two divergent suffixes -> 12 distinct long prompts at once
+        # (churn) -> replay and a divergent suffix again. max_tokens 1, thinking off. Commit mode only.
+        import random as _rnd, concurrent.futures as _cf
+        t_end = time.monotonic() + float(budget_sec)
+
+        def _blob(seed, rows=150):
+            r = _rnd.Random(seed)
+            return "\n".join(" ".join(str(r.randrange(10)) for _ in range(30)) for _ in range(rows))
+
+        def _ask(msgs):
+            body = {"model": E12_RUN["model_id"], "max_tokens": 1, "temperature": 0.0, "messages": msgs,
+                    "chat_template_kwargs": {"enable_thinking": False}}
+            t0 = time.monotonic()
+            req = _urlreq.Request(SGL_URL + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                  headers={"Content-Type": "application/json"})
+            r = json.loads(_urlreq.urlopen(req, timeout=max(5.0, t_end - time.monotonic())).read())
+            u = r.get("usage") or {}
+            det = u.get("prompt_tokens_details") if isinstance(u.get("prompt_tokens_details"), dict) else {}
+            return {"prompt": u.get("prompt_tokens"), "cached": int(det.get("cached_tokens") or 0),
+                    "cached_reported": "cached_tokens" in det, "sec": round(time.monotonic() - t0, 2)}
+
+        A = {"role": "system", "content": "E12-CACHE-DIAG reference A\n" + _blob(1)}
+        q = lambda text: {"role": "user", "content": text}
+        steps = []
+
+        def step(name, msgs):
+            if time.monotonic() > t_end - 5:
+                steps.append({"step": name, "skipped": "budget"})
+                return
+            try:
+                res = _ask(msgs)
+            except Exception as _e:
+                res = {"error": repr(_e)[:200]}
+            res["step"] = name
+            res.update({"g_" + k: v for k, v in _e12_capacity_probe().items()})
+            steps.append(res)
+        step("warm", [A, q("Reply with one word.")])
+        step("replay_exact", [A, q("Reply with one word.")])
+        step("divergent_1", [A, q("Divergent continuation one. Reply with one word.")])
+        step("divergent_2", [A, q("Divergent continuation two. Reply with one word.")])
+        if time.monotonic() < t_end - 30:
+            churn = [[{"role": "system", "content": f"E12-CACHE-DIAG churn {i}\n" + _blob(100 + i)}, q("Reply with one word.")]
+                     for i in range(max(1, int(E12_RUN.get("streams") or 12)))]
+
+            def _safe(m):
+                try:
+                    return _ask(m)
+                except Exception as _e:
+                    return {"error": repr(_e)[:120]}
+            with _cf.ThreadPoolExecutor(len(churn)) as _ex:
+                cr = list(_ex.map(_safe, churn))
+            steps.append({"step": "churn", "n": len(cr), "errors": sum(1 for x in cr if "error" in x),
+                          "prompt_sum": sum(int(x.get("prompt") or 0) for x in cr),
+                          "sec_max": max((x.get("sec") or 0) for x in cr),
+                          **{"g_" + k: v for k, v in _e12_capacity_probe().items()}})
+        step("replay_after_churn", [A, q("Reply with one word.")])
+        step("divergent_after_churn", [A, q("Divergent continuation three. Reply with one word.")])
+        by = {x["step"]: x for x in steps if "prompt" in x}
+        pa = (by.get("warm") or {}).get("prompt")
+        out = {"budget_sec": budget_sec, "prompt_tokens_A": pa, "steps": steps,
+               "summary": {k: (by[k]["cached"], by[k]["prompt"]) for k in ("warm", "replay_exact", "divergent_1", "divergent_2",
+                                                                             "replay_after_churn", "divergent_after_churn")
+                           if k in by}}
+        print("E12 cache diag (cached, prompt):", json.dumps(out["summary"]), flush=True)
+        return out
+
+
+    def _e12_no_spec(cmd):   # the same server command without --speculative-* (each takes one value)
+        out, skip = [], False
+        for x in cmd:
+            if skip:
+                skip = False
+                continue
+            if str(x).startswith("--speculative-"):
+                skip = True
+                continue
+            out.append(x)
+        return out
+
+
+    def _e12_parity():
+        # R6-X1 target-only parity (user 2026-10-21): the rev 6 system prompt + first opener of each task, with tools, T 0,
+        # one request at a time, max_tokens 2,048, thinking on and off. DFlash2 twice (control), then a relaunch without
+        # speculative decoding. Judged on equality and on what Duck acts on (tool-call presence and arguments, finish).
+        global E11_SERVER
+        TA, _, _, wrs = E12A._import_duck()
+        Agent = E12A.make_agent_class()
+        probes = []
+        for tid in TASK_IDS:
+            ag = Agent(task=CHALLENGES[tid], task_id=tid, branch=0, view="facts", model=E12_RUN["model_id"],
+                       base_url=SGL_URL + "/v1", provider="vllm")
+            d = E12_OUT / f"parity_{tid}"
+            d.mkdir(parents=True, exist_ok=True)
+            sp = d / TA.RUNTIME_STATE_FILENAME
+            wrs(sp, current_frame=None, history=[])
+            for think in (True, False):
+                probes.append((tid, think, {"model": E12_RUN["model_id"], "max_tokens": 2048, "temperature": 0.0, "top_p": 1.0,
+                                            "messages": [{"role": "system", "content": ag._system_prompt},
+                                                         {"role": "user", "content": E12A.R6_TEXT["first"] + E12A.R6_COMPLETE}],
+                                            "tools": ag._tools(sp), "tool_choice": "auto",
+                                            "chat_template_kwargs": {"preserve_thinking": True, "enable_thinking": think}}))
+
+        def _ask(body):
+            req = _urlreq.Request(SGL_URL + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                  headers={"Content-Type": "application/json"})
+            r = json.loads(_urlreq.urlopen(req, timeout=900).read())
+            m = r["choices"][0]["message"]
+            return {"reasoning": str(m.get("reasoning_content") or ""), "content": str(m.get("content") or ""),
+                    "calls": [str((tc.get("function") or {}).get("arguments", "")) for tc in (m.get("tool_calls") or [])],
+                    "finish": r["choices"][0].get("finish_reason"), "tokens": (r.get("usage") or {}).get("completion_tokens")}
+
+        def _round(tag):
+            rows = []
+            for tid, think, body in probes:
+                try:
+                    rows.append(_ask(body))
+                except Exception as _e:
+                    rows.append({"error": repr(_e)[:300]})
+            (E12_OUT / f"parity_{tag}.json").write_text(json.dumps(rows), encoding="utf-8")
+            return rows
+        out = {"probes": [{"task": t, "thinking": k} for t, k, _ in probes]}
+        a, b = _round("dflash_a"), _round("dflash_b")
+        try:
+            cmd, env = list(E11_SERVER.cmd), E11_SERVER.env
+            e11_kill_server(wait=True)
+            srv = E11Server(_e12_no_spec(cmd), env, "target_only")
+            srv.start()
+            ok, why = srv.wait_ready(min(SGL_RELAUNCH_TIMEOUT_SEC, max(60, HARD_STOP - time.perf_counter() - 600)))
+            E11_SERVER = srv
+            out["target_only_launch"] = {"ok": ok, "why": why, "spec_flags_removed": [x for x in cmd if str(x).startswith("--speculative-")]}
+            t = _round("target_only") if ok else [{"error": "target-only launch failed"} for _ in probes]
+        except Exception as _e:
+            out["target_only_launch"] = {"ok": False, "why": repr(_e)[:300]}
+            t = [{"error": "target-only launch failed"} for _ in probes]
+
+        def _pre(x, y):
+            n = 0
+            for c1, c2 in zip(x, y):
+                if c1 != c2:
+                    break
+                n += 1
+            return n
+        cmp_ = []
+        for (tid, think, _), ra, rb, rt in zip(probes, a, b, t):
+            row = {"task": tid, "thinking": think}
+            if "error" not in ra and "error" not in rb:
+                row["control_identical"] = ra == rb
+            if "error" not in ra and "error" not in rt:
+                ta, tt = ra["reasoning"] + ra["content"], rt["reasoning"] + rt["content"]
+                row.update(target_identical=ra == rt, common_prefix_chars=_pre(ta, tt), dflash_chars=len(ta), target_chars=len(tt),
+                           same_tool_call_presence=bool(ra["calls"]) == bool(rt["calls"]), same_tool_args=ra["calls"] == rt["calls"],
+                           same_finish=ra["finish"] == rt["finish"], dflash_tokens=ra["tokens"], target_tokens=rt["tokens"])
+            cmp_.append(row)
+        out["compare"] = cmp_
+        ok_rows = [r for r in cmp_ if "target_identical" in r]
+        out["summary"] = {"probes": len(cmp_), "control_identical": sum(1 for r in cmp_ if r.get("control_identical")),
+                          "target_identical": sum(1 for r in ok_rows if r["target_identical"]),
+                          "same_tool_call_presence": sum(1 for r in ok_rows if r["same_tool_call_presence"]),
+                          "same_finish": sum(1 for r in ok_rows if r["same_finish"]), "compared": len(ok_rows)}
+        print("E12 parity:", json.dumps(out["summary"]), flush=True)
+        return out
+
+
+    def _e12_r6_preflight(n):
+        # R6-X1 (bounded, inside this session): the drafter's tap-layer config (SGLang #37475) and an isolation smoke for
+        # #36548 (n concurrent requests with distinct markers; a marker in another request's reply = contamination).
+        out = {}
+        try:
+            _cfg = json.loads((SGL_DRAFT_PATH / "config.json").read_text(encoding="utf-8"))
+            _flat = dict(_cfg)
+            for _v in list(_cfg.values()):
+                if isinstance(_v, dict):
+                    _flat.update(_v)
+            out["drafter_target_layer_config"] = {k: v for k, v in _flat.items() if "layer" in k.lower()
+                                                  and ("target" in k.lower() or "tap" in k.lower())}
+        except Exception as _e:
+            out["drafter_config_error"] = repr(_e)[:200]
+        try:
+            import concurrent.futures as _cf, random as _rnd
+            marks = ["ZQ" + str(_rnd.randrange(10 ** 6, 10 ** 7)) + "K" + str(i) for i in range(n)]
+
+            def _one(m):
+                body = {"model": E12_RUN["model_id"], "max_tokens": 24, "temperature": 0.0,
+                        "messages": [{"role": "user", "content": "Reply with exactly this code and nothing else: " + m}],
+                        "chat_template_kwargs": {"enable_thinking": False}}
+                req = _urlreq.Request(SGL_URL + "/v1/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                      headers={"Content-Type": "application/json"})
+                r = json.loads(_urlreq.urlopen(req, timeout=60).read())     # E21 rev 2b (C1 M3): <= ~2 min per preflight
+                return str(r["choices"][0]["message"].get("content") or "")
+            with _cf.ThreadPoolExecutor(n) as _ex:
+                replies = list(_ex.map(_one, marks))
+            out.update(E12A.isolation_verdict(marks, replies))     # C6-2: PASS / FAIL / INCONCLUSIVE
+        except Exception as _e:
+            out.update(isolation_error=repr(_e)[:300], isolation_state="INCONCLUSIVE", isolation_ok=None)
+        try:   # R6-X1 parity CONTROL: the same request twice at T 0, one at a time; equal replies = a deterministic baseline.
+            # A target-only (no DFlash) comparison needs a separate server launch and is never run beside production.
+            pc = []
+            for _m in ("PARITY-A-" + str(n), "PARITY-B-" + str(n)):
+                _a, _b = _one(_m), _one(_m)
+                pc.append({"same": _a == _b, "own_marker": _m in _a})
+            out["parity_control"] = {"pairs": len(pc), "identical": sum(x["same"] for x in pc),
+                                     "own_marker": sum(x["own_marker"] for x in pc),
+                                     "note": "same config, batch size 1, T 0; target-only parity = separate launch (not run)"}
+        except Exception as _e:
+            out["parity_control"] = {"error": repr(_e)[:300]}
+        print("E12 rev 6 preflight:", json.dumps(out)[:800], flush=True)
+        return out
+
+
+    def _e12_branch_done(rec):
+        with _E12_LOCK:
+            E12_RECORDS.setdefault(rec["task_id"], []).append(rec)
+            E12_RUN["branches_done"] += 1
+            E12_RUN["branches_accepted"] += int(bool(rec.get("accepted")))
+        try:
+            e12_write_submission()
+        except Exception as _e:
+            print("E12 submission write failed:", repr(_e)[:200], flush=True)
+
+
+    _E12_STOP = threading.Event()
+
+
+    def _e12_heartbeat(every=300, _stop=_E12_STOP):     # E21 rev 2c: bound to this half's stop event (GPT audit 1)
+        while not _stop.wait(every):
+            snap = {r.get("name"): r.get("value") for r in metrics_snapshot() if isinstance(r, dict) and "name" in r}
+            keep = {k: v for k, v in snap.items() if any(s in k for s in ("num_running_reqs", "num_queue_reqs", "gen_throughput",
+                                                                            "token_usage", "cache_hit_rate"))}
+            print(f"E12 [{(time.perf_counter() - NOTEBOOK_T0) / 60:.0f} min] branches done {E12_RUN['branches_done']}"
+                  f"/{len(TASK_IDS) * E12_BRANCHES}, accepted {E12_RUN['branches_accepted']} | {json.dumps(keep)[:400]}", flush=True)
+
+
+    if ENGINE_READY and E10_SANDBOX_SELFTEST.get("ok"):
+        try:
+            try:
+                E12_RUN["model_id"] = json.loads(_urlreq.urlopen(SGL_URL + "/v1/models", timeout=30).read())["data"][0]["id"]
+            except Exception as _e:
+                E12_RUN["model_id"] = E21_SERVED[(ENGINE_INFO.get("cfg") or {}).get("weights", "fp8")]   # E21: the served name
+                print("E12: /v1/models failed, using the model path:", repr(_e)[:200], flush=True)
+            E12_RUN["streams"] = min(int(CONCURRENCY), E12_STREAMS or int(CONCURRENCY))
+            os.environ["ARC3_MAX_ACTIVE_STREAMS"] = str(E12_RUN["streams"])
+            _end = min(HARD_STOP - E12_STOP_BEFORE_HARD_SEC, E21_HALF_END_PC)     # E21: this half's latest end
+            if E12_SOLVE_WINDOW_SEC:
+                _end = min(_end, time.perf_counter() + E12_SOLVE_WINDOW_SEC)
+            if P.get("hidden_equiv"):   # gate 4b (user 2026-10-21): this run gets the hidden run's compute per task
+                _ra = PROFILE_TABLE["RERUN_ALL"]
+                _hid_end = _ra["time_budget_sec"] - _ra["hard_margin_sec"] - E12_STOP_BEFORE_HARD_SEC
+                _start = time.perf_counter() - NOTEBOOK_T0
+                _per, _ = _e12_g4b_window(_hid_end, _start, len(TASK_IDS))          # hidden test = 240 tasks
+                E12_RUN["g4b"] = {"hidden_solve_end_sec": _hid_end, "solve_start_sec": round(_start), "hidden_tasks": 240,
+                                  "sec_per_task": round(_per, 1), "tasks": len(TASK_IDS), "window_sec": round(_per * len(TASK_IDS))}
+                _end = min(_end, time.perf_counter() + _per * len(TASK_IDS))
+                print("E12 gate 4b:", json.dumps(E12_RUN["g4b"]), flush=True)
+            E12_RUN["deadline_in_sec"] = round(_end - time.perf_counter())
+            E12_RUN["started_sec"] = round(time.perf_counter() - NOTEBOOK_T0)
+            print("E12 solving:", len(E12_ORDER), "tasks x", E12_BRANCHES, "branches | streams", E12_RUN["streams"],
+                  "| model", E12_RUN["model_id"], "| stops in", E12_RUN["deadline_in_sec"], "s | order head", E12_ORDER[:5], flush=True)
+            threading.Thread(target=_e12_heartbeat, daemon=True, name="e12_heartbeat").start()
+            # rev 6 R6-S5 (GPT plan review 2): per-stream allowance = 90 % of the KV pool / streams, so 10 resident histories
+            # plus their reply reserve fit; the reserve itself follows each request's cap (R6-D1)
+            _kv = int(ENGINE_INFO.get("kv_tokens") or 866744)
+            E12_RUN["rev6_kv_tokens"] = _kv
+            # E15B #46 (Exp 15 Notes/02): a FIXED window, not KV / streams (16 streams -> ~54k would trim earlier than rev 6g);
+            # an attempt's history stays <= ~50k, the KV admission gate (0.95) covers memory
+            E12_RUN["rev6_window"] = min(131072, int(E15B["E12_B_WINDOW"]))
+            os.environ["E12_DUCK_CONTEXT_WINDOW"] = str(E12_RUN["rev6_window"])
+            E12_RUN["rev6_preflight"] = _e12_r6_preflight(E12_RUN["streams"])
+            if E12_RUN["rev6_preflight"].get("isolation_state") == "INCONCLUSIVE":
+                # H6-17 (GPT rev 6e audit 3; user 2026-10-22): a missing marker without a leak is retried once before the
+                # 6-stream fail-safe; a FAIL never is
+                _first = E12_RUN["rev6_preflight"]
+                E12_RUN["rev6_preflight"] = _e12_r6_preflight(E12_RUN["streams"])
+                E12_RUN["rev6_preflight"]["retry_of"] = {k: _first.get(k) for k in ("isolation_state", "isolation_own_marker",
+                                                                                      "isolation_leaks")}
+            # C6-2 (rev 6c audits): full concurrency only on an isolation PASS; FAIL / INCONCLUSIVE / error -> 6 streams
+            _workers = E12A.workers_for_isolation(E12_RUN["rev6_preflight"].get("isolation_ok"), E12_RUN["streams"])
+            if E12_RUN["rev6_preflight"].get("isolation_state") != "PASS":
+                print("E12 rev 6 WARNING: isolation preflight", E12_RUN["rev6_preflight"].get("isolation_state"),
+                      "-> workers", _workers, flush=True)
+            E12_RUN["rev6_workers"] = _workers
+            print("E12 rev 6: window", E12_RUN["rev6_window"], "| workers", _workers, "| first exposure",
+                  E12_R6["E12_R6_FIRST_EXPOSURE"], "| branch 1 view", E12_R6["E12_R6_B1_VIEW"], flush=True)
+            if not RERUN and (E12_SOLVE_WINDOW_SEC or (P.get("hidden_equiv") and E12_RUN.get("g4b"))):
+                # SA-1 + H6-6 (GPT rev 6e audit 2): every commit window (gate 4b and the plain solve window) starts after the
+                # preflight, bounded by the hard stop; the per-task compute of gate 4b stays the hidden run's. The hidden
+                # rerun keeps its absolute end (no window). H6-3: nothing else runs before solving
+                _shift = (time.perf_counter() - NOTEBOOK_T0) - E12_RUN["started_sec"]     # started_sec: set when _end was fixed
+                _end = _e12_shifted_end(_end, _shift, min(HARD_STOP - E12_STOP_BEFORE_HARD_SEC, E21_HALF_END_PC))
+                E12_RUN["window_shift"] = {"shift_sec": round(_shift, 1),
+                                           "window_start_sec": round(time.perf_counter() - NOTEBOOK_T0)}
+                if E12_RUN.get("g4b"):
+                    E12_RUN["g4b"].update(window_start_sec=E12_RUN["window_shift"]["window_start_sec"], shift_sec=round(_shift, 1))
+                E12_RUN["deadline_in_sec"] = round(_end - time.perf_counter())
+                print("E12: the solve window starts after the preflight (shift", round(_shift, 1), "s), stops in",
+                      E12_RUN["deadline_in_sec"], "s", flush=True)
+            # E15B #15 (code audit H1): a server watchdog for the solve. A dead SGLang process (or /health failing for
+            # 180 s) is relaunched with the same command (at most 2 times, only with >= 20 min left); while it is down the
+            # branches wait (arc2_duck.SERVER_DOWN) instead of burning their consecutive-failure budget.
+            E12_RUN["watchdog"] = {"relaunches": [], "health_fail_sec_max": 0, "old_logs": [], "tok_acc": 0.0, "tok_last": None,
+                                   "health_probes": 0}
+            _e15b_solve_end = time.perf_counter() + max(0.0, _end - time.perf_counter())
+            E15B_SOLVE_END_PC = _e15b_solve_end       # B1: per-branch submission writes stop here (the final write stays)
+            _e15b_tok0 = _e15b_gen_tokens_total()
+            E12_RUN["watchdog"]["tok_base"] = _e15b_tok0
+
+            # A7 (Notes/07): the limits come from env only for the CPU harness's fault test; Kaggle uses the defaults
+            _WD_POLL = float(os.environ.get("E15B_WD_POLL_SEC", "10"))
+            _WD_STALL = float(os.environ.get("E15B_WD_STALL_SEC", "600"))     # E21 rev 2h: no-progress limit
+            _WD_FAIL = float(os.environ.get("E15B_WD_FAIL_SEC", "180"))
+            _WD_MIN_LEFT = float(os.environ.get("E15B_WD_MIN_LEFT_SEC", str(20 * 60)))
+            E12_RUN["watchdog"]["limits"] = {"poll_sec": _WD_POLL, "fail_sec": _WD_FAIL, "min_left_sec": _WD_MIN_LEFT}
+
+            def _e15b_watchdog(_wd_stop=_E12_STOP, _wd_run=E12_RUN, _wd_half=E21_HALF, _e15b_solve_end=_e15b_solve_end):
+                # E21 rev 2f (VAL2_cells F1): this half's objects bound at def time (a module-level binding is global
+                # after wrap() and half B would rebind it)
+                # E21: the E15B watchdog on vLLM: a dead server (or /health failing for _WD_FAIL s while its log is silent)
+                # is relaunched once with the same half's ready config (e21_relaunch, CELL 5); while it is down the
+                # branches wait (arc2_duck.SERVER_DOWN) instead of burning their consecutive-failure budget
+                _bad, _sz_last = None, {}
+                _wd = _wd_run["watchdog"]
+                _prog = {"v": None, "t": time.monotonic()}      # rev 2h: the last progress value and when it changed
+                _wd.update(stall_sec=_WD_STALL, stalls=0, no_progress_sec_max=0)
+                while not _wd_stop.wait(_WD_POLL):
+                    if E21_HALF != _wd_half:          # rev 2c: a half-A watchdog never acts in half B
+                        return
+                    _srv = E11_SERVER
+                    _dead = _srv is None or not _srv.alive()
+                    _stall = False
+                    if not _dead:
+                        _tk = _e15b_gen_tokens_total()      # B6: the last counter value of THIS server (it resets on relaunch)
+                        if _tk is not None:
+                            _wd["tok_last"] = _tk
+                        # rev 2h (GPT v3 HIGH-1): /health 200 + a silent log while running requests make no progress = hung
+                        _pr = _e21_progress()
+                        if _pr is not None:
+                            if not _pr[0] or _pr[1] != _prog["v"]:
+                                _prog.update(v=_pr[1], t=time.monotonic())
+                            else:
+                                _np = time.monotonic() - _prog["t"]
+                                _wd["no_progress_sec_max"] = max(_wd["no_progress_sec_max"], round(_np))
+                                _stall = _np >= _WD_STALL
+                    if _stall:
+                        _wd["stalls"] += 1
+                        print("E15B watchdog: no progress for", round(time.monotonic() - _prog["t"]), "s with",
+                              _pr[0], "requests running -> treated as dead", flush=True)
+                    elif not _dead:
+                        try:     # B2: a growing server log = alive; /health only when it is silent
+                            _sz = os.path.getsize(_srv.log_path)
+                        except Exception:
+                            _sz = None
+                        if _sz is not None and _sz != _sz_last.get(id(_srv)):
+                            _sz_last[id(_srv)] = _sz
+                            _bad = None
+                            continue
+                        try:
+                            _wd["health_probes"] += 1
+                            _urlreq.urlopen(SGL_URL + "/health", timeout=10).read()
+                            _bad = None
+                            continue
+                        except Exception:
+                            _bad = _bad or time.monotonic()
+                            _wd["health_fail_sec_max"] = max(_wd["health_fail_sec_max"],
+                                                                             round(time.monotonic() - _bad))
+                            if time.monotonic() - _bad < _WD_FAIL:
+                                continue
+                    _left = _e15b_solve_end - time.perf_counter()
+                    _rec = {"t": round(time.perf_counter() - NOTEBOOK_T0), "dead": _dead, "left_sec": round(_left),
+                            "stall": _stall}
+                    if len(_wd["relaunches"]) >= 2 or _left < _WD_MIN_LEFT:
+                        _rec["action"] = "none (limit or < 20 min left)"
+                        _wd["relaunches"].append(_rec)
+                        print("E15B watchdog: server down, no relaunch:", json.dumps(_rec), flush=True)
+                        return
+                    if E21_HALF != _wd_half:          # rev 2f: re-check right before acting
+                        return
+                    E12A.SERVER_DOWN.set()
+                    print("E15B watchdog: server down -> relaunch", json.dumps(_rec), flush=True)
+                    try:
+                        try:
+                            _wd["old_logs"].append(str(_srv.log_path))
+                        except Exception:
+                            pass
+                        if _wd.get("tok_last") is not None and _wd.get("tok_base") is not None:   # B6
+                            _wd["tok_acc"] += max(0.0, _wd["tok_last"] - _wd["tok_base"])
+                        _wd["tok_base"], _wd["tok_last"] = 0.0, None
+                        _ok, _why = e21_relaunch()
+                        _rec.update(ok=_ok, why=_why)
+                    except Exception as _e:
+                        _rec.update(ok=False, why=repr(_e)[:300])
+                    finally:
+                        E12A.SERVER_DOWN.clear()
+                        _wd["relaunches"].append(_rec)
+                        _bad = None
+                        _prog.update(v=None, t=time.monotonic())
+                    print("E15B watchdog:", json.dumps(_rec), flush=True)
+                    if not _rec.get("ok") and len(_wd["relaunches"]) >= 2:    # B3: a failed relaunch retries once
+                        return
+            threading.Thread(target=_e15b_watchdog, daemon=True, name="e15b_watchdog").start()
+            if P.get("parity"):          # R6-X1 diagnostic profile: no solving (the fallback submission stays)
+                E12_RUN["parity"] = _e12_parity()
+            else:
+              E12A.solve_all_r6({t: CHALLENGES[t] for t in E12_ORDER}, E12_ORDER, out_dir=E12_OUT,
+                              deadline=time.monotonic() + max(0.0, _end - time.perf_counter()), base_url=SGL_URL + "/v1",
+                              model_id=E12_RUN["model_id"], branches=E12_BRANCHES, max_generated_tokens=E12_MAX_GEN_PER_BRANCH,
+                              save_request_logs=E12_REQUEST_LOGS, on_branch_done=_e12_branch_done_r6, workers=_workers,
+                              first_exposure_tokens=E12_R6["E12_R6_FIRST_EXPOSURE"] or None, b1_view=E12_R6["E12_R6_B1_VIEW"],
+                              min_admit_sec=E12_R6["E12_R6_MIN_ADMIT_SEC"], capacity_probe=_e12_capacity_probe,
+                              kv_admit_limit=E12_R6["E12_R6_KV_ADMIT"], kv_poll_sec=E12_R6["E12_R6_KV_POLL"],
+                              min_chunk_tokens=E12_R6["E12_R6_MIN_CHUNK"],
+                              fair_share=bool(E12_R6["E12_R6_FAIR_SHARE"]),
+                              stage2_p90_cutoff=bool(E12_R6["E12_R6_P90_CUTOFF"]),
+                              join_grace_sec=90.0,       # E15B #54: room for the final harvest / partial test (30 s grace)
+                              max_generated_tokens_b1=E15B["E12_B_ATTEMPT_TOKENS_B1"],
+                              skip_b1_if_accepted=bool(E15B["E12_B_SKIP_B1_IF_ACCEPTED"]),     # rev 3i: R
+                              extra_attempts=bool(E15B["E12_B_EXTRA_ATTEMPTS"]),               # rev 3i: stage 3
+                              max_attempts=int(E15B["E12_B_MAX_ATTEMPTS"]),
+                              # rev 3j: 1 = after the attempt 3s (notebook 1), 2 = before the attempt 3s (notebook 2)
+                              b1_accepted_mode={0: "", 1: "after3", 2: "before3"}[int(E15B["E12_B_B1_ACC_MODE"])],   # NB6 E4: 0 -> "" (E15B SUBMIT)
+                              weak_commit=bool(E15B["E12_B_WEAK_COMMIT"]))    # rev 3f: attempt 2's session cap
+            E12_RUN["rev6_scheduler"] = dict(E12A.SCHED_LAST)
+            # E21 rev 2c (GPT audits 1-2): the deadline contract as evidence (planned solve end vs when the solver returned)
+            E12_RUN["solve_overrun_sec"] = round(max(0.0, time.perf_counter() - _e15b_solve_end), 1)
+            E12_RUN["planned_solve_end_sec"] = round(_e15b_solve_end - NOTEBOOK_T0, 1)
+            E12_RUN["solve_end_epoch"] = time.time() + (_e15b_solve_end - time.perf_counter())   # rev 2f: request t / t0 are epoch
+            E12_RUN["stragglers"] = (E12_RUN["rev6_scheduler"] or {}).get("stragglers")
+            if E12_RUN["solve_overrun_sec"] > 120:
+                E12_RUN["deadline_violation"] = True
+                print("E21 WARNING: the solver returned", E12_RUN["solve_overrun_sec"], "s after its deadline", flush=True)
+            try:      # E15B #29, #30, #39: per-attempt summary + real concurrency from the 30-s server gauges
+                _att = [r for v in E12_RECORDS.values() for r in v]
+                _ev = [r.get("b_events") or {} for r in _att]
+                # rev 3f: each attempt's own budget (attempt 1 = E12_B_ATTEMPT_TOKENS, attempt 2 = E12_B_ATTEMPT_TOKENS_B1)
+                _bud = lambda r: int(E15B["E12_B_ATTEMPT_TOKENS_B1"] if r.get("branch") >= 1 else E15B["E12_B_ATTEMPT_TOKENS"])
+                _g = [x for x in (E12_RUN["rev6_scheduler"].get("gauges") or []) if isinstance(x, list) and len(x) >= 5
+                      and isinstance(x[3], (int, float))]
+                _run = [x[3] for x in _g]
+                _q = [x[4] for x in _g if isinstance(x[4], (int, float))]
+                # A1 (Notes/07): the 30-s samples in which every client stream was busy (workers_running >= streams)
+                _S = E12_RUN.get("streams") or 0
+                _full = [x for x in _g if len(x) >= 6 and isinstance(x[5], (int, float)) and _S and x[5] >= _S]
+                E12_RUN["b_summary"] = {
+                    "attempts": len(_att), "attempt2_started": sum(1 for r in _att if r.get("branch") == 1),
+                    "accepted": sum(1 for r in _att if r.get("accepted")),
+                    "at_budget": sum(1 for r in _att if int(r.get("generated_tokens") or 0) >= _bud(r) - 64),
+                    # no host-accepted candidate at all (an accepted exact check counts too), but a transform was written
+                    "at_budget_with_progress": sum(1 for r in _att if int(r.get("generated_tokens") or 0)
+                                                   >= _bud(r) - 64
+                                                   and not any(x.get("accepted") for x in (r.get("submissions") or [])
+                                                               + (r.get("checked") or []))
+                                                   and ((r.get("rev6_events") or {}).get("first_transform_tokens") is not None)),
+                    "commit_turns": sum(1 for e in _ev if e.get("commit_at_tokens") is not None),
+                    "commit_with_tool_call": sum(1 for e in _ev if e.get("commit_tool_call")),
+                    "submit_tool_routed": sum(int(e.get("submit_tool_routed") or 0) for e in _ev),
+                    "reasoning_harvest_ran": sum(1 for e in _ev if (e.get("reasoning_harvest") or {}).get("ran")),
+                    "reasoning_harvest_new_accepted": sum(int((e.get("reasoning_harvest") or {}).get("new_accepted") or 0) for e in _ev),
+                    "trimmed_requests": sum(1 for r in _att for q in (r.get("requests") or []) if q.get("trimmed")),
+                    "worker_errors": E12_RUN["rev6_scheduler"].get("worker_errors"),
+                    "setup_failed": E12_RUN["rev6_scheduler"].get("setup_failed"),     # rev 3h: Auditor 4 #4
+                    "cut_code_saved": sum(int(e.get("cut_code_saved") or 0) for e in _ev),     # rev 3h
+                    "cut_code_harvested": sum(1 for e in _ev if (e.get("reasoning_harvest") or {}).get("cut_code_blocks")),
+                    # rev 3i: R + stage 3
+                    "b1_skipped": E12_RUN["rev6_scheduler"].get("b1_skipped"),
+                    "extra_started": E12_RUN["rev6_scheduler"].get("extra_started"),
+                    "extra_by_attempt": E12_RUN["rev6_scheduler"].get("extra_by_attempt"),
+                    "extra_accepted": sum(1 for r in _att if int(r.get("branch") or 0) >= 2 and r.get("accepted")),
+                    "b1_deferred": E12_RUN["rev6_scheduler"].get("b1_deferred"),                 # rev 3j
+                    "b1_deferred_started": E12_RUN["rev6_scheduler"].get("b1_deferred_started"),
+                    "weak_accepts": E12_RUN["rev6_scheduler"].get("weak_accepts"),               # rev 3k W1
+                    "weak_only_tasks_continued": E12_RUN["rev6_scheduler"].get("weak_only_tasks_continued"),
+                    "stage2_errors": E12_RUN["rev6_scheduler"].get("stage2_errors"),
+                    "server_running_mean": round(sum(_run) / len(_run), 2) if _run else None,
+                    "server_queue_gt0_share": round(sum(1 for v in _q if v > 0) / len(_q), 3) if _q else None,
+                    "gauge_samples": len(_g), "streams": E12_RUN.get("streams"),
+                    "client_full_samples": len(_full),
+                    "server_running_mean_client_full": round(sum(x[3] for x in _full) / len(_full), 2) if _full else None,
+                    "server_at_streams_share_client_full": (round(sum(1 for x in _full if x[3] >= _S) / len(_full), 3)
+                                                            if _full else None),
+                    "kv_stale_checks": E12_RUN["rev6_scheduler"].get("kv_stale_checks"),      # A4
+                    # #34: accepted submissions vs harvested exact checks; #31 roll-up; #35 the effort actually sent
+                    "accepted_submit": sum(int((r.get("b_candidate") or {}).get("submitted_accepted") or 0) > 0 for r in _att),
+                    "harvested_only": sum(1 for r in _att if int((r.get("b_candidate") or {}).get("harvested") or 0) > 0
+                                          and not int((r.get("b_candidate") or {}).get("submitted_accepted") or 0)),
+                    "never_wrote_candidate": sum(1 for r in _att if not (r.get("b_candidate") or {}).get("candidate_source_written")),
+                    "wrote_never_checked": sum(1 for r in _att if (r.get("b_candidate") or {}).get("candidate_source_written")
+                                               and not (r.get("b_candidate") or {}).get("check_executed")),
+                    "partial_test_runs": sum(1 for e in _ev if (e.get("partial_test") or {}).get("name")),
+                    "effective_effort": E12_REASONING_EFFORT or "xhigh (template default)",
+                    # #32: server-side generated tokens in the solve vs the attempts' count
+                    # B6: per server (the counter resets on a relaunch): the finished servers' deltas + the current one
+                    "server_gen_tokens": (lambda a, b: round((E12_RUN["watchdog"].get("tok_acc") or 0.0) + a - b)
+                                          if a is not None and b is not None else None)(
+                        _e15b_gen_tokens_total(), E12_RUN["watchdog"].get("tok_base")),
+                    "counted_gen_tokens": sum(int(r.get("generated_tokens") or 0) for r in _att),
+                    "server_down_waits": dict(E12A.SERVER_WAITS), "watchdog": E12_RUN.get("watchdog")}
+                try:
+                    E12_RUN["b_summary"]["server_log"] = _e15b_server_log_summary(_e15b_all_server_logs())   # #42 / #53; B6
+                except Exception as _e:
+                    E12_RUN["b_summary"]["server_log"] = {"error": repr(_e)[:200]}
+                print("E15B summary:", json.dumps(E12_RUN["b_summary"]), flush=True)
+                if _run and E12_RUN["b_summary"]["server_running_mean"] < (E12_RUN.get("streams") or 0) - 0.5:
+                    print("E15B WARNING: mean server running", E12_RUN["b_summary"]["server_running_mean"], "< streams - 0.5",
+                          flush=True)
+            except Exception as _e:
+                E12_RUN["b_summary"] = {"error": repr(_e)[:300]}
+            # H6-3 (GPT rev 6e audits): the cache diagnostic runs AFTER solving, so the solver starts from the same server
+            # state as the hidden rerun (which never runs it). Its time comes from what is left before the output margin;
+            # the solve deadline never moves for it. Skipped when under 90 s are left
+            if not RERUN and not P.get("parity") and E12_R6.get("E12_R6_CACHE_DIAG"):
+                _left = HARD_STOP - E12_STOP_BEFORE_HARD_SEC - time.perf_counter() - 30
+                if (E12_RUN.get("rev6_scheduler") or {}).get("stragglers"):      # rev 6g H7-4
+                    E12_RUN["cache_diag"] = {"skipped": "a solver straggler may still be sending requests"}
+                elif _left >= 90:
+                    try:
+                        E12_RUN["cache_diag"] = _e12_cache_diag(budget_sec=min(240.0, _left))
+                        E12_RUN["cache_diag"]["ran"] = "after solving"
+                    except Exception as _e:
+                        E12_RUN["cache_diag"] = {"error": repr(_e)[:300]}
+                else:
+                    E12_RUN["cache_diag"] = {"skipped": "less than 90 s before the output margin", "left_sec": round(_left)}
+        except BaseException:
+            E12_RUN["error"] = traceback.format_exc()[-3000:]
+            print("E12 solver error (submission.json keeps what was written):", E12_RUN["error"], flush=True)
+    else:
+        E12_RUN["error"] = f"not run: ENGINE_READY={ENGINE_READY}, sandbox self-test={E10_SANDBOX_SELFTEST.get('ok')}"
+        print("E12:", E12_RUN["error"], "-> CELL 0 fallback submission", flush=True)
+    _E12_STOP.set()
+    E12_RUN["finished_sec"] = round(time.perf_counter() - NOTEBOOK_T0)
+    try:
+        e12_write_submission()
+    except Exception:
+        print("E12 final submission write failed:", traceback.format_exc()[-1000:], flush=True)
+
+
+# ---- E28 W4 W17 (the Kaggle 400-kB commit limit): e21_cell7 = NB6Q's text verbatim (E15B CELL 7 as wrapped by E21),
+# packed (lzma + base85, sha256 checked) and defined here by exec into the notebook namespace (E27 NBDF technique)
+E28_C7_SHA = "3be03c1b206d0e05fd16f9bd6fdab00faea2fbccc46199467956ce4b9ddbd740"
+_e28_c7 = __import__("lzma").decompress(__import__("base64").b85decode("{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;DHw(@Ld2h8A$(5_BVd|d$l}pG)^!5!`sT1g;RT@)%!tOVAs8)fhgSEAv4vz9pOh`f=IUymrh?4&2RfPv_&PMH)==8rfD2ju!r~v6|`d}?ttc*)bVqv{4~<juCj9%<e=lWHvKy6l+l=JV}){2;SvzSl|x>i8l8HOsgGbLy|50yD`eW_TP!ZD3zpnwY#14HKY@zuoQIfRSEx6EMT&JzR5Fu0qQVk)kuFjfVUARtgqo1oT1dX~OP!d*2SHsR>`a9PG4^)i2AgeXoWWrtx}P4Fqi$vH6Ap4E{lgECK^VSD*NG0R=2Yisa`v5S!8}t}?L0F$2r5sU*sl&*9<s3pa#lljEacwW79ot=+A1FO+Cj}G?;Blibo9oo;f=5mHrzi(Wv6v;&K}}4!-7({ll%7OpXj8d%x;CKgfVYG+2UenN^WKQ;*%?0nth|28byajO-ls%BU2iD*nAXLkmZwUqsv8L7)Sj087~Xs6G}-nbXt_Rz!coDRoIwvcyw!AcVUds_=7QhBX~cIWjF4!Wi(5v|JDf9$^}JNu#9EKIHn%%uD&&;ErdF**-$ATDO#&{lHj6?gL?2P=`L&yJ=?O3bq~m>s3bsgH4H>BWSjM0W_#-n$6@SCnr=5XtKW@~ug_jV_N34rVOy%CVm+>P*#Ap@g9IRiTi=E1p|;-PQY(c;^%`69@?ezW5z7%5!KP6CK%vKnafJ@n#x+Q*9iPLkx4Y@-19tpda^KXij6hxW-We;H`J$kF?!`6c{%<}ao8gQJH1&_@ti!2@+#EqVl*_^1;%jP*YSNy3hXsd!e{cv$=CKellXOr>pIMb`=iihB<|;#5z2j(i=wf*1^k=QA6z4MpB=OcLxZdepkqUz0{brmm!|6T%ylj7f-9$M=<{5$jIde-2eY+STlZ7*;Jlvgm7icoE&-zx5@}oF2AbGBuF^BCwe({Pl*)aWv<x{$<sJzqx6&#9wmv`B&>tfEgMq1Niov+@4OS0yefx#tj>8ab8Y}jRj&p9)(ZzGMa<16sS!pJVdgL+0Cj_4@2HJ(4<L+#jjD7G1!t16aA^y%bY7{bfx<)XBuwJ>dZOxNEd!<obHQf*LXw$wm6=3I^9U)(1vMxgq1DL=z<T@<H=z%6$BOXlpthnkO7emKs!wuhIlN*}=*{>EB`)i(n?Q>d#F$5E#2Dy)D-@<qC}QfCLFG|wk_q!G`%y#Ds7I>B2}&|B8Ic}*i)+iaX98-S*G*Brtcva#z62&$H#BfFVjLN#H1hNpaE_hpUZ?Cm~Do$5xoZ^VKfQch_A7?ST(7_jMhR?L!YMXaJW_~EfC$DW>jF5Rj~wRT=f0h50_j4)&HToM}x76qr?`&ko@EaG$}v6)o}A-{c`uqx^I5^%AIT)M;$<BjR_b9-W$v){F1$32fM#&~4oe)$=axZ@<kwI~Y>$nmOK{GK2<%S4$EGAnS>Ke$3KTv!O;Dq!6egI_6Lna!3lRRp4x@AjEQ82~U8SM(ZkJ>4jB9fiCtF@+!CV-AL_+-8$qS)Qhv;-XBSvkz+D-kbMh)ejg()1}CsObkS^&a8Z_Ymx=oJXH+Hm236k9_>kiqwKjV*wXXu#G&MI8-9XzZkr54)&%E1{wQPu+Ex_`C!apx>dnLURakKwsLOdKxOMqIc8!|7I)1U>R)@ZLhtplNSveZQPi;)zZy)g@BzC>+{b2;y^Yda2eau8pH|>YH2*R-EKmC@bf=JxhVwe1HG;+a%HahA=H9E0lOYTc!Vwf%hsWx?HycLYVxMB(Y5ynx<BeG!TuIP9^g*D$y!ZJ)IF(AQV<q*x?k8=(=m4;E~MF$S<mS1GziRUv$@WB24g=M*H_%O6_7G40BoyZH!PSlI<*?2Zda;pToC5}%<0~V?zYfAtNx~=tyhav300mDNq?*kdgZ`LB9heVqsLMgIUuwBDnc4}70>yF+Y6Cyd08@(jg>%VDdZ`}_wQOKJ<faCm`)A^r@x*$Aj+JbrHM0(7%GIR5pG0zq1%u%B&$te*(mnz6x|4W)Mf096q&Q&6_335o;!i$W)v-I}sN5`}dty5%X>>IiC>ZGd8yPw*eT%yhMuK!GP6!)$xVSd^Vwbu~fI)dBGMNLy=4IR!R44&uQ4;a^7yOtFviye1$0U-=%wE!=JSC6ce*nAPz(s&+JaOh`CIBD3r=&5pGH|%VHV3sf1477za5Y=JuyZgm*DIBp@z@U?F*0Y7KGH>8N#fkr9PeV_pQ{L#NrAd$%zkKCJ5WfAeTRetZSHDu~bl(QNSvv&fkVYk&5<(xZwNLdXxe85F2p;Cl^bipa<Y=mW;_(M*M449_(^6Goo|@)reqU3xkvofP3CMT+4o2tmn&m!zz*ke1__~`UhMHAja!4N3H`*-p6ds0q9^8o<*5y7+m-~PPA%co(AG|7O3G9}escy?X9n_3h4++Tj5Nu=6gi<*}5J`;p0J1d9V)265)4LI*X(mE$G#JXf^gCb9*kSs}G$0$0#hg6MMV8t{!PI2e5T$J2v0nhF%(--9v!rMV&r(WQ)a$OahV8G2K9Xnfh3KW-OdK%K!g$RqsK!2_a5QFOD_l&v1Di##$Rkbf>k{O$<k6PinKw`%fuv~fF+A9OY0z5l1kICZs}>vOD&bJ_T+q7Z=r>W#g6`yLTS5Y-ehO9lPq|N%04^Du7c?IN!Tz&BG~i$4(p_HTTL8(E5L1!CSeApEYga`|d0%5xAMH!N$R}AGCB_?@=0so*?2xr~Y7Jh>6oYf0yVMV~A_HePCXqMPKaI&qDgN53Jtx)v4+XSBtufdJ9GzA~1-s+wk7ie(C@>QXd{gk%iyzeGR9#w!oDVg^8R;saNlgv<SkODgseSs|;QM0OJpR0!S5qSPwDBkJyT_W7H72CG)$H?$si+7{9NH)di~?(1&m}?KB9-4j4xSA62@Xb1%vv|u8_7rBZ6i(sh{eReP)_}-z)IzR7gCu~{MiA{<?4)`;0tpu?2x~g@%}@Deh_c6V(v`7dI>$6`%G_%X)kG@0ex#k6o3+<+324#s$#WQpaAmtOH3h}CTEZh$B9A`7wKW0DRizHWUYsq%luBA?W>^kVPHxcBAFYs1bz|y7M#fRXtUjqGLnZ^$<oU+BK8t>)<^=<nmY>TlVkw{cu?JefZhjm=S4C(HVfI)i|k}>Mm$Mn*UUM4E;8C}yJzwN_(#JVin^|9{EWCX4!|ahv}U8-cyxe&E@1KB*!v>oY=qxE6za~ZHy+L*z<zayT1I4oBRQy@5$8<_2ALUQ`)t0GqjjXg<+-A0hA{_+96d34!)!?#RJfa7_7rT?1*G=X03uNXVr8|rS5f1Y^3}j(vZ-c@R6Lm8SbZ$m(%-wZuMM@8sU4*hw6j5NH!G8{I+uZFhu#r75hJq5t$6ZI3o-*V>Gb+i89){GIMk9u&*k1_8vZ;p^<v)3ISH(G?Syv#8Ahz!RFLdc7RRQ0H8NyP3~D@xT0N)Oj&^L|rOs641y8ecqrefl7C3I6P<ArSv^xaWeNXIt_Z+oJ><Rh=g^>b#f|<k}{l^WD_ki;_8y_InbJ324mT$-A$&Ceex?2y00b<^I^bk*JYFNUoa=5}n4l-BR`99<0qriftCDskN9&Mm5H<jJ*mMFx&Kn6S9^ldoosd!NWn=o&XfXV>PZ2Q5-`x9P`c4LI5FM9I2>zOq#i6jXQWz(Zy#pp)+#i7i$4M=lY3lG8Da_S=&Q5cW|9k?s7geNH1EnNa_lZGxeE@KM<{$}ANDGuIho1>4}=<(xfs)feN5sl;@NvEQcXH}ppLz?#AECf1V0McK@GqCn7_0i{kG&#TfEm!$pa@`cXaM&ZW-Rfyi==Kpq$9cxE0%ZC|B}k+?JGBpv66^uEtIcDx$|=oKP50|hAsK1T$_P{_vk%0C$^eh%$m18S2c2};-s2}F4aS&u>aaH5;lE;YZVXA{0F*yOLy~Z(Ui~HR(Zl><jLY(+yeVzsK1IDdt<Vv2IwukeVb=R5i1-!C;pnmV_7U`Ksb>LX0mA)eqqxhRER*#}M5EVBXj2558g}UF+C@L22dshwe*>M^IeYo=4EX3t-!Nm`7;u4S^c;sk$Ym|*Ii_PO%mja@n`Dgi+;KyiUSpkQ)lLj8jisXiW{QHge;6=Fd)Dl(##&I3oxi63>SbvHrvd&E+@N!_Z^FF~6HL&Rq5pmKeip^8*h4T@pL=O}CwJahQ!a?072X_g(~L!4>0}eYm<^D<4^0r<+wzqR3RIavM24<G!ID%wLZdlZ^h02+>i_&*_l&BPeCM!Gvjo;e_4l2j1BkYDxmdvk>Y=o)$c!OP;CQ-K#5&p{hi?fM(QJj{-3i14*dk}=M(0IET$3AR;2ijTiXVUqp}Ev1z3ImJc*{}cr!%h;9aQ}Tn)Eg%XFO-=cc29#=y&oi)9lemW_}KgvK8k5C;pppXlJT=0eL)0V@Lz=cD7Ip*XKm7<<rN>)B(Uy=p%uRW*-F9tCwGVkSkG&j|5!;o|JS2)4F#~V}dV!yRr;LhH!<PiLwAUN6h-K_ghOCN5fk8{{V8-Ovc}ZmVutL5(y~(mSz`?SIxH*uIiE6Hyjv;ixK$WV=sFV*cM-7i~O}>y#2zfy*tpMW?#cXMvX&ar!#Pau6>u%Pf`8*0XvL*mYm}s2Wes1AOoMxsVeD0rm2w&%$4v6VzHLVXLX9X!a-+|ynoh;SzQz{(sSOQpvVXnEIo-!4!TKv)6~+YxQ3`9X-Th7XaciPEA2Od*jZ+jLJ>6be^}&2vU@>k3Yf;Ps48*Fxo3t)uf9}L^Dn<o90%l!$E(@jZzj8}!q?=xEG3Z$lah2ejKG*ZQPx`FD}Eg=qyNwL8zDJGw$jR?L%*m|C|mD!n(W)dtr3(HMXh!$@z=~4+Y1cq{+(w4rr48KCvekA3RIMT>>dB>cFF>wBSM?6uLAsrs~<M`S(sbnH?CPu%52KxdZ13k0=(4!w|KzY<!T4;AJlghm7@Y6!PLeJoSoJA8c=hoDh-WmTMdj|_b<4r@TXd=MO~X{%v{0qhPfOaaiHRzn1LOf(?wHJi!eQ_MBSjWAy7DqSx@q?F+eFwm`4mSBGX3xGaz}4v<l>b!L*i{46jOAcer&rrWIOZqq+B(Z85PRA6Mi(;10^b-~gA}QUTqwHo!;lE=%l{fL#=OaxUTHdFGC?>$;OWFVE;S=`k`~u<$c|n03Nr>E~!z8^GLVk-Cn&fRIgF0Dfjzk3z@m48|&d=cLoj9M@3<cPjUU)m!ht_M!opem$HVAUbc16Y|GMFS}T>{}M*SqSz5SyA?7nZQwynCJGzCLL{!3PAZfTzt2<gGlWoHTAYS9WZ5T3q!WAjl{pb>Zhh9)^ovpgUumXJp;vYiw#Qc(!s5pub3uCaLvyFrdUupmGN!WT`Ol|+S{|%Yz}0KXoAid}fPdCP{C3QOA{S0^xv`6DB#`ACF>(#Eu*OQQ>cN<rZVn5hiQWrFVxoSG=^J?3h)q?xzy-sqqx?>Oi26a$>4SU)kdjmwfE$Zyfh%mfHYUr2)Uz@dc~RidC1IzKRuZq-k5COSM;g8Du9q?YRokWGh*Xo_)eYEgyD)mcX^~Up%cB&%4$vqjqt%^EDAppyj=SZMX+ZpF6hJyH{2?$UEPDTc8eMKc-n?QiKCHS1^HRn_b(J$nYXZF1xl_S_FpiliVRpo%64<q4AHL@a?nGDK45~q88+8He5Bk`s*@-olT%dobfCdZK>ZC6<1}3M8KtY-;?}(a{CWq-iRzeK)Ex|{eTZVq3=<2L$x=wlhvj_1qD(eyVqP+!-BRabDb5x*d=5i_A8X^fN0gc2DLWzX4=BV#mf)dk^i9}cRLNF+QU=*zF06Thz^I@y6MBqwpB+r}_7~LPK+=k)V)2CF2kj_POk=%M)7yi(uj_5=FZqYovnR)wkhV)^r>Cuf`3)mWjTZqBPpEz^wxNb01<rUo6IcmH*=Wy93Y~-GQ8(iH2dyySV1st#KSN<op4);~~vCld6&B15DF|}L4d+3m{_@+PTzr}cspkiz^9Rh=nfpug{FtN^g0nClMm6qZhF^yL?0<s_ZBMS!^rG7sng*a^Q0lsX@8=<y`<qa~ocXRr0th#`A*^%fQd@_C;zB90XCBe68>g|OQjnoL8T`GUW{HhN;Xl#Qvn`EmG4iyaHt@s%DTyF&}M~6-lO@^|BehtR_)H`_mKzgR3on0L)<;JE$Ao18!J$w+1DX&R_l>R+2)KT6{;Lk0yh*$-^!#g#5ik-AVw``5F@MzQ0^tGB!VZdOf6l)qoW{;byWYuj~dZ~us84@Ial2Lb%W0EQog*h9o{o`}g+XQ%5aFT;3Oq>{RrF(1vaXdw&DYyF4{fOa#xrw8q_8BYJQNP->u;fetHDls%UuvIo7A33JEUA6>r6-X-26l%abvQ}%&}iByMU<SIpo?4+=mYX|`f(wc>O?Qa&BKduV$p%(8NXeyJo)sqxSv70>_i!qXE55Jsv=GeUNa^a4UJR=WY$`KLvvI9Gf$910YVKd@QE;eCxdO2h?}UCDt+=U$UxLA*<Tt#s}%_H*|%rL{eq5>^LR9BAv=_-sIwmGR$@R)%7U93I3#Rpn}=uJTZ#+zm{aR6;LLE0UDk++4r%9!YBbOyqOl;2PZ>8vZS7Y58Cz3Lc=09hdu1&qcBXSBDBZfKh%ctq6eHm!&<SEJw#3;!)i~|C{xVF3N4waBIB@-&Up-^ZmUPOQS9KK3X&nmAd{ag*$Wv1UB4BG9cxrsX&{Q)ol}*N~M)d5keLZx#lWFJr_HggnJ|FqX9_NKXI8X#BOL(#200f@(q(^GhD`y8r$r#cEfxMJ3W}RAjks40ngJ=y*WXwf>I<)U2sQ3Wj5-1!sdJfHnE!v|VEqcwRU>=^X)Y7$m>l71y)uq!Lx-T`+Q0UafgL7V|$l4DKgfT(9w8_^QdO8e<PYb4iV)0UOUv;{G2L*L+tcO==DWx0W50zyCU*-D`0?P4+WiSL#Ap0&WK2s;G=o#0S+-U4J@VO}|uWGSy1Ll(XtHeaNfB7qO#EYOELkA4H$5$tFc^o+0x3Zv5@nv7u5u1!lP}<XG*WrHCQ^(RIwG_!(9*$Ud@W`%Q+TA+`nPPG$na;!dDc;uwigaM1usxcIZ$+=!zl|x4^}A8|1(9xO+~Na1Q2963D#dEA<8wi$4BykNX`)=Cfzd6oVu~sHT<!AyBW0YNjZ`3uOwtej2AILA%voji%Q$df55|QD>N+5v;i7Jj&~H9vV`s?2y{+DE3LAl;N4Um=c*Uu)#_vqF*)ZBz%&=TSzFm9ot6A@+BFJ7cX`IzBw`dIf`AXGFPB*B<nzMxH5wi`#U~`>4PJw{icawl#dhydpFMU49DX#y?C0^vmFEyKdB^m_XwvBe>2;fMC>d6jzXqR0ei5ZGD4zx|9(_A#D!z29HlBu47QA~BpMKiYqOAb@&kxIaExa-(P#$wDN&Ecc2b(P9Twx}(s%b$@{ZC=YGrPKT9-1*G|!9U+)XzsZqc6<pBTa{<Yf_lb@6zX!2Fn#A!+t5hC(xw`J$@^mktfp+SBHhC>reeMGO#2~5`-EY{sP&rv3R-+x_v=iXd}|nckWKXppp%rP&a<TuTtS8;RMs7h+N|QiquVLe#ojBk&Dd?9L{JB3Kyq#VB1R^u_d)SGjS{LXAnWK%%Y_#kgis3v3EPc<+4`2_ScrT2>mtpQE%sly9viC=Dr;#R!yAG)*sGl*A+PGdw$2OsSE)MuG93cbTODFS_x&Q27Ve^B_u9F_av%<OlV$75u%XT-{Wci)^PrJMCO!uig*h=+JG5~b^+v;ccH3(O!Sam`D^cxcr#`Nk`_2}gN}>EId$$_z`Qqu32^z0BEyIgk-45RR%+Y6pKwE)eHD~+h<NB2$Msp_&<jpW_Eyv!>CntKng2|5}iwZstf;80f{3zyOKOo2SJMOWtu(=)&>LmAFv6{D7r0jH0kjsO$8Yr5rRGfd5`UJAV_d9FZ@L8H~^<Y(5oG&=C`Lz3zH0DY@|6dKeSYI+k&`dRkF<kO@r<|@3x2mKSX>LA{_`wbLdp&vqnQfx#ROR^8GwHd4R-WX+kLThb5-w+1AO`k_BZ_(dKx|@<?3l1)3|LZTfp&8PH`*CiXPITFQT%XA9R+Fve^WXHzrJJC(LCs}R))WJp8vqlSRFC=Bu~^^;ktLTS3-=j(<&!uuC-3&d*b^#xD6i_{0Xzdyr!%z3s!4?aSEyvMZqz+e_X-K5-=4#ao*`05Cwshafph0_*BP^;4rBq9qUoZPLVdye)x`fji^CMFvP5LE18%9vTc^AXtm&2unsEcDgxgz^3n3$p`Ke28%2|PV3pqa6s*$yZ!i*m;Uu|38bTk%Ff;(^r_Vj<?7zxPI<_YJV}RPWn&gYW<plf@KB4Gy#w{``07!S0_IL>KWh9|~`X75R+i0%k%aE08wpR;7;>{LsovvT?u5|^_eGV#k@*{%$OrUhGwdY}Z_wqvpy1Y-5D$DT)dgA$b6rgPY`m6wRX}(PmWFONhkY7A$)CK$kFvanxt?s^BLtd;Wis1(V22f|_Y!a_mI8IkSduOxpUG<w@Y2~ILb5iku;aCD@T5PCAo`J&x_hFKrHrKuyQ%x;N<aB(U`Y-eu#b=>qZ5AO`&%2t2oA?IIGc`Kj{;1(*eEjm}_>B}<fceI-&f-vAr}d_iZ}FO&0U&1z3H0ccJnnX#9zz-d=8I5!#SI+(s7u-ZUqj)2qPxG%XBqD&P}8k&byi_N$29Ln6+tg(V{hlG8#Oc~1$KSpo1TL<UqEib(N1OOnSaT<(8Z#a+iGpQCauiPdlnGYsI{X_OoyJMq9A@~kajxy3RpV&_k9xerM2&&lEi@8a^%Cg2vMNWMwCOm->woq>Qv>9#3IC`K*~lnBb=AcCN@{>cuGE<U@K@KSsn<RyBaw!%K4x-5{*&1Vr<D7CtP+-pqHPgKae8ICIvy<CM*VC7OFkAYh3l<j(;nyHR6d^Wip*miDVKkM}><M&{Aa0wrF52x171vp8NKJ>}y-sw$|-I{V@Yfu_5V|S(U~RxRIxP0fpt3Fb#9Yh9j^0%dc|)2;>d`u!I%BonK@wLE7E(aN=z|DybynEaZcBB@pj2{Gt%zE&~t+a(U0`Uwqq?_0zuwREKCvam9{w_dnkM;OQ6ciL#59{{kRs=PG0chF(9k8MtMNSZ%ln;OUOPe-05+zqQ{nu9O~|C9gF{)_+QQX#aHA&HuvaJHPmLqc6U@rn^hssBjPR;Au>~w<(&fF)mQVx+1NR;Jbd6-(rPam(+YWJ^=Gw$EI3JerDtbwX^49Vfp=hO!KSHOSw#t?s+e&l8_gRQ=Pd@LbSxoK)=K}pnSv$#h{ti@N9XOi%Ne5c5h1%4;AZ4>++RWEj3g#1diY6sbh&PRKMk5DWS}$F|oX84%P`tqATRLWJ<Zjbtxibj|rw<%EtHIG*cy-RARH%qCqlKIsM6+^aHodZZ^vO<?!Ri()ch=ZTC!0MzahbF#E-DQpb=*r0fGe({cn<JN(OJTIcoxY*2H1c`6ZP(5W><W{9kbV%&owneMbwy*bvb(+iP1>?KD&G#zjpmMF}x!UJlH3qEPFqE17f$<`+8=Jb1aaxf8&iwKd*ND}v5#**m&?3AUgAMydj^#c!3O=A1sMAW%uq)>Ctb*zw@aJt7$#`&{wMr6uBmSo#TSD&QS2om%|NQAxC#f44RGOgSND;l-Db78M7pnC7J<bL9X;H1y5l0{g=f-=b}l<K%aOFl)73|4J+%*!!5V8fKn?!fda8#(w*;`C4=IkX$zT!#?yE!7HIR=~iJyQN8J2=HQOnjzx{`vhc1N~kf@ZW=+}gMz6|$#!P(Lfb?wsM`y41Wpq3Qm8}MryQ1{<;<^<2~tpLTu7_FR8f;m#Cs+Jmd>3fhtiB*6Hf7txPy}dmRC1>UKa2zpzK=WEtwXTIP=+A53_xZ`n08P%k?}dQ5^2#D~4;qE>1Q&+ovJ7*|lq}$ms-L&yBBsp$SY`wCh$8^ypvWvP}?Kr)btmFHt*UTeK&Wi4Af<Sv7YgMCg56fp_0ccHC+j7uVj*>pJbdqzT0OgA2$|b{MMQ8&;H@`&Zhx&y_5bhLT-#vruE<hreE|DQFayLC628Rj67}T~+knA5=-E;s4pDI6bB_r@=Foe4}ayQ*nwvwo3?qyr%@Gz{@xs&at)77p_BFJs&=biwZdTxuBPVh*7;=jUbW)Nf@2b)Y^%ihIghWT&Y<}2i}VP)+ZXl9}C**r7^3=jDfT}MG{J#a|QI4cPWUEj?L~FTfMTJY#hai;Agqpzu4nX6e#0ex-U;%C@@r4dIDO_052{J)kCS{`)OCKXB9%4BF&lRa=}33CjDeWl8Un~cqe*1_nHozyNbdRqR2+UqX-48nm{o&ZOuwIHxnfvSM$`%ZEoj><t3L8$$gN{cr%yB-u3JfiZ@5!gaLI?yGX@R0b+T<7w=WGY8~L{M;aE=DIHID7M|lh_#l7)Hl8jsJ2_xZ00E3Zn1TWT5Im<^vBYQl0ssI200dcD")).decode("utf-8")
+if hashlib.sha256(_e28_c7.encode("utf-8")).hexdigest() != E28_C7_SHA:
+    raise RuntimeError("E28_C7_EMBED_SHA_MISMATCH: e21_cell7")
+exec(compile(_e28_c7, "e21_cell7 (NB6Q verbatim, packed)", "exec"), globals())
+
+
+# ==================================================================== CELL 8 — NB5: boots and phases
+# Commit: warm-up -> pure decode window -> SMOKE (2 tasks, A/C split) -> SMOKE gate -> EVAL (eval subset, scored)
+# [-> MTP-off boot -> EVALOFF]. Hidden rerun: warm-up -> EVAL on every hidden task (CELL 0's fallback stays otherwise).
+BASE_OUT = OUT
+NB5_ALL_IDS, NB5_ALL_CH, NB5_ALL_SOL = list(TASK_IDS), dict(CHALLENGES), (dict(SOLUTIONS) if SOLUTIONS is not None else None)
+NB5_EVAL_CH = _load_json(ARC_ROOT / "arc-agi_evaluation_challenges.json") if not RERUN else {}
+NB5_EVAL_SOL = (_load_json(ARC_ROOT / "arc-agi_evaluation_solutions.json")
+                if not RERUN and (ARC_ROOT / "arc-agi_evaluation_solutions.json").exists() else None)
+NB5_REPORT = {"run_id": RUN_ID, "profile": PROFILE, "rerun": RERUN, "config": CONFIG.get("nb5"), "boots": NB5_BOOTS,
+              "phases": {}, "errors": []}
+try:
+    if not E10_SANDBOX_SELFTEST.get("ok"):
+        raise RuntimeError("sandbox self-test failed: " + json.dumps(E10_SANDBOX_SELFTEST)[:300])
+    nb5_rc2_inputs()
+    if not MERLIN_OK:
+        raise RuntimeError("Merlin inputs missing: " + json.dumps(R.get("inputs"), default=str)[:600])
+    nb5_rc2_prompts()            # RC2 A0 (host facts, merge + background sha256) + the Flash-Next tokenizer / xhigh template
+    NB5_TAILS = NB5L.tails(lambda s_: TOK.encode(s_, add_special_tokens=False).ids)
+    NB5_REPORT["tails"] = NB5_TAILS
+    NB5_REPORT["prompt_render"] = {k: v for k, v in R.get("prompt_render", {}).items() if "text" not in k}
+    # A-14: the local tokenizer + template are a /tokenize fallback only when RC2's pinned hashes were verified at load
+    NB5_LOCAL_TOK.update(verified=bool(MERLIN_PROMPTS and R.get("prompt_render", {}).get("hashes_ok")), hf=_HF, template=_tpl,
+                         encode=lambda s_: TOK.encode(s_, add_special_tokens=False).ids, default_kwargs=json.loads(XHIGH),
+                         why=None if (MERLIN_PROMPTS and R.get("prompt_render", {}).get("hashes_ok")) else
+                         "tokenizer / template hashes not verified (or not the Merlin checkpoint)")
+    NB5_REPORT["local_tokenizer"] = {"verified": NB5_LOCAL_TOK["verified"], "why": NB5_LOCAL_TOK["why"]}
+    step("A0", "merlin_install", 10, lambda: {"install": (lambda e: {"ok": True, "tree": e["kv"].get("MERLIN_TREE")}
+                                                           if not FAKE else {"fake": True})(merlin_install())})
+    _ok, _why = (sha_gate(min(1500, left() - 900)) if not RERUN
+                 else (True, "rerun: no sha gate (E18 R2 / E15B SUBMIT have none)"))   # NB6 P6
+    R["setup"]["sha_gate"] = {"ok": _ok, "why": _why}
+    if not _ok:
+        raise RuntimeError("sha256 gate: " + _why)
+    if P.get("patch_60490"):                       # R2 lever a: #60490 before the first boot (fail safe: RC2 pin only)
+        try:
+            NB5_PIN["patch_60490"] = nb5_apply_60490()
+        except Exception as _e:
+            NB5_PIN["patch_60490"] = {"ok": False, "error": f"{type(_e).__name__}: {_e}"[:800]}
+        R["setup"]["patch_60490"] = NB5_REPORT["patch_60490"] = NB5_PIN["patch_60490"]
+        log("NB5 #60490:", json.dumps(NB5_PIN["patch_60490"], default=str)[:600])
+    if P.get("fixed_window_sec"):    # E28 W4 W13 (= E26 K100Q K9): the fixed solve window (one phase; shortened, never skipped)
+        NB5_EQ.update(window_sec=float(P["fixed_window_sec"]), plan={"window_sec": float(P["fixed_window_sec"]), "fixed": True,
+                      "source": "E28 W4: the 6-h EVAL120 solve window (user 2026-11-01)"})
+    NB5_REPORT["e28_sched"] = globals().get("E28_SCHED_REC")   # E28 W4 W13: the scheduler patch state (CELL 3)
+    _groups = []
+    for _sp in P["nb5_phases"]:
+        _sp = list(_sp) + [None] * (7 - len(_sp))
+        _key = (_sp[3], _sp[5] or NB5_KV_DTYPE)
+        if not _groups or _groups[-1][0] != _key:
+            _groups.append([_key, []])
+        _groups[-1][1].append(_sp)
+    for (_mtp, _kv), _phs in _groups:
+        _b = nb5_boot(f"merlin_{_kv}_{'mtp' if _mtp == 'on' else 'nomtp'}", _phs, _mtp == "on", _kv)
+        log("NB5 boot", _b["tag"], _b.get("status"))
+        nb5_write_report()
+        if _b.get("status") not in ("DONE",):
+            # R2: the second paired phase still runs after a failed first boot (recorded); a GPU-release abort stops all
+            if not P.get("continue_after_failed_boot") or ABORT.get("why"):
+                break
+except BaseException:
+    NB5_REPORT["errors"].append(traceback.format_exc()[-3000:])
+    print("NB5 error (submission.json keeps what was written):", traceback.format_exc()[-2000:], flush=True)
+NB5_FINAL_KILL = True
+for _s in list(NB5_SERVERS):
+    try:
+        _s.kill()
+    except Exception:
+        pass
+nb5_write_report()
+
+
+# ==================================================================== CELL 9 — NB5 report: the four averages, counters, bundle
+try:
+    _ph = NB5_REPORT.get("phases") or {}
+    _main = _ph.get("EVAL") or next(iter(_ph.values()), {})
+    _gen_total = sum(float(((b.get("counters_end") or {}).get("vllm:generation_tokens_total")) or 0) for b in NB5_BOOTS)
+    _nb_sec = time.perf_counter() - NOTEBOOK_T0
+    NB5_REPORT["throughput"] = {
+        "pure_decode": [{k: (b.get("pure_decode") or {}).get(k) for k in ("band", "level", "status", "tok_s", "running_mean",
+                                                                         "mean_acceptance_length", "step_ms", "engine_rates")} | {"boot": b["tag"]}
+                        for b in NB5_BOOTS if b.get("pure_decode")],
+        "steady_mixed": {n: p.get("steady_mixed") for n, p in _ph.items()},
+        "solver_window": {n: p.get("solver_window") for n, p in _ph.items()},
+        "whole_notebook": {"gen_tokens_all_boots": _gen_total, "sec": round(_nb_sec, 1), "tok_s": NB5L.rate(_gen_total, _nb_sec)},
+        # revision 1: productive decode time / wall time and the token-weighted version, next to the rates
+        "duty_factor": {**{n: p.get("duty") for n, p in _ph.items()},
+                        "whole_notebook": NB5L.duty_factor("\n".join(f.read_text(encoding="utf-8", errors="replace")
+                                                                      for f in sorted(LOGS.glob("server_*.log"))),
+                                                           _nb_sec, _gen_total,
+                                                           next((b["pure_decode"].get("tok_s") for b in NB5_BOOTS
+                                                                 if (b.get("pure_decode") or {}).get("status") == "STEADY"), None))},
+        "note": "pure decode = a settled decode-only window at running == workers; steady mixed = stats lines with every slot "
+                "running (turn prefill included); solver window = server tokens / solve seconds; whole notebook = every boot's "
+                "tokens / the notebook's seconds (boots, probes, warm-ups included). All after the JIT warm-up."}
+    if "EVAL" in _ph and "EVALOFF" in _ph:     # the paired MTP on / off accuracy comparison (same tasks, equal windows)
+        _a, _b = _ph["EVAL"], _ph["EVALOFF"]
+        NB5_REPORT["mtp_pair"] = {"score_on": _a.get("score"), "score_off": _b.get("score"),
+                                  "accepted_on": (_a.get("bands") or {}).get("accepted"), "accepted_off": (_b.get("bands") or {}).get("accepted"),
+                                  "correct_on": (_a.get("bands") or {}).get("correct"), "correct_off": (_b.get("bands") or {}).get("correct"),
+                                  "solver_tok_s_on": (_a.get("solver_window") or {}).get("tok_s"),
+                                  "solver_tok_s_off": (_b.get("solver_window") or {}).get("tok_s"),
+                                  "target_only_commit_replay": _b.get("paired_commit_replay")}
+    # revision 5: the gates only a GPU run can pass, with what THIS run measured; a fake-server pass is not evidence
+    _cp = ((NB5_BOOTS[0].get("probes") or {}).get("commit_probe") or {}) if NB5_BOOTS else {}
+    _vc, _sp, _cw = _cp.get("variant_c") or {}, _cp.get("server_parsers") or {}, _cp.get("cold_vs_warm") or {}
+    _v = lambda ok: None if ok is None else ("PASS" if ok else "FAIL")
+    NB5_REPORT["gpu_only_gates"] = {
+        "evidence": "FAKE_SERVER (local harness): NOT production evidence" if FAKE else "GPU run",
+        "token_id_completion_semantics": {"rule": "server render ends '<think>\\n', /tokenize = chat prompt_tokens, the C reply ends "
+                                                  "with finish stop, a closed think, a parsed call",
+                                          "tail_ok": _cp.get("tail_ok"), "render_parity": _cp.get("render_parity"),
+                                          "natural_finish": _vc.get("natural_finish"), "calls": _vc.get("tool_calls"),
+                                          "verdict": _v(bool(_cp.get("tail_ok") and _cp.get("render_parity") and _vc.get("natural_finish")
+                                                             and _vc.get("tool_calls"))) if _cp else None},
+        "parser_correctness": {"rule": "the same continue_final_message ids: server qwen3 / qwen3_coder parse == Duck's markup parse",
+                               "cfm_starts_with_c": _cp.get("cfm_starts_with_c"), "args_equal": _sp.get("args_equal_client_parse"),
+                               "verdict": _v(_sp.get("args_equal_client_parse")) if "args_equal_client_parse" in _sp else "INCONCLUSIVE"},
+        "mtp_on_state_consistency": {"rule": "greedy C reply with a cold prefix (cache_salt) == with the warm prefix; MTP-off replay "
+                                             "(NB5EVAL30MTP) for target-only parity", "cold_vs_warm": _cw.get("verdict"),
+                                     "target_only_replay": (_ph.get("EVALOFF") or {}).get("paired_commit_replay") or "not run",
+                                     "verdict": {"EQUAL": "PASS", "DIFFER": "FAIL"}.get(_cw.get("verdict"), "INCONCLUSIVE")},
+        "real_prefix_reuse": {"rule": "whole-run prefix hit >= 88 % (PLAN W2), commit turns cached", "phases": {
+            n: {"client_prefix_hit_pct": (p.get("tracer") or {}).get("prefix_hit_pct"),
+                "server_prefix_hit_pct": (p.get("counters") or {}).get("prefix_hit_pct"),
+                "block_floor_pct": (p.get("tracer") or {}).get("prefix_hit_pct_at_block_floor"),
+                "retained_session_hit_share": (p.get("tracer") or {}).get("retained_session_hit_share"),
+                "commit_C_cached_pct": (((p.get("tracer") or {}).get("commit_by_variant") or {}).get("C") or {}).get("cached_pct")}
+            for n, p in _ph.items()},
+            "verdict": _v(((_main.get("counters") or {}).get("prefix_hit_pct") or 0) >= 88.0) if _main.get("counters") else None}}
+    if FAKE:
+        for _k in ("token_id_completion_semantics", "parser_correctness", "mtp_on_state_consistency", "real_prefix_reuse"):
+            NB5_REPORT["gpu_only_gates"][_k]["verdict"] = "LOCAL_ONLY (" + str(NB5_REPORT["gpu_only_gates"][_k]["verdict"]) + ")"
+    _bs = {n: p for n, p in _ph.items() if (p.get("budget_plan") or {}).get("budget")}
+    if _bs:                                    # PLAN v3.6 NB5BUDGET: solve rate, concurrency, tok/s per budget
+        NB5_REPORT["budget_sweep"] = {n: {"budget": p["budget_plan"]["budget"], "workers": p["budget_plan"]["workers"],
+                                          "task_norm_pct": (p.get("score") or {}).get("eval_task_norm_pct"),
+                                          "query_hits": (p.get("score") or {}).get("eval_query_hits"),
+                                          "server_running_mean": (p.get("b_summary") or {}).get("server_running_mean"),
+                                          "solver_tok_s": (p.get("solver_window") or {}).get("tok_s"),
+                                          "budget_limited_attempts": p.get("budget_limited_attempts")} for n, p in _bs.items()}
+    _q = {n: p for n, p in _ph.items() if n.startswith("Q_")}
+    if _q:                                     # addendum 5: per config and the paired task x config table
+        NB5_REPORT["quality_ab"] = {
+            "configs": {n: {"kv": p.get("kv_dtype"), "workers": p.get("workers"), "score": p.get("score"),
+                            "exact_tasks": sum(1 for v in (p.get("quality") or {}).values() if v.get("exact_all_tests")),
+                            "complete_tasks": sum(1 for v in (p.get("quality") or {}).values() if v.get("complete")),
+                            "output_tokens": sum(v.get("output_tokens") or 0 for v in (p.get("quality") or {}).values()),
+                            "tool_call_rate": (p.get("tracer") or {}).get("tool_call_rate"),
+                            "ttft_mean_sec": ((p.get("latency_means") or {}).get("time_to_first_token_seconds") or {}).get("mean_sec"),
+                            "phase_sec": (p.get("phase_window") or {}).get("sec")} for n, p in _q.items()},
+            "paired": {t: {n: {k: (p.get("quality") or {}).get(t, {}).get(k) for k in ("exact_all_tests", "complete", "output_tokens",
+                                                                                         "wall_sec", "tool_call_rate", "first_request_latency_sec")}
+                           for n, p in _q.items()} for t in (P.get("task_list") or NB5_QUALITY_TASKS)}}
+    if P.get("quality_ab"):                    # R2: per phase + the paired FP8 / BF16 summary (all / finished in both)
+        _pc = {n: {"kv": p.get("kv_dtype"), "status": p.get("status"), "fp8_status": p.get("fp8_status"),
+                   "window": p.get("window"), "window_plan": p.get("window_plan"), "capacity_levers": p.get("capacity_levers"),
+                   "speed": p.get("speed"), "order": p.get("order"), "score": p.get("score"),
+                   "tasks": (p.get("qab") or {}).get("tasks") or {}, "summary": (p.get("qab") or {}).get("summary")}
+               for n, p in _q.items()}
+        _qa = NB5_REPORT.setdefault("quality_ab", {})
+        _qa.update(nb0=NB5_QAB_NB0, fp8_label=NB5_QAB_FP8_LABEL, groups=NB5_QAB_GROUPS, per_config=_pc)
+        # Q-1 / Q-2 / Q-3 / Q-5: windows check (both DONE, numeric, |delta| <= 2 s, none unequal), paired, deployment_comparison
+        # (all tasks / finished in both / missing-incomplete-failed matrix), precision_comparison UNVERIFIED, phase_diff
+        _qa.update(NB5L.qab_report(_pc))
+        for n, v in _pc.items():
+            print(NB5L.qab_table_text(v["tasks"], n), flush=True)
+            print(n, "summary:", json.dumps(v.get("summary"), default=str), "| levers:", json.dumps(v.get("capacity_levers"), default=str)[:1500],
+                  "| speed:", json.dumps(v.get("speed"), default=str), "| window:", json.dumps(v.get("window"), default=str), flush=True)
+        _pa = _qa["paired"]
+        for _blk in ("all", "finished_in_both"):
+            for _g, _s in ((_pa.get(_blk) or {}).items() if isinstance(_pa.get(_blk), dict) else []):
+                print(f"PAIRED [{_blk}] {_g}: tasks {_s['tasks']} | solved FP8 {_s['solved_FP8']} BF16 {_s['solved_BF16']} | both "
+                      f"{_s['both']} FP8-only {_s['FP8_only']} BF16-only {_s['BF16_only']} neither {_s['neither']} | discordant "
+                      f"{_s['discordant']} (McNemar p {_s['mcnemar_p']}; paired n {_s['paired_n']}, min attainable p "
+                      f"{_s['min_attainable_p_paired_n']} / {_s['min_attainable_p_at_discordant']} at this discordant count; "
+                      f"{_s['reading']}) {_s['discordant_tasks']}", flush=True)
+        if "skipped" in _pa:
+            print("PAIRED:", _pa["skipped"], flush=True)
+        print("deployment_comparison:", _qa["deployment_comparison"]["status"], json.dumps(_qa["windows_check"]), "| matrix:",
+              json.dumps({n: (p["outcomes"], p["tasks_missing"]) for n, p in _qa["deployment_comparison"]
+                          ["missing_incomplete_failed"]["phases"].items()}), "| precision_comparison: UNVERIFIED | phase_diff:",
+              json.dumps(_qa["phase_diff"]["differences"], default=str)[:2500], flush=True)
+    try:                                       # E28 W4 W14: the E28 block (I8 / C12 / 131072 read-back, pool / F, scheduler)
+        NB5_REPORT["e28_summary"] = e28_summary()
+        print("E28 W4 SUMMARY:", json.dumps(NB5_REPORT["e28_summary"], default=str)[:4000], flush=True)
+        NB5_REPORT["e28_sched_report"] = e28_sched_report(BASE_OUT / "e28_sched_report.json", BASE_OUT / "phase_EVAL" / "nb5_sampler.jsonl")
+        print("E28 W4 SCHED REPORT:", json.dumps(NB5_REPORT["e28_sched_report"], default=str)[:6000], flush=True)
+    except Exception as _e:
+        print("E28 W4 summary error:", repr(_e)[:300], flush=True)
+    nb5_write_report()
+    print("NB5 REPORT:", json.dumps({"throughput": NB5_REPORT["throughput"], "phases": {n: {k: p.get(k) for k in (
+        "status", "score", "workers", "running_check", "commit_mode")} for n, p in _ph.items()}}, default=str)[:6000], flush=True)
+except BaseException:
+    print("NB5 report error:", traceback.format_exc()[-2000:], flush=True)
+try:
+    _pack = WORKING / "Q27X_NB5_BUNDLE.zip"
+    with zipfile.ZipFile(_pack, "w", zipfile.ZIP_DEFLATED) as z:
+        for fp in [BASE_OUT / "nb5_report.json", SUBMISSION_PATH, ENG_OUT / "nb5_engine.json", ENG_OUT / "telemetry.jsonl"] \
+                + sorted(LOGS.glob("*.log")) + sorted(TRACES.glob("*")) + sorted(BASE_OUT.glob("phase_*/e12_run_report.json")) \
+                + sorted(BASE_OUT.glob("phase_*/nb5_sampler.jsonl")):
+            if fp.exists() and fp.is_file():
+                z.write(fp, arcname=fp.relative_to(WORKING).as_posix() if WORKING in fp.parents else fp.name)
+    print("NB5 bundle:", _pack, round(_pack.stat().st_size / 1e6, 1), "MB", flush=True)
+except BaseException:
+    print("NB5 bundle error:", traceback.format_exc()[-1500:], flush=True)
