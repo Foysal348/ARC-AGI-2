@@ -4,6 +4,13 @@ Keep this file current. Newest status first in section 1. Dates are BDT (UTC+6).
 
 ## 1. Status
 
+- **2026-11-04 (architecture figure)**
+  - New Figure 1 (`fig:arch`, TikZ, at the start of Section 2):
+    - (a) the solver pipeline: generation boxes in blue, scoring and selection boxes in orange;
+    - red callouts give each measurement at the stage where it applies (generation, pool and diversity, selection, repeated runs), as R1 / R2 ranges taken from numbers already in the paper;
+    - (b) how the numbers are produced: notebooks -> saved outputs -> `score_all.py` / `paper_stats.py` -> `NUMBERS.md` -> paper.
+  - The paper is now 12 pages with 5 figures; METADATA comments are updated to match.
+  - `make_arxiv.py --draft`: clean build (0 errors, 0 overfull / underfull), abstract unchanged (1,900 characters). Not submitted.
 - **2026-11-04 (checked against the competition overview)**
   - The Kaggle citation is now the official one from the competition page: Chollet, Knoop, Kamradt, Reade, Cruz, Howard,
     "ARC Prize 2026 - ARC-AGI-2", Kaggle 2026.

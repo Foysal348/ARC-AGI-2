@@ -31,7 +31,7 @@ Every number in it is in `paper/NUMBERS.md`. Compared with draft v1b, it drops o
 ## Comments
 
 ```text
-11 pages, 4 figures, 2 tables
+12 pages, 5 figures, 2 tables
 ```
 
 Once the repository is public, the team may append `; code and data: https://github.com/Foysal348/ARC-AGI-2`.
@@ -84,4 +84,4 @@ First-time submitters in `cs.LG` / `cs.AI` need an arXiv endorser. The endorseme
 3. **Endorser.** Decide who submits and requests the endorsement.
 4. **Rebuild.** `python -B scripts/make_arxiv.py` (without `--draft`) must pass, then commit the regenerated package.
 5. **Final review.** Foysal reviews and approves. Only then is the paper submitted.
-6. **After upload.** Check arXiv's PDF preview (pages, 4 figures, references) before confirming.
+6. **After upload.** Check arXiv's PDF preview (pages, 5 figures, references) before confirming.

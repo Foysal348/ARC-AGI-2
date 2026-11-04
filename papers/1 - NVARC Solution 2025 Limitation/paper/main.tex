@@ -14,6 +14,7 @@
 \usepackage{pgfplots}
 \usepgfplotslibrary{fillbetween}
 \pgfplotsset{compat=1.18}
+\usetikzlibrary{positioning,arrows.meta,calc}
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage[hidelinks]{hyperref}
 \usepackage[capitalise,noabbrev]{cleveref}
@@ -90,6 +91,58 @@ Our notebooks modify the released solver. Compared with our team's reproduction 
 \end{itemize}
 Run~A still uses the fixed baseline, the 1200\,s cap and \code{hash()} seeds.
 The results below describe the pipeline as run in these notebooks.
+\Cref{fig:arch} shows the architecture of our study. Panel (a) is the solver, with the stage at which each of our measurements applies. Panel (b) shows how the numbers are produced from the saved notebook outputs.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize, node distance=9mm and 3.5mm,
+  box/.style={draw=#1, fill=#1!8, rounded corners=2pt, align=center, text width=2.7cm, minimum height=1.3cm, inner sep=2pt},
+  box/.default=oiblue,
+  meas/.style={draw=oiver, fill=oiver!5, rounded corners=2pt, align=left, text width=2.7cm, inner sep=2.5pt},
+  wide/.style={text width=5.9cm},
+  arr/.style={-{Stealth[length=1.8mm]}, semithick},
+  link/.style={densely dashed, oiver, semithick},
+  lab/.style={anchor=south west, font=\small\bfseries, inner sep=0pt}]
+% (a) solver: generation (blue), then scoring and selection (orange)
+\node[box] (task) {\textbf{ARC task}\\demonstration pairs and test inputs};
+\node[box, right=of task] (ttt) {\textbf{Test-time training}\\per-task LoRA (rank 256), 128 augmented samples, 1 epoch};
+\node[box, right=of ttt] (views) {\textbf{16 views}\\per test input: 8 dihedral $\times$ 2 colour permutations};
+\node[box, right=of views] (dfs) {\textbf{Thresholded DFS}\\keeps outputs with $p>0.2$, at most 4 per view};
+\node[box, right=of dfs] (dec) {\textbf{Decode, invert augmentation}\\all-zero placeholder if no output};
+\node[box=oiorange, below=of task] (pool) {\textbf{Candidate pool}\\distinct grids of one test input};
+\node[box=oiorange, right=of pool] (resc) {\textbf{Rescoring}\\NLL of each grid under 8 further augmentations};
+\node[box=oiorange, right=of resc] (rank) {\textbf{Two rankers}\\probmul and kgmon, both favour grids found often};
+\node[box=oiorange, right=of rank] (sel) {\textbf{``Dual'' selection}\\in effect the probmul top 2};
+\node[box=oiorange, right=of sel] (sub) {\textbf{Submission}\\2 attempts per test input};
+\foreach \a/\b in {task/ttt, ttt/views, views/dfs, dfs/dec, pool/resc, resc/rank, rank/sel, sel/sub}
+  \draw[arr] (\a) -- (\b);
+\draw[arr] (dec.south) -- ++(0,-4.5mm) -| (pool.north);
+% measurements (values for R1 and R2)
+\node[meas, wide, anchor=south] (mgen) at ($(dfs.east |- ttt.north)!0.5!(dec.west |- ttt.north)+(0,4mm)$) {\textbf{Generation} (\S\ref{sec:generation}): 116--117 of 172 test inputs never get a correct candidate; for 47--48 of them the candidates are ${>}90$\,\% cell-correct on average.};
+\node[meas, wide, anchor=north] (mpool) at ($(pool.east |- rank.south)!0.5!(resc.west |- rank.south)+(0,-5mm)$) {\textbf{Pool and diversity} (\S\ref{sec:generation}--\ref{sec:diversity}): the answer is in the pool for 55--56 of 172 test inputs; 14.0--14.4 candidates, but only 7.3--7.6 distinct grids.};
+\node[meas, anchor=north] (msel) at ($(sel |- rank.south)+(0,-5mm)$) {\textbf{Selection} (\S\ref{sec:selection}): 45--49 answered vs.\ 55--56 in the pool: +4.67 to +7.67 points with a perfect selector.};
+\node[meas, anchor=north] (mrun) at ($(sub |- rank.south)+(0,-5mm)$) {\textbf{Repeated runs} (\S\ref{sec:union}): the union of five full runs grows from 51 to 62 test inputs.};
+\draw[link] (mgen.south -| dfs.north) -- (dfs.north);
+\draw[link] (mpool.north -| pool.south) -- (pool.south);
+\draw[link] (msel.north) -- (sel.south);
+\draw[link] (mrun.north) -- (sub.south);
+\node[lab] at ($(task.west |- ttt.north)+(0,2mm)$) {(a) Solver pipeline and where we measure};
+% (b) how the numbers are produced, below the lowest measurement box
+\path let \p1 = (mpool.south), \p2 = (msel.south), \p3 = (mrun.south) in
+  coordinate (low) at (0, {min(\y1, \y2, \y3)});
+\node[box=oigreen, anchor=north] (nb) at ($(task |- low)+(0,-10mm)$) {\textbf{Our Kaggle notebooks}\\34 notebooks, 58 saved versions, 2 runs downloaded by hand};
+\node[box=oigreen, right=of nb] (outs) {\textbf{Saved outputs}\\41 distinct results; logs of \R{1}, \R{2} with per-unit tables};
+\node[box=oigreen, right=of outs] (scr) {\textbf{Scripts (CPU only)}\\\code{score\_all.py}: pass@2, unions\\\code{paper\_stats.py}: pools, classes, runs, leaderboard};
+\node[box=oigreen, right=of scr] (num) {\textbf{Numbers and figure tables}\\\code{NUMBERS.md} gives the source of each number};
+\node[box=oigreen, right=of num] (pap) {\textbf{This paper}\\no notebook-printed score used unchecked};
+\foreach \a/\b in {nb/outs, outs/scr, scr/num, num/pap}
+  \draw[arr] (\a) -- (\b);
+\node[lab] at ($(nb.north west)+(0,2mm)$) {(b) How the numbers are produced};
+\end{tikzpicture}
+\caption{Architecture of the study. (a)~The NVARC solver as run in our notebooks (blue: generation; orange: scoring and selection). Red boxes give the quantity measured at each stage, as ranges over the two logged runs \R{1} and \R{2} (five full runs for the union). (b)~The measurement pipeline: every number is recomputed from saved outputs by two scripts that need no GPU.}
+\label{fig:arch}
+\end{figure}
 
 \paragraph{Model and test-time training.}
 The base model is \code{sorokin/qwen3\_4b\_grids15\_sft139}, a Qwen3-4B~\citep{qwen3} model fine-tuned on grid tasks, loaded in bfloat16 with Unsloth~\citep{unsloth}.
