@@ -34,14 +34,18 @@ def _rc1_tensor(t):
          "contig": t.is_contiguous(), "device": t.device.type, "numel": t.numel()}
     if not t.numel():
         return d
+    import math as _m
     x = t.detach()
-    rows = x.shape[0] if x.dim() >= 2 else 1
-    flat = x.reshape(rows, -1) if x.dim() >= 2 else x.reshape(1, -1)
-    step = max(1, (1 << 22) // max(1, flat.shape[1]))       # ~4M elements per chunk: temporaries stay < ~40 MB
+    base = x if x.dim() >= 2 else x.reshape(1, -1)
+    rows = base.shape[0]
+    row_elems = max(1, _m.prod(base.shape[1:]))
+    step = max(1, (1 << 22) // row_elems)                   # ~4M elements per chunk: temporaries stay < ~40 MB
+    # RC1 audit: never reshape the whole tensor (a non-contiguous one would be copied in full); slice rows, then reshape
+    chunk = lambda r0: base.narrow(0, r0, min(step, rows - r0)).reshape(min(step, rows - r0), -1)
     if x.dtype in (torch.float16, torch.bfloat16, torch.float32):
         bad, bad_rows, mn, mx, sab, nfin = 0, [], None, None, 0.0, 0
         for r0 in range(0, rows, step):
-            c = flat[r0:r0 + step]
+            c = chunk(r0)
             fin = torch.isfinite(c)
             nb = (~fin).sum(1)
             if int(nb.sum().item()):
@@ -68,7 +72,7 @@ def _rc1_tensor(t):
         mn = mx = None
         off = 0
         for r0 in range(0, rows, step):
-            k = flat[r0:r0 + step].reshape(-1).to(torch.int64)
+            k = chunk(r0).reshape(-1).to(torch.int64)
             w = (torch.arange(k.numel(), device=k.device, dtype=torch.int64) + off) % 1009 + 1
             s += int(k.sum().item())
             ws += int((k * w).sum().item())                 # position-weighted sum: catches permutations
@@ -110,6 +114,12 @@ def _rc1_scan(model, when):
         for n, v in vars(m).items():                  # expert maps and other plain tensor attributes
             if isinstance(v, torch.Tensor) and n not in tens:
                 tens[n] = v
+        em = _rc1_expert_map(m)                       # SGLang 0.5.21: the EP map lives on the dispatcher
+        if em is not None:
+            tens["dispatcher.local_expert_mapping"] = em
+        for k in ("reduce_results",):
+            if isinstance(getattr(m, k, None), bool):
+                r[k] = getattr(m, k)
         r["tensors"] = {}
         for n, t in sorted(tens.items()):
             try:
@@ -129,10 +139,24 @@ _FIX_FW = int(os.environ.get("E13_RC1_FIX_FORWARDS", "2"))
 _FIX_TOKENS = int(os.environ.get("E13_RC1_FIX_TOKENS", "6"))
 
 
-def _rc1_fixture(name, mod, args, kwargs, out, fw):
-    """RC1 (GPT audit 3, test B): for layers E13_RC1_FIX_LAYERS and the first E13_RC1_FIX_FORWARDS forwards, save the
-    experts module's hidden input, top-k ids / weights and output (first E13_RC1_FIX_TOKENS tokens, CPU copies) plus the
-    rank's expert ownership, so the notebook can recompute the MoE from the checkpoint's GPTQ weights."""
+def _rc1_expert_map(mod):
+    """The rank's global -> local expert map. SGLang 0.5.21 StandardDispatcher: mod.dispatcher.local_expert_mapping
+    (int32 [num_experts], -1 = not on this rank; built on the first EP dispatch). Fallback: a module attribute / buffer."""
+    import torch
+    d = getattr(mod, "dispatcher", None)
+    em = getattr(d, "local_expert_mapping", None) if d is not None else None
+    if isinstance(em, torch.Tensor):
+        return em
+    return next((v for k, v in list(mod.named_buffers(recurse=False)) + list(vars(mod).items())
+                 if "expert_map" in k and isinstance(v, torch.Tensor)), None)
+
+
+_FIX_PRE = {}
+
+
+def _rc1_fixture_pre(name, mod, args, kwargs, fw):
+    """RC1 audit: copy the inputs BEFORE the module runs. FusedMoE may run in place (inplace=True with a fused shared
+    expert), so the post hook could see the output in the input tensor."""
     import re as _re2
     import torch
     if os.environ.get("E13_RC1_FIXTURE") != "1" or fw >= _FIX_FW:
@@ -141,9 +165,35 @@ def _rc1_fixture(name, mod, args, kwargs, out, fw):
     if not m or int(m.group(1)) not in _FIX_LAYERS:
         return
     ins = list(_tensors(args)) + list(_tensors(kwargs))
-    fl = [t for t in ins if t.is_floating_point()]
-    it = [t for t in ins if not t.is_floating_point() and t.dtype != torch.bool]
-    hid = next((t for t in fl if t.dim() == 2 and t.shape[-1] == getattr(mod, "hidden_size", t.shape[-1])), fl[0] if fl else None)
+    n = _FIX_TOKENS
+    pick = lambda t: t[:n].detach().to("cpu").clone() if t is not None and t.dim() >= 1 else None
+    _FIX_PRE[(name, fw)] = {"fl": [(pick(t), list(t.shape)) for t in ins if t.is_floating_point()][:6],
+                            "it": [(pick(t), list(t.shape)) for t in ins if not t.is_floating_point() and t.dtype != torch.bool][:4],
+                            "hidden_size": getattr(mod, "hidden_size", None)}
+
+
+def _rc1_fixture(name, mod, args, kwargs, out, fw):
+    """RC1 (GPT audit 3, test B): for layers E13_RC1_FIX_LAYERS and the first E13_RC1_FIX_FORWARDS forwards, save the
+    experts module's hidden input, top-k ids / weights (copied in the pre hook) and output (first E13_RC1_FIX_TOKENS
+    tokens, CPU copies) plus the rank's expert map and reduce flag, so the notebook can recompute the MoE from the
+    checkpoint's GPTQ weights."""
+    import re as _re2
+    import torch
+    if os.environ.get("E13_RC1_FIXTURE") != "1" or fw >= _FIX_FW:
+        return
+    m = _re2.search(r"layers\.(\d+)\.mlp\.experts$", name)
+    if not m or int(m.group(1)) not in _FIX_LAYERS:
+        return
+    pre = _FIX_PRE.pop((name, fw), None)
+    if pre is None:                                   # no pre copy: fall back to the args (marked)
+        ins = list(_tensors(args)) + list(_tensors(kwargs))
+        n0 = _FIX_TOKENS
+        pk = lambda t: t[:n0].detach().to("cpu").clone() if t is not None and t.dim() >= 1 else None
+        pre = {"fl": [(pk(t), list(t.shape)) for t in ins if t.is_floating_point()][:6],
+               "it": [(pk(t), list(t.shape)) for t in ins if not t.is_floating_point() and t.dtype != torch.bool][:4],
+               "hidden_size": getattr(mod, "hidden_size", None), "from": "post_args"}
+    hs = pre.get("hidden_size")
+    hid = next((t for t, sh in pre["fl"] if len(sh) == 2 and (hs is None or sh[-1] == hs)), pre["fl"][0][0] if pre["fl"] else None)
     outs = [t for t in _tensors(out) if t.is_floating_point()]
     n = _FIX_TOKENS
     rank = None
@@ -153,15 +203,14 @@ def _rc1_fixture(name, mod, args, kwargs, out, fw):
     except Exception:
         pass
     pick = lambda t: t[:n].detach().to("cpu").clone() if t is not None and t.dim() >= 1 else None
-    fix = {"name": name, "fw": fw, "rank": rank, "hidden": pick(hid),
-           "ints": [pick(t) for t in it[:4]], "int_shapes": [list(t.shape) for t in it[:4]],
-           "floats": [pick(t) for t in fl[:6]], "float_shapes": [list(t.shape) for t in fl[:6]],
+    fix = {"name": name, "fw": fw, "rank": rank, "hidden": hid, "hidden_from": pre.get("from", "pre_hook"),
+           "ints": [t for t, _ in pre["it"]], "int_shapes": [sh for _, sh in pre["it"]],
+           "floats": [t for t, _ in pre["fl"]], "float_shapes": [sh for _, sh in pre["fl"]],
            "out": pick(outs[0]) if outs else None,
            "meta": {k: getattr(mod, k) for k in ("num_experts", "num_local_experts", "moe_ep_rank", "moe_ep_size", "top_k",
                                                    "num_fused_shared_experts", "reduce_results", "hidden_size",
                                                    "intermediate_size_per_partition") if isinstance(getattr(mod, k, None), (int, bool))}}
-    em = next((v for k, v in list(mod.named_buffers(recurse=False)) + list(vars(mod).items())
-               if "expert_map" in k and isinstance(v, torch.Tensor)), None)
+    em = _rc1_expert_map(mod)
     if em is not None:
         fix["expert_map"] = em.detach().to("cpu").clone()
     os.makedirs(_D, exist_ok=True)

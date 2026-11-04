@@ -1,0 +1,42 @@
+# Fix list: E29_DFLASH_D3S rev 2c (3 GPT risk audits, 2026-11-02) -> rev 2d
+
+All 3 audits:
+- GPU smoke GO; 6 h / 12 h production NO-GO until fixed and validated.
+- No new engine crash blocker found from source.
+- Rev 2c kits are ALL OK on ed2e23a7 (units, real, direct; `ladder_bad` empty). These reports were not in the audit zip.
+
+| # | Sev | Item | Audits | Verified | Fix | Tests |
+|---|---|---|---|---|---|---|
+| F1 | HIGH | Late phase C: a C item dispatched to DIRECT in the last `drain_min` (26) min is not admitted (`e29_direct.py:527-528` ADMIT / DRAIN), returns no record, and is still counted "C done". The E28 Duck C attempt for that task is lost | A2 HIGH-01, A3 HIGH-01 | TRUE: `e29d_sched_patch.py:106` checks only `_e29d_on()` | In the phase-C dispatch, `use_direct = phase == "C" and _e29d_on() and remaining_sec > drain_min * 60 + margin`. `drain_min` comes from the validated runtime E29_DIRECT2, through one hook / env shared by notebook, scheduler and payload. Otherwise the ORIGINAL E28 Duck C path runs for that same item: one C completion, one reservation release | Fake clock: at T-27 min -> DIRECT with >0 streams. At T-25 -> Duck C, one completion, a valid attempt_2. Also: the exact boundary, server down, `on=False` |
+| F2 | HIGH | No first-prefill memory gate: the warmup does not force a maximal QSA prefill, and PP1 free is not measured worker-side | A1 R1, A3 gate 3 (= our O-3) | TRUE (`export:3925-3952`) | On every DFlash try, before the phases: a forced max-size prefill probe (116k / 131k prompt, through the batched-tokens chunks). Then read each worker's own free memory (`torch.cuda.mem_get_info` via worker RPC) and record it. OOM -> the D ladder steps. Free below a margin (from the NB-S1 data: 577 MiB min with 256/256) -> one ladder step. Real failure only | OOM at the probe -> step; low free -> step; ok -> phases |
+| F3 | HIGH | The QSA 128/64 env read-back is record-only | A1 R4, A2, A3 HIGH-02 | TRUE (`e29_lib.py:279-343`) | Require all 4 workers enumerated with 128/64 before the first prefill. If `/proc` is unavailable, use a worker-rank RPC read-back. On a mismatch or missing rank: relaunch the same rung WITHOUT the QSA env, i.e. Merlin's GPU-proven 256/256 + EMBED_HOST, recorded. DFlash is not dropped | 4 ranks correct -> PASS; one rank 256 -> 256/256 relaunch; rank missing -> same |
+| F4 | HIGH | The in-run DFlash -> MTP relaunch runs only `sampled_check`: no I8 read-back / `e28_i8_gate`, no C-11 / method map on the new server | A1 R3 | TRUE (`export:2286-2325, 3778-3821`) | After the relaunch run the same boot gates as an E28 boot: C-11, method map, `i8_readback` / `e28_i8_gate`. I8 not engaged -> E28's own I8 rule (same pin, BF16 head) | Injected in-run OOM per rung, plus zero-accept: new argv / env, pin 7,933,526,016, 24 seqs, no DFlash / QSA vars, I8_ENGAGED or an explicit BF16 relaunch |
+| F5 | MEDIUM | A missing or old payload silently turns DIRECT / LIVE off | A1 R5, A2, A3 MEDIUM-05 | TRUE (designed) | Keep "never stop the run". Add a top-level `effective_algorithm` record (drafter DFlash / MTP, DIRECT ON / OFF + why, QSA effective, EMBED_HOST) printed at the start and in the report / LIVE header. In EVAL a DIRECT-off run is flagged `experiment_validity: DIRECT_OFF` | Missing module -> record + flag, run continues |
+| F6 | MEDIUM | EMBED_HOST host-RAM pressure; the cgroup is near 177 GB | A1 R6 (= our O-6) | — | Record cgroup `memory.current / max` at ready, after the F2 probe, and in every LIVE 15-min line. No gate | Line format |
+| F7 | MEDIUM | 24 long DIRECT contexts -> preemption / throughput risk | A1 R2, A2, A3 MEDIUM-03 | Design | No code change; measure in the smoke (residents, preemptions, PP1 min free, completed attempt_2), and keep the `E29_DIRECT2` switch | Smoke |
+| F8 | LOW | The audit pack was not self-contained (`e28_sched_patch.py`, Duck payload, rev 2c kit reports missing) | A1 R8, A3 | TRUE (my zip) | Next zip includes them | — |
+| F9 | MEDIUM | Size: 3,228 B left under 400 kB | A1 R7 | TRUE | Build assert already present; move new code to the payload module | — |
+
+## Re-check of all 4 audits (A1 = RISK_AUDIT, A2 = A3 = GPT_AUDIT, the same audit; A4 = INDEPENDENT_AUDIT: report + patch plan + repro)
+
+| # | Sev | Item | Audits | Verified | Fix |
+|---|---|---|---|---|---|
+| F1+ | HIGH | (refines F1) A4: E28's last C start was at 21,291 s of 21,600 s, so late C is real. Do not weaken the 26-min drain to hide the no-op | A4 H1 | TRUE (E28 report) | A hook `E12A.E29D_CAN_START(deadline)` = now + 60 s + drain_min*60 < deadline, set in `e29_direct_setup`, cleared on OFF / failure. The patched worker takes the DIRECT branch only if the hook is callable and True. Otherwise the original `sess()` Duck C. Tests: 31 min left -> DIRECT; 20 / 1 min -> Duck C; OFF -> Duck; hook raises -> Duck. `E28_RELEASE` exactly once and `done.C` exactly once per path |
+| F10 | HIGH | In-run XID: `df_relaunch_plan` returns None -> the watchdog relaunches the SAME DFlash config. That contradicts the boot rule "XID -> MTP" | A4 H2 | TRUE (`e29_lib.py` df_relaunch_plan: `if not is_oom or is_device_fault: return None`) | Check the device fault FIRST: `if is_device_fault(log): return "mtp"`, so XID + OOM -> MTP too. Plain OOM -> next rung (unchanged); a healthy non-OOM death -> same config. MTP relaunch = top pin / 24 / I8 / no DFlash or QSA env, with F4's gates. Report `GPU_DEVICE_FAULT`. Tests for all five cases |
+| F11 | HIGH (A4) / my view MEDIUM | `SSEQ.finish()` exception swallowed -> the MTP boot runs on a possibly modified tree | A4 H3 | TRUE (`export:2120-2124, 2172-2176`) | A4 wants fail-closed (raise). That kills the whole production run, leaving only the CELL 0 identity submission, which is worse than the risk. Proposed instead: (1) snapshot the pristine SHAs of every seam-touched file before the apply; (2) after `finish()`, verify those SHAs; (3) if not pristine, restore again from the snapshot and re-verify; (4) if still not pristine, run the MTP boot with the `q_seam_inert` read-back (seam env unset; NBDF-K100's Q arm was proven seam-inert on GPU). Inert -> continue, recorded `SEAM_REVERT_UNVERIFIED_INERT`. Not inert -> a real failure of that try (E28 ladder). Tests: finish raises; partial restore; clean |
+| F12 | MEDIUM | Check the final `submission.json`: all task ids, every test input, valid 0-9 grids, the CELL 0 fallback kept. Its shape after an interruption | A1 smoke 4, A3 gate 5 | — | A record-only validator at the end of CELL 7/9 and after every write (cheap): `submission_check` in the report + the LIVE header |
+| F13 | MEDIUM | A KV ledger to judge 24-stream residency | A4 M2 | — | Record running-held / reclaimable blocks, F, preemptions and the queue lengths in the LIVE 15-min line (with F6 host RAM) |
+| F14 | LOW | A speed claim for QSA without the 4-rank read-back | A4 L1 | — | Label `UNVERIFIED_QSA` in the report when the read-back is incomplete (covered by F3 / F5) |
+| S1 | smoke plan | The smoke should include: a 256/256 + EMBED_HOST control; the 131k first prefill; 24 mixed streams; one early + one late C (DIRECT and Duck routes); injected faults (warmup failure, in-run OOM, XID, zero-accept) where feasible; the submission schema | A1, A3, A4 | — | Build a SMOKE profile / switch values (separate kernel, plain lines only) after rev 2d |
+
+## Dispatch plan (parallel, split by file ownership)
+- **Agent E29-B (existing builder, owns `build_e29_final.py`, `e29_lib.py`, `e29_live.py`, the generated `e29_nbx.py`, the kits):** F2, F3, F4, F5, F6, F9, F10, F11, F12, F13, F14, plus the F1 notebook hook (`E29D_CAN_START` in `e29_direct_setup`). It integrates and rebuilds at the end.
+- **Agent SCHED (owns `e29_direct_build.py`, `e29d_sched_patch.py` generation, `e29d_direct_tests.py`):** F1 / F1+ in the scheduler patch (hook use + tests). It delivers the regenerated patch + its sha to E29-B.
+- **Agent TEST (owns a NEW file `e29_rev2d_adversarial_tests.py` + the audit-zip packer):** turns A4's `audit_repro_e29.py` and every audit regression case (F1 / F10 / F11 / F3 / F4 / F12) into executable tests against the rebuilt modules, plus a SELF-CONTAINED audit zip packer (F8: e28_sched_patch.py, the Duck payload, nb5_lib, the rev 2c / 2d kit reports). Runs after E29-B's rebuild.
+- DEFAULT / MTP_V64 / ALL_OFF stay byte-identical.
+
+**Then:**
+1. New payload version.
+2. 3 kits.
+3. A self-contained audit zip.
+4. The smoke (user go).

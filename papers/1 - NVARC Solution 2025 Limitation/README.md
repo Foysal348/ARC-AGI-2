@@ -1,0 +1,87 @@
+# Paper 1: NVARC Solution 2025 Limitation (handoff README)
+
+Written for the AI that takes over this paper (Hamid vai's AI) and for any reader who opens this folder cold.
+The status and the next steps are in `PLAN.md`. This file says what the paper is, where everything is, and how the numbers are made.
+
+## 1. What this paper is
+
+- **Title (fixed by the user 2026-11-04).** *Where the NVARC Pipeline Saturates on ARC-AGI-2: Candidate-Pool Ceiling, Selection Headroom and Generation Collapse*
+
+- **Series.** One of 7 planned arXiv papers by team Hack2Publish (Kaggle ARC Prize 2026, ARC-AGI-2 track). This one is paper 1.
+  The others: 2 Poetiq-inspired solution, 3 Direct solution, 4 Duck-inspired agent, 5 4xL4 speed-up configurations,
+  6 solving the ARC-AGI-2 eval under Kaggle limits, 7 PDD hybrid.
+- **Subject.** The NVARC 2025 winning solution:
+  - model `sorokin/qwen3_4b_grids15_sft139`, a Qwen3-4B fine-tuned on grids;
+  - per-puzzle test-time LoRA training on augmented train pairs;
+  - `turbo_dfs` beam search;
+  - candidate scoring with augmentation likelihoods (`score_full_probmul_3`, `score_kgmon`);
+  - 2 attempts.
+- **Claim the data supports.** In every NVARC run we measured, the score is capped by the candidate pool:
+  - perfect selection adds only +4.67 to +7.67 task-norm;
+  - about 68 % of test inputs never get a correct candidate;
+  - re-running (seeds, versions) mostly re-finds the same puzzles.
+- **Claims the data does NOT support** (keep out of the paper, or state as limits):
+  - "no NVARC variant can ever do better";
+  - "more samples / diversity would not help". This was never run. Experiment 34 in v2 is only a proposal.
+- **Tone rule for arXiv.** Write it as an empirical analysis with measured numbers, not an opinion piece.
+  arXiv CS moderation rejects un-reviewed position papers. Do not write "thousands of competitors wasted 8 months";
+  state what was measured.
+
+## 2. Folder map
+
+| path | what |
+|---|---|
+| `README.md` | this file |
+| `PLAN.md` | status, decisions, next steps (keep it updated) |
+| `v25_v2_ceiling_findings_2026-11-04.md` | **main findings**: numbers for the ceiling, selection headroom, generation wall, diversity collapse, union over runs; section 6 lists misleading outputs inside the notebooks |
+| `v3_misleading_claims_audit_2026-11-04.md` | audit of `fork-of-arc-2026d-32-22lb-updated-v3`: 16 claims vs code vs run output |
+| `data/arc-agi_evaluation_solutions.json`, `data/arc-agi_evaluation_challenges.json` | public ARC-AGI-2 eval set (120 tasks, 172 test inputs); the scoring ground truth |
+| `data/run_scores.csv` | per-run score table (written by `scripts/score_all.py`) |
+| `data/union_units.json`, `data/pool_units.json` | right units across all submissions; candidate-pool units per run log |
+| `scripts/score_all.py` | **reproduces every score and union in the findings** (run: `python -B scripts/score_all.py` from this folder) |
+| `scripts/fetch_versions.py` | downloads every saved version's output + log of every NVARC notebook (needs Kaggle auth, see section 4) |
+| `provided notebooks/` | 2 notebooks the user downloaded by hand from Kaggle with outputs: `fork-of-arc-2026d-32-22lb-updated-v3.ipynb` (eval 37.83), `arc-2026d-with-codex_v25.ipynb` (eval 37.67) |
+| `source notebook arc-2026d-with-codex/` | the 2026-10-19 copy of `arc-2026d-with-codex` = Kaggle version **v2**: notebook (35 cells, 34 numbered experiments), run log, extracted stdout `output/arc-2026d-with-codex_stdout.txt` |
+| `kaggle versions arc-2026d-with-codex/v1`, `/v2` | outputs + full logs of both saved versions of that notebook. v1 = a second run with Experiments 1-19 (pool data); v2 = same as the folder above |
+| `kaggle versions/<slug>/vN/output/` | every saved version of every NVARC notebook (filled by `scripts/fetch_versions.py`; `manifest.json` lists what exists, file sizes and sha256) |
+| `NVARC family (34 notebooks, downloaded 2026-10-19)/` | copy of `resources/NVARC family/`: code + latest output of the team's 34 NVARC notebooks, `README.md` (LB per notebook, which runs covered all 120 tasks), `index.json` |
+| `related data/` | NVARC family README; NVARC vs our Qwen3.8-27B EVAL120 comparison (2026-10-19) |
+
+## 3. How the numbers are made
+
+- **Unit.** One test input (172 in the eval set).
+- **Pass@2.** A unit is right if `attempt_1` or `attempt_2` equals the solution grid.
+- **Task-norm.** The sum over right units of 1 / (test inputs of that task), out of 120. This is what Kaggle's LB uses.
+  - Notebook-printed scores such as "37.8/111" use their own denominators.
+  - Always re-score from `submission.json` with `scripts/score_all.py`.
+- **Candidate pool.** The "GT Present cases" table of EXPERIMENT 1 in a run log: the test inputs whose decoded candidates contain the answer.
+  - Only runs with the experiment cells have this: v1 and v2 of `arc-2026d-with-codex`.
+  - v25 and v3 print puzzle-level counts only (48 and 47 puzzles in pool).
+- **Notebook diagnostics are not trusted as printed.** Several are buggy: inverted labels, wrong denominators, circular simulations, fallback grids mislabelled as crashes or pruning. See findings section 6 and the v3 audit.
+
+## 4. Kaggle access (rules)
+
+- **Account.** All these notebooks are on Kaggle account `foysalemonshanto`.
+- **Auth.** Scripts authenticate by executing the preamble of `D:/ARC AGI 2/_scratch/foysal_kit_log.py` up to `api.authenticate()`.
+  **Never open or print token or credential files** (`~/.kaggle/*.json`, access_token files, `C:\Users\hp\hamid vai`).
+- **Older versions.** The Kaggle CLI only downloads the latest version.
+  - Older versions come from `ApiListKernelSessionOutputRequest` with `version_label="v1"`, `"v2"`, ...
+  - The label is "v" + version number. A bare number gives 404.
+  - The response also carries the full run log (`resp.log`).
+- **Notebook source of old versions.** `kernels_pull owner/slug/N` returns 403. Only the latest source is available, or the user downloads it from the web UI (as with the two `provided notebooks`).
+- **Never push, run or submit on Kaggle without the user's explicit go.**
+
+## 5. Key numbers (2026-11-04)
+
+| measure | value |
+|---|---|
+| best single run (eval) | v3 37.83 / 120 (51 / 172 units) |
+| union of all scored submissions (41 unique, all 58 saved versions) | 64 / 172 units, task-norm 46.50 = 38.75 % |
+| full 120-task runs (4.7-4.8 h) | 6: task-norm 33.50-37.83; union of 5 grows 51 -> 62 units (+6, +1, +3, +1); 37 units right in all 5 |
+| candidate pool, v2 / v1 | 55 / 172 (oracle 41.17) / 56 / 172 (oracle 40.50) |
+| selection headroom, v2 / v1 | +7.67 / +4.67 |
+| top-k coverage of the answer | v2: 36 / 45 / 51 / 54 / 55 / 55 / 55; v1: 39 / 49 / 52 / 54 / 55 / 56 / 56 (k = 1 / 2 / 3 / 5 / 10 / 20 / 100) |
+| test inputs with no correct candidate | v2: 117 / 172 (68 %) |
+| candidates per test input / unique | v2: 14.0 / 7.3; v1: 14.4 / 7.6 |
+| all evidence union (submissions + pools) | 70 / 172, task-norm 50.83 = 42.36 % |
+| best NVARC LB | 32.64; the same version scored 27.36-32.64 over 10 submissions |

@@ -34,30 +34,41 @@ def _patch(mod):
     st = {"n": 0, "freed": 0}
 
     def process_weights_after_loading(model, *a, **k):
+        # RC1 audit: wrap the quant-method CLASS (once per class), never an instance: one quant method object may be
+        # shared by many layers, and the wrapper takes the layer from its argument, so names and calls stay per layer.
         import gc
+        names = {id(m): n for n, m in model.named_modules()}
+        wrapped = []
         for name, m in model.named_modules():
             qm = getattr(m, "quant_method", None)
-            if qm is None or "moe" not in type(qm).__name__.lower() or getattr(qm, "_e13_gc", False):
+            cls = type(qm)
+            if qm is None or "moe" not in cls.__name__.lower() or cls in wrapped:
                 continue
-            f = qm.process_weights_after_loading
+            f = cls.__dict__.get("process_weights_after_loading")
+            if f is None:                             # inherited: wrap at this class so subclasses stay untouched
+                f = getattr(cls, "process_weights_after_loading", None)
+            if f is None or getattr(f, "_e13_gc", False):
+                continue
 
-            def g(layer, _f=f, _name=name):
+            def g(self, layer, *aa, _f=f, **kk):
                 b0 = _alloc()
-                r = _f(layer)
+                r = _f(self, layer, *aa, **kk)
                 b1 = _alloc()
                 gc.collect()
                 b2 = _alloc()
                 st["n"] += 1
                 st["freed"] += max(0, b1 - b2)
                 if st["n"] <= 3 or b1 - b2 >= 16 << 20:
-                    _log({"ev": "vgc", "module": _name, "qm": type(qm).__name__, "before": b0, "after_pwal": b1, "after_gc": b2})
+                    _log({"ev": "vgc", "module": names.get(id(layer), "?"), "qm": type(self).__name__, "before": b0,
+                          "after_pwal": b1, "after_gc": b2})
                 return r
+            g._e13_gc = True
             try:
-                qm.process_weights_after_loading = g
-                qm._e13_gc = True
+                setattr(cls, "process_weights_after_loading", g)
+                wrapped.append(cls)
             except Exception as e:
                 _log({"ev": "vgc_wrap_error", "module": name, "error": repr(e)[:200]})
-        _log({"ev": "vpwal_start", "alloc": _alloc()})
+        _log({"ev": "vpwal_start", "alloc": _alloc(), "wrapped_classes": [c.__name__ for c in wrapped]})
         try:
             return orig(model, *a, **k)
         finally:
