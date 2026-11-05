@@ -1,0 +1,142 @@
+from pathlib import Path
+
+_MOD_SRC = '# flashnext HC-down split-K (session 22) - installed as vllm/models/qwen4_exp/nvidia/ops/fn_hc_down.py by s05m_hc_down.py.\n# The merged "down + inject" projection of every hyper-connection mixer (FP8 weight 336 x 10240, bf16 activations, M = tokens) runs in\n# Humming as a stream-K GEMM over only 6 output tiles: 27 of 58 SMs, ~33 us at M 60 on an L4 (~120 GB/s; ~30 us even with the weight in\n# L2: the long K loop per tile is the limit). Here the K dimension is split over many thread blocks (each does one output tile over one K\n# slice), the partial sums go to a workspace, a second small kernel adds them in a fixed order (deterministic) and writes bf16.\n# Weights: the checkpoint\'s FP8 bytes [N, K] and per-row or per-(row, K-block) scales, kept by s05m before Humming transforms the layer\n# (Humming\'s copy is then freed). Same math as Humming\'s W8A16 path (FP8 -> bf16 weights, fp32 accumulation), other summation order.\nimport torch\n\nfrom vllm.triton_utils import tl, triton\n\n\n@triton.jit(do_not_specialize=["M"])   # K_PER_SPLIT stays specialized: its alignment lets Triton vectorize the loads\ndef _fn_hcd_partial(x, w, s, part, M, N, K, stride_xm, NG, G_SIZE, K_PER_SPLIT,\n                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ROW_SCALE: tl.constexpr):\n    pid_n, pid_k, pid_m = tl.program_id(0), tl.program_id(1), tl.program_id(2)\n    offs_m = pid_m * BM + tl.arange(0, BM)\n    offs_n = pid_n * BN + tl.arange(0, BN)\n    mm, nm = offs_m < M, offs_n < N\n    acc = tl.zeros([BM, BN], dtype=tl.float32)\n    k0 = pid_k * K_PER_SPLIT\n    for kk in range(0, K_PER_SPLIT, BK):\n        offs_k = k0 + kk + tl.arange(0, BK)\n        a = tl.load(x + offs_m[:, None] * stride_xm + offs_k[None, :], mask=mm[:, None], other=0.0)\n        b = tl.load(w + offs_n[:, None] * K + offs_k[None, :], mask=nm[:, None], other=0.0)\n        if ROW_SCALE:                                    # one scale per output row: applied once after the K loop (bf16 weights: scale 1)\n            acc += tl.dot(a, tl.trans(b.to(tl.bfloat16)))\n        else:                                            # per (row, K-block) scales\n            sc = tl.load(s + offs_n * NG + (k0 + kk) // G_SIZE, mask=nm, other=0.0)\n            acc += tl.dot(a, tl.trans(b.to(tl.bfloat16))) * sc[None, :]\n    if ROW_SCALE:\n        acc = acc * tl.load(s + offs_n, mask=nm, other=0.0)[None, :]\n    tl.store(part + pid_k * M * N + offs_m[:, None] * N + offs_n[None, :], acc, mask=mm[:, None] & nm[None, :])\n\n\n@triton.jit(do_not_specialize=["MN"])\ndef _fn_hcd_reduce(part, out, MN, SPLITS: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    m = offs < MN\n    acc = tl.zeros([BLOCK], dtype=tl.float32)\n    for s in range(SPLITS):\n        acc += tl.load(part + s * MN + offs, mask=m, other=0.0)\n    tl.store(out + offs, acc.to(out.dtype.element_ty), mask=m)\n\n\n_ws = {}\n\n\ndef _workspace(numel, device):\n    t = _ws.get(device)\n    if t is None or t.numel() < numel:\n        t = torch.empty(max(numel, 1 << 20), dtype=torch.float32, device=device)\n        _ws[device] = t\n    return t\n\n\ndef plan(M):\n    """(BM, BN, BK, SPLITS, warps), searched on one L4 at N 336, K 10240 with the input in L2 (session 22, tools/l4_hc_down_vs_humming.py,\n    tools/hcd_plan.py). vs Humming: M 60 23.5 vs 28.7 us (weight in L2 16.4 vs 27.6), M 128 25.6 vs 44.0, M 512 ~67 vs 69.6,\n    M 1024 ~125 vs 112.6 (the only case slower: prefill chunks)"""\n    if M <= 64:\n        return (16 if M <= 16 else (32 if M <= 32 else 64)), 32, 128, 5, 8\n    if M <= 128:\n        return 64, 32, 128, 5, 8\n    if M <= 256:\n        return 64, 128, 128, 4, 4\n    return 64, 128, 64, 2, 4\n\n\ndef hc_down(x, w8, scale, out=None, plan_fn=None):\n    """x [M, K] bf16 (contiguous rows), w8 [N, K] float8_e4m3fn (or bf16 with scale ones), scale [N, NG] fp32 -> out [M, N] (x\'s dtype)"""\n    M, K = x.shape\n    N = w8.shape[0]\n    assert w8.shape[1] == K and x.stride(1) == 1\n    NG = scale.shape[1]\n    G = K // NG\n    if out is None:\n        out = torch.empty((M, N), dtype=x.dtype, device=x.device)\n    if M == 0:\n        return out\n    BM, BN, bk, splits, warps = (plan_fn or plan)(M)\n    assert K % (bk * splits) == 0 and (G >= K or G % bk == 0), (K, bk, splits, G)\n    part = _workspace(splits * M * N, x.device)\n    grid = (triton.cdiv(N, BN), splits, triton.cdiv(M, BM))\n    _fn_hcd_partial[grid](x, w8, scale, part, M, N, K, x.stride(0), NG, G, K // splits, BM=BM, BN=BN, BK=bk,\n                          ROW_SCALE=NG == 1, num_warps=warps, num_stages=3)\n    _fn_hcd_reduce[(triton.cdiv(M * N, 1024),)](part, out, M * N, SPLITS=splits, BLOCK=1024, num_warps=4)\n    return out\n'
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_fl = _root / "model_executor/layers/quantization/utils/humming/linear.py"
+_fo = _root / "models/qwen4_exp/nvidia/ops/fn_hc_down.py"
+assert _fl.exists() and _fo.parent.is_dir(), f"{_fl} not found: run the earlier steps first"
+assert _MOD_SRC and "def hc_down(" in _MOD_SRC, "the module source is missing (build the notebook with its builder)"
+_MARK = "# flashnext HC-down split-K (session 22)"
+_HELPERS = '''def _fn_hcd_target(layer) -> bool:   ''' + _MARK + '''
+    import os
+
+    return os.environ.get("FLASHNEXT_HC_DOWN") == "1" and str(getattr(layer, "prefix", "")).endswith("input_mix_weight_down_block_inject")
+
+
+def _fn_hcd_keep(layer, weight_schema, tensors):
+    """keep the FP8 weight [N, K] + fp32 scales [N, NG] of an HC down + inject layer before Humming re-lays them out"""
+    if not _fn_hcd_target(layer):
+        return
+    extra = sorted(set(tensors) - {"weight", "weight_scale"})
+    if extra or getattr(layer, "has_bias", False):
+        raise RuntimeError(f"FLASHNEXT_HC_DOWN=1: {layer.prefix} has {extra or 'a bias'}; the split-K kernel supports weight + weight_scale only")
+    w = tensors["weight"]
+    if "float8e4m3" not in str(getattr(weight_schema, "b_dtype", "")).lower() and "e4m3" not in str(getattr(weight_schema, "b_dtype", "")).lower():
+        raise RuntimeError(f"FLASHNEXT_HC_DOWN=1: {layer.prefix} weight type {getattr(weight_schema, 'b_dtype', None)} is not FP8 e4m3")
+    w8 = w.view(torch.float8_e4m3fn)
+    n, k = w8.shape
+    sc = tensors["weight_scale"].float()
+    if sc.numel() == 1:
+        s32 = sc.reshape(1, 1).expand(n, 1)
+    elif sc.numel() == n:
+        s32 = sc.reshape(n, 1)
+    elif sc.dim() == 2 and sc.shape[0] == n and k % sc.shape[1] == 0 and (k // sc.shape[1]) % 64 == 0:
+        s32 = sc
+    elif (sc.dim() == 2 and k % sc.shape[1] == 0 and (k // sc.shape[1]) % 64 == 0
+          and (gn := int(getattr(weight_schema, "weight_scale_group_size_n", 0) or 0)) > 0 and -(-n // gn) == sc.shape[0]):
+        s32 = sc.repeat_interleave(gn, 0)[:n]                       # 2-D block scales: one row of blocks per gn output rows
+    else:
+        raise RuntimeError(f"FLASHNEXT_HC_DOWN=1: {layer.prefix} weight_scale shape {tuple(sc.shape)} for weight {tuple(w8.shape)} not understood")
+    w8, s32 = w8.contiguous().clone(), s32.contiguous().clone()
+    # the layer's output partitions are [lora rank, hc count, pad]: the pad rows get no checkpoint weight (uninitialized memory, can be
+    # NaN) and the model drops those output columns; zero them here so the kernel writes zeros there, and check only the real rows
+    parts = list(getattr(layer, "output_partition_sizes", [n]))
+    real = sum(parts[:2]) if len(parts) == 3 else n
+    if not 0 < real <= n:
+        raise RuntimeError(f"FLASHNEXT_HC_DOWN=1: {layer.prefix} output partitions {parts} do not fit the weight rows {n}")
+    if real < n:
+        w8.view(torch.uint8)[real:] = 0                             # byte 0 = +0.0 in e4m3fn
+        s32[real:] = 0
+    layer._fn_hcd_pending = (w8, s32, real)
+
+
+def _fn_hcd_check_and_switch(layer, config, tensors):
+    """compare the split-K kernel with Humming's GEMM on one random input, then free Humming's copy and switch the layer over"""
+    pending = layer.__dict__.pop("_fn_hcd_pending", None)
+    if pending is None:
+        return
+    from vllm.models.qwen4_exp.nvidia.ops.fn_hc_down import hc_down
+
+    w8, s32, real = pending
+    g = torch.Generator(device=w8.device).manual_seed(1234)
+    x = (torch.randn(16, w8.shape[1], device=w8.device, generator=g) * 0.5).to(layer.params_dtype)
+    ref = apply_humming_linear(layer, x, layer_config=config, compute_config=get_humming_linear_compute_config(),
+                               locks=torch.zeros(1024, dtype=torch.int32, device=w8.device)).float()
+    got = hc_down(x, w8, s32).float()
+    got, ref = got[:, :real], ref[:, :real]                          # the pad columns are dropped by the model
+    rel = ((got - ref).abs().max() / ref.abs().max().clamp_min(1e-6)).item()
+    if not rel < 2e-2:
+        raise RuntimeError(f"FLASHNEXT_HC_DOWN=1: {layer.prefix} split-K vs Humming relative max difference {rel:.3e} (limit 2e-2) on the "
+                           f"{real} real rows of {w8.shape[0]} | non-finite: split-K {int((~got.isfinite()).sum())}, Humming "
+                           f"{int((~ref.isfinite()).sum())}, kept weight {int((~w8[:real].float().isfinite()).sum())}, scales "
+                           f"{int((~s32[:real].isfinite()).sum())}")
+    for name in tensors:
+        old = getattr(layer, name)
+        setattr(layer, name, torch.nn.Parameter(torch.empty(0, dtype=old.dtype, device=old.device), requires_grad=False))
+    layer._fn_hcd = (w8, s32)
+    _fn_hcd_count[0] += 1
+    if _fn_hcd_count[0] == 1:
+        print(f"flashnext HC-down split-K: ON | first layer {layer.prefix}: weight {tuple(w8.shape)}, scales {tuple(s32.shape)}, "
+              f"real rows {real} (pad rows zeroed), self-check rel diff {rel:.2e}", flush=True)
+
+
+_fn_hcd_count = [0]
+
+
+def _flashnext_small_pad(layer) -> bool:'''
+_EDITS = [
+    ("helpers", "def _flashnext_small_pad(layer) -> bool:", _HELPERS),
+    ("keep the FP8 weight before the transform",
+     """    tensors.update(input_tensors)
+    layer.weight_schema = weight_schema
+""",
+     """    tensors.update(input_tensors)
+    layer.weight_schema = weight_schema
+    _fn_hcd_keep(layer, weight_schema, tensors)   """ + _MARK + """
+"""),
+    ("self-check, free Humming's copy, switch",
+     """    for name, tensor in tensors.items():
+        param = torch.nn.Parameter(tensor, requires_grad=False)
+        setattr(layer, name, param)
+
+    return config
+""",
+     """    for name, tensor in tensors.items():
+        param = torch.nn.Parameter(tensor, requires_grad=False)
+        setattr(layer, name, param)
+    _fn_hcd_check_and_switch(layer, config, tensors)   """ + _MARK + """
+
+    return config
+"""),
+    ("apply_humming_linear routes to the split-K kernel",
+     """    from vllm.utils.humming import humming_forward
+
+    mode = layer_config.input_quant_mode
+""",
+     """    _fn = layer.__dict__.get("_fn_hcd")
+    if _fn is not None:   """ + _MARK + """
+        from vllm.models.qwen4_exp.nvidia.ops.fn_hc_down import hc_down as _fn_hc_down
+
+        _flat = x.reshape(-1, x.size(-1))
+        _out = _fn_hc_down(_flat if _flat.stride(-1) == 1 else _flat.contiguous(), _fn[0], _fn[1])
+        return _out.view(*x.shape[:-1], _out.size(-1))
+    from vllm.utils.humming import humming_forward
+
+    mode = layer_config.input_quant_mode
+"""),
+]
+if not _fo.exists() or _fo.read_text() != _MOD_SRC:
+    _fo.write_text(_MOD_SRC)
+    compile(_MOD_SRC, str(_fo), "exec")
+    print("HC-down split-K: [installed]", _fo)
+_s = _fl.read_text()
+for _label, _old, _new in _EDITS:
+    if _new in _s:
+        print("HC-down split-K: [already]", _label)
+        continue
+    assert _s.count(_old) == 1, f"HC-down split-K edit '{_label}': anchor found {_s.count(_old)} times in {_fl} (patch cell changed?)"
+    _s = _s.replace(_old, _new)
+    print("HC-down split-K: [installed]", _label)
+compile(_s, str(_fl), "exec")
+_fl.write_text(_s)
+print("(FLASHNEXT_HC_DOWN=1 before the server starts; unset = unchanged)")

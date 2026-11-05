@@ -1,0 +1,91 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_f = _root / "models/qwen4_exp/nvidia/qsa.py"
+assert _f.exists(), f"{_f} not found: run the earlier steps first"
+_MARK = "# flashnext DCP comm (session 22)"
+_EDITS = [
+    ("query all-gather started before the indexer",
+     """        selected = self.indexer(
+            projected_qk,
+            positions,
+            self.topk_indices_buffer[:num_tokens],
+        )
+""",
+     """        _fn_impl = self.impl
+        if _FN_DCP_QUERY_EARLY and getattr(_fn_impl, "dcp_world_size", 1) > 1:   """ + _MARK + """
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            _q = query
+            if getattr(_fn_impl, "_fn_k4", False):
+                from .ops.qsa_k4 import k4_rotate
+
+                _q = k4_rotate(query)
+            _q = _q[:num_tokens].contiguous()
+            _cur = torch.cuda.current_stream()
+            _side = _fn_dcp_side_stream()
+            _side.wait_stream(_cur)
+            with torch.cuda.stream(_side):
+                _qa = get_dcp_group().all_gather(_q, dim=1)
+            _q.record_stream(_side)
+            _fn_impl._fn_query_all = (_qa, _side)
+        selected = self.indexer(
+            projected_qk,
+            positions,
+            self.topk_indices_buffer[:num_tokens],
+        )
+"""),
+    ("the attention uses the early all-gather",
+     """        # The DCP group is the pair of TP ranks that share this KV head: gather both ranks' query heads.
+        query_all = group.all_gather(query[:num_tokens].contiguous(), dim=1)
+""",
+     """        # The DCP group is the pair of TP ranks that share this KV head: gather both ranks' query heads.
+        _fn_early = self.__dict__.pop("_fn_query_all", None)   """ + _MARK + """
+        if _fn_early is not None:
+            query_all, _side = _fn_early
+            torch.cuda.current_stream().wait_stream(_side)
+            query_all.record_stream(torch.cuda.current_stream())
+        else:
+            query_all = group.all_gather(query[:num_tokens].contiguous(), dim=1)
+"""),
+    ("BF16 partials",
+     """        merged = self.dcp_combine(partial, lse, group, is_lse_base_on_e=False)
+""",
+     """        if _FN_DCP_BF16_PARTIAL:   """ + _MARK + """
+            partial = partial.to(torch.bfloat16)
+        merged = self.dcp_combine(partial, lse, group, is_lse_base_on_e=False)
+"""),
+    ("switches + side stream",
+     """class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+""",
+     """_FN_DCP_QUERY_EARLY = __import__("os").environ.get("FLASHNEXT_DCP_QUERY_EARLY") == "1"   """ + _MARK + """
+_FN_DCP_BF16_PARTIAL = __import__("os").environ.get("FLASHNEXT_DCP_BF16_PARTIAL") == "1"
+_fn_dcp_side = []
+
+
+def _fn_dcp_side_stream():
+    if not _fn_dcp_side:
+        _fn_dcp_side.append(torch.cuda.Stream())
+    return _fn_dcp_side[0]
+
+
+if _FN_DCP_QUERY_EARLY:
+    print("flashnext DCP comm: query all-gather early ON", flush=True)
+if _FN_DCP_BF16_PARTIAL:
+    print("flashnext DCP comm: BF16 partials ON", flush=True)
+
+
+class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+"""),
+]
+_s = _f.read_text()
+for _label, _old, _new in _EDITS:
+    if _new in _s:
+        print("DCP comm: [already]", _label)
+        continue
+    assert _s.count(_old) == 1, f"DCP comm edit '{_label}': anchor found {_s.count(_old)} times in {_f} (patch cell changed?)"
+    _s = _s.replace(_old, _new)
+    print("DCP comm: [installed]", _label)
+compile(_s, str(_f), "exec")
+_f.write_text(_s)
+print("(FLASHNEXT_DCP_QUERY_EARLY=1 and/or FLASHNEXT_DCP_BF16_PARTIAL=1 before the server starts; unset = unchanged)")

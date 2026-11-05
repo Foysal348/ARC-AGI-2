@@ -1,0 +1,157 @@
+import os
+from pathlib import Path
+
+INPUT_ROOT = "/kaggle/input"
+manifests, model_dirs = [], []
+for d, _, files in os.walk(INPUT_ROOT):
+    fs = set(files)
+    if "UTILITY_MANIFEST.json" in fs:
+        manifests.append(d)
+    if "config.json" in fs and any(f.endswith(".safetensors") for f in fs):
+        model_dirs.append(d)
+
+def _one(what, found, hint):
+    if len(found) != 1:
+        raise RuntimeError(f"step 0: {what}: found {len(found)}, need exactly 1:\n  " + "\n  ".join(sorted(found) or ["(none)"]) + f"\n{hint}")
+    return found[0]
+
+_inside = lambda d, top: d == top or d.startswith(top.rstrip("/") + "/")
+UTILITY_PATH = _one("the vLLM utility (folder with UTILITY_MANIFEST.json)", manifests,
+                    "Attach the utility notebook's output (one version only).")
+MODEL_PATH = _one("the model (folder with config.json and .safetensors files)", [d for d in model_dirs if not _inside(d, UTILITY_PATH)],
+                  "Attach exactly one model version.")
+assert "TEST_FILE" in globals(), "run the START cell first"
+COMP_DIR = os.path.dirname(TEST_FILE)
+print("utility    :", UTILITY_PATH)
+print("model      :", MODEL_PATH)
+print("test tasks :", TEST_FILE, f"({len(TEST_TASKS)} tasks)")
+
+PREFETCH_READERS = 24
+PREFETCH_LOG = "/kaggle/working/prefetch.log"
+NGRAM_SHM = "/dev/shm/flashnext_ngram.bin"
+_PREFETCH_PY = r"""
+import json, os, re, struct, sys, time, glob
+from concurrent.futures import ThreadPoolExecutor
+# session 16 (startup test 6): argv = root, readers, log, [n-gram table file in /dev/shm]. With the 4th argument, the n-gram rows of the
+# ple-*.safetensors files are written ONCE into that file (rows in global order, layout in <file>.json; read from the network and dropped
+# from the page cache right away, so the 51 GB are not held twice); every other file is read into the page cache as before.
+root, n, log = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+shm = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+# in the order vLLM loads them (its natural sort, weight_utils._natural_sort_key), each file by many readers at once: when RAM gets
+# tight while vLLM pins the n-gram table, Linux drops the OLDEST cached data first, i.e. what vLLM has already loaded (session 11:
+# the earlier order "first pieces of every file first" let it drop the starts of files vLLM still needed -> network re-reads)
+nat = lambda p: [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(p))]
+files = sorted(glob.glob(os.path.join(root, "*.safetensors")), key=nat)
+piece = 256 << 20
+ESIZE = {"F8_E4M3": 1, "F8_E5M2": 1, "U8": 1, "I8": 1, "BF16": 2, "F16": 2, "F32": 4}
+TORCH = {"F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2", "U8": "uint8", "I8": "int8", "BF16": "bfloat16", "F16": "float16", "F32": "float32"}
+
+def header(f):
+    with open(f, "rb") as fh:
+        k = struct.unpack("<Q", fh.read(8))[0]
+        return json.loads(fh.read(k)), 8 + k
+
+table_jobs, shm_meta = [], None
+if shm:
+    shards, ple_files = {}, [f for f in files if os.path.basename(f).startswith("ple-")]
+    for f in ple_files:
+        h, data0 = header(f)
+        for name, v in h.items():
+            m = re.search(r"ngram_embedding\.shard_(\d+)\.weight$", name)
+            if m:
+                if int(m.group(1)) in shards:
+                    raise SystemExit(f"n-gram shm: shard {m.group(1)} appears twice")
+                shards[int(m.group(1))] = (f, data0 + v["data_offsets"][0], v["data_offsets"][1] - v["data_offsets"][0], v["dtype"], v["shape"])
+    if not shards:
+        raise SystemExit("n-gram shm: no ngram_embedding.shard_N.weight tensors in the ple-*.safetensors files")
+    idx = sorted(shards)
+    if idx != list(range(len(idx))):
+        raise SystemExit(f"n-gram shm: shard numbers are not 0..{len(idx) - 1}")
+    dtypes = {shards[i][3] for i in idx}; dims = {tuple(shards[i][4][1:]) for i in idx}
+    if len(dtypes) != 1 or len(dims) != 1 or len(next(iter(dims))) != 1:
+        raise SystemExit(f"n-gram shm: mixed shard dtypes/shapes {dtypes} {dims}")
+    dt = dtypes.pop(); dim = next(iter(dims))[0]; row = dim * ESIZE[dt]
+    shard_rows = shards[0][4][0]
+    if any(shards[i][4][0] != shard_rows for i in idx[:-1]) or shards[idx[-1]][4][0] > shard_rows:
+        raise SystemExit("n-gram shm: the shards do not all have the same number of rows (only the last may be shorter)")
+    total_rows = sum(shards[i][4][0] for i in idx)
+    size = (total_rows + 65536) * row                     # spare rows (zeros, never touched) for vLLM's per-GPU padding
+    shm_meta = {"source": root, "torch_dtype": TORCH[dt], "row_bytes": row, "rows": total_rows, "shard_rows": shard_rows,
+                "shards": len(idx), "file_bytes": size, "complete": False}
+    old = json.load(open(shm + ".json")) if os.path.exists(shm + ".json") else None
+    if old and old.get("complete") and {k: old.get(k) for k in shm_meta if k != "complete"} == {k: v for k, v in shm_meta.items() if k != "complete"} \
+            and os.path.exists(shm) and os.path.getsize(shm) == size:
+        shm_meta = None                                    # already built in this session
+    else:
+        free = os.statvfs(os.path.dirname(shm)); free = free.f_bavail * free.f_frsize
+        if free < total_rows * row:
+            raise SystemExit(f"n-gram shm: {os.path.dirname(shm)} has {free / 1e9:.1f} GB free, the table needs {total_rows * row / 1e9:.1f} GB")
+        for p in (shm, shm + ".json"):
+            if os.path.exists(p):
+                os.remove(p)
+        with open(shm, "wb") as fh:
+            fh.truncate(size)
+        for i in idx:
+            f, off, nbytes = shards[i][:3]
+            dst = i * shard_rows * row
+            for o in range(0, nbytes, 64 << 20):
+                table_jobs.append((f, off + o, dst + o, min(64 << 20, nbytes - o)))
+    files = [f for f in files if not os.path.basename(f).startswith("ple-")]   # vLLM reads only the tiny non-table tensors there itself
+
+jobs = [("cache", f, o, None, min(piece, os.path.getsize(f) - o)) for f in files for o in range(0, os.path.getsize(f), piece)] + \
+       [("table", f, o, d, s) for f, o, d, s in table_jobs]
+total, done, t0 = sum(j[4] for j in jobs), [0], time.time()
+shm_fd = os.open(shm, os.O_RDWR) if table_jobs else None
+
+def run(j):
+    kind, f, off, dst, size = j
+    fd = os.open(f, os.O_RDONLY)
+    try:
+        start, left = off, size
+        while left > 0:
+            b = os.pread(fd, min(left, 16 << 20), off)
+            if not b:
+                raise IOError(f"short read {f} at {off}")
+            if kind == "table":
+                w = os.pwrite(shm_fd, b, dst + (off - start))
+                if w != len(b):
+                    raise IOError(f"short write to {shm}")
+            off += len(b); left -= len(b); done[0] += len(b)
+        if kind == "table":
+            os.posix_fadvise(fd, start, size, os.POSIX_FADV_DONTNEED)   # the rows are in /dev/shm now: do not keep the network copy
+    finally:
+        os.close(fd)
+
+with open(log, "w") as L:
+    L.write(f"prefetch: {len(files)} files to the page cache"
+            + (f" + n-gram table {sum(j[3] for j in table_jobs) / 2**30:.1f} GiB to {shm}" if table_jobs else
+               (f" | n-gram table already in {shm}" if shm else "")) + f", {total / 2**30:.1f} GiB, {n} readers\n"); L.flush()
+    with ThreadPoolExecutor(n) as ex:
+        futs = [ex.submit(run, j) for j in jobs]
+        while not all(f.done() for f in futs):
+            time.sleep(10)
+            L.write(f"{time.time() - t0:6.0f} s  {done[0] / 2**30:6.1f} / {total / 2**30:.1f} GiB  {done[0] / 1e6 / (time.time() - t0):6.0f} MB/s\n"); L.flush()
+        for f in futs:
+            f.result()
+    if shm_meta is not None:
+        os.fsync(shm_fd) if shm_fd is not None else None
+        shm_meta["complete"] = True
+        json.dump(shm_meta, open(shm + ".json", "w"))
+        L.write(f"NGRAM SHM DONE: {shm_meta['rows']:,} rows x {shm_meta['row_bytes']} bytes = {shm_meta['rows'] * shm_meta['row_bytes'] / 2**30:.1f} GiB in {shm}\n")
+    L.write(f"PREFETCH DONE: {done[0] / 2**30:.1f} GiB in {time.time() - t0:.0f} s ({done[0] / 1e6 / (time.time() - t0):.0f} MB/s)\n")
+"""
+PREFETCH_AFTER_STEP2 = False
+if PREFETCH_READERS and PREFETCH_AFTER_STEP2:
+    print(f"model prefetch: starts in step 2, after the utility tars ({PREFETCH_READERS} readers, log {PREFETCH_LOG})")
+elif PREFETCH_READERS:
+    _old = globals().get("PREFETCH_PROC")
+    if _old is not None and _old.poll() is None:
+        print("model prefetch: already running (started by an earlier run of this cell), log", PREFETCH_LOG)
+    elif os.path.exists(PREFETCH_LOG) and "PREFETCH DONE" in open(PREFETCH_LOG).read():
+        print("model prefetch: already done in this session:", open(PREFETCH_LOG).read().strip().splitlines()[-1])
+    else:
+        import subprocess, sys
+        Path("/kaggle/working/prefetch.py").write_text(_PREFETCH_PY)
+        PREFETCH_PROC = subprocess.Popen([sys.executable, "/kaggle/working/prefetch.py", MODEL_PATH, str(PREFETCH_READERS), PREFETCH_LOG, NGRAM_SHM or ""],
+                                         stdout=subprocess.DEVNULL, stderr=open(PREFETCH_LOG + ".err", "w"), start_new_session=True)
+        print(f"model prefetch: reading {MODEL_PATH} into RAM in the background with {PREFETCH_READERS} readers (log {PREFETCH_LOG}); step 6 waits for it")

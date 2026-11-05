@@ -1,0 +1,37 @@
+import os
+from pathlib import Path
+_f = Path("/tmp/site-vllm/vllm/model_executor/model_loader/weight_utils.py")
+_s = _f.read_text()
+_MARK = "flashnext startup test 14: skip every tensor of a non-local expert"
+_old = "if should_skip_weight(name, local_expert_ids):"
+_new = "if should_skip_weight(name, local_expert_ids) or _fn_skip_nonlocal_expert(name, local_expert_ids):"
+_helper = """
+
+# ---- {mark}
+_FN_EXPERT_RE = __import__("re").compile(r"\\.experts\\.(\\d+)\\.")
+_FN_EP_SKIPPED = [0]
+
+
+def _fn_skip_nonlocal_expert(name, local_expert_ids):
+    if local_expert_ids is None or __import__("os").environ.get("FLASHNEXT_EP_FILTER_ALL") != "1":
+        return False
+    m = _FN_EXPERT_RE.search(name)
+    if m is None or int(m.group(1)) in local_expert_ids:
+        return False
+    _FN_EP_SKIPPED[0] += 1
+    if _FN_EP_SKIPPED[0] == 1 or _FN_EP_SKIPPED[0] % 25000 == 0:
+        logger.info("flashnext EP filter (all tensors): %d non-local expert tensors skipped so far (e.g. %s)", _FN_EP_SKIPPED[0], name)
+    return True
+""".replace("{mark}", _MARK)
+if _MARK in _s:
+    print("  [already]", _f)
+else:
+    _n = _s.count(_old)
+    assert _n >= 1, f"{_f}: '{_old}' not found (vLLM differs from 0.31.0?)"
+    assert "logger" in _s, f"{_f}: no logger"
+    _s = _s.replace(_old, _new) + _helper
+    compile(_s, str(_f), "exec")
+    _f.write_text(_s)
+    print(f"  [patch] {_f}: {_n} place(s) also skip every tensor of a non-local expert when FLASHNEXT_EP_FILTER_ALL=1")
+os.environ["FLASHNEXT_EP_FILTER_ALL"] = "1"
+print("FLASHNEXT_EP_FILTER_ALL = 1 (needs --enable-ep-weight-filter, which step 6 passes)")

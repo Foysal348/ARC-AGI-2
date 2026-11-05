@@ -1,0 +1,344 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_km = _root / "v1/core/kv_cache_manager.py"
+_sm = _root / "v1/core/single_type_kv_cache_manager.py"
+for _p in (_km, _sm):
+    assert _p.exists(), f"{_p} not found: run the earlier steps first"
+_MARK = "# flashnext exact resume (session 18b)"
+_KM_EDITS = [
+    ("adopt after vLLM's hit search",
+     """            computed_blocks, num_new_computed_tokens, num_uncached = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
+            )
+""",
+     """            computed_blocks, num_new_computed_tokens, num_uncached = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
+                )
+            )
+            if _FN_ER["on"]:   """ + _MARK + """
+                computed_blocks, num_new_computed_tokens, num_uncached = _fn_er_adopt(
+                    self, request, max_cache_hit_length, computed_blocks, num_new_computed_tokens, num_uncached)
+"""),
+    ("release after the allocation",
+     """        new_blocks = self.coordinator.allocate_new_blocks(
+            request.request_id,
+            num_tokens_need_slot,
+            num_tokens_main_model,
+            num_encoder_tokens,
+        )
+""",
+     """        new_blocks = self.coordinator.allocate_new_blocks(
+            request.request_id,
+            num_tokens_need_slot,
+            num_tokens_main_model,
+            num_encoder_tokens,
+        )
+        if _FN_ER["pending"]:   """ + _MARK + """
+            _fn_er_done(self, request)
+"""),
+    ("park in free()",
+     '''        """Free the blocks allocated for the request.
+        We free the blocks in reverse order so that the tail blocks are evicted
+        first when caching is enabled.
+
+        Args:
+            request: The request to free the blocks.
+
+        """
+''',
+     '''        """Free the blocks allocated for the request.
+        We free the blocks in reverse order so that the tail blocks are evicted
+        first when caching is enabled.
+
+        Args:
+            request: The request to free the blocks.
+
+        """
+        if _FN_ER["on"]:   ''' + _MARK + '''
+            _fn_er_park(self, request)
+'''),
+    ("park in pop_blocks_for_free()",
+     '''        Returns:
+            The request's blocks in allocation order.
+
+        """
+        return self.coordinator.pop_blocks_for_free(request.request_id)
+''',
+     '''        Returns:
+            The request's blocks in allocation order.
+
+        """
+        if _FN_ER["on"]:   ''' + _MARK + '''
+            _fn_er_park(self, request)
+        return self.coordinator.pop_blocks_for_free(request.request_id)
+'''),
+]
+_SM_EDITS = [
+    ("ring hand-over",
+     '''    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        return
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        return
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        return 0
+
+
+class KpoolTailManager(CircularBufferManager):''',
+     '''    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        from vllm.v1.core.kv_cache_manager import _FN_ER   ''' + _MARK + '''
+        _e = _FN_ER["pending"].get(request_id)
+        if _e is not None and self.kv_cache_group_id in _e["ring"] and not self.req_to_blocks[request_id]:
+            self.req_to_blocks[request_id].append(_e["ring"][self.kv_cache_group_id])
+            _e["ring_taken"].add(self.kv_cache_group_id)
+        return
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
+    ) -> None:
+        return
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        return 0
+
+
+class KpoolTailManager(CircularBufferManager):'''),
+]
+_FN = '''
+
+''' + _MARK + '''
+import collections as _fer_col
+import os as _fer_os
+import time as _fer_time
+
+_FN_ER = {"on": _fer_os.environ.get("FLASHNEXT_EXACT_RESUME") == "1", "entries": _fer_col.OrderedDict(), "pending": {},
+          "ttl": float(_fer_os.environ.get("FLASHNEXT_EXACT_RESUME_TTL", "600")),
+          "min_free": int(_fer_os.environ.get("FLASHNEXT_EXACT_RESUME_MIN_FREE", "64")), "cap": 512,
+          "any_finish": _fer_os.environ.get("FLASHNEXT_EXACT_RESUME_TEST_ANY_FINISH") == "1",   # TEST ONLY: also park length-capped calls
+          "n": _fer_col.Counter(), "tot": _fer_col.Counter(), "t": _fer_time.time(), "errors": 0, "said": False}
+_FER_KEYS = ("parked", "parked blocks pinned", "adopted", "tokens gained", "no entry", "entry not longer", "prompt differs",
+             "hashed block lost", "released: ttl", "released: pressure", "released: replaced", "skipped: not stopped", "skipped: short")
+
+
+def _fer_err(where, e):
+    _FN_ER["errors"] += 1
+    if _FN_ER["errors"] <= 20:
+        print(f"FLASHNEXT EXACT RESUME {where} error: {e!r}"[:400], flush=True)
+
+
+def _fer_report():
+    now = _fer_time.time()
+    if now - _FN_ER["t"] < 60:
+        return
+    _FN_ER["t"] = now
+    n, tot = _FN_ER["n"], _FN_ER["tot"]
+    tot.update(n)
+    print("FLASHNEXT EXACT RESUME (last 60 s | total): " + " | ".join(f"{k} {n[k]} / {tot[k]}" for k in _FER_KEYS)
+          + f" || entries {len(_FN_ER['entries'])} pending {len(_FN_ER['pending'])} errors {_FN_ER['errors']}", flush=True)
+    n.clear()
+
+
+def _fer_key(ids):
+    from vllm.v1.core.single_type_kv_cache_manager import fn_trim_sink_of
+    sink = fn_trim_sink_of(ids)
+    return hash(tuple(ids[:sink + 200])) if len(ids) >= sink + 200 else None
+
+
+def _fer_release(mgr, e, why):
+    pins = [b for b in e["pins"] if not any(b is e["ring"][g] for g in e["ring_taken"])]
+    e["pins"] = []
+    if pins:
+        mgr.block_pool.free_blocks(pins)
+    if why:
+        _FN_ER["n"]["released: " + why] += 1
+
+
+def _fer_drop(mgr, key, why):
+    e = _FN_ER["entries"].pop(key, None)
+    if e is not None:
+        for rid in [r for r, x in _FN_ER["pending"].items() if x is e]:
+            _FN_ER["pending"].pop(rid, None)
+        _fer_release(mgr, e, why)
+
+
+def _fer_housekeeping(mgr):
+    ents = _FN_ER["entries"]
+    now = _fer_time.time()
+    while ents:
+        k, e = next(iter(ents.items()))
+        if now - e["t"] > _FN_ER["ttl"] or len(ents) > _FN_ER["cap"]:
+            _fer_drop(mgr, k, "ttl")
+        else:
+            break
+    while ents and mgr.block_pool.get_num_free_blocks() < _FN_ER["min_free"]:
+        _fer_drop(mgr, next(iter(ents)), "pressure")
+
+
+def _fn_er_park(mgr, request):
+    try:
+        from vllm.v1.request import RequestStatus
+        from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, MambaManager
+        from vllm.utils.math_utils import cdiv
+        if not _FN_ER["said"]:
+            _FN_ER["said"] = True
+            print(f"flashnext exact resume: ON (ttl {_FN_ER['ttl']:.0f} s, min free blocks {_FN_ER['min_free']})", flush=True)
+        if request.status != RequestStatus.FINISHED_STOPPED and not (_FN_ER["any_finish"] and request.status == RequestStatus.FINISHED_LENGTH_CAPPED):
+            _FN_ER["n"]["skipped: not stopped"] += 1
+            return
+        L = int(request.num_computed_tokens)
+        ids = list(request.all_token_ids)
+        if L < 1024 or L > len(ids):
+            _FN_ER["n"]["skipped: short"] += 1
+            return
+        T = ids[:L]
+        key = _fer_key(T)
+        if key is None:
+            _FN_ER["n"]["skipped: short"] += 1
+            return
+        coord = mgr.coordinator
+        groups, pins, hashed, ring = [], [], [], {}
+        for m in coord.single_type_managers:
+            blocks = m.req_to_blocks.get(request.request_id)
+            if not blocks:
+                return
+            if isinstance(m, CircularBufferManager):
+                ring[m.kv_cache_group_id] = blocks[0]
+                pins.append(blocks[0])
+                groups.append(("ring",))
+            elif isinstance(m, MambaManager):
+                idx = (L - 1) // m.block_size
+                if idx >= len(blocks) or blocks[idx].is_null:
+                    return
+                pins.append(blocks[idx])
+                groups.append(("state", idx, blocks[idx]))
+            else:
+                n = cdiv(L, m.block_size)
+                if n > len(blocks):
+                    return
+                sel = list(blocks[:n])
+                for j, b in enumerate(sel):
+                    if b.is_null:
+                        continue
+                    if b.block_hash is not None and j < n - 1:
+                        hashed.append((b, b.block_hash))
+                    else:
+                        pins.append(b)
+                groups.append(("blocks", sel))
+        for b in pins:
+            b.ref_cnt += 1                       # the request still holds one: the block stays out of the free queue
+        if key in _FN_ER["entries"]:
+            _fer_drop(mgr, key, "replaced")
+        _FN_ER["entries"][key] = {"L": L, "T": T, "groups": groups, "pins": pins, "hashed": hashed, "ring": ring, "ring_taken": set(),
+                                  "t": _fer_time.time()}
+        _FN_ER["n"]["parked"] += 1
+        _FN_ER["n"]["parked blocks pinned"] += len(pins)
+        _fer_housekeeping(mgr)
+    except Exception as e:
+        _fer_err("park", e)
+    try:
+        _fer_report()
+    except Exception:
+        pass
+
+
+def _fn_er_adopt(mgr, request, max_len, computed_blocks, hit, unc):
+    try:
+        _FN_ER["pending"].pop(request.request_id, None)
+        if not _FN_ER["entries"]:
+            return computed_blocks, hit, unc
+        _fer_housekeeping(mgr)
+        ids = list(request.prompt_token_ids or [])
+        key = _fer_key(ids)
+        e = _FN_ER["entries"].get(key) if key is not None else None
+        if e is None:
+            _FN_ER["n"]["no entry"] += 1
+            return computed_blocks, hit, unc
+        L = e["L"]
+        if L <= hit or L > max_len:
+            _FN_ER["n"]["entry not longer"] += 1
+            return computed_blocks, hit, unc
+        if ids[:L] != e["T"]:
+            _FN_ER["n"]["prompt differs"] += 1
+            return computed_blocks, hit, unc
+        if any(b.block_hash != h for b, h in e["hashed"]):
+            _FN_ER["n"]["hashed block lost"] += 1
+            _fer_drop(mgr, key, "")
+            return computed_blocks, hit, unc
+        null = mgr.block_pool.null_block
+        out = []
+        for g in e["groups"]:
+            if g[0] == "ring":
+                out.append([])
+            elif g[0] == "state":
+                out.append([null] * g[1] + [g[2]])
+            else:
+                out.append(list(g[1]))
+        _FN_ER["pending"][request.request_id] = e
+        _FN_ER["n"]["adopted"] += 1
+        _FN_ER["n"]["tokens gained"] += L - hit
+        return tuple(out), L, 0
+    except Exception as ex:
+        _fer_err("adopt", ex)
+        _FN_ER["pending"].pop(request.request_id, None)
+        return computed_blocks, hit, unc
+
+
+def _fn_er_done(mgr, request):
+    try:
+        e = _FN_ER["pending"].pop(request.request_id, None)
+        if e is None:
+            return
+        for k in [k for k, x in _FN_ER["entries"].items() if x is e]:
+            _FN_ER["entries"].pop(k, None)
+        _fer_release(mgr, e, "")
+    except Exception as ex:
+        _fer_err("done", ex)
+'''
+
+def _fn_er_apply(path, edits, tail):
+    s = path.read_text()
+    if _MARK in s:
+        return "already"
+    for label, old, new in edits:
+        assert s.count(old) == 1, f"exact resume edit '{label}': anchor found {s.count(old)} times in {path} (vLLM or an earlier cell changed?)"
+        s = s.replace(old, new, 1)
+    s += tail
+    compile(s, str(path), "exec")
+    path.write_text(s)
+    return "installed"
+
+print("exact resume:", _fn_er_apply(_km, _KM_EDITS, _FN), "in", _km, "|", _fn_er_apply(_sm, _SM_EDITS, ""), "in", _sm,
+      "(FLASHNEXT_EXACT_RESUME=1; log lines 'FLASHNEXT EXACT RESUME')")
+import os as _os_er
+_os_er.environ["FLASHNEXT_EXACT_RESUME"] = "1"

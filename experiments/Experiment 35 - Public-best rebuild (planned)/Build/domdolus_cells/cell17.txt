@@ -1,0 +1,104 @@
+import os
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_MARK = "# flashnext ckpack (session 18b)"
+_f = _root / "models/qwen4_exp/nvidia/indexer_qsa.py"
+_EDITS = [
+    ("indexer keys FP8",
+     """        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+            "bf16"
+        )
+""",
+     """        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+            "bf16"
+        )
+        if _FN_CKP["on"]:   """ + _MARK + """
+            self.indexer_kv_dtype = "fp8"
+"""),
+    ("two layers per compressed-key row",
+     """        self.compressed_key_cache = QSACompressedKeyCache(
+            head_size=self.index_head_dim,
+            dtype=indexer_dtype,
+            compress_ratio=self.compress_ratio,
+            prefix=f"{cache_prefix}compressed_key_cache",
+            cache_config=cache_config,
+            vllm_config=vllm_config,
+        )
+""",
+     """        if _FN_CKP["on"]:   """ + _MARK + """
+            self.compressed_key_cache = _fn_ckp_make(self, QSACompressedKeyCache, indexer_dtype, cache_prefix, cache_config, vllm_config)
+        else:
+            self.compressed_key_cache = QSACompressedKeyCache(
+                head_size=self.index_head_dim,
+                dtype=indexer_dtype,
+                compress_ratio=self.compress_ratio,
+                prefix=f"{cache_prefix}compressed_key_cache",
+                cache_config=cache_config,
+                vllm_config=vllm_config,
+            )
+"""),
+    ("forward uses this layer's half of the row",
+     """        compressed_key_cache = self.compressed_key_cache.kv_cache
+""",
+     """        compressed_key_cache = _fn_ckp_view(self.compressed_key_cache)   """ + _MARK + """
+"""),
+]
+_TAIL = '''
+
+''' + _MARK + '''
+import os as _fn_ckp_os
+
+_FN_CKP = {"on": _fn_ckp_os.environ.get("FLASHNEXT_QSA_CKPACK") == "1", "open": None, "pairs": 0}
+
+
+class _FnCkPartner:
+    """The second layer of a pair: no cache of its own; bytes [w, 2w) of the owner's rows, the owner's metadata (prefix)."""
+
+    def __init__(self, owner, width):
+        self._owner, self._w = owner, width
+        self.prefix = owner.prefix
+
+    @property
+    def kv_cache(self):
+        return self._owner.kv_cache[..., self._w:2 * self._w]
+
+
+def _fn_ckp_make(ix, cls, dtype, cache_prefix, cache_config, vllm_config):
+    if dtype != torch.float8_e4m3fn:
+        raise RuntimeError(f"flashnext ckpack needs FP8 indexer keys, got {dtype}")
+    w = int(ix.index_head_dim)
+    owner = _FN_CKP["open"]
+    if owner is None or owner._fn_ck_cfg is not vllm_config:
+        owner = cls(head_size=2 * w, dtype=dtype, compress_ratio=ix.compress_ratio, prefix=f"{cache_prefix}compressed_key_cache",
+                    cache_config=cache_config, vllm_config=vllm_config)
+        owner._fn_ck_cfg, owner._fn_ck_w = vllm_config, w
+        _FN_CKP["open"] = owner
+        return owner
+    _FN_CKP["open"] = None
+    _FN_CKP["pairs"] += 1
+    print(f"flashnext ckpack: {cache_prefix}compressed_key_cache shares the FP8 rows of {owner.prefix} (bytes {w}-{2 * w - 1}); "
+          f"pairs so far {_FN_CKP['pairs']}", flush=True)
+    return _FnCkPartner(owner, w)
+
+
+def _fn_ckp_view(c):
+    if isinstance(c, _FnCkPartner):
+        return c.kv_cache
+    w = getattr(c, "_fn_ck_w", None)
+    return c.kv_cache if w is None else c.kv_cache[..., :w]
+'''
+assert _f.exists(), f"{_f} not found: run the earlier steps first"
+_s = _f.read_text()
+if _MARK in _s:
+    print("ckpack: [already] in", _f)
+else:
+    for _label, _old, _new in _EDITS:
+        assert _s.count(_old) == 1, f"ckpack edit '{_label}': anchor found {_s.count(_old)} times in {_f} (vLLM or an earlier cell changed?)"
+        _s = _s.replace(_old, _new)
+    _s += _TAIL
+    compile(_s, str(_f), "exec")
+    _f.write_text(_s)
+    print("ckpack: [installed] in", _f)
+os.environ["FLASHNEXT_QSA_CKPACK"] = "1"
+print("FLASHNEXT_QSA_CKPACK =", os.environ["FLASHNEXT_QSA_CKPACK"])

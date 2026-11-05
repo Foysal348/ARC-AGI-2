@@ -1,0 +1,116 @@
+import os
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_fs, _fb = _root / "v1/core/sched/scheduler.py", _root / "v1/core/block_pool.py"
+_MARK = "# flashnext miss deferral (session 22)"
+
+_HELPERS = '''
+
+''' + _MARK + '''
+import os as _fmd_os
+import time as _fmd_time
+
+_FN_MD = {"on": _fmd_os.environ.get("FLASHNEXT_MISS_DEFER") == "1",
+          "window_s": float(_fmd_os.environ.get("FLASHNEXT_DEFER_WINDOW_S", "60")),
+          "max_s": float(_fmd_os.environ.get("FLASHNEXT_DEFER_MAX_S", "1200")),   # replay: 180 s re-started the cascade; harness timeout 3600 s
+          "gap_s": float(_fmd_os.environ.get("FLASHNEXT_DEFER_GAP_S", "60")),
+          "min_tokens": int(_fmd_os.environ.get("FLASHNEXT_DEFER_MIN_TOKENS", "16384")),
+          "frac": float(_fmd_os.environ.get("FLASHNEXT_DEFER_FRAC", "0.5")),
+          "clock": _fmd_time.monotonic, "last_att_evict": -1e18, "att_evicted": 0, "deferred": 0, "first": {}, "deferred_reqs": set(),
+          "released": 0, "held_back": 0, "rel": None, "rel_done": None, "t": _fmd_time.time()}
+
+
+def _fn_md_pressure() -> bool:
+    return _FN_MD["clock"]() - _FN_MD["last_att_evict"] <= _FN_MD["window_s"]
+
+
+def _fn_md_defer(request, requests) -> bool:
+    """True = skip this large miss now; False once it has waited max_s (aging), one released call at a time."""
+    m = _FN_MD
+    now = m["clock"]()
+    t0 = m["first"].setdefault(request.request_id, now)
+    if now - t0 >= m["max_s"]:
+        if m["rel"] == request.request_id:
+            return False
+        if m["rel"] is not None:
+            r = requests.get(m["rel"])
+            if r is not None and r.num_computed_tokens < r.num_prompt_tokens:
+                m["held_back"] += 1
+                return True
+            if m["rel_done"] is None:
+                m["rel_done"] = now
+            if now - m["rel_done"] < m["gap_s"]:
+                m["held_back"] += 1
+                return True
+        m["rel"], m["rel_done"] = request.request_id, None
+        m["released"] += 1
+        return False
+    m["deferred"] += 1
+    m["deferred_reqs"].add(request.request_id)
+    return True
+
+
+def _fn_md_report(requests) -> None:
+    m = _FN_MD
+    now = _fmd_time.time()
+    if now - m["t"] >= 60:
+        m["t"] = now
+        for rid in [r for r in m["first"] if r not in requests]:
+            del m["first"][rid]
+        print(f"flashnext miss defer (total): attention blocks evicted {m['att_evicted']} | scan skips {m['deferred']} "
+              f"(distinct calls {len(m['deferred_reqs'])}) | run after waiting {m['max_s']:.0f} s: {m['released']} (one at a time, gap "
+              f"{m['gap_s']:.0f} s; held back {m['held_back']}) | waiting now {len(m['first'])} | pressure now {_fn_md_pressure()}", flush=True)
+'''
+
+_SCHED_EDITS = [
+    ("count scheduler steps",
+     "            while token_budget > 0:\n                # Requests holding KV blocks are always drained first.\n",
+     "            if _FN_MD[\"on\"]:   " + _MARK + "\n                _fn_md_report(self.requests)\n"
+     "            while token_budget > 0:\n                # Requests holding KV blocks are always drained first.\n"),
+    ("skip a large miss under pressure",
+     "                    # Skip request with pending mm encoding prefetches\n                    if self._ec_transfer_pending(request, num_computed_tokens):\n"
+     "                        skip_request(request_queue)\n                        continue\n\n                    # Track first scheduled prefill",
+     "                    # Skip request with pending mm encoding prefetches\n                    if self._ec_transfer_pending(request, num_computed_tokens):\n"
+     "                        skip_request(request_queue)\n                        continue\n\n"
+     "                    if (_FN_MD[\"on\"] and not load_kv_async   " + _MARK + "\n"
+     "                            and request.num_prompt_tokens >= _FN_MD[\"min_tokens\"]\n"
+     "                            and num_computed_tokens < _FN_MD[\"frac\"] * request.num_prompt_tokens\n"
+     "                            and _fn_md_pressure() and (self.running or len(request_queue) > 1)\n"
+     "                            and _fn_md_defer(request, self.requests)):\n"
+     "                        skip_request(request_queue)\n"
+     "                        continue\n\n"
+     "                    # Track first scheduled prefill"),
+]
+_POOL_EDITS = [
+    ("count evictions of cached attention blocks",
+     "        evicted_hashes = self._remove_cached_block_hashes(block)\n        if not evicted_hashes:\n"
+     "            # The block doesn't have hash, eviction is not needed\n            return False\n",
+     "        evicted_hashes = self._remove_cached_block_hashes(block)\n        if not evicted_hashes:\n"
+     "            # The block doesn't have hash, eviction is not needed\n            return False\n"
+     "        if not getattr(self, \"_fn_dropping\", False):   " + _MARK + "\n"
+     "            from vllm.v1.core.sched.scheduler import _FN_MD\n"
+     "            from vllm.v1.core.kv_cache_coordinator import _FN_SEG as _fmd_seg\n"
+     "            from vllm.v1.core.kv_cache_utils import get_group_id as _fmd_gid\n"
+     "            if _FN_MD[\"on\"] and _fmd_gid(evicted_hashes[0]) not in _fmd_seg[\"state_groups\"]:\n"
+     "                _FN_MD[\"att_evicted\"] += 1\n"
+     "                _FN_MD[\"last_att_evict\"] = _FN_MD[\"clock\"]()\n"),
+]
+
+def _apply(path, edits, tail):
+    s = path.read_text()
+    if _MARK in s:
+        return "already"
+    for label, old, new in edits:
+        assert s.count(old) == 1, f"miss deferral edit '{label}': anchor found {s.count(old)} times in {path} (vLLM or a patch cell changed?)"
+        s = s.replace(old, new)
+    s += tail
+    compile(s, str(path), "exec")
+    path.write_text(s)
+    return "installed"
+
+print("miss deferral:", _fs.relative_to(_root), f"[{_apply(_fs, _SCHED_EDITS, _HELPERS)}]", "|",
+      _fb.relative_to(_root), f"[{_apply(_fb, _POOL_EDITS, '')}]")
+assert os.environ.get("FLASHNEXT_OFFLOAD_EVICT") == "1", "miss deferral reads the DeltaNet group ids recorded by the evict offload (patch cell)"
+os.environ["FLASHNEXT_MISS_DEFER"] = "1"
+print("FLASHNEXT_MISS_DEFER =", os.environ["FLASHNEXT_MISS_DEFER"])

@@ -1,0 +1,61 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_f = _root / "models/qwen4_exp/nvidia/model.py"
+assert _f.exists(), f"{_f} not found: run the earlier steps first"
+_s = _f.read_text()
+_MARK = "# flashnext token embedding in host RAM (session 17)"
+_ANCHOR = """        loaded = loader.load_weights(
+            weights,
+            mapper=mapper,
+        )
+        return loaded
+"""
+_NEW = """        loaded = loader.load_weights(
+            weights,
+            mapper=mapper,
+        )
+        _flashnext_embed_to_host(self)   """ + _MARK + """
+        return loaded
+"""
+_FN = '''
+
+''' + _MARK + '''
+def _flashnext_embed_to_host(model) -> None:
+    import os
+
+    if os.environ.get("FLASHNEXT_EMBED_HOST") != "1":
+        return
+    from vllm.utils.platform_utils import is_uva_available
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    if not is_uva_available():
+        raise RuntimeError("FLASHNEXT_EMBED_HOST=1: this platform has no UVA; unset FLASHNEXT_EMBED_HOST")
+    emb = model.embed_tokens
+    if getattr(emb, "_flashnext_host_weight", None) is not None:
+        return
+    w = emb.weight
+    if w.device.type != "cuda":
+        raise RuntimeError(f"FLASHNEXT_EMBED_HOST=1: embed_tokens.weight is on {w.device}, expected the GPU")
+    host = torch.empty(w.shape, dtype=w.dtype, device="cpu", pin_memory=True)
+    host.copy_(w.data)
+    view = get_accelerator_view_from_cpu_tensor(host)
+    if not torch.equal(view[: min(4096, view.shape[0])], w.data[: min(4096, w.shape[0])]):
+        raise RuntimeError("FLASHNEXT_EMBED_HOST=1: the host copy of embed_tokens differs from the GPU weights")
+    emb._flashnext_host_weight = host            # keeps the pinned memory alive
+    emb.weight.data = view
+    torch.cuda.empty_cache()
+    print(f"flashnext embed host: embed_tokens {tuple(w.shape)} {w.dtype} moved to pinned host RAM "
+          f"({host.numel() * host.element_size() / 2**20:.0f} MiB per GPU freed)", flush=True)
+'''
+if _MARK in _s:
+    print("embed host: [already] in", _f)
+else:
+    assert _s.count(_ANCHOR) == 1, f"embed host anchor found {_s.count(_ANCHOR)} times in {_f} (vLLM changed?)"
+    _s = _s.replace(_ANCHOR, _NEW) + _FN
+    _f.write_text(_s)
+    compile(_s, str(_f), "exec")
+    print("embed host: [installed] in", _f, "(FLASHNEXT_EMBED_HOST=1 before the server starts; unset = unchanged)")
+import os
+os.environ["FLASHNEXT_EMBED_HOST"] = "1"
+print("FLASHNEXT_EMBED_HOST =", os.environ["FLASHNEXT_EMBED_HOST"])

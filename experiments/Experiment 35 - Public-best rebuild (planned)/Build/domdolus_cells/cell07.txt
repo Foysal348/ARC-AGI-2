@@ -1,0 +1,148 @@
+import hashlib, shutil, subprocess, sys, tarfile, time
+from pathlib import Path
+
+UTIL = Path(UTILITY_PATH)
+if not (UTIL / "UTILITY_MANIFEST.json").is_file():
+    found = subprocess.run("find /kaggle -maxdepth 6 -name UTILITY_MANIFEST.json 2>/dev/null", shell=True, capture_output=True, text=True).stdout
+    raise RuntimeError(f"UTILITY_MANIFEST.json is not in {UTIL}. Manifests found on this machine:\n{found or '(none)'}\nSet UTILITY_PATH in step 1 to the folder that holds it.")
+MANIFEST = json.loads((UTIL / "UTILITY_MANIFEST.json").read_text())
+WHEELHOUSE = UTIL
+print("utility:", UTIL, "\n", {k: MANIFEST.get(k) for k in ("created", "vllm", "torch", "humming", "layout", "pack", "pivotools_commit")})
+assert MANIFEST.get("vllm") == KIND["vllm"], (f"This utility holds vLLM {MANIFEST.get('vllm')!r}, but MODEL_KIND {MODEL_KIND!r} needs {KIND['vllm']}. "
+                                              "Point UTILITY_PATH at the right utility, or change MODEL_KIND.")
+VSITE, ASITE = Path("/tmp/site-vllm"), Path("/tmp/site-arc")
+
+def _warm(path, readers=16, piece=64 << 20):
+    from concurrent.futures import ThreadPoolExecutor
+    size, t0 = path.stat().st_size, time.time()
+    def _read(off):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            left = min(piece, size - off)
+            while left > 0:
+                b = os.pread(fd, min(left, 16 << 20), off)
+                if not b:
+                    raise IOError(f"short read {path} at {off}")
+                off += len(b); left -= len(b)
+        finally:
+            os.close(fd)
+    with ThreadPoolExecutor(readers) as ex:
+        list(ex.map(_read, range(0, size, piece)))
+    print(f"  {path.name}: {size / 1e9:.1f} GB read into RAM in {time.time() - t0:.0f} s ({size / 1e6 / max(time.time() - t0, 1e-3):.0f} MB/s, {readers} readers)", flush=True)
+
+def materialize(name, dest):
+    if (dest / ".ready").exists():
+        print(f"{name}: already in {dest}"); return
+    shutil.rmtree(dest, ignore_errors=True)
+    t0 = time.time()
+    tar = UTIL / f"{name}.tar"
+    if tar.exists():
+        dest.mkdir(parents=True)
+        _warm(tar)
+        _t1 = time.time()
+        _r = subprocess.run(["tar", "-xf", str(tar), "-C", str(dest)], capture_output=True, text=True)
+        if _r.returncode:
+            raise RuntimeError(f"tar failed for {tar} (exit {_r.returncode}): {_r.stderr[-2000:]}")
+        print(f"  {tar.name}: unpacked from RAM in {time.time() - _t1:.0f} s", flush=True)
+    else:
+        shutil.copytree(UTIL / name, dest, symlinks=True)
+    (dest / ".ready").write_text("ok")
+    print(f"{name}: ready in {dest} after {time.time() - t0:.0f}s")
+
+def offline_install(site, find_links, lock_file, label):
+    if (site / ".install_ok").exists():
+        print(f"{label}: already installed in {site}"); return
+    shutil.rmtree(site, ignore_errors=True); site.mkdir(parents=True)
+    t0 = time.time()
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--no-index", "--find-links", str(find_links), "--requirement", str(lock_file),
+                        "--target", str(site), "--upgrade", "--ignore-installed", "--only-binary", ":all:", "--no-compile", "--disable-pip-version-check",
+                        "--no-warn-conflicts"], capture_output=True, text=True)
+    print(f"{label}: pip exit {r.returncode} after {time.time() - t0:.0f}s")
+    if r.returncode:
+        print((r.stderr or r.stdout)[-3000:]); raise RuntimeError(f"{label} install failed")
+    (site / ".install_ok").write_text("ok")
+
+if MANIFEST.get("layout") == "nopip-sites":
+    materialize("site-vllm", VSITE); materialize("site-arc", ASITE)
+    for d in [VSITE / "bin", ASITE / "bin", *VSITE.glob("nvidia/*/bin"), *VSITE.glob("nvidia/*/nvvm/bin"), VSITE / "triton" / "backends" / "nvidia" / "bin"]:
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file():
+                    f.chmod(f.stat().st_mode | 0o755)
+else:
+    print("older utility layout: offline install from its wheels (pip with --no-index)")
+    offline_install(VSITE, UTIL, UTIL / "requirements.lock", "vLLM environment")
+    offline_install(ASITE, UTIL / "arc", UTIL / "arc" / "requirements.arc.lock", "harness environment")
+
+if globals().get("PREFETCH_AFTER_STEP2") and PREFETCH_READERS:
+    _old = globals().get("PREFETCH_PROC")
+    if _old is not None and _old.poll() is None:
+        print("model prefetch: already running, log", PREFETCH_LOG)
+    elif os.path.exists(PREFETCH_LOG) and "PREFETCH DONE" in open(PREFETCH_LOG).read():
+        print("model prefetch: already done in this session")
+    else:
+        Path("/kaggle/working/prefetch.py").write_text(_PREFETCH_PY)
+        PREFETCH_PROC = subprocess.Popen([sys.executable, "/kaggle/working/prefetch.py", MODEL_PATH, str(PREFETCH_READERS), PREFETCH_LOG, NGRAM_SHM or ""],
+                                         stdout=subprocess.DEVNULL, stderr=open(PREFETCH_LOG + ".err", "w"), start_new_session=True)
+        PREFETCH_T0 = time.time()
+        print(f"model prefetch: started now, {time.time() - T0:.0f} s after the kernel start ({PREFETCH_READERS} readers, log {PREFETCH_LOG})", flush=True)
+
+homes = [p.parent.parent for p in VSITE.glob("nvidia/*/bin/nvcc")]
+assert homes, "nvcc not found in the vLLM packages of the utility"
+CUDA_HOME = homes[0]
+lib = CUDA_HOME / "lib"
+if lib.is_dir() and not (CUDA_HOME / "lib64").exists():
+    (CUDA_HOME / "lib64").symlink_to(lib, target_is_directory=True)
+for d in (CUDA_HOME / "lib", CUDA_HOME / "lib64"):
+    if d.is_dir():
+        for f in d.glob("lib*.so.*"):
+            base = f.name.split(".so.")[0] + ".so"
+            if not (d / base).exists():
+                try: (d / base).symlink_to(f.name)
+                except OSError: pass
+print("CUDA_HOME =", CUDA_HOME)
+
+DRIVER_STUB = Path("/tmp/cuda-driver-stub")
+
+def vllm_env(extra=None):
+    env = dict(os.environ)
+    if DRIVER_STUB.exists():
+        env["LIBRARY_PATH"] = os.pathsep.join([str(DRIVER_STUB)] + ([env["LIBRARY_PATH"]] if env.get("LIBRARY_PATH") else []))
+    env["PYTHONPATH"] = os.pathsep.join([str(VSITE / "nvidia_cutlass_dsl" / "dsl_packages"), str(VSITE)])
+    env["CUDA_HOME"] = env["CUDA_PATH"] = str(CUDA_HOME)
+    env["PATH"] = os.pathsep.join([str(CUDA_HOME / "bin"), str(VSITE / "bin"), env.get("PATH", "")])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join([str(CUDA_HOME / "lib"), str(VSITE / "torch" / "lib")] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
+    env.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1",
+                "TOKENIZERS_PARALLELISM": "false", "VLLM_ENGINE_READY_TIMEOUT_S": "3600"})
+    if extra: env.update(extra)
+    return env
+
+def find_libcuda():
+    code = "import torch; torch.cuda.init(); print('\\n'.join(l.split()[-1] for l in open('/proc/self/maps') if 'libcuda.so' in l))"
+    r = subprocess.run([sys.executable, "-c", code], env=vllm_env(), capture_output=True, text=True)
+    paths = [p for p in r.stdout.split() if "libcuda.so" in p]
+    if paths:
+        return os.path.realpath(paths[0])
+    out = subprocess.run("find /usr /lib /lib64 /opt /run -name 'libcuda.so*' 2>/dev/null | head -5", shell=True, capture_output=True, text=True).stdout.split()
+    return os.path.realpath(out[0]) if out else None
+
+DRIVER_STUB.mkdir(exist_ok=True)
+import glob as _glob
+_libs = sorted({os.path.realpath(p) for d in ("/usr/local/nvidia/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib")
+                for p in _glob.glob(f"{d}/libcuda.so*") if os.path.isfile(p)})
+real = _libs[0] if len(_libs) == 1 else find_libcuda()
+print("driver library lookup:", "direct (one file in the driver folders)" if len(_libs) == 1 else f"CUDA probe ({len(_libs)} candidates found directly)")
+if real is None:
+    print("WARNING: could not find the NVIDIA driver library (libcuda). Kernels that compile at first use may fail to link.")
+else:
+    link = DRIVER_STUB / "libcuda.so"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(real)
+    Path("/tmp/t_link.c").write_text("int main(){return 0;}")
+    r = subprocess.run(["gcc", "/tmp/t_link.c", "-lcuda", "-o", "/tmp/t_link"], env=vllm_env(), capture_output=True, text=True)
+    print(f"driver library {real} -> {link} | linking with -lcuda:", "OK" if r.returncode == 0 else r.stderr[-300:])
+
+chk = "import torch, vllm; print('torch', torch.__version__, '| cuda', torch.version.cuda, '| vllm', vllm.__version__)\nimport humming; print('humming ok')"
+STEP2_CHECK = (chk, vllm_env())
+print("step 2 import check (torch, vllm, humming): runs in the background when the server starts (step 6)")

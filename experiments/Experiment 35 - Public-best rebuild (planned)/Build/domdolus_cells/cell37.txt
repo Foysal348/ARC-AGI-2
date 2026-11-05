@@ -1,0 +1,44 @@
+import re
+from pathlib import Path
+_MARK = "flashnext startup test 11: wait for the model prefetch"
+_WAIT_CODE = """import os as _fw_os, time as _fw_time
+_fw_log = _fw_os.environ.get("FLASHNEXT_WAIT_PREFETCH")
+if _fw_log:  # {mark}
+    _fw_t0 = _fw_time.time()
+    while "PREFETCH DONE" not in (open(_fw_log).read() if _fw_os.path.exists(_fw_log) else ""):
+        _fw_err = (open(_fw_log + ".err").read() if _fw_os.path.exists(_fw_log + ".err") else "")
+        if "Traceback" in _fw_err or "Error" in _fw_err:
+            raise RuntimeError("the model prefetch failed: " + _fw_err[-1500:])
+        _fw_pid = int(_fw_os.environ.get("FLASHNEXT_WAIT_PREFETCH_PID") or 0)
+        if _fw_pid and not _fw_os.path.exists(f"/proc/{_fw_pid}") and "PREFETCH DONE" not in open(_fw_log).read():
+            raise RuntimeError("the model prefetch process ended without PREFETCH DONE: " + _fw_err[-1500:])
+        if _fw_time.time() - _fw_t0 > 1800:
+            raise RuntimeError("the model prefetch is not done after 30 min (" + _fw_log + ")")
+        _fw_time.sleep(1)
+    logger.info("flashnext: waited %.0f s for the model prefetch before loading the model", _fw_time.time() - _fw_t0)
+""".replace("{mark}", _MARK)
+_hits = []
+for _f in sorted(Path("/tmp/site-vllm/vllm/v1/worker").rglob("*.py")):
+    _s = _f.read_text()
+    if "Loading model from scratch" not in _s:
+        continue
+    if _MARK in _s:
+        print("  [already]", _f); _hits.append(_f); continue
+    _lines = _s.splitlines(True)
+    _idx = [k for k, l in enumerate(_lines) if "Loading model from scratch" in l]
+    assert len(_idx) == 1, f"{_f}: 'Loading model from scratch' is on {len(_idx)} lines (vLLM differs from 0.31.0?)"
+    _k = _idx[0]
+    _start = _k
+    while not re.match(r"\s*(logger|self\.logger|log)\b", _lines[_start]) and _start > _k - 3:
+        _start -= 1
+    assert re.match(r"\s*(logger|self\.logger|log)\b", _lines[_start]), f"{_f}: no logger call at line {_k + 1}: {_lines[_k]!r}"
+    _ind = re.match(r"\s*", _lines[_start]).group(0)
+    assert "logger" in _s, f"{_f}: no logger in this file"
+    _new = "".join(_ind + l if l.strip() else l for l in _WAIT_CODE.splitlines(True))
+    _s2 = "".join(_lines[:_start]) + _new + "".join(_lines[_start:])
+    compile(_s2, str(_f), "exec")
+    _f.write_text(_s2)
+    print(f"  [patch] {_f}: wait for the prefetch before line {_start + 1} ({_lines[_k].strip()[:80]})")
+    _hits.append(_f)
+assert _hits, "no vLLM file logs 'Loading model from scratch...' (vLLM differs from 0.31.0?)"
+print(f"loader wait installed in {len(_hits)} file(s); active when step 6 sets FLASHNEXT_WAIT_PREFETCH")

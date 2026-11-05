@@ -1,0 +1,161 @@
+import glob, json, os, subprocess, threading, time
+from datetime import datetime
+
+TIME_BUDGET_MIN = 11 * 60 + 55
+VALIDATION_MODE = False
+VALIDATION_TIME_MIN = 6 * 60 - 5
+VALIDATION_TASKS = 0
+CHECK_ATTEMPTS = True
+
+IS_RERUN = os.getenv("KAGGLE_IS_COMPETITION_RERUN") is not None
+INPUT_ROOT = "/kaggle/input"
+SUBMISSION = "/kaggle/working/submission.json"
+WORK = "/tmp/arc_run"
+
+def _kernel_start():
+    btime = int(next(l for l in open("/proc/stat") if l.startswith("btime")).split()[1])
+    ticks = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19])
+    return btime + ticks / os.sysconf("SC_CLK_TCK")
+
+T0 = _kernel_start()
+VALIDATING = VALIDATION_MODE and not IS_RERUN
+if VALIDATION_MODE and IS_RERUN:
+    print("VALIDATION_MODE = True is IGNORED: this is the competition rerun, the hidden test tasks run (set it back to False to avoid confusion)")
+_BUDGET_MIN = VALIDATION_TIME_MIN if VALIDATING else TIME_BUDGET_MIN
+DEADLINE = T0 + _BUDGET_MIN * 60
+_fmt = lambda t: datetime.fromtimestamp(t).strftime("%H:%M:%S")
+assert T0 <= time.time() + 5, f"kernel start time {T0} is in the future: cannot set the timer"
+
+_test_name = "arc-agi_test_challenges.json"
+_found = sorted(os.path.join(d, _test_name) for d, _, fs in os.walk(INPUT_ROOT) if _test_name in fs)
+if len(_found) != 1:
+    raise RuntimeError(f"need exactly one {_test_name} under {INPUT_ROOT} (attach the ARC Prize competition data), found {len(_found)}:\n  " + "\n  ".join(_found or ["(none)"]))
+TEST_FILE = _found[0]
+if VALIDATING:
+    TEST_FILE = os.path.join(os.path.dirname(_found[0]), "arc-agi_evaluation_challenges.json")
+    for _f in (TEST_FILE, TEST_FILE.replace("_challenges.json", "_solutions.json")):
+        if not os.path.exists(_f):
+            raise RuntimeError(f"VALIDATION_MODE: {_f} is missing (the competition data must hold the evaluation tasks and their solutions)")
+TEST_TASKS = json.load(open(TEST_FILE))
+if VALIDATING and VALIDATION_TASKS > 0:
+    TEST_TASKS = dict(list(TEST_TASKS.items())[:VALIDATION_TASKS])
+print(f"competition rerun: {IS_RERUN} | " + ("VALIDATION MODE: evaluation" if VALIDATING else "test") + f" tasks: {len(TEST_TASKS)} from {TEST_FILE}")
+print(f"kernel started {_fmt(T0)} | now {_fmt(time.time())} | DEADLINE {_fmt(DEADLINE)} ({_BUDGET_MIN // 60} h {_BUDGET_MIN % 60} min after the kernel start)")
+
+_SUB_LOCK = threading.Lock()
+_LAST_GOOD = {}
+_LAST_REC = {}
+
+def _grid_ok(g):
+    return (isinstance(g, list) and 0 < len(g) <= 30 and all(isinstance(r, list) and 0 < len(r) <= 30 and len(r) == len(g[0]) for r in g)
+            and all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9 for r in g for v in r))
+
+_TP = lambda g: [list(r) for r in zip(*g)]
+_FL = lambda g: [list(r)[::-1] for r in g]
+_BACK = {"": None, "P": None, "T": _TP, "F": _FL, "2": None, "3": None}
+_ROUND_ORDER = {"": 0, "2": 1, "P": 1, "T": 2, "3": 2, "F": 3}
+
+def _split_id(rid):
+    head, _, var = rid.rpartition("_")
+    return (head, var) if head and var in ("P", "T", "F", "2", "3") else (rid, "")
+
+def _back(g, var):
+    f = _BACK[var]
+    return f(g) if (f and isinstance(g, list) and g and all(isinstance(r, list) for r in g)) else g
+
+def _records():
+    for f in glob.glob(f"{WORK}/out_*/*/*/check_attempts.json") + glob.glob(f"{WORK}/parked/*/*/*/check_attempts.json"):
+        try:
+            _LAST_REC[f] = (json.load(open(os.path.join(os.path.dirname(os.path.dirname(f)), "metadata.json")))["puzzle_id"],
+                            json.load(open(f)).get("records") or [])
+        except Exception:
+            pass
+    recs = {}
+    for rid, rs in _LAST_REC.values():
+        tid, var = _split_id(rid)
+        recs.setdefault(tid, []).extend(dict(r, tests=[_back(g, var) for g in (r.get("tests") or [])]) for r in rs)
+    return {tid: sorted(rs, key=lambda r: (r["ok"] / max(1, r["n"]), r["pct"]), reverse=True) for tid, rs in recs.items()}
+
+def write_submission(quiet=False):
+    with _SUB_LOCK:
+        for f in sorted(glob.glob(f"{WORK}/sub_*/submission.json")):
+            try:
+                _LAST_GOOD[f] = json.load(open(f))
+            except Exception:
+                pass
+        finals = {}
+        for content in _LAST_GOOD.values():
+            for rid, entries in content.items():
+                tid, var = _split_id(rid)
+                if isinstance(entries, list):
+                    finals.setdefault(tid, []).append((_ROUND_ORDER[var], [_back(e.get("attempt_1"), var) if isinstance(e, dict) else None for e in entries]))
+        recs = _records() if CHECK_ATTEMPTS else {}
+        out, answered, bad, from_ck = {}, 0, 0, [0, 0]
+        for tid, task in TEST_TASKS.items():
+            rows, has = [], False
+            fs = [a for _, a in sorted(finals.get(tid, []), key=lambda x: x[0])]
+            for i in range(len(task["test"])):
+                cands = []
+                for a in fs:
+                    g = a[i] if i < len(a) else None
+                    if g is not None and not _grid_ok(g):
+                        bad += 1
+                    elif g is not None:
+                        cands.append((g, "final"))
+                cands += [(r["tests"][i], "check") for r in recs.get(tid, []) if i < len(r.get("tests") or []) and _grid_ok(r["tests"][i])]
+                a1 = cands[0] if cands else (None, None)
+                a2 = next((c for c in cands if c[0] != a1[0]), (None, None))
+                from_ck[0] += a1[1] == "check"
+                from_ck[1] += a2[1] == "check"
+                row = {"attempt_1": a1[0], "attempt_2": a2[0]}
+                for k in ("attempt_1", "attempt_2"):
+                    has |= row[k] is not None
+                    row[k] = row[k] if row[k] is not None else [[0]]
+                rows.append(row)
+            out[tid] = rows
+            answered += has
+        tmp = SUBMISSION + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(out, fh)
+        os.replace(tmp, SUBMISSION)
+    if not quiet:
+        print(f"submission.json: {len(out)} tasks, {answered} with an answer" + (f", {bad} malformed answers left out" if bad else "")
+              + (f" | from check() records: attempt_1 {from_ck[0]}, attempt_2 {from_ck[1]} test inputs" if CHECK_ATTEMPTS else ""), flush=True)
+    return answered, bad
+
+def _skip_later_cells():
+    ip = get_ipython()
+    if _skip_cell not in ip.input_transformers_cleanup:
+        ip.input_transformers_cleanup.append(_skip_cell)
+
+def _skip_cell(lines):
+    return ["pass\n"]
+
+STOP_EVERYTHING = ("arcagi2.evaluation.evaluate", "stage_manager.py", "vllm.entrypoints", "VLLM::", "/kaggle/working/prefetch.py")
+
+def _deadline_watch():
+    while time.time() < DEADLINE:
+        time.sleep(15)
+    DEADLINE_HIT.set()
+    print(f"\n[{_fmt(time.time())}] DEADLINE reached: writing submission.json, stopping the harness and vLLM, skipping the later cells", flush=True)
+    write_submission()
+    _skip_later_cells()
+    for _ in range(240):
+        for pattern in STOP_EVERYTHING:
+            subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
+        if _ == 1:
+            write_submission()
+        time.sleep(15)
+
+DEADLINE_HIT = threading.Event()
+write_submission()
+if IS_RERUN or VALIDATING:
+    if VALIDATING:
+        print(f"NOT the competition rerun, VALIDATION MODE: {len(TEST_TASKS)} evaluation tasks, score at the end of step 7")
+    if not any(t.name == "deadline-watch" and t.is_alive() for t in threading.enumerate()):
+        threading.Thread(target=_deadline_watch, name="deadline-watch", daemon=True).start()
+    print(f"the pipeline runs: steps 0-7; everything stops at {_fmt(DEADLINE)} at the latest")
+else:
+    _skip_later_cells()
+    print("NOT the competition rerun: placeholder submission.json written, ALL LATER CELLS ARE SKIPPED (this is what 'Save Version' should do).\n"
+          "To validate here: set VALIDATION_MODE = True, restart the kernel and run all (set it back to False before you submit).")

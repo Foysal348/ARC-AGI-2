@@ -1,0 +1,204 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_f = _root / "v1/core/single_type_kv_cache_manager.py"
+_fp = _root / "v1/core/block_pool.py"
+assert _f.exists() and _fp.exists(), f"{_f} / {_fp} not found: run the earlier steps first"
+_s = _f.read_text()
+_MARK = "# flashnext hold-states switch (session 17)"
+_EDITS = [
+    ("take back at the end of the call",
+     """            for _i, _b, _a in _fn_h:
+                if _blocks is not None and _i < len(_blocks) and _blocks[_i].is_null:
+                    _blocks[_i] = _b
+""",
+     """            for _e in _fn_h:
+                _i, _b, _a = _e[:3]
+                if len(_e) > 3:   """ + _MARK + """: freed at retire time; take it back if its cache entry survived
+                    _FN_HOLD["prot"].pop(_b.block_id, None)
+                    if _b.is_null or _b.block_hash is None or _b.block_hash != _e[3]:
+                        _FN_HOLD["lost"] += 1
+                        continue
+                    if _b.ref_cnt == 0:
+                        self.block_pool.free_block_queue.remove(_b)
+                    _b.ref_cnt += 1
+                    _FN_HOLD["back"] += 1
+                if _blocks is not None and _i < len(_blocks) and _blocks[_i].is_null:
+                    _blocks[_i] = _b
+"""),
+    ("retire: cached instead of pinned",
+     """        held.append((idx, block, aligned))
+        same = sorted((h for h in held if h[2] == aligned), key=lambda h: h[0])
+        pool = self.block_pool
+        for h in same[: -(2 if aligned else 1)]:
+            held.remove(h)
+            pool._fn_dropping = True
+""",
+     """        _cached = _FN_HOLD["mode"] != "pin"
+        held.append((idx, block, aligned, block.block_hash) if _cached else (idx, block, aligned))
+        same = sorted((h for h in held if h[2] == aligned), key=lambda h: h[0])
+        pool = self.block_pool
+        for h in same[: -(2 if aligned else 1)]:
+            held.remove(h)
+            if len(h) > 3:            # already freed at retire time: drop its cache entry only while it is still ours and unused
+                _FN_HOLD["prot"].pop(h[1].block_id, None)
+                if h[1].block_hash is not None and h[1].block_hash == h[3] and h[1].ref_cnt == 0:
+                    pool._fn_dropping = True
+                    try:
+                        pool._maybe_evict_cached_block(h[1])
+                    finally:
+                        pool._fn_dropping = False
+                _FN_SEG["states_dropped"] += 1
+                continue
+            pool._fn_dropping = True
+"""),
+    ("retire: free the kept state at once in cached mode",
+     """            pool.free_blocks([h[1]])
+            _FN_SEG["states_dropped"] += 1
+        return True
+""",
+     """            pool.free_blocks([h[1]])
+            _FN_SEG["states_dropped"] += 1
+        if _cached:
+            pool.free_blocks([block])     # a normal cached block: reclaimable when the pool is full, taken back at the end of the call
+            _FN_HOLD["freed"] += 1
+            if _FN_HOLD["mode"] == "protect":
+                _FN_HOLD["prot"][block.block_id] = float("inf")    # block_pool.py: second chance at the head of the free queue
+                pool._fn_protect = _FN_HOLD
+        return True
+"""),
+]
+_EDITS.append(("retire: pinnew keeps only the newest state pinned",
+               """        aligned = ((idx + 1) * self.block_size) % self.scheduler_block_size == 0
+        _cached = _FN_HOLD["mode"] != "pin"
+""",
+               """        aligned = ((idx + 1) * self.block_size) % self.scheduler_block_size == 0
+        if _FN_HOLD["mode"] == "pinnew":   """ + _MARK + """: only the newest state stays pinned
+            for h in list(held):
+                held.remove(h)
+                self.block_pool.free_blocks([h[1]])    # the older state: a normal cached block from now on
+                _FN_SEG["states_dropped"] += 1
+            held.append((idx, block, aligned))
+            return True
+        _cached = _FN_HOLD["mode"] not in ("pin", "pinnew")
+"""))
+_POOL_MARK = "# flashnext hold-states second chance (session 17)"
+_POOL_EDIT = ("protect: second chance for held states",
+              """        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+
+        if self._reuse_watchers:
+""",
+              """        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if getattr(self, "_fn_protect", None) is not None and self._fn_protect["prot"]:   """ + _POOL_MARK + """
+            ret = _fn_second_chance(self, ret, self._fn_protect)
+
+        if self._reuse_watchers:
+""")
+_POOL_FN = '''
+
+''' + _POOL_MARK + '''
+_FN_SCAN = 256   # free blocks looked at beyond the ones asked for, per call, before a held state is taken anyway
+
+
+def _fn_second_chance(pool, ret, hold):
+    """The blocks just taken from the head of the free queue: held DeltaNet states among them go back to the TAIL (evicted last) and the
+    next free blocks replace them; if only held states are found within _FN_SCAN blocks, the oldest held states are taken ("forced").
+    hold["prot"]: block id -> time until which it is protected (inf = a held state; park mode: a call's blocks for FLASHNEXT_PARK_S s)."""
+    import time as _t
+    prot, q, now = hold["prot"], pool.free_block_queue, _t.monotonic()
+
+    def _p(b):
+        e = prot.get(b.block_id)
+        if e is None:
+            return False
+        if e < now:
+            del prot[b.block_id]
+            return False
+        return True
+
+    keep, saved = [], []
+    for b in ret:
+        (saved if _p(b) else keep).append(b)
+    if not saved:
+        return ret
+    scan = _FN_SCAN
+    while len(keep) < len(ret) and scan > 0 and q.num_free_blocks > 0:
+        b = q.popleft()
+        scan -= 1
+        (saved if _p(b) else keep).append(b)
+    while len(keep) < len(ret):
+        b = saved.pop(0)
+        prot.pop(b.block_id, None)
+        hold["forced"] += 1
+        keep.append(b)
+    if saved:
+        q.append_n(saved)
+    return keep
+'''
+_fc = _root / "v1/core/kv_cache_coordinator.py"
+_PARK_MARK = "# flashnext hold-states park (session 17)"
+_PARK_EDIT = ("park: a finished call's blocks are protected for a while",
+              "    return [e[3] for e in entries]\n",
+              "    _fn_park_blocks(managers, [e[3] for e in entries if not e[4]])   " + _PARK_MARK + "\n    return [e[3] for e in entries]\n")
+_PARK_FN = '''
+
+''' + _PARK_MARK + '''
+def _fn_park_blocks(managers, blocks):
+    from vllm.v1.core import single_type_kv_cache_manager as _st
+
+    hold = getattr(_st, "_FN_HOLD", None)
+    if not hold or hold["mode"] != "park" or not managers:
+        return
+    pool = managers[0].block_pool
+    if getattr(getattr(pool, "_fn_on_evict", None), "__name__", "") != "_fn_gpu_evicted":
+        return                                   # the GPU pool only (the RAM offload's pool has its own coordinator)
+    import time as _t
+
+    until, prot, n = _t.monotonic() + hold["park_s"], hold["prot"], 0
+    for b in blocks:
+        if not b.is_null and b.block_hash is not None:
+            prot[b.block_id] = until
+            n += 1
+    hold["parked"] += n
+    pool._fn_protect = hold
+    if len(prot) > 4 * pool.num_gpu_blocks:      # entries never met at the head of the free queue again: forget the expired ones
+        now = _t.monotonic()
+        for k in [k for k, e in prot.items() if e < now]:
+            del prot[k]
+'''
+if _MARK in _s:
+    print("hold-states switch: [already] in", _f)
+else:
+    for label, old, new in _EDITS:
+        assert _s.count(old) == 1, f"hold-states edit '{label}': anchor found {_s.count(old)} times in {_f} (patch cell changed?)"
+        _s = _s.replace(old, new)
+    _s += ("\n\n" + _MARK + "\nimport os as _fh_os\n_FN_HOLD = {\"mode\": _fh_os.environ.get(\"FLASHNEXT_HOLD_STATES\", \"pin\"), "
+           "\"freed\": 0, \"back\": 0, \"lost\": 0, \"forced\": 0, \"parked\": 0, \"prot\": {}, "
+           "\"park_s\": float(_fh_os.environ.get(\"FLASHNEXT_PARK_S\", \"60\"))}\nassert _FN_HOLD[\"mode\"] in (\"pin\", \"pinnew\", \"cached\", \"protect\", \"park\"), "
+           "f\"FLASHNEXT_HOLD_STATES must be pin, pinnew, cached, protect or park, not {_FN_HOLD['mode']!r}\"\n")
+    _f.write_text(_s)
+    compile(_s, str(_f), "exec")
+    print("hold-states switch: [installed] in", _f, "(FLASHNEXT_HOLD_STATES = pin | pinnew | cached | protect | park before the server starts; unset = pin)")
+_p = _fp.read_text()
+if _POOL_MARK in _p:
+    print("hold-states second chance: [already] in", _fp)
+else:
+    label, old, new = _POOL_EDIT
+    assert _p.count(old) == 1, f"hold-states edit '{label}': anchor found {_p.count(old)} times in {_fp} (vLLM changed?)"
+    _p = _p.replace(old, new) + _POOL_FN
+    _fp.write_text(_p)
+    compile(_p, str(_fp), "exec")
+    print("hold-states second chance: [installed] in", _fp)
+_c = _fc.read_text()
+if _PARK_MARK in _c:
+    print("hold-states park: [already] in", _fc)
+else:
+    label, old, new = _PARK_EDIT
+    assert _c.count(old) == 1, f"hold-states edit '{label}': anchor found {_c.count(old)} times in {_fc} (patch cell changed?)"
+    _c = _c.replace(old, new) + _PARK_FN
+    _fc.write_text(_c)
+    compile(_c, str(_fc), "exec")
+    print("hold-states park: [installed] in", _fc)
+import os
+os.environ["FLASHNEXT_HOLD_STATES"] = "pinnew"
+print("FLASHNEXT_HOLD_STATES =", os.environ["FLASHNEXT_HOLD_STATES"])

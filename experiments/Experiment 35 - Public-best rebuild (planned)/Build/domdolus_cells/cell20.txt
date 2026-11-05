@@ -1,0 +1,268 @@
+import os
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_OP = _root / "v1/engine/output_processor.py"
+_AL = _root / "v1/engine/async_llm.py"
+for _p in (_OP, _AL):
+    assert _p.exists(), f"{_p} not found: run the earlier steps first"
+_MARK = "# flashnext token splice (session 18b)"
+
+_OP_EDITS = [
+    ("record a finished request's tokens",
+     """                else:
+                    self._finish_request(req_state)
+                    if not engine_core_output.finished:
+""",
+     """                else:
+                    if finish_reason == FinishReason.STOP:   """ + _MARK + """
+                        _fn_tsp_record(req_state)
+                    self._finish_request(req_state)
+                    if not engine_core_output.finished:
+"""),
+]
+_AL_EDITS = [
+    ("splice the new prompt",
+     """        self.input_processor.assign_request_id(request)
+
+        # We start the output_handler on the first call to add_request() so
+""",
+     """        self.input_processor.assign_request_id(request)
+        from vllm.v1.engine.output_processor import _fn_tsp_apply   """ + _MARK + """
+
+        _fn_tsp_apply(self, request)
+
+        # We start the output_handler on the first call to add_request() so
+"""),
+]
+_OP_TAIL = r'''
+
+
+''' + _MARK + r'''
+import array as _tsp_array
+import bisect as _tsp_bisect
+import collections as _tsp_col
+import itertools as _tsp_it
+import os as _tsp_os
+import time as _tsp_time
+
+_FN_TSP = {"on": _tsp_os.environ.get("FLASHNEXT_TOKEN_SPLICE") == "1", "seqs": _tsp_col.OrderedDict(), "tb": None, "tok": None,
+           "n": _tsp_col.Counter(), "tot": _tsp_col.Counter(), "t": _tsp_time.time(), "errors": 0, "said": False}
+_TSP_KEYS = ("recorded", "spliced", "tokens re-used", "already exact", "no key", "no candidate", "bytes differ", "straddle re-encoded",
+             "straddle bad utf8", "image moved", "image check failed", "max_tokens lowered")
+
+
+def _tsp_err(where, e):
+    _FN_TSP["errors"] += 1
+    if _FN_TSP["errors"] <= 20:
+        print(f"FLASHNEXT TOKEN SPLICE {where} error: {e!r}"[:400], flush=True)
+
+
+def _tsp_report():
+    now = _tsp_time.time()
+    if now - _FN_TSP["t"] < 60:
+        return
+    _FN_TSP["t"] = now
+    n, tot = _FN_TSP["n"], _FN_TSP["tot"]
+    tot.update(n)
+    print("FLASHNEXT TOKEN SPLICE (last 60 s | total): " + " | ".join(f"{k} {n[k]} / {tot[k]}" for k in _TSP_KEYS)
+          + f" || keys {len(_FN_TSP['seqs'])} errors {_FN_TSP['errors']}", flush=True)
+    n.clear()
+
+
+def _tsp_tables(tokenizer_name):
+    """Byte string of every token id (byte-level BPE) + the tokenizer for re-encoding a remainder."""
+    if _FN_TSP["tb"] is not None:
+        return _FN_TSP["tb"]
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(tokenizer_name)
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs, n_ = bs[:], 0
+    for b in range(256):                           # GPT-2 byte-level alphabet (bytes_to_unicode)
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n_)
+            n_ += 1
+    dec = {chr(c): b for b, c in zip(bs, cs)}
+    added = {i: t.content for i, t in tok.added_tokens_decoder.items()}
+    n = max(len(tok), max(added) + 1 if added else 0)
+    tb = []
+    for i in range(n):
+        if i in added:
+            tb.append(added[i].encode("utf-8"))
+            continue
+        s = tok.convert_ids_to_tokens(i)
+        tb.append(bytes(dec[c] for c in s) if s is not None and all(c in dec for c in s) else None)
+    _FN_TSP["tb"], _FN_TSP["tok"] = tb, tok
+    return tb
+
+
+def _tsp_key(ids):
+    """hash of the first prompt = everything before the first "<|im_start|>assistant" (the trim cell's sink rule; its token ids are only
+    set up in the engine process, so they are looked up here from the tokenizer); None without such a turn."""
+    tok = _FN_TSP["tok"]
+    if "im_start" not in _FN_TSP:
+        _FN_TSP["im_start"] = tok.convert_tokens_to_ids("<|im_start|>")
+        _FN_TSP["assistant"] = tok.encode("assistant", add_special_tokens=False)
+    st, mk = _FN_TSP["im_start"], _FN_TSP["assistant"]
+    ids = list(ids)
+    i = -1
+    while True:
+        try:
+            i = ids.index(st, i + 1)
+        except ValueError:
+            return None
+        if ids[i + 1:i + 1 + len(mk)] == mk:
+            return hash(tuple(ids[:i])) if i > 0 else None
+
+
+def _fn_tsp_record(req_state):
+    if not _FN_TSP["on"]:
+        return
+    try:
+        p = req_state.prompt_token_ids
+        o = req_state.detokenizer.output_token_ids if req_state.detokenizer is not None else None
+        if not p or not o:
+            return
+        if _FN_TSP["tok"] is None:
+            return                                 # tables not loaded yet: the first request has not been seen (cannot happen after it)
+        S = _tsp_array.array("i", p)
+        S.extend(o)
+        key = _tsp_key(p)
+        if key is None:
+            return
+        lst = _FN_TSP["seqs"].pop(key, [])
+        lst = [x for x in lst if not (len(x) <= len(S) and x[:len(x)] == S[:len(x)])][-3:] + [S]
+        _FN_TSP["seqs"][key] = lst
+        while len(_FN_TSP["seqs"]) > 600:
+            _FN_TSP["seqs"].popitem(last=False)
+        _FN_TSP["n"]["recorded"] += 1
+    except Exception as e:
+        _tsp_err("record", e)
+
+
+def _tsp_try(S, P, tb):
+    """New prompt ids (list) for P built on S[:L], with the moved image offsets, or None + reason."""
+    L = len(S) - 1
+    m = min(L, len(P))
+    d = 0
+    while d < m and S[d] == P[d]:          # first difference (C-level slices would be faster; prompts are <= ~100K)
+        d += 1
+    if d >= L:
+        return "already exact", None
+    bS = b"".join(tb[t] for t in S[d:L])
+    lens = [len(tb[t]) for t in P[d:]]
+    cum = list(_tsp_it.accumulate(lens))
+    k = _tsp_bisect.bisect_left(cum, len(bS))     # P[d:d+k+1] covers len(bS) bytes
+    if k >= len(cum):
+        return "bytes differ", None
+    bP = b"".join(tb[t] for t in P[d:d + k + 1])
+    if bP[:len(bS)] != bS:
+        return "bytes differ", None
+    rest_ids = []
+    if cum[k] > len(bS):                           # P token d+k straddles the end of S[:L]: re-encode its remaining bytes
+        rem = bP[len(bS):]
+        try:
+            rem_s = rem.decode("utf-8")
+        except UnicodeDecodeError:
+            return "straddle bad utf8", None
+        rest_ids = _FN_TSP["tok"].encode(rem_s, add_special_tokens=False)
+        if b"".join(tb[t] for t in rest_ids) != rem:
+            return "straddle bad utf8", None
+    j = d + k + 1                                  # first P index after the spliced span
+    new = list(S[:L]) + list(rest_ids) + list(P[j:])
+    return ("straddle" if rest_ids else "ok"), (new, d, j, L + len(rest_ids))
+
+
+def _fn_tsp_apply(engine, request):
+    if not _FN_TSP["on"]:
+        return
+    try:
+        if not _FN_TSP["said"]:
+            _FN_TSP["said"] = True
+            print("flashnext token splice: ON (follow-up prompts take the model's own token ids where the text is the same)", flush=True)
+        P = request.prompt_token_ids
+        if not P or request.prompt_embeds is not None:
+            return
+        tb = _tsp_tables(engine.model_config.tokenizer)
+        key = _tsp_key(P)
+        if key is None:
+            _FN_TSP["n"]["no key"] += 1
+            return
+        cands = _FN_TSP["seqs"].get(key)
+        if not cands:
+            _FN_TSP["n"]["no candidate"] += 1
+            return
+        best, why = None, "bytes differ"
+        for S in reversed(cands):
+            r, res = _tsp_try(S, P, tb)
+            if r == "already exact":
+                _FN_TSP["n"]["already exact"] += 1
+                return
+            if res is not None and (best is None or res[3] > best[0][3]):
+                best = (res, r)
+            elif res is None:
+                why = r
+        if best is None:
+            _FN_TSP["n"][why] += 1
+            return
+        (new, d, j, newj), how = best
+        delta = newj - j
+        feats = request.mm_features or []
+        if feats:
+            import dataclasses as _dc
+            moved = []
+            for f in feats:
+                o = f.mm_position.offset
+                if o < d:
+                    moved.append(f.mm_position)
+                elif o >= j:
+                    moved.append(_dc.replace(f.mm_position, offset=o + delta))
+                else:                                          # inside the spliced span: same byte position in S
+                    bpos = sum(len(tb[t]) for t in P[d:o])
+                    acc, q = 0, d
+                    while acc < bpos:
+                        acc += len(tb[new[q]])
+                        q += 1
+                    ln = f.mm_position.length
+                    if acc != bpos or new[q:q + ln] != P[o:o + ln]:
+                        _FN_TSP["n"]["image check failed"] += 1
+                        return
+                    moved.append(_dc.replace(f.mm_position, offset=q))
+                    _FN_TSP["n"]["image moved"] += 1
+            for f, pos in zip(feats, moved):
+                f.mm_position = pos
+        request.prompt_token_ids = new
+        sp = request.sampling_params
+        mml = engine.model_config.max_model_len
+        if sp is not None and sp.max_tokens is not None and len(new) + sp.max_tokens > mml:
+            sp.max_tokens = max(1, mml - len(new))
+            _FN_TSP["n"]["max_tokens lowered"] += 1
+        _FN_TSP["n"]["spliced"] += 1
+        _FN_TSP["n"]["tokens re-used"] += newj - d
+        if how == "straddle":
+            _FN_TSP["n"]["straddle re-encoded"] += 1
+    except Exception as e:
+        _tsp_err("apply", e)
+    finally:
+        try:
+            _tsp_report()
+        except Exception:
+            pass
+'''
+
+_done = []
+for _f, _edits, _tail in ((_OP, _OP_EDITS, _OP_TAIL), (_AL, _AL_EDITS, "")):
+    _s = _f.read_text()
+    if _MARK in _s:
+        _done.append(f"{_f.name} [already]")
+        continue
+    for _label, _old, _new in _edits:
+        assert _s.count(_old) == 1, f"token splice edit '{_label}': anchor found {_s.count(_old)} times in {_f} (vLLM changed?)"
+        _s = _s.replace(_old, _new)
+    _s += _tail
+    compile(_s, str(_f), "exec")
+    _f.write_text(_s)
+    _done.append(f"{_f.name} [installed]")
+os.environ["FLASHNEXT_TOKEN_SPLICE"] = "1"
+print("token splice:", " | ".join(_done), "| FLASHNEXT_TOKEN_SPLICE =", os.environ["FLASHNEXT_TOKEN_SPLICE"])

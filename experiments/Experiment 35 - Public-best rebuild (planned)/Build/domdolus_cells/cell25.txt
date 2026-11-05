@@ -1,0 +1,368 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_qsa = _root / "models/qwen4_exp/nvidia/qsa.py"
+_idx = _root / "models/qwen4_exp/nvidia/ops/qsa_indexer.py"
+_mr = _root / "v1/worker/gpu/model_runner.py"
+_k4 = _root / "models/qwen4_exp/nvidia/ops/qsa_k4.py"
+_gdn = _root / "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py"
+_hc = _root / "models/qwen4_exp/nvidia/hyperconnection.py"
+_mu = _root / "v1/worker/mamba_utils.py"
+_hcd = _root / "models/qwen4_exp/nvidia/ops/fn_hc_down.py"
+_hcds = _root / "models/qwen4_exp/nvidia/ops/fn_hcd_silu.py"
+_qg = _root / "models/qwen4_exp/nvidia/ops/fn_qsa_gate.py"
+for _p in (_qsa, _idx, _mr, _k4, _gdn, _hc, _hcd, _mu):
+    assert _p.exists(), f"{_p} not found: run the earlier steps first (fn_hc_down.py comes from the HC-down cell)"
+_HCDS_SRC = '# flashnext HC-down + SiLU in one pass (session 22, roadmap C2) - installed as vllm/models/qwen4_exp/nvidia/ops/fn_hcd_silu.py by\n# s05q_decode_trims.py (FLASHNEXT_TRIM_HCD_SILU). On the L4 (sm_89) vLLM runs the hyper-connection "down + inject" projection, then a separate SiLU kernel over its\n# first lora_rank columns (vLLM\'s fused down + SiLU GEMM needs sm_90). With the HC-down split-K kernel (fn_hc_down.py) on, the second\n# (reduce) kernel can apply the SiLU itself: it writes the low-rank part silu(x / hc_count) [M, lora_rank] and the injection logits\n# [M, hc_count] as two contiguous tensors (what the next GEMM and the combine read), the pad columns are dropped. One kernel less per\n# HC mixer (96 per decode step). Bit-identical to fn_hc_down + split + vLLM\'s _hc_silu_kernel (the down output is rounded to bf16 first).\nimport torch\n\nfrom vllm.models.qwen4_exp.nvidia.ops.fn_hc_down import _fn_hcd_partial, _workspace, plan\nfrom vllm.triton_utils import tl, triton\n\n\n@triton.jit(do_not_specialize=["M"])\ndef _fn_hcd_reduce_silu(part, lora_out, inj_out, M, N, LORA: tl.constexpr, HC: tl.constexpr, SPLITS: tl.constexpr,\n                        BLOCK: tl.constexpr):\n    row = tl.program_id(0)\n    cols = tl.arange(0, BLOCK)\n    m = cols < LORA + HC\n    acc = tl.zeros([BLOCK], dtype=tl.float32)\n    for s in range(SPLITS):\n        acc += tl.load(part + s * M * N + row * N + cols, mask=m, other=0.0)\n    v = acc.to(lora_out.dtype.element_ty)               # the bf16 down output, as fn_hc_down\'s reduce writes it\n    x = v.to(tl.float32) / HC                           # then vLLM\'s _hc_silu_kernel on it: bit-identical\n    y = x * tl.sigmoid(x)\n    tl.store(lora_out + row * LORA + cols, y.to(lora_out.dtype.element_ty), mask=cols < LORA)\n    tl.store(inj_out + row * HC + (cols - LORA), v, mask=(cols >= LORA) & m)\n\n\ndef hc_down_silu(x, w8, scale, lora_rank, hc_count, plan_fn=None):\n    """x [M, K] bf16, w8 [N, K] (N = lora_rank + hc_count + pad), scale [N, NG] fp32 -> (silu(down / hc) [M, lora], injection [M, hc])"""\n    M, K = x.shape\n    N = w8.shape[0]\n    assert w8.shape[1] == K and x.stride(1) == 1 and N >= lora_rank + hc_count\n    NG = scale.shape[1]\n    G = K // NG\n    lora = torch.empty((M, lora_rank), dtype=x.dtype, device=x.device)\n    inj = torch.empty((M, hc_count), dtype=x.dtype, device=x.device)\n    if M == 0:\n        return lora, inj\n    BM, BN, bk, splits, warps = (plan_fn or plan)(M)\n    assert K % (bk * splits) == 0 and (G >= K or G % bk == 0), (K, bk, splits, G)\n    part = _workspace(splits * M * N, x.device)\n    grid = (triton.cdiv(N, BN), splits, triton.cdiv(M, BM))\n    _fn_hcd_partial[grid](x, w8, scale, part, M, N, K, x.stride(0), NG, G, K // splits, BM=BM, BN=BN, BK=bk,\n                          ROW_SCALE=NG == 1, num_warps=warps, num_stages=3)\n    _fn_hcd_reduce_silu[(M,)](part, lora, inj, M, N, LORA=lora_rank, HC=hc_count, SPLITS=splits,\n                              BLOCK=triton.next_power_of_2(lora_rank + hc_count), num_warps=4)\n    return lora, inj\n'
+assert _HCDS_SRC and "def hc_down_silu(" in _HCDS_SRC, "the fn_hcd_silu.py source is missing (build the notebook with its builder)"
+_QG_SRC = '# flashnext QSA output gate in one kernel (session 22) - installed as vllm/models/qwen4_exp/nvidia/ops/fn_qsa_gate.py by\n# s05q_decode_trims.py (FLASHNEXT_TRIM_QSA_GATE). The DCP attention path ends with\n#   output[:T] = (merged.to(bf16).float() * torch.sigmoid(gate.float())).to(output.dtype)\n# = ~6 small kernels per QSA layer (casts, sigmoid, multiply, cast, slice copy). This kernel does the same arithmetic in one pass:\n# torch\'s CUDA sigmoid is 1 / (1 + expf(-x)) in FP32 (IEEE division, accurate expf); here libdevice exp (the same expf) and div_rn,\n# then the FP32 product rounded to bf16 (round to nearest even, as .to()). Bit-identical (Colab L4 check over all 65,536 bf16 gate values).\nimport torch\n\nfrom vllm.triton_utils import tl, triton\n\ntry:\n    from triton.language.extra.cuda import libdevice as _libdevice\nexcept ImportError:  # older Triton layout\n    from triton.language.extra import libdevice as _libdevice\n\n\n@triton.jit\ndef _fn_qsa_gate_kernel(m_ptr, g_ptr, o_ptr, sm0, sm1, sg0, sg1, so0, so1, D: tl.constexpr, BLOCK_D: tl.constexpr):\n    t = tl.program_id(0)\n    h = tl.program_id(1)\n    d = tl.arange(0, BLOCK_D)\n    mask = d < D\n    m = tl.load(m_ptr + t * sm0 + h * sm1 + d, mask=mask, other=0.0).to(tl.bfloat16).to(tl.float32)\n    g = tl.load(g_ptr + t * sg0 + h * sg1 + d, mask=mask, other=0.0).to(tl.float32)\n    s = tl.math.div_rn(1.0, 1.0 + _libdevice.exp(-g))\n    tl.store(o_ptr + t * so0 + h * so1 + d, (m * s).to(o_ptr.dtype.element_ty), mask=mask)\n\n\ndef qsa_gate_store(merged: torch.Tensor, gate: torch.Tensor, out: torch.Tensor) -> None:\n    """out[t, h, :] = bf16(float(bf16(merged)) * sigmoid(float(gate))), all [T, H, D]; same values as the torch expression."""\n    T, H, D = merged.shape\n    assert gate.shape == (T, H, D) and out.shape == (T, H, D), (merged.shape, gate.shape, out.shape)\n    if T == 0:\n        return\n    m = merged if merged.stride(-1) == 1 else merged.contiguous()\n    g = gate if gate.stride(-1) == 1 else gate.contiguous()\n    assert out.stride(-1) == 1, out.stride()\n    _fn_qsa_gate_kernel[(T, H)](m, g, out, m.stride(0), m.stride(1), g.stride(0), g.stride(1), out.stride(0), out.stride(1),\n                                D=D, BLOCK_D=triton.next_power_of_2(D), num_warps=2)\n'
+assert _QG_SRC and "def qsa_gate_store(" in _QG_SRC, "the fn_qsa_gate.py source is missing (build the notebook with its builder)"
+_MARK = "# flashnext decode trims (session 22)"
+_EDITS = {
+    _qsa: [
+        ("K4 query rotated once (switch)",
+         """_FN_DCP_QUERY_EARLY = __import__("os").environ.get("FLASHNEXT_DCP_QUERY_EARLY") == "1"   # flashnext DCP comm (session 22)
+""",
+         """_FN_DCP_QUERY_EARLY = __import__("os").environ.get("FLASHNEXT_DCP_QUERY_EARLY") == "1"   # flashnext DCP comm (session 22)
+_FN_TRIM_K4_ROT = __import__("os").environ.get("FLASHNEXT_TRIM_K4_ROT") == "1"   """ + _MARK + """
+_FN_TRIM_QSA_GATE = __import__("os").environ.get("FLASHNEXT_TRIM_QSA_GATE") == "1"   """ + _MARK + """
+if _FN_TRIM_K4_ROT:
+    print("flashnext decode trims: K4_ROT ON", flush=True)
+if _FN_TRIM_QSA_GATE:
+    print("flashnext decode trims: QSA_GATE ON", flush=True)
+"""),
+        ("K4 query rotated once",
+         """                key_cache, value_cache = k4_views(kv_cache, self.head_size)
+                query = k4_rotate(query)
+""",
+         """                key_cache, value_cache = k4_views(kv_cache, self.head_size)
+                if not (_FN_TRIM_K4_ROT and "_fn_query_all" in self.__dict__):   """ + _MARK + """: the early DCP copy is already rotated
+                    query = k4_rotate(query)
+"""),
+        ("QSA output gate in one kernel",
+         """        gate = output_gate[:num_tokens].reshape(num_tokens, num_heads, -1)
+        # Same rounding as the unpatched kernel: BF16 attention output, gate applied in FP32.
+        output[:num_tokens] = (
+""",
+         """        gate = output_gate[:num_tokens].reshape(num_tokens, num_heads, -1)
+        if _FN_TRIM_QSA_GATE:   """ + _MARK + """: the same arithmetic in one kernel (ops/fn_qsa_gate.py)
+            from .ops.fn_qsa_gate import qsa_gate_store
+
+            qsa_gate_store(merged, gate, output[:num_tokens])
+            return output
+        # Same rounding as the unpatched kernel: BF16 attention output, gate applied in FP32.
+        output[:num_tokens] = (
+"""),
+    ],
+    _idx: [
+        ("gap math once per forward pass (memo)",
+         """def _fn_sw_gap(visible_blocks, token_topk, compress_ratio, row_start=0):
+    \"\"\"(sink, first recent group) per row in compressed groups (int64), or None when sink+window is inactive.\"\"\"
+""",
+         """_FN_TRIM_GAP_ONCE = _fn_os.environ.get("FLASHNEXT_TRIM_GAP_ONCE") == "1"   """ + _MARK + """
+_FN_STEP_MEMO = [None, {}]                      # [forward context (strong ref), {key: value}]
+if _FN_TRIM_GAP_ONCE:
+    print("flashnext decode trims: GAP_ONCE ON", flush=True)
+
+
+def _fn_step_memo(key, compute):
+    \"\"\"compute() once per forward pass for this key (FLASHNEXT_TRIM_GAP_ONCE=1), else every call.\"\"\"
+    if not _FN_TRIM_GAP_ONCE:
+        return compute()
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return compute()
+    ctx = get_forward_context()
+    if _FN_STEP_MEMO[0] is not ctx:
+        _FN_STEP_MEMO[0], _FN_STEP_MEMO[1] = ctx, {}
+    key = (torch.cuda.is_current_stream_capturing(),) + key
+    memo = _FN_STEP_MEMO[1]
+    if key not in memo:
+        memo[key] = compute()
+    return memo[key]
+
+
+def _fn_sw_gap(visible_blocks, token_topk, compress_ratio, row_start=0):
+    \"\"\"(sink, first recent group) per row in compressed groups (int64), or None when sink+window is inactive.\"\"\"
+    if _FN_SW_WINDOW <= 0 and _FN_SW_LIMIT <= 0:
+        return None
+    _sink = _FN_SW_SINK_TOK
+    return _fn_step_memo(("gap", visible_blocks.data_ptr(), tuple(visible_blocks.shape), tuple(visible_blocks.stride()), visible_blocks.dtype,
+                          token_topk, compress_ratio, row_start, None if _sink is None else _sink.data_ptr()),
+                         lambda: _fn_sw_gap_compute(visible_blocks, token_topk, compress_ratio, row_start))
+
+
+def _fn_sw_gap_compute(visible_blocks, token_topk, compress_ratio, row_start=0):
+    \"\"\"(sink, first recent group) per row in compressed groups (int64), or None when sink+window is inactive.\"\"\"
+"""),
+        ("decode compact arguments once per forward pass",
+         """    if _fn_compact:
+        _fn_lo = _fn_gap[0].to(torch.int32).contiguous()
+        _fn_shift = (_fn_gap[1] - _fn_gap[0]).to(torch.int32).contiguous()
+        _fn_vis = (visible_blocks - _fn_shift).to(visible_blocks.dtype)
+        _fn_kw = dict(gap_lo_ptr=_fn_lo, gap_shift_ptr=_fn_shift, COMPACT=True)
+""",
+         """    if _fn_compact:
+        def _fn_compact_args():   """ + _MARK + """
+            _lo = _fn_gap[0].to(torch.int32).contiguous()
+            _shift = (_fn_gap[1] - _fn_gap[0]).to(torch.int32).contiguous()
+            return _lo, _shift, (visible_blocks - _shift).to(visible_blocks.dtype)
+
+        _fn_lo, _fn_shift, _fn_vis = _fn_step_memo(("compact", id(_fn_gap), visible_blocks.data_ptr(), tuple(visible_blocks.shape),
+                                                    tuple(visible_blocks.stride()), visible_blocks.dtype), _fn_compact_args)
+        _fn_kw = dict(gap_lo_ptr=_fn_lo, gap_shift_ptr=_fn_shift, COMPACT=True)
+"""),
+        ("compact shift-back in one kernel (switch + kernel)",
+         """_FN_SW_CHECK = _fn_os.environ.get("FLASHNEXT_QSA_SW_CHECK") == "1"
+""",
+         """_FN_SW_CHECK = _fn_os.environ.get("FLASHNEXT_QSA_SW_CHECK") == "1"
+_FN_TRIM_QSA_SHIFT = _fn_os.environ.get("FLASHNEXT_TRIM_QSA_SHIFT") == "1"   """ + _MARK + """
+if _FN_TRIM_QSA_SHIFT:
+    print("flashnext decode trims: QSA_SHIFT ON", flush=True)
+
+
+@triton.jit
+def _fn_shift_back_kernel(bi_ptr, lo_ptr, sh_ptr, n_cols, stride_r, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = c < n_cols
+    lo = tl.load(lo_ptr + r)
+    sh = tl.load(sh_ptr + r)
+    b = tl.load(bi_ptr + r * stride_r + c, mask=m)
+    tl.store(bi_ptr + r * stride_r + c, tl.where(b >= lo, b + sh, b).to(bi_ptr.dtype.element_ty), mask=m)
+
+
+def _fn_shift_back(block_indices, lo, shift):
+    \"\"\"block_indices[r, c] += shift[r] where block_indices[r, c] >= lo[r] (in place), one kernel.\"\"\"
+    rows, cols = block_indices.shape
+    if rows == 0 or cols == 0:
+        return
+    assert block_indices.stride(1) == 1 and lo.is_contiguous() and shift.is_contiguous()
+    _fn_shift_back_kernel[(rows, triton.cdiv(cols, 1024))](block_indices, lo, shift, cols, block_indices.stride(0), BLOCK=1024, num_warps=4)
+"""),
+        ("compact shift-back in one kernel",
+         """        block_indices.add_(torch.where(block_indices >= _fn_lo[:, None], _fn_shift[:, None], 0).to(block_indices.dtype))
+""",
+         """        if _FN_TRIM_QSA_SHIFT:   """ + _MARK + """
+            _fn_shift_back(block_indices, _fn_lo, _fn_shift)
+        else:
+            block_indices.add_(torch.where(block_indices >= _fn_lo[:, None], _fn_shift[:, None], 0).to(block_indices.dtype))
+"""),
+    ],
+    _mr: [
+        ("top-k exchange on BF16 logits (switch)",
+         """def _fn_topk_all_to_all(logits_shard, metadata, vocab_size, tp_rank):
+""",
+         """_FN_TRIM_TOPK_BF16 = __import__("os").environ.get("FLASHNEXT_TRIM_TOPK_BF16") == "1"   """ + _MARK + """
+if _FN_TRIM_TOPK_BF16:
+    print("flashnext decode trims: TOPK_BF16 ON", flush=True)
+
+
+def _fn_topk_all_to_all(logits_shard, metadata, vocab_size, tp_rank):
+"""),
+        ("top-k exchange on BF16 logits",
+         """    vals, ids = torch.topk(logits_shard.float(), k, dim=-1)
+""",
+         """    if _FN_TRIM_TOPK_BF16:   """ + _MARK + """: same selected values (BF16 -> FP32 is exact), no full FP32 copy
+        vals, ids = torch.topk(logits_shard, k, dim=-1)
+        vals = vals.float()
+    else:
+        vals, ids = torch.topk(logits_shard.float(), k, dim=-1)
+"""),
+    ],
+    _k4: [
+        ("K4 rotation as FWHT: helpers + query path",
+         """def k4_rotate(x: torch.Tensor) -> torch.Tensor:
+    \"\"\"x [..., D] -> x @ H in x's dtype (queries before attention, keys before they are stored).\"\"\"
+    return (x.float() @ hadamard(x.shape[-1], x.device)).to(x.dtype)
+""",
+         """def k4_rotate(x: torch.Tensor) -> torch.Tensor:
+    \"\"\"x [..., D] -> x @ H in x's dtype (queries before attention, keys before they are stored).\"\"\"
+    if _FN_TRIM_K4_FWHT:   """ + _MARK + """
+        return _fn_fwht_rotate(x)
+    return (x.float() @ hadamard(x.shape[-1], x.device)).to(x.dtype)
+
+
+_FN_TRIM_K4_FWHT = __import__("os").environ.get("FLASHNEXT_TRIM_K4_FWHT") == "1"   """ + _MARK + """
+if _FN_TRIM_K4_FWHT:
+    print("flashnext decode trims: K4_FWHT ON", flush=True)
+
+
+@triton.jit
+def _fn_fwht_stage(x, ROWS: tl.constexpr, D: tl.constexpr, H: tl.constexpr):
+    x = tl.reshape(x, (ROWS, D // (2 * H), 2, H))
+    x = tl.permute(x, (0, 1, 3, 2))
+    a, b = tl.split(x)
+    x = tl.join(a + b, a - b)
+    x = tl.permute(x, (0, 1, 3, 2))
+    return tl.reshape(x, (ROWS, D))
+
+
+@triton.jit
+def _fn_fwht256(x, ROWS: tl.constexpr):
+    \"\"\"x [ROWS, 256] float32 -> x @ hadamard(256): 8 butterfly stages (Sylvester order), then the 1/16 scale.\"\"\"
+    x = _fn_fwht_stage(x, ROWS, 256, 1)
+    x = _fn_fwht_stage(x, ROWS, 256, 2)
+    x = _fn_fwht_stage(x, ROWS, 256, 4)
+    x = _fn_fwht_stage(x, ROWS, 256, 8)
+    x = _fn_fwht_stage(x, ROWS, 256, 16)
+    x = _fn_fwht_stage(x, ROWS, 256, 32)
+    x = _fn_fwht_stage(x, ROWS, 256, 64)
+    x = _fn_fwht_stage(x, ROWS, 256, 128)
+    return x * 0.0625
+
+
+@triton.jit
+def _fn_fwht256_kernel(x_ptr, y_ptr, M, stride_x, stride_y, BLOCK_M: tl.constexpr):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, 256)
+    mask = rows[:, None] < M
+    x = tl.load(x_ptr + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    tl.store(y_ptr + rows[:, None] * stride_y + cols[None, :], _fn_fwht256(x, BLOCK_M).to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def _fn_fwht_rotate(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[-1] != 256:
+        raise RuntimeError(f"FLASHNEXT_TRIM_K4_FWHT supports head size 256 only, got {x.shape[-1]}")
+    x2 = x.reshape(-1, 256)
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    y = torch.empty((x2.shape[0], 256), dtype=x.dtype, device=x.device)
+    _fn_fwht256_kernel[(triton.cdiv(x2.shape[0], 2),)](x2, y, x2.shape[0], x2.stride(0), y.stride(0), BLOCK_M=2, num_warps=1)
+    return y.reshape(x.shape)
+"""),
+        ("K4 rotation as FWHT: store kernel flag",
+         """    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    tok = tl.program_id(0)
+""",
+         """    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROTATE: tl.constexpr = False,   """ + _MARK + """: rotate the key here (FWHT) instead of a separate fp32 matmul
+):
+    tok = tl.program_id(0)
+"""),
+        ("K4 rotation as FWHT: store kernel rotates",
+         """    k = tl.load(key_ptr + tok * stride_key_tok + head * stride_key_head + dims).to(tl.float32)      # already rotated (k4_store)
+""",
+         """    k = tl.load(key_ptr + tok * stride_key_tok + head * stride_key_head + dims).to(tl.float32)      # already rotated (k4_store)
+    if ROTATE:   """ + _MARK + """
+        k = tl.reshape(_fn_fwht256(tl.reshape(k, (1, HEAD_DIM)), 1), (HEAD_DIM,))
+"""),
+        ("K4 rotation as FWHT: store call",
+         """    k_rot = (key[:n].float() @ hadamard(head_dim, key.device)).contiguous()
+""",
+         """    if _FN_TRIM_K4_FWHT:   """ + _MARK + """: the store kernel rotates the BF16 key rows itself
+        if head_dim != 256:
+            raise RuntimeError(f"FLASHNEXT_TRIM_K4_FWHT supports head size 256 only, got {head_dim}")
+        k_in = key if key.stride(-1) == 1 else key.contiguous()
+        _k4_store_kernel[(n, key.shape[1])](
+            k_in, value, kv_cache, slot_mapping,
+            k_in.stride(0), k_in.stride(1), value.stride(0), value.stride(1),
+            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+            kv_cache.shape[0] * kv_cache.shape[2],
+            PAGE_SIZE=kv_cache.shape[2], HEAD_DIM=head_dim, ROTATE=True, num_warps=2,
+        )
+        return
+    k_rot = (key[:n].float() @ hadamard(head_dim, key.device)).contiguous()
+"""),
+    ],
+    _gdn: [
+        ("GDN b/a without copies: call site",
+         """        torch.ops.vllm.qwen_gdn_attention_core(
+            mixed_qkv,
+            b.contiguous(),
+            a.contiguous(),
+            core_attn_out,
+""",
+         """        torch.ops.vllm.qwen_gdn_attention_core(   """ + _MARK + """: strided b/a views, see _forward_core
+            mixed_qkv,
+            b if _FN_TRIM_GDN_AB else b.contiguous(),
+            a if _FN_TRIM_GDN_AB else a.contiguous(),
+            core_attn_out,
+"""),
+        ("GDN b/a without copies (switch)",
+         """logger = init_logger(__name__)
+""",
+         """logger = init_logger(__name__)
+_FN_TRIM_GDN_AB = os.environ.get("FLASHNEXT_TRIM_GDN_AB") == "1"   """ + _MARK + """
+if _FN_TRIM_GDN_AB:
+    print("flashnext decode trims: GDN_AB ON", flush=True)
+"""),
+        ("GDN b/a without copies: mixed path copies",
+         """        num_accepted_tokens = attn_metadata.num_accepted_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+""",
+         """        num_accepted_tokens = attn_metadata.num_accepted_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens].contiguous()   """ + _MARK + """: no-op when b/a come contiguous (switch off)
+        a = a[:num_actual_tokens].contiguous()
+"""),
+    ],
+    _hc: [
+        ("HC down + SiLU fused (switch)",
+         """from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
+""",
+         """from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
+
+_FN_TRIM_HCD_SILU = __import__("os").environ.get("FLASHNEXT_TRIM_HCD_SILU") == "1"   """ + _MARK + """
+_FN_HCDS_MAX_M = 128                 # decode / small mixed steps; larger M keeps split-K + vLLM's SiLU (M 1024: +6.6 us fused)
+_fn_hcds_said = [False]
+if _FN_TRIM_HCD_SILU:
+    print(f"flashnext decode trims: HCD_SILU ON (M <= {_FN_HCDS_MAX_M})", flush=True)
+"""),
+        ("HC down + SiLU fused",
+         """        down_and_injection = self.input_mix_weight_down_block_inject(xn)
+        split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+""",
+         """        if _FN_TRIM_HCD_SILU and xn.shape[0] <= _FN_HCDS_MAX_M:   """ + _MARK + """
+            _fn = self.input_mix_weight_down_block_inject.__dict__.get("_fn_hcd")
+            if _fn is None:
+                raise RuntimeError("FLASHNEXT_TRIM_HCD_SILU=1 needs the HC-down split-K kernel (FLASHNEXT_HC_DOWN=1): "
+                                   f"{self.input_mix_weight_down_block_inject.prefix} has no kept FP8 weight")
+            from .ops.fn_hcd_silu import hc_down_silu as _fn_hcd_silu
+
+            if not _fn_hcds_said[0]:
+                _fn_hcds_said[0] = True
+                print(f"flashnext HC-down + SiLU fused: ON (M <= {_FN_HCDS_MAX_M}) | first layer "
+                      f"{self.input_mix_weight_down_block_inject.prefix}", flush=True)
+            return _fn_hcd_silu(xn if xn.stride(-1) == 1 else xn.contiguous(), _fn[0], _fn[1], self.lora_rank, self.hc_count)
+        down_and_injection = self.input_mix_weight_down_block_inject(xn)
+        split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+"""),
+    ],
+    _mu: [
+        ("DeltaNet align copies: 1 tile",
+         """_TEMPORAL_TILES = 16
+""",
+         """_TEMPORAL_TILES = 1 if __import__("os").environ.get("FLASHNEXT_TRIM_MAMBA_TILES") == "1" else 16   """ + _MARK + """
+if _TEMPORAL_TILES == 1:
+    print("flashnext decode trims: MAMBA_TILES ON", flush=True)
+"""),
+    ],
+}
+for _mod, _src in ((_hcds, _HCDS_SRC), (_qg, _QG_SRC)):
+    if not _mod.exists() or _mod.read_text() != _src:
+        compile(_src, str(_mod), "exec")
+        _mod.write_text(_src)
+        print("decode trims: [installed]", _mod)
+    else:
+        print("decode trims: [already]", _mod)
+for _f, _edits in _EDITS.items():
+    _s = _f.read_text()
+    for _label, _old, _new in _edits:
+        if _new in _s:
+            print("decode trims: [already]", _label)
+            continue
+        assert _s.count(_old) == 1, f"decode trims edit '{_label}': anchor found {_s.count(_old)} times in {_f} (an earlier cell changed?)"
+        _s = _s.replace(_old, _new)
+        print("decode trims: [installed]", _label)
+    compile(_s, str(_f), "exec")
+    _f.write_text(_s)
+print("(FLASHNEXT_TRIM_K4_ROT / _GAP_ONCE / _TOPK_BF16 / _K4_FWHT / _GDN_AB / _HCD_SILU / _MAMBA_TILES / _QSA_GATE / _QSA_SHIFT = 1 before the server starts; unset = unchanged)")

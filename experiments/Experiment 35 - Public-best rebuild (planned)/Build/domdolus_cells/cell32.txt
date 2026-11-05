@@ -1,0 +1,217 @@
+import subprocess
+from pathlib import Path
+
+_ZS = Path(REPO) / "src/arcagi2/sandbox/local_sandbox.py"
+_ZC = Path(REPO) / "src/arcagi2/api/clients.py"
+_ZV = Path(REPO) / "src/arcagi2/api/clients_v3.py"
+for _p in (_ZS, _ZC, _ZV):
+    assert _p.exists(), f"{_p} not found: run steps 4, 5 and 5v first."
+_Z_MARK = "step 5z fix"
+
+_ZS_EDITS = [("repl init", '''        self._pid = None
+        self._killed = None
+
+    async def _start_kernel(self):''', '''        self._pid = None
+        self._killed = None
+        self.setup_code = []     # step 5z fix (b): the setup cells (clients.py sets them); run again in a fresh python process
+
+    async def _start_kernel(self):'''),
+("reader stops", '''        run = asyncio.ensure_future(self._run(code))
+        while not run.done():
+            if self._killed is not None:
+                run.cancel()
+                why = self._killed
+                try:
+                    self._kc.stop_channels()
+                    await self._km.shutdown_kernel(now=True)
+                except Exception:
+                    pass
+                await self._start_kernel()
+                raise _MemoryStopped(why)
+            await asyncio.wait({run}, timeout=0.5)
+        return run.result()
+''', '''        run = asyncio.ensure_future(self._run(code))
+        try:
+            while not run.done():
+                if self._killed is not None:
+                    run.cancel()
+                    why = self._killed
+                    try:
+                        self._kc.stop_channels()
+                        await self._km.shutdown_kernel(now=True)
+                    except Exception:
+                        pass
+                    await self._start_kernel()
+                    raise _MemoryStopped(why)
+                await asyncio.wait({run}, timeout=0.5)
+            return run.result()
+        finally:
+            # step 5z fix (a): a call that is given up (the timeout in execute) stops its reader of the kernel's output too; before, the
+            # reader kept going, took the output of later calls and made some fail with an empty error (-> the whole run restarted)
+            if not run.done():
+                run.cancel()
+                await asyncio.wait({run})
+'''),
+("execute", '''            except Exception:
+                try:
+                    self._kc.stop_channels()
+                    await self._km.shutdown_kernel(now=True)
+                    await self._start_kernel()
+                except Exception as e:
+                    raise SandboxInfrastructureError(f"Kernel could not be recovered: {e}") from e
+            raise ExecutionTimeoutError(f"Code execution timed out after {timeout} seconds")
+        except _MemoryStopped as e:
+            raise ExecutionError(trace=f"MemoryError: this python process {e}, so it was stopped and replaced by a fresh one. "
+                                       f"Every variable, function and import from earlier calls is gone: define them again. "
+                                       f"Use less memory (smaller arrays, no huge lists or caches).")
+        except Exception as e:
+            raise SandboxInfrastructureError(f"Code execution failed: {e}") from e
+        if error is not None:
+            raise ExecutionError(trace=error)
+        return ExecutionResult(text="".join(chunks).strip() if chunks else None)
+''', '''            except Exception:
+                await self._replace_kernel("a timed-out call did not stop when interrupted")
+                raise ExecutionError(trace=f"TimeoutError: the code ran longer than {timeout:g} seconds and did not stop when interrupted, "
+                                           f"so this python process was replaced by a fresh one. {self._fresh_note()}")
+            raise ExecutionTimeoutError(f"Code execution timed out after {timeout} seconds")
+        except _MemoryStopped as e:
+            await self._rerun_setup()
+            raise ExecutionError(trace=f"MemoryError: this python process {e}, so it was stopped and replaced by a fresh one. "
+                                       f"{self._fresh_note()} Use less memory (smaller arrays, no huge lists or caches).")
+        except Exception as e:
+            # step 5z fix (b): a python process that stops answering is replaced (setup run again) and the model is told; before, this
+            # was a SandboxInfrastructureError, and the solver restarted the WHOLE run from its first prompt
+            logger.warning(f"step 5z: python process broken ({type(e).__name__}: {e}): replacing it")
+            await self._replace_kernel(f"{type(e).__name__}: {e}")
+            raise ExecutionError(trace=f"PythonProcessError: this python process stopped answering, so it was replaced by a fresh one. "
+                                       f"{self._fresh_note()}")
+        if error is not None:
+            raise ExecutionError(trace=error)
+        return ExecutionResult(text="".join(chunks).strip() if chunks else None)
+
+    def _fresh_note(self) -> str:
+        # step 5z fix (b): what the model has in the fresh python process
+        if self.setup_code:
+            return ("`puzzle`, check() and the helper functions are loaded again, but every variable, function and import of your own "
+                    "from earlier calls is gone: define them again.")
+        return "Every variable, function and import from earlier calls is gone: define them again."
+
+    async def _rerun_setup(self):
+        # step 5z fix (b): the setup cells again, in the fresh python process
+        for cell in self.setup_code:
+            chunks, error = await asyncio.wait_for(self._run(cell), timeout=120)
+            if error is not None:
+                raise SandboxInfrastructureError(f"the setup code failed in a fresh python process: {error[-800:]}")
+        logger.info(f"step 5z: python process replaced, setup run again ({len(self.setup_code)} cells)")
+
+    async def _replace_kernel(self, why: str):
+        # step 5z fix (b): a fresh python process + the setup; only if that fails is it an infrastructure error (whole-run restart)
+        try:
+            try:
+                self._kc.stop_channels()
+                await self._km.shutdown_kernel(now=True)
+            except Exception:
+                pass
+            await self._start_kernel()
+            await self._rerun_setup()
+        except Exception as e:
+            raise SandboxInfrastructureError(f"Kernel could not be replaced ({why}): {e!r}") from e
+''')]
+
+_ZC_OLD = '''                        logger.info(f"Initial code in REPL executed successfully")
+'''
+_ZC_NEW = '''                        logger.info(f"Initial code in REPL executed successfully")
+                        repl.setup_code = list(initial_code)   # step 5z fix (b): a replaced python process runs these again
+'''
+
+_ZV_OLD = '''                        _ae = self._assistant_entry(st, message, completion_tokens)
+                        if _ae.msg.get("content") is None and not _ae.msg.get("tool_calls"):
+                            _ae.msg["content"] = ""         # an empty reply (only thinking): vLLM refuses content None without tool calls (HTTP 400)
+                        entries.append(_ae)
+                        entries.append(self._user_entry(st, feedback))
+'''
+_ZV_NEW = '''                        _ae = self._assistant_entry(st, message, completion_tokens)
+                        if not _ae.msg.get("content") and not _ae.msg.get("tool_calls"):
+                            # step 5z fix (c): a reply with only thinking is sent back with content "" (content None -> vLLM 400)
+                            for _z_key in [k for k, v in _ae.msg.items() if v is None]:
+                                del _ae.msg[_z_key]
+                            _ae.msg["content"] = ""
+                        entries.append(_ae)
+                        entries.append(self._user_entry(st, feedback))
+'''
+
+for _p, _edits in ((_ZS, _ZS_EDITS), (_ZC, [("setup hook", _ZC_OLD, _ZC_NEW)]), (_ZV, [("empty reply", _ZV_OLD, _ZV_NEW)])):
+    _t = _p.read_text()
+    if _Z_MARK in _t:
+        print("already patched:", _p)
+        continue
+    for _name, _old, _new in _edits:
+        assert _t.count(_old) == 1, f"step 5z: unexpected source in {_p.name} ({_name}: found {_t.count(_old)} times; for clients_v3.py run step 5v first)"
+        _t = _t.replace(_old, _new, 1)
+    compile(_t, str(_p), "exec")
+    _p.write_text(_t)
+    print("patched:", _p, "|", ", ".join(n for n, _, _ in _edits))
+
+_Z_CHECK = r'''
+import asyncio, os, signal, time
+from arcagi2.sandbox.local_sandbox import LocalKernelSandbox
+from arcagi2.sandbox.base import ExecutionError
+from arcagi2.sandbox.exceptions import ExecutionTimeoutError
+import arcagi2.api.clients as C, arcagi2.api.clients_v3 as V, inspect
+assert "repl.setup_code = list(initial_code)" in inspect.getsource(C) and "step 5z fix (c)" in inspect.getsource(V)
+async def quick(repl, n):
+    bad = 0
+    for k in range(n):
+        r = await repl.execute(f"for _ in range(3): print({k} * 7)\nlen(puzzle['train'])", 30)
+        bad += r.text != "\n".join([str(k * 7)] * 3) + "\n3"
+    return bad
+async def main():
+    async with LocalKernelSandbox() as sb:
+        async with sb.create_repl() as repl:
+            repl.setup_code = ["puzzle = {'train': [1, 2, 3]}"]
+            await repl.execute(repl.setup_code[0], 60)
+            for _ in range(3):
+                try:
+                    await repl.execute("import time; time.sleep(60)", 2)
+                    raise SystemExit("no timeout")
+                except ExecutionTimeoutError:
+                    pass
+                bad = await quick(repl, 15)
+                assert bad == 0, f"{bad} of 15 outputs after a timeout were wrong"
+            print("a: 3 timeouts, then 45 quick calls: all outputs right, no error")
+            async def _no_interrupt(*a, **k):
+                raise RuntimeError("the interrupt did not work (live check)")
+            repl._km.interrupt_kernel = _no_interrupt
+            try:
+                await repl.execute("import time; time.sleep(60)", 2)
+                raise SystemExit("no error")
+            except ExecutionError as e:
+                assert "replaced by a fresh one" in e.trace and "`puzzle`" in e.trace, e.trace
+            assert await quick(repl, 5) == 0
+            print("b: a call that ignores the interrupt -> fresh python process, `puzzle` loaded again, next calls right")
+            repl._killed = "used too much memory (live check)"
+            try:
+                await repl.execute("import time; time.sleep(5)", 30)
+                raise SystemExit("no error")
+            except ExecutionError as e:
+                assert e.trace.startswith("MemoryError") and "`puzzle`" in e.trace, e.trace
+            assert await quick(repl, 5) == 0
+            print("b: memory stop -> fresh python process, `puzzle` loaded again, next calls right")
+            import queue
+            async def _empty(*a, **k):
+                raise queue.Empty     # what the 64K run's broken calls raised
+            repl._kc.get_iopub_msg = _empty
+            try:
+                await repl.execute("1 + 1", 30)
+                raise SystemExit("no error")
+            except ExecutionError as e:
+                assert e.trace.startswith("PythonProcessError") and "`puzzle`" in e.trace, e.trace
+            assert await quick(repl, 5) == 0
+            print("b: a broken output channel (queue.Empty) -> fresh python process instead of a whole-run restart, next calls right")
+asyncio.run(main())
+'''
+_r = subprocess.run([ARC_PY, "-c", _Z_CHECK], capture_output=True, text=True, cwd=str(REPO), env=ARC_ENV, timeout=600)
+print((_r.stdout + _r.stderr).strip()[-2500:])
+assert _r.returncode == 0, "step 5z: the live check failed: paste the WHOLE message above"
+print("STEP 5z done: a. timed-out calls stop their reader | b. a broken python process is replaced with the setup run again | "
+      "c. empty replies are sent back with content \"\"")

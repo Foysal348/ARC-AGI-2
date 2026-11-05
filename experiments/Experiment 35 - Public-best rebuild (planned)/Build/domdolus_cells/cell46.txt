@@ -1,0 +1,716 @@
+import glob, json, os, random, re, shutil, subprocess, sys, time, urllib.request
+from datetime import datetime
+
+MAX_GEN_TOKENS = 200_000
+TEXT_GRIDS = False
+CONCURRENCY = 70
+REASONING_EFFORT = "xhigh"
+SEED = 0
+TRIM_TARGET = 16384
+TRIM_MARGIN = 1024
+TRIM_NOTE = True
+RECOVERY_MAX = 5
+REPORT_EVERY_S = 60
+STOP_MARGIN_MIN = 1
+MAX_REVIVALS = 3
+THIRD_TRY = False
+TRY3_MIN_LEFT_MIN = 60
+MIN_LEFT_FOR_REVIVAL_MIN = 30
+
+assert REASONING_EFFORT in ("low", "medium", "xhigh"), f"REASONING_EFFORT must be low, medium or xhigh, not {REASONING_EFFORT!r}"
+assert "DEADLINE" in globals() and "write_submission" in globals(), "Run the START cell first."
+assert "PORTS" in globals() and "N_SEQS" in globals() and "ARC_PY" in globals(), "Run the earlier steps first."
+assert len(PORTS) == 1, "the stage manager is written for one server copy (step 1: REPLICAS = 1)"
+assert TEXT_GRIDS or USE_IMAGES_EFFECTIVE, "TEXT_GRIDS = False needs the images (the server of step 6 has images off)"
+STOP_AT = DEADLINE - STOP_MARGIN_MIN * 60
+fmt = lambda t: datetime.fromtimestamp(t).strftime("%H:%M")
+served_len = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORTS[0]}/v1/models", timeout=10))["data"][0].get("max_model_len")
+assert served_len == WINDOW, f"The server has max_model_len={served_len} but this run assumes {WINDOW}. Run step 6 again (the server cell)."
+print("server:", PORTS[0], "| window", WINDOW, "| sequences", N_SEQS, "| runs at a time (both tries)", CONCURRENCY)
+
+OUTS = [f"{WORK}/out_0"]
+SUBS = [f"{WORK}/sub_0"]
+shutil.rmtree(WORK, ignore_errors=True)
+os.makedirs(WORK, exist_ok=True)
+_LAST_GOOD.clear(); _LAST_REC.clear()
+
+ids = sorted(TEST_TASKS)
+random.Random(SEED).shuffle(ids)
+open(f"{WORK}/.env", "w").write("VLLM_API_KEY=dummy\n")
+json.dump({k: TEST_TASKS[k] for k in ids}, open(f"{WORK}/subset_0.json", "w"))
+_sol_file = os.path.join(os.path.dirname(TEST_FILE), "arc-agi_evaluation_solutions.json")
+SOLUTIONS = {}
+if os.path.exists(_sol_file):
+    SOLUTIONS = {k: v for k, v in json.load(open(_sol_file)).items() if k in TEST_TASKS}
+print("tasks:", len(ids), "| solutions known for", len(SOLUTIONS), "(live CORRECT counts)" if SOLUTIONS else "(the hidden test: no CORRECT counts)")
+
+MANAGER_SRC = r'''# STAGE MANAGER (session 16, owner's request): rounds 1, 2 and 3 of the run in ONE harness process, at the same time.
+# Started by step 8 with the harness's python: `python stage_manager.py settings.json`. Writes status.json every few seconds (step 8 prints it)
+# and runs.json at the end (step 8 merges the attempts from it).
+#   round 1: every task, as it is.
+#   round 2: a task whose round-1 run ended WITHOUT a final answer runs again in a new conversation, transposed ("T"; "P" = as it is can be
+#            added). Session 17 (owner): also when round 1 had a check() passing every training example but gave no answer (s16: 6 of 10 such
+#            functions were wrong or half right on the test). Note: round 1's best function and code (with the orientation it was written
+#            for); if that function passes every training example, the note asks to check it on the test inputs and confirm or fix it,
+#            otherwise to work breadth-first.
+#   round 3: a task whose round-1 and round-2 runs all ended without a final answer runs once more, mirrored left-right ("F"), with the best
+#            function and code of each earlier run. Each round builds on the ones before. (S["only_final_ends"] = False: s16's rule, where a
+#            100% check() also ended a task.)
+# SCHEDULING: a free slot takes a queued round-1 run first, else a queued round-2 run, else a queued round-3 run (owner, session 16).
+# SECOND TRY (S["second_try"], session 17, owner, Kaggle; default off): no rounds; every task also gets an independent try 2 ("<id>_2": the
+#   same grids, a new conversation, no note), queued from the start as a round-2 run. Round 1 first as above, so a try 2 starts only when
+#   no try 1 is queued. Among the queued tries 2: tasks whose try 1 ended without a final answer first, then tasks whose try 1 still runs,
+#   then tasks whose try 1 gave a final answer (in the order they were queued within each group).
+# BUDGET: every run stops at the same token limit (ARC_MAX_GEN_TOKENS). All runs together get TOTAL_TOKEN_BUDGET decoded tokens. Every round-1
+# task keeps its full limit reserved until it ends (round 1 always goes first); a round-2/3 run starts only when a free slot exists AND
+# the budget minus (tokens of ended runs + max(used, limit) of running runs + the limit for every round-1 task not started yet) is at
+# least one limit. A round-1 task that ends early gives its unused tokens back to rounds 2 and 3.
+import asyncio, glob, json, logging, os, re, signal, sys, time
+from pathlib import Path
+
+S = json.load(open(sys.argv[1]))
+LIMIT = int(S["limit"])
+TOTAL = int(S["total_budget"])
+CONC = int(S["concurrency"])
+ROUND2 = list(S["round2_variants"])        # subset of ["P", "T"]
+ROUND3 = list(S["round3_variants"])        # subset of ["F"]
+assert set(ROUND2) <= {"P", "T"} and set(ROUND3) <= {"F"}, (ROUND2, ROUND3)
+OUT = {1: S["out1"], 2: S["out2"], 3: S["out3"]}
+SUB = {1: S["sub1"], 2: S["sub2"], 3: S["sub3"]}
+NOTES = S["notes_file"]
+STATUS = S["status_file"]
+ROUND_OF = {"": 1, "P": 2, "T": 3, "F": 3, "2": 2, "3": 3}   # session 18b: "T" = the transposed try 3 | session 22: "3" = the plain try 3
+ONLY_FINAL = bool(S.get("only_final_ends", False))   # session 17: only a final answer ends a task
+SECOND_TRY = bool(S.get("second_try", False))       # session 17 (owner, Kaggle): an independent try 2 per task instead of rounds
+assert not (SECOND_TRY and (ROUND2 or ROUND3)), "second_try replaces the rounds: round2_variants and round3_variants must be empty"
+THIRD_TRY = bool(S.get("third_try", False))        # session 18b (owner): transposed try 3 for tasks whose try 1 gave no final answer
+TRY3_MIN_LEFT_S = 60 * float(S.get("try3_min_left_min", 60))
+assert not THIRD_TRY or SECOND_TRY, "third_try needs second_try"
+# session 17 (Kaggle): per-round token limits written for the harness (ARC_RUN_LIMITS file; 0 = no limit, only the deadline), no token
+# budget (total_budget 0: time decides), a pause file (while it exists no run starts: a vLLM server is being restarted), an absolute stop time.
+LIMITS_FILE = S.get("limits_file")
+ROUND_LIMIT = {int(r): int(v) for r, v in (S.get("round_limits") or {}).items()}
+PAUSE_FILE = S.get("pause_file")
+STOP_EPOCH = S.get("stop_epoch")
+BUDGET_ON = TOTAL > 0
+_STOP = []                                   # SIGTERM from the notebook: stop like at the time limit (runs cancelled, runs.json written)
+signal.signal(signal.SIGTERM, lambda *_: _STOP.append(1))
+assert not LIMITS_FILE or set(ROUND_LIMIT) == {1, 2, 3}, "limits_file needs round_limits for rounds 1, 2 and 3"
+
+from dotenv import load_dotenv
+from arcagi2.evaluation.evaluate import puzzle_worker
+from arcagi2.solver.config import SOLVER_CONFIGS
+from arcagi2.utils.logging_utils import setup_infra_logger_console_handler
+
+tp = lambda g: [list(r) for r in zip(*g)]
+fl = lambda g: [list(r)[::-1] for r in g]
+TRANSFORM = {"": None, "P": None, "T": tp, "F": fl, "2": None, "3": None}     # each is its own inverse: the same function maps answers back
+
+STEPS = ("This time work breadth-first:\n"
+         "1. Look at the examples and write down 4-5 DIFFERENT candidate rules, a few lines each. Do not check any of them by hand.\n"
+         "2. Write each rule as a function and run them all through check() in one python call.\n"
+         "3. Continue from the rule with the best check() result, using its list of wrong cells. If none comes close, write new "
+         "candidate rules that differ from the ones you tried.\n"
+         "Never verify a rule cell by cell in your thinking: check() does that exactly and costs far fewer tokens.")
+ORIENT = {"": "the original grids", "P": "the original grids", "T": "the original grids transposed (rows and columns swapped)",
+          "F": "the original grids mirrored left-right (each row reversed)"}
+ORDINAL = {2: "a second", 3: "a third"}
+# HYBRID INFORMED TRY 2 (owner, session 18b): try 2 waits until its try 1 has ended. Try 1 gave a final answer -> NOTE_ALT (find a
+# different rule); no final -> a fresh start without a note (INFORMED_NEW = True adds NOTE_NEW instead; RTX: no measurable effect).
+INFORMED_TRY2 = False              # session 22 (owner): no more 'evolve style': try 2 is plain and queued from the start
+INFORMED_NEW = False
+NOTE_ALT = ("[Note from the harness] This is a second attempt at this puzzle. An earlier attempt found a rule whose function reproduces EVERY "
+            "training example; its code is below. A rule can fit every training example and still be wrong on the test input(s): it may miss "
+            "a case that only a test input shows. Find a DIFFERENT rule that also reproduces every training example and would give a different "
+            "output on at least one test input, and give that as your final answer. Do not submit the earlier rule again.\n{earlier}")
+NOTE_NEW = ("[Note from the harness] This is a second attempt at this puzzle. An earlier attempt used its whole budget without finding a rule "
+            "that reproduces every training example. Do not follow the same route: find a different rule.\n{earlier}")
+NOTE = ("[Note from the harness] This is {nth} attempt at this puzzle. {prev} without finding a rule that reproduces every training example. "
+        "You see {orient}; {saw}\n{earlier}\n{ideas}\n" + STEPS)
+NOTE_CONFIRM = ("[Note from the harness] This is {nth} attempt at this puzzle. {prev} You see {orient}; {saw}\n{earlier}\n"
+                "A function can reproduce every training example and still be wrong on the test input(s). First check that its rule really "
+                "explains every training example, then look at what it does on each test input: write it for the grids you see, run check() and "
+                "look at the test outputs with show(). If it is right, give it as your final answer. If it misses something a test input needs, "
+                "fix it, run check() again and give the fixed version as your final answer.")
+PREV_CONFIRM = {2: ("An earlier attempt wrote a function that reproduces EVERY training example, but its budget of {k}K tokens ran out before it "
+                    "gave a final answer.", "the earlier attempt may have seen the grids differently, so its code works on the grids IT saw."),
+                3: ("The earlier attempts each used their whole budget of {k}K tokens without giving a final answer; at least one of them wrote a "
+                    "function that reproduces EVERY training example.", "the earlier attempts saw the grids differently, so their code works on "
+                    "the grids THEY saw.")}
+PREV = {2: ("An earlier attempt used its whole budget of {k}K tokens", "the earlier attempt may have seen the grids differently, so its code works "
+            "on the grids IT saw.", "Its idea is incomplete or wrong, so do not just repeat it."),
+        3: ("The earlier attempts each used their whole budget of {k}K tokens", "the earlier attempts saw the grids differently, so their code "
+            "works on the grids THEY saw.", "Their ideas are incomplete or wrong, so do not just repeat them.")}
+
+
+def log(msg):
+    logging.getLogger("arcagi2.evaluation.evaluate").info(f"STAGE {msg}")
+
+
+def view(task, f):
+    if f is None:
+        return task
+    return {"train": [{"input": f(e["input"]), "output": f(e["output"])} for e in task["train"]],
+            "test": [{"input": f(e["input"])} for e in task["test"]]}
+
+
+def _grid(g):
+    return isinstance(g, list) and bool(g) and all(isinstance(r, list) and r and all(isinstance(v, int) and not isinstance(v, bool) for v in r) for r in g) \
+        and len({len(r) for r in g}) == 1
+
+
+class Run:
+    def __init__(self, pid, var):
+        self.pid, self.var, self.rid = pid, var, pid + ("_" + var if var else "")
+        self.round = ROUND_OF[var]
+        self.state = "queued"           # queued | running | ended | skipped
+        self.task = None
+        self.folder = None              # the sample folder (out/<uid>/<sample>/)
+        self.used = 0
+        self.final = False              # a final answer (attempt_1 grid in the round's submission)
+        self.full = False               # a check() record passing every training example
+        self.t0 = self.t1 = None
+
+    def find_folder(self):
+        if self.folder:
+            return self.folder
+        for m in glob.glob(f"{OUT[self.round]}/*/metadata.json"):
+            try:
+                if json.load(open(m))["puzzle_id"] == self.rid:
+                    subs = [d for d in glob.glob(os.path.join(os.path.dirname(m), "*/")) if os.path.exists(d + "metadata.json")]
+                    if subs:
+                        self.folder = subs[0]
+                        return self.folder
+            except Exception:
+                continue
+        return None
+
+    def read_used(self):
+        f = self.find_folder()
+        if f and os.path.exists(f + "run.log"):
+            g = re.findall(r"V3_GEN (\d+)", open(f + "run.log", errors="replace").read())
+            self.used = int(g[-1]) if g else 0
+        return self.used
+
+    def records(self):
+        f = self.find_folder()
+        try:
+            return json.load(open(f + "check_attempts.json")).get("records") or [] if f else []
+        except Exception:
+            return []
+
+    def finish(self):
+        self.read_used()
+        try:
+            sub = json.load(open(f"{SUB[self.round]}/submission.json"))
+        except Exception:
+            sub = {}
+        self.final = any(isinstance(e, dict) and _grid(e.get("attempt_1")) for e in (sub.get(self.rid) or []))
+        self.full = any(r.get("n") and r.get("ok") == r.get("n") for r in self.records())
+
+    @property
+    def solved_train(self):
+        """the task needs no next round: a final answer (session 17), or (s16 rule) also a check() passing every training example"""
+        return self.final or (self.full and not ONLY_FINAL)
+
+
+def best(run):
+    rs = sorted(run.records(), key=lambda r: (r["ok"] / max(1, r["n"]), r["pct"]), reverse=True) if run else []
+    return rs[0] if rs else None
+
+
+def earlier_text(n, prev, var):
+    """one line (+ code) per earlier run of the task: what it saw, its best check() result, its code"""
+    r = best(prev)
+    saw = ORIENT[prev.var] + (" (the same grids as you)" if ORIENT[prev.var] == ORIENT[var] else "")
+    if r is None:
+        return f"- Attempt {n} saw {saw}. It never wrote a function that check() could test: it spent its budget checking ideas by hand."
+    s = f"- Attempt {n} saw {saw}. Its best function got {r['ok']}/{r['n']} training examples right ({r['pct']}% of the training cells)"
+    if r.get("code"):
+        return s + ". Its code (for the grids it saw):\n```python\n" + r["code"].rstrip() + "\n```"
+    return s + "."
+
+
+async def main():
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    setup_infra_logger_console_handler(logging.INFO)
+    load_dotenv(S["env_file"])
+    config = SOLVER_CONFIGS[S["config_name"]]
+    config.set_vllm_base_url(S["base_url"])
+    for r in (1, 2, 3):
+        Path(OUT[r]).mkdir(parents=True, exist_ok=False)
+        Path(SUB[r]).mkdir(parents=True, exist_ok=True)
+        json.dump({}, open(f"{SUB[r]}/submission.json", "w"))
+    fh = logging.FileHandler(f"{OUT[1]}/run.log")           # the main log (step 10 reads the sample errors from it)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    lg = logging.getLogger("arcagi2.evaluation.evaluate")
+    lg.addHandler(fh); lg.setLevel(logging.INFO)
+
+    tasks = json.load(open(S["challenge_file"]))
+    ids = list(tasks)
+    notes = {pid: None for pid in ids}                      # round 1: explicitly no note
+    def write_notes():
+        tmp = NOTES + ".tmp"
+        json.dump(notes, open(tmp, "w")); os.replace(tmp, NOTES)
+    write_notes()
+    limits = {}                                             # session 17: run id -> its decoded-token limit (written before the run starts)
+    def write_limits():
+        if LIMITS_FILE:
+            tmp = LIMITS_FILE + ".tmp"
+            json.dump(limits, open(tmp, "w")); os.replace(tmp, LIMITS_FILE)
+    write_limits()
+
+    runs = [Run(pid, "") for pid in ids] + ([Run(pid, "2") for pid in ids] if SECOND_TRY else [])
+    by = {(r.pid, r.var): r for r in runs}
+    if INFORMED_TRY2:
+        for r in runs:                                      # informed try 2: waits until its try 1 has ended
+            if r.var == "2":
+                r.state = "waiting"
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(10 ** 6)                        # concurrency is decided here, not by the semaphore
+    k = ROUND_LIMIT.get(1, LIMIT) // 1000                   # the earlier rounds' budget, for the notes
+    t_start = time.time()
+    deadline = float(STOP_EPOCH) if STOP_EPOCH else t_start + float(S["time_limit_hours"]) * 3600
+    events = []
+
+    def event(msg):
+        events.append(f"{(time.time() - t_start) / 60:5.1f} min  {msg}")
+        log(msg)
+
+    def start(run):
+        if run.var == "2":                             # second try: explicitly no note (a missing note stops the harness)
+            t1 = by[(run.pid, "")]
+            notes[run.rid] = None
+            if INFORMED_TRY2 and t1.state == "ended" and (t1.final or INFORMED_NEW):
+                notes[run.rid] = (NOTE_ALT if t1.final else NOTE_NEW).format(earlier=earlier_text(1, t1, ""))
+            write_notes()
+        elif run.var == "3" and THIRD_TRY:           # try 3 (session 22): an independent PLAIN run, explicitly no note
+            notes[run.rid] = None
+            write_notes()
+        elif run.round > 1:
+            prev = [r for r in runs if r.pid == run.pid and r.round < run.round]
+            prev.sort(key=lambda r: (r.round, r.var))
+            earlier = "\n".join(earlier_text(n, r, run.var) for n, r in enumerate(prev, 1))
+            if any(r.full for r in prev):              # session 17: an earlier function fits every training example -> confirm or fix it
+                pv, saw = PREV_CONFIRM[min(3, len(prev) + 1)]
+                notes[run.rid] = NOTE_CONFIRM.format(nth=ORDINAL[run.round], prev=pv.format(k=k), orient=ORIENT[run.var], saw=saw, earlier=earlier)
+            else:
+                pv, saw, ideas = PREV[min(3, len(prev) + 1)]
+                notes[run.rid] = NOTE.format(nth=ORDINAL[run.round], prev=pv.format(k=k), orient=ORIENT[run.var], saw=saw, ideas=ideas,
+                                             earlier=earlier)
+            write_notes()
+        if LIMITS_FILE:
+            limits[run.rid] = ROUND_LIMIT[run.round]
+            write_limits()
+        run.state, run.t0 = "running", time.time()
+        run.task = asyncio.create_task(puzzle_worker(semaphore=sem, lock=lock, config=config, puzzle_id=run.rid,
+                                                     puzzle_json=view(tasks[run.pid], TRANSFORM[run.var]),
+                                                     evaluation_output_folder=Path(OUT[run.round]),
+                                                     submission_file=Path(f"{SUB[run.round]}/submission.json"), num_samples=1))
+        event(f"start round {run.round} {run.rid}")
+
+    def committed():
+        c = 0
+        for r in runs:
+            if r.state == "ended":
+                c += r.used
+            elif r.state == "running":
+                c += max(r.read_used(), LIMIT)
+            elif r.state == "queued" and r.round == 1:
+                c += LIMIT
+        return c
+
+    def status(done=False, why=""):
+        st = {"time_min": round((time.time() - t_start) / 60, 1), "done": done, "why": why, "limit": LIMIT, "total_budget": TOTAL,
+              "paused": bool(PAUSE_FILE) and os.path.exists(PAUSE_FILE), "stop_epoch": deadline,
+              "concurrency": CONC, "rounds": {}, "events": events[-12:]}
+        used = 0
+        for rd in (1, 2, 3):
+            rr = [r for r in runs if r.round == rd]
+            for r in rr:
+                if r.state == "running":
+                    r.read_used()
+            used += sum(r.used for r in rr)
+            st["rounds"][rd] = {s: sum(r.state == s for r in rr) for s in ("waiting", "queued", "running", "ended", "skipped")}
+            st["rounds"][rd].update(final=sum(r.final for r in rr if r.state == "ended"), full_check=sum(r.full and not r.final for r in rr if r.state == "ended"),
+                                    tokens=sum(r.used for r in rr))
+        st["tokens_used"] = used
+        st["tokens_committed"] = committed()
+        tmp = STATUS + ".tmp"
+        json.dump(st, open(tmp, "w")); os.replace(tmp, STATUS)
+
+    def follow_up(run):
+        """after a run ends: queue the next round of its task when every run so far failed"""
+        pid = run.pid
+        if THIRD_TRY and run.round == 1 and not run.final and (pid, "3") not in by:
+            nr = Run(pid, "3"); runs.append(nr); by[(pid, "3")] = nr
+            event(f"try 1 {pid}: no final answer -> try 3 (plain) queued")
+        if run.round == 1 and not run.solved_train and ROUND2:
+            for v in ROUND2:
+                nr = Run(pid, v); runs.append(nr); by[(pid, v)] = nr
+            event(f"round 1 {pid}: no final answer" + (", a full check() to confirm" if run.full else ", no full check()") + f" -> round 2 queued ({'+'.join(ROUND2)})")
+        elif run.round == 1 and not run.solved_train and not ROUND2 and ROUND3:
+            for v in ROUND3:
+                nr = Run(pid, v); runs.append(nr); by[(pid, v)] = nr
+            event(f"round 1 {pid}: failed -> round 3 queued (no round 2)")
+        elif run.round == 2 and ROUND3:
+            r2 = [by[(pid, v)] for v in ROUND2]
+            if all(r.state == "ended" for r in r2) and not any(r.solved_train for r in r2):
+                for v in ROUND3:
+                    nr = Run(pid, v); runs.append(nr); by[(pid, v)] = nr
+                event(f"round 2 {pid}: no final answer" + (" (a full check() to confirm)" if any(r.full for r in r2) else "") + " -> round 3 queued")
+
+    why = "all runs ended"
+    try:
+        while True:
+            for r in runs:
+                if r.state == "running" and r.task.done():
+                    r.state, r.t1 = "ended", time.time()
+                    r.finish()
+                    event(f"end round {r.round} {r.rid}: {r.used // 1000}K tokens | final answer {'yes' if r.final else 'no'} | full check() {'yes' if r.full else 'no'}")
+                    follow_up(r)
+                    t2 = by.get((r.pid, "2"))
+                    if r.var == "" and t2 is not None and t2.state == "waiting":      # informed try 2 may start now
+                        t2.state = "queued"
+                        event(f"try 2 of {r.pid} queued " + ("with the different-rule note" if r.final else
+                                                             ("with the new-route note" if INFORMED_NEW else "fresh (no note)")))
+            if time.time() > deadline or _STOP:
+                why = "stopped by the notebook" if _STOP else "time limit"
+                break
+            paused = bool(PAUSE_FILE) and os.path.exists(PAUSE_FILE)
+            free_slots = 0 if paused else CONC - sum(r.state == "running" for r in runs)
+            for r in runs:                                   # round 1 first: its tokens are reserved
+                if free_slots <= 0:
+                    break
+                if r.state == "queued" and r.round == 1:
+                    start(r); free_slots -= 1
+            def extra_order(r):                              # session 22 (owner): every try 2 before any try 3 (try 3 last)
+                return r.round                               # 2 = try 2, 3 = try 3; queue order within each
+            for r in sorted((r for r in runs if r.state == "queued" and r.round in (2, 3)), key=extra_order):
+                if free_slots <= 0:
+                    break
+                if r.round == 3 and THIRD_TRY and deadline - time.time() < TRY3_MIN_LEFT_S:
+                    continue                                 # try 3: not in the last minutes
+                if r.state == "queued" and (not BUDGET_ON or TOTAL - committed() >= LIMIT):
+                    start(r); free_slots -= 1
+            running = [r for r in runs if r.state == "running"]
+            queued = [r for r in runs if r.state == "queued"]
+            if not running and not queued:
+                break
+            if not running and queued and not paused:        # nothing runs, nothing can start: the budget is used up
+                for r in queued:
+                    r.state = "skipped"
+                event(f"budget used up: {len(queued)} queued runs skipped")
+                why = "token budget used up"
+                break
+            status()
+            await asyncio.sleep(float(S.get("poll_s", 5)))
+    finally:
+        live = [r for r in runs if r.state == "running"]
+        for r in live:
+            r.task.cancel()
+        if live:
+            await asyncio.gather(*[r.task for r in live], return_exceptions=True)
+            for r in live:
+                r.state, r.t1 = "ended", time.time()
+                r.finish()
+            event(f"stopped ({why}): {len(live)} running runs cancelled")
+        for r in runs:
+            if r.state in ("queued", "waiting"):
+                r.state = "skipped"
+        json.dump([{"pid": r.pid, "var": r.var, "rid": r.rid, "round": r.round, "state": r.state, "used": r.used, "final": r.final,
+                    "full": r.full, "folder": r.folder, "minutes": round(((r.t1 or time.time()) - r.t0) / 60, 1) if r.t0 else None} for r in runs],
+                  open(S["runs_file"], "w"), indent=1)
+        status(done=True, why=why)
+        fh.close()
+
+
+asyncio.run(main())
+'''
+open(f"{WORK}/stage_manager.py", "w").write(MANAGER_SRC)
+PAUSE_FILE = f"{WORK}/PAUSE"
+SETTINGS = {"challenge_file": f"{WORK}/subset_0.json", "config_name": "qwen3_8_flash_next_free", "base_url": f"http://127.0.0.1:{PORTS[0]}/v1",
+            "env_file": f"{WORK}/.env", "limit": MAX_GEN_TOKENS, "total_budget": 0, "concurrency": CONCURRENCY,
+            "round2_variants": [], "round3_variants": [], "second_try": True, "third_try": THIRD_TRY, "try3_min_left_min": TRY3_MIN_LEFT_MIN, "time_limit_hours": 12, "stop_epoch": STOP_AT,
+            "out1": OUTS[0], "sub1": SUBS[0], "out2": f"{WORK}/out_r2", "sub2": f"{WORK}/sub_r2", "out3": f"{WORK}/out_r3", "sub3": f"{WORK}/sub_r3",
+            "notes_file": f"{WORK}/notes.json", "limits_file": f"{WORK}/limits.json", "pause_file": PAUSE_FILE,
+            "round_limits": {"1": MAX_GEN_TOKENS, "2": MAX_GEN_TOKENS, "3": MAX_GEN_TOKENS},
+            "status_file": f"{WORK}/status.json", "runs_file": f"{WORK}/runs.json", "poll_s": 5, "only_final_ends": True}
+json.dump(SETTINGS, open(f"{WORK}/settings.json", "w"), indent=1)
+
+def metric(port, name):
+    try:
+        text = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5).read().decode()
+        return sum(float(m.group(1)) for m in re.finditer(rf"^vllm:{name}(?:\{{[^}}]*\}})?\s+([\d.eE+-]+)", text, re.M))
+    except Exception:
+        return None
+
+t_start = time.time()
+env = {**ARC_ENV, "ARC_CTX_WINDOW": str(WINDOW), "ARC_TRIM_TARGET": str(TRIM_TARGET), "ARC_TRIM_MARGIN": str(TRIM_MARGIN), "ARC_TRIM_NOTE": "1" if TRIM_NOTE else "0",
+       "ARC_MAX_GEN_TOKENS": str(MAX_GEN_TOKENS), "ARC_IMAGES": "1" if USE_IMAGES_EFFECTIVE else "0",
+       "ARC_COMPACT": "1", "ARC_RECOVERY_MAX": str(RECOVERY_MAX), "ARC_DEADLINE_EPOCH": str(STOP_AT), "ARC_SAMPLE_SECONDS": "0",
+       "ARC_SALVAGE_AT_DEADLINE": "0", "ARC_REASONING_FIELD": "reasoning", "ARC_REASONING_EFFORT": REASONING_EFFORT,
+       "ARC_CHECK_HELPER": "1", "ARC_GRID_HELPERS": "1", "ARC_CHECK_ATTEMPTS": "1", "ARC_THINK_CAP": "0", "ARC_BUDGET_REMINDERS": "0",
+       "ARC_FINAL_REVIEW": "0", "ARC_RERUN_NOTES": SETTINGS["notes_file"], "ARC_RUN_LIMITS": SETTINGS["limits_file"],
+       "ARC_TEXT_GRIDS": "1" if TEXT_GRIDS else "0"}
+print(f"started {fmt(t_start)} | THREE PLAIN TRIES: try 1, try 2 (independent, no note), try 3 (plain) for tasks without a final in try 1 (stops starting {TRY3_MIN_LEFT_MIN} min before the end; queue: tries 1, then tries 2, then tries 3) | {MAX_GEN_TOKENS:,} decoded tokens per run | "
+      f"text grids: {'ON' if TEXT_GRIDS else 'OFF (sizes + images + `puzzle`)'} | reasoning {REASONING_EFFORT} | stops at {fmt(STOP_AT)} (deadline {fmt(DEADLINE)})")
+
+LOG7 = f"{WORK}/evaluate_0.log"
+manager = None
+
+def launch_manager():
+    global manager
+    manager = subprocess.Popen([ARC_PY, f"{WORK}/stage_manager.py", f"{WORK}/settings.json"], stdout=open(LOG7, "ab"), stderr=subprocess.STDOUT,
+                               env=env, cwd=WORK)
+    print(f"stage manager started (pid {manager.pid})", flush=True)
+
+launch_manager()
+
+def tail(path, n):
+    try:
+        return open(path, errors="replace").read().replace("\r", "\n").splitlines()[-n:]
+    except Exception:
+        return []
+
+_TPb = lambda g: [list(r) for r in zip(*g)]
+_FLb = lambda g: [list(r)[::-1] for r in g]
+
+def correct_now(rd):
+    if not SOLUTIONS:
+        return None, set()
+    path = f"{SUBS[0]}/submission.json" if rd == 1 else f"{SETTINGS['sub%d' % rd]}/submission.json"
+    try:
+        sub = json.load(open(path))
+    except Exception:
+        return 0, set()
+    right, tasks = 0, set()
+    for rid, e in sub.items():
+        tid, var = (rid.rpartition("_")[0], rid.rpartition("_")[2]) if rd > 1 else (rid, "")
+        f = {"T": _TPb, "F": _FLb}.get(var)
+        sol = SOLUTIONS.get(tid)
+        got = [x.get("attempt_1") if isinstance(x, dict) else None for x in e]
+        if sol and len(got) >= len(sol) and all(g is not None and (f(g) if f else g) == s for g, s in zip(got, sol)):
+            right += 1; tasks.add(tid)
+    return right, tasks
+
+_seen = set()
+
+_LOAD = {"prev": None, "rows": []}
+_LOAD_KEYS = ("generation_tokens_total", "prompt_tokens_total", "num_preemptions_total", "prefix_cache_hits_total", "prefix_cache_queries_total",
+              "external_prefix_cache_hits_total", "kv_cache_usage_perc", "num_requests_running", "num_requests_waiting")
+_NB = None
+
+def _gpu_blocks():
+    global _NB
+    if _NB is None:
+        m = re.findall(r"KVDIAG pool \| num_blocks (\d+)", open(SERVERS[0]["log"], errors="replace").read())
+        _NB = int(m[-1]) if m else 0
+    return _NB
+
+def _census():
+    try:
+        for l in reversed(open(SERVERS[0]["log"], errors="replace").readlines()[-400:]):
+            if "FLASHNEXT CENSUS free" in l:
+                held = sum(int(h) for h in re.findall(r"g\d+:(\d+)/", l))
+                if held > 0:
+                    return int(re.search(r"CENSUS free (\d+)", l).group(1)), held
+    except Exception:
+        pass
+    return None
+
+def _load_line():
+    now = time.time()
+    v = {k: metric(PORTS[0], k) for k in _LOAD_KEYS}
+    if any(x is None for k, x in v.items() if k != "external_prefix_cache_hits_total"):
+        print("    LOAD: /metrics not readable"); return
+    prev, _LOAD["prev"] = _LOAD["prev"], (now, v)
+    if prev is None:
+        return
+    dt = now - prev[0]
+    d = {k: (v[k] or 0) - (prev[1][k] or 0) for k in _LOAD_KEYS}
+    hit = 100 * d["prefix_cache_hits_total"] / d["prefix_cache_queries_total"] if d["prefix_cache_queries_total"] else float("nan")
+    ram = 100 * d["external_prefix_cache_hits_total"] / d["prefix_cache_queries_total"] if d["prefix_cache_queries_total"] and v["external_prefix_cache_hits_total"] is not None else float("nan")
+    c, nb = _census(), _gpu_blocks()
+    row = dict(t=round((now - t_start) / 60, 1), decode=d["generation_tokens_total"] / dt,
+               computed=(d["prompt_tokens_total"] - d["prefix_cache_hits_total"]) / dt, hit=hit, ram=ram, preempt=d["num_preemptions_total"],
+               usage=100 * v["kv_cache_usage_perc"], running=v["num_requests_running"], waiting=v["num_requests_waiting"],
+               held=c[1] if c else None, not_held=(nb - c[0] - c[1]) if c and nb else None)
+    _LOAD["rows"].append(row)
+    print(f"    LOAD (last {dt:.0f} s): decode {row['decode']:.0f} tok/s | prompt computed {row['computed']:.0f} tok/s | prefix hit {hit:.0f}% "
+          f"(RAM {ram:.0f}%) | preemptions {row['preempt']:.0f} | KV usage {row['usage']:.0f}% | running {row['running']:.0f} waiting {row['waiting']:.0f}"
+          + (f" | GPU blocks: tasks {row['held']} / held by nothing running {row['not_held']} / pool {nb}" if c else ""), flush=True)
+    try:
+        _hd = [l for l in open(SERVERS[0]["log"], errors="replace").readlines()[-3000:] if "HITDIAG summary" in l]
+        if _hd:
+            print("    HITDIAG" + _hd[-1].split("HITDIAG summary")[-1].rstrip()[:420], flush=True)
+    except Exception as _e:
+        print("    HITDIAG line failed:", repr(_e)[:120])
+
+def _load_summary():
+    rows = [r for r in _LOAD["rows"] if r["t"] >= 10]
+    if not rows:
+        print("LOAD TEST: no rows after 10 min"); return
+    mean = lambda k: sum(r[k] for r in rows if r[k] == r[k]) / max(1, sum(1 for r in rows if r[k] == r[k]))
+    print(f"\nSPEED SUMMARY (CONCURRENCY {CONCURRENCY}, minutes 10-{rows[-1]['t']:.0f}): decode {mean('decode'):.0f} tok/s | prompt computed "
+          f"{mean('computed'):.0f} tok/s | prefix hit {mean('hit'):.0f}% (RAM {mean('ram'):.0f}%) | preemptions {sum(r['preempt'] for r in rows):.0f} | "
+          f"KV usage {mean('usage'):.0f}% | running {mean('running'):.0f}"
+          + (f" | GPU blocks held by nothing running: mean {mean('not_held'):.0f}, max {max(r['not_held'] for r in rows if r['not_held'] is not None)}"
+             if any(r["not_held"] is not None for r in rows) else ""))
+    print("Kaggle load test with improvements 1-3 at CONCURRENCY 60 for comparison: decode 651 tok/s (minutes 10-81), prefix hit 94%, preemptions 0")
+    json.dump(_LOAD["rows"], open("/kaggle/working/loadtest_rows.json", "w"), indent=1)
+
+def report():
+    try:
+        st = json.load(open(SETTINGS["status_file"]))
+    except Exception:
+        print(f"[{(time.time() - t_start) / 60:5.1f} min] no status yet", flush=True); return None
+    R = st["rounds"]
+    w = lambda rd: R.get(str(rd), {})
+    answered, _ = write_submission(quiet=True)
+    print(f"[{st['time_min']:5.1f} min] WORKING: try 1 {w(1).get('running', 0)} | try 2 {w(2).get('running', 0)} | try 3 {w(3).get('running', 0)}"
+          f"   (at most {CONCURRENCY}) | ANSWERED {answered} of {len(ids)} in submission.json | deadline in {(DEADLINE - time.time()) / 3600:.2f} h"
+          + (" | PAUSED (server restart)" if st.get("paused") else "") + f" | restarts {revivals}", flush=True)
+    for rd in (1, 2, 3):
+        x = w(rd)
+        ok, _ = correct_now(rd)
+        print(f"    try {rd}: queued {x.get('queued', 0):3d} | running {x.get('running', 0):3d} | ended {x.get('ended', 0):3d} "
+              f"(final answer {x.get('final', 0)}" + (f", CORRECT {ok}" if ok is not None else "") + f", full check() only {x.get('full_check', 0)}) | "
+              f"skipped {x.get('skipped', 0)} | tokens {x.get('tokens', 0):,}")
+    if SOLUTIONS:
+        _t1, _t2, _t3 = (correct_now(r)[1] for r in (1, 2, 3))
+        print(f"    tasks with a CORRECT final answer so far: {len(_t1 | _t2 | _t3)} (try 1 {len(_t1)}, try 2 {len(_t2)}, try 3 {len(_t3)}, "
+              f"only try 2 {len(_t2 - _t1 - _t3)}, only try 3 {len(_t3 - _t1 - _t2)}); "
+              f"attempts from check() are in submission.json too")
+    g1 = metric(PORTS[0], "generation_tokens_total")
+    if g1 is not None:
+        print(f"    tokens decoded: {st.get('tokens_used', 0):,} (finished replies) | server: {g1:,.0f} since its start")
+    try:
+        _load_line()
+    except Exception as _e:
+        print("    LOAD line failed:", repr(_e)[:200])
+    try:
+        _mem = {l.split(":")[0]: int(l.split()[1]) / 1048576 for l in open("/proc/meminfo")}
+        _gk = sum(1 for _ in open(MEM_GUARD_LOG)) if os.path.exists(MEM_GUARD_LOG) else 0
+        print(f"    RAM: available {_mem['MemAvailable']:.0f} of {_mem['MemTotal']:.0f} GiB | guard stops {_gk}")
+    except Exception as e:
+        print("    RAM: could not read", e)
+    for e in st.get("events", []):
+        if e not in _seen and ("queued" in e or "skipped" in e or "stopped" in e):
+            _seen.add(e); print("    >", e)
+    errs = [l for l in tail(LOG7, 400) if "Traceback" in l or " ERROR " in l]
+    if errs:
+        print("    last error line:", errs[-1][:200])
+    return st
+
+SERVER_DOWN_LIMIT = 3
+NO_PROGRESS_MIN = 10
+_down = [0] * len(SERVERS)
+_last_gen = [(None, time.time()) for _ in SERVERS]
+def dead_servers():
+    out = []
+    for r, s in enumerate(SERVERS):
+        exited = s.get("proc") is not None and s["proc"].poll() is not None
+        g = metric(s["port"], "generation_tokens_total")
+        _down[r] = 0 if g is not None else _down[r] + 1
+        if g is not None and g != _last_gen[r][0]:
+            _last_gen[r] = (g, time.time())
+        stuck_min = (time.time() - _last_gen[r][1]) / 60
+        if exited:
+            out.append((r, f"exited (code {s['proc'].returncode})"))
+        elif _down[r] >= SERVER_DOWN_LIMIT:
+            out.append((r, f"has not answered /metrics for {_down[r]} reports"))
+        elif g is not None and stuck_min >= NO_PROGRESS_MIN:
+            out.append((r, f"answers but has generated no token for {stuck_min:.0f} min (hung)"))
+    return out
+
+def revive(dead):
+    global revivals
+    revivals += 1
+    tag = f"restart{revivals}"
+    open(PAUSE_FILE, "w").write(tag)
+    for r, why in dead:
+        lg = SERVERS[r]["log"]
+        print(f"\nvLLM server {r} {why}. Error lines of {lg}:")
+        bad = [l for l in tail(lg, 200000) if re.search(r"Traceback|Error|OutOfMemory|out of memory|Killed", l)]
+        print("\n".join(l[:300] for l in bad[-15:]) or "\n".join(l[:300] for l in tail(lg, 15)))
+    print(subprocess.run("free -g; dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -3", shell=True, capture_output=True, text=True).stdout)
+    write_submission()
+    for s in SERVERS:
+        if os.path.exists(s["log"]):
+            shutil.copy(s["log"], s["log"].replace(".log", f".before-{tag}.log"))
+    stop_servers()
+    print(f"RESTART {revivals} of {MAX_REVIVALS} (new runs paused): starting vLLM again with window {S['max_len']}, util {S['util']}, "
+          f"{'eager' if S['eager'] else 'CUDA graphs'}, flags {flag_variants[S['vi']]}", flush=True)
+    for rep in range(len(SERVERS)):
+        state = start(rep, build_cmd(SERVERS[rep]["port"], S["max_len"], S["util"], **flag_variants[S["vi"]], eager=S["eager"], mtp=S["mtp"]), S["p2p_off"])
+        if state != "ok":
+            print(f"copy {rep} did not come back ({state}). Error lines:\n  " + "\n  ".join(root_cause(log_text(SERVERS[rep]["log"])) or ["(none)"]))
+            return False
+    for r in range(len(SERVERS)):
+        _down[r], _last_gen[r] = 0, (None, time.time())
+    os.remove(PAUSE_FILE)
+    print("server back: new runs start again", flush=True)
+    return True
+
+revivals = 0
+stop_reason = "all runs ended"
+try:
+    while manager.poll() is None:
+        time.sleep(REPORT_EVERY_S)
+        if DEADLINE_HIT.is_set() or time.time() >= STOP_AT:
+            stop_reason = f"deadline ({fmt(STOP_AT)})"
+            break
+        report()
+        dead = dead_servers()
+        if dead:
+            left_min = (STOP_AT - time.time()) / 60
+            if revivals < MAX_REVIVALS and left_min >= MIN_LEFT_FOR_REVIVAL_MIN:
+                try:
+                    if revive(dead):
+                        continue
+                    stop_reason = "the vLLM server did not come back after a restart"
+                except Exception as e:
+                    stop_reason = f"the restart failed: {type(e).__name__}: {e}"
+            else:
+                stop_reason = (f"the vLLM server died ({dead[0][1]}) and " +
+                               (f"{MAX_REVIVALS} restarts are used up" if revivals >= MAX_REVIVALS else f"only {left_min:.0f} min are left"))
+            break
+except KeyboardInterrupt:
+    stop_reason = "interrupted by hand"
+
+if manager.poll() is None and stop_reason.startswith("deadline"):
+    try:
+        manager.wait(120)
+    except subprocess.TimeoutExpired:
+        pass
+if manager.poll() is None:
+    manager.terminate()
+    try:
+        manager.wait(120)
+    except subprocess.TimeoutExpired:
+        manager.kill()
+if DEADLINE_HIT.is_set():
+    stop_reason = "deadline (the START cell's timer stopped everything)"
+print(f"\nSTOPPED: {stop_reason} | {(time.time() - t_start) / 60:.0f} min | stage manager exit code {manager.returncode} | restarts {revivals}")
+report()
+if manager.returncode not in (0, None, -15):
+    print("\n".join(l[:300] for l in tail(LOG7, 30)))
+answered, bad = write_submission()
+print(f"FINAL submission.json: {len(TEST_TASKS)} tasks, {answered} with an answer -> {SUBMISSION}")
+try:
+    _load_summary()
+except Exception as _e:
+    print("LOAD TEST SUMMARY failed:", repr(_e)[:200])
+if SOLUTIONS:
+    _score = 0.0
+    for tid, sol in SOLUTIONS.items():
+        e = json.load(open(SUBMISSION)).get(tid) or []
+        _score += sum(i < len(e) and g in (e[i]["attempt_1"], e[i]["attempt_2"]) for i, g in enumerate(sol)) / len(sol)
+    print(f"SCORE (trial, solutions known): {_score:.2f} / {len(SOLUTIONS)}")
+for f in (LOG7, SETTINGS["runs_file"], SETTINGS["status_file"]):
+    if os.path.exists(f):
+        shutil.copy(f, "/kaggle/working")
+stop_servers()
+print("vLLM stopped; done at", fmt(time.time()))

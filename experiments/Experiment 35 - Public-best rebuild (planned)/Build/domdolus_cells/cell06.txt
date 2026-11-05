@@ -1,0 +1,49 @@
+import json, os, platform, re, shutil, subprocess, sys
+from pathlib import Path
+
+assert all(n in globals() for n in ("UTILITY_PATH", "MODEL_PATH", "COMP_DIR")), "run step 0 first: it finds the utility, the model and the competition data"
+print("utility:", UTILITY_PATH, "| model:", MODEL_PATH, "| competition data:", COMP_DIR)
+MODEL_KIND   = "flashnext"
+
+KINDS = {
+    "flashnext": dict(vllm="0.31.0", tp=4, replicas=1, kv_dtype="fp8",  gpu_util=0.92, expert_parallel=True,  min_gpus=4),
+    "gsq27":     dict(vllm="0.27.1", tp=2, replicas=2, kv_dtype="fp8",  gpu_util=0.95, expert_parallel=False, min_gpus=2),
+}
+assert MODEL_KIND in KINDS, f"MODEL_KIND must be one of {list(KINDS)}"
+KIND = KINDS[MODEL_KIND]
+assert "PUT-THE" not in UTILITY_PATH + MODEL_PATH, "type the two paths at the top of this cell first"
+
+print("python", sys.version.split()[0], "|", platform.platform())
+assert sys.version_info[:2] == (3, 12), "The utility is built for Python 3.12. Use that environment (Session options)."
+ALLOW_OTHER_GPU = False
+gpus = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,driver_version,compute_cap", "--format=csv,noheader"],
+                      capture_output=True, text=True).stdout.strip().splitlines()
+print("gpus:"); print("\n".join("  " + g for g in gpus))
+N_GPUS = len(gpus)
+caps = [float(g.split(",")[-1]) for g in gpus]
+if min(caps) < 8.9 and not ALLOW_OTHER_GPU:
+    raise RuntimeError(f"These GPUs have compute capability {min(caps)}, but this notebook needs 8.9 (L4 or newer). In the Session options choose the accelerator 'GPU L4 x4'.")
+if N_GPUS < KIND["min_gpus"]:
+    raise RuntimeError(f"{MODEL_KIND} needs at least {KIND['min_gpus']} GPUs, this machine has {N_GPUS}.")
+gpu_gb = float(gpus[0].split(",")[2].replace("MiB", "").strip()) / 1024
+smi = subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout
+m = re.search(r"CUDA Version:\s*([\d.]+)", smi)
+print("driver supports CUDA:", m.group(1) if m else "unknown")
+if m and float(m.group(1)) < 13.0:
+    print("WARNING: torch 2.13 in the utility is built for CUDA 13; this driver supports an older CUDA.")
+
+TP = KIND["tp"] if N_GPUS >= KIND["tp"] else N_GPUS
+REPLICAS = KIND["replicas"] if N_GPUS >= TP * KIND["replicas"] else 1
+KV_DTYPE = KIND["kv_dtype"]
+GPU_UTIL = KIND["gpu_util"]
+EXPERT_PARALLEL = KIND["expert_parallel"] and TP > 1
+print(f"\nkind {MODEL_KIND}: vLLM {KIND['vllm']} | {REPLICAS} copy x TP {TP} | KV cache {KV_DTYPE} | expert parallel {EXPERT_PARALLEL}")
+
+mem_gb = lambda key: int(next(l for l in open("/proc/meminfo") if l.startswith(key)).split()[1]) / 1048576 * 1.073741824
+shm = shutil.disk_usage("/dev/shm")
+print(f"RAM {mem_gb('MemTotal'):.0f} GB (available {mem_gb('MemAvailable'):.0f}) | CPU cores {os.cpu_count()} | /dev/shm {shm.total / 1e9:.1f} GB | free disk /tmp {shutil.disk_usage('/tmp').free / 1e9:.0f} GB")
+if MODEL_KIND == "flashnext":
+    print("Flash-Next keeps its 51 GB n-gram table in pinned host memory (split over the GPUs' processes): this needs about 70 GB of free RAM.",
+          "OK" if mem_gb("MemAvailable") >= 70 else "<- WARNING: not enough free RAM")
+if shm.total < 2e9:
+    print("WARNING: /dev/shm is small; vLLM with several GPUs passes data through shared memory. If the server hangs at startup, tell me.")

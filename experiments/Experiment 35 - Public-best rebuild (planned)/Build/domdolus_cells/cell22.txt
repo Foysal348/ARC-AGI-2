@@ -1,0 +1,134 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_fr = _root / "v1/worker/gpu/model_runner.py"
+assert _fr.exists(), f"{_fr} not found: run the earlier steps first"
+_MARK = "# flashnext top-k exchange (session 22)"
+_HELPERS = '''
+_FN_TOPK = __import__("os").environ.get("FLASHNEXT_TOPK_EXCHANGE") == "1"   ''' + _MARK + '''
+_FN_TOPK_K = int(__import__("os").environ.get("FLASHNEXT_TOPK_EXCHANGE_K", "64"))
+_fn_topk_stats = {"fast": 0, "full": 0, "why": {}, "t": time.time()}
+
+
+def _fn_topk_reason(runner, batch, grammar_output):
+    """None if this step may use the candidate exchange, else the reason (counted)"""
+    s = runner.sampler
+    idx = batch.idx_mapping_np
+    if s is None:
+        return "no sampler"
+    if grammar_output is not None:
+        return "grammar"
+    if batch.num_draft_tokens:
+        return "speculative tokens"
+    if int(batch.cu_num_logits_np[-1]) != idx.shape[0]:
+        return "logit rows != requests"
+    if s.get_logprobs_dims(idx) is not None:
+        return "logprobs"
+    if s.return_sampling_mask or s.trace_replay_state is not None or s.compute_nans:
+        return "sampling mask / trace / nans"
+    st = s.sampling_states
+    tk, temp = st.top_k.np[idx], st.temperature.np[idx]
+    if not np.all((temp == 0.0) | ((tk >= 1) & (tk <= _FN_TOPK_K))):
+        return "top_k outside 1..K"
+    for p in s.logits_processors:
+        n = type(p).__name__
+        if n == "LogitBiasState":
+            if np.any(p.use_logit_bias[idx]):
+                return "logit bias"
+        elif n == "PenaltiesState":
+            if np.any(p.use_penalty[idx]):
+                return "penalties"
+        elif n == "BadWordsState":
+            if int(p.num_bad_words.np[idx].max()) != 0:
+                return "bad words"
+        else:
+            return "custom logits processor " + n
+    tb = s.thinking_budget_state
+    if tb.enabled and np.any(tb.use_thinking_budget[idx]):
+        return "thinking budget"
+    return None
+
+
+def _fn_topk_count(runner, why):
+    st = _fn_topk_stats
+    if why is None:
+        st["fast"] += 1
+    else:
+        st["full"] += 1
+        st["why"][why] = st["why"].get(why, 0) + 1
+    if time.time() - st["t"] > 60 and runner.batch_sharder is not None and runner.batch_sharder.tp_rank == 0:
+        st["t"] = time.time()
+        print(f"flashnext top-k exchange: fast {st['fast']} | full {st['full']} {st['why']}", flush=True)
+
+
+def _fn_topk_all_to_all(logits_shard, metadata, vocab_size, tp_rank):
+    """per request, this rank's K best (value, token id) -> the owner; returns compact logits [n, tp*K] and token ids [n, tp*K]"""
+    from vllm.distributed.parallel_state import get_tp_group
+    k = _FN_TOPK_K
+    shard_w = logits_shard.shape[-1]
+    vals, ids = torch.topk(logits_shard.float(), k, dim=-1)
+    packed = torch.stack([vals, (ids + tp_rank * shard_w).to(torch.float32)], dim=-1).reshape(logits_shard.shape[0], 2 * k)
+    recv = packed.new_empty(metadata.tp_size * metadata.num_local_logits, 2 * k)
+    torch.distributed.all_to_all_single(
+        recv,
+        packed.contiguous(),
+        output_split_sizes=[metadata.num_local_logits] * metadata.tp_size,
+        input_split_sizes=metadata.num_logits_per_rank,
+        group=get_tp_group().device_group,
+    )
+    recv = recv.view(metadata.tp_size, metadata.num_local_logits, k, 2).permute(1, 0, 2, 3).reshape(metadata.num_local_logits, metadata.tp_size * k, 2)
+    tok = recv[..., 1].round().to(torch.int64)
+    logits = recv[..., 0].masked_fill(tok >= vocab_size, float("-inf")).contiguous()
+    return logits, tok
+
+
+class GPUModelRunner(LoRAModelRunnerMixin):
+'''
+_EDITS = [
+    ("helpers", "\nclass GPUModelRunner(LoRAModelRunnerMixin):\n", _HELPERS),
+    ("candidate ids variable",
+     """        shard_metadata = None
+        global_input_batch = input_batch
+""",
+     """        shard_metadata = None
+        global_input_batch = input_batch
+        _fn_ids = None   """ + _MARK + """
+"""),
+    ("exchange",
+     """            sample_hidden_states = hidden_states[sorted_logits_indices]
+            local_logits = self.model.compute_logits_local(sample_hidden_states)
+            logits = all_to_all_logits(local_logits, shard_metadata)
+            logits = logits[:, : self.vocab_size]
+""",
+     """            sample_hidden_states = hidden_states[sorted_logits_indices]
+            local_logits = self.model.compute_logits_local(sample_hidden_states)
+            _fn_why = _fn_topk_reason(self, global_input_batch, grammar_output) if _FN_TOPK else "off"   """ + _MARK + """
+            if _FN_TOPK:
+                _fn_topk_count(self, _fn_why)
+            if _fn_why is None:
+                logits, _fn_ids = _fn_topk_all_to_all(local_logits, shard_metadata, self.vocab_size, self.batch_sharder.tp_rank)
+            else:
+                logits = all_to_all_logits(local_logits, shard_metadata)
+                logits = logits[:, : self.vocab_size]
+"""),
+    ("map drawn positions to token ids",
+     """            assert self.sampler is not None
+            sampler_output = self.sampler(logits, input_batch)
+""",
+     """            assert self.sampler is not None
+            sampler_output = self.sampler(logits, input_batch)
+            if _fn_ids is not None:   """ + _MARK + """
+                sampler_output.sampled_token_ids = torch.gather(_fn_ids, 1, sampler_output.sampled_token_ids.view(-1, 1).to(torch.int64))
+"""),
+]
+_s = _fr.read_text()
+for _label, _old, _new in _EDITS:
+    if _new in _s:
+        print("top-k exchange: [already]", _label)
+        continue
+    assert _s.count(_old) == 1, f"top-k exchange edit '{_label}': anchor found {_s.count(_old)} times in {_fr} (patch cell changed?)"
+    _s = _s.replace(_old, _new)
+    print("top-k exchange: [installed]", _label)
+compile(_s, str(_fr), "exec")
+_fr.write_text(_s)
+print("(FLASHNEXT_TOPK_EXCHANGE=1 before the server starts, with FLASHNEXT_BATCH_SHARDED_SAMPLING=1; unset = unchanged)")

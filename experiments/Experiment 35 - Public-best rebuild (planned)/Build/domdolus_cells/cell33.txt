@@ -1,0 +1,90 @@
+import subprocess
+from pathlib import Path
+
+assert "SINK_JUMP" in globals() and SINK_JUMP and SINK_JUMP[0] == "auto", "run the cell that sets SINK_JUMP first (RTX step 5c / Kaggle patch cell)"
+_PT = Path(REPO) / "src/arcagi2/tools/repl_tool.py"
+_PS = Path(REPO) / "src/arcagi2/solver/prompts/system_prompt_free.txt"
+_PA = Path(REPO) / "src/arcagi2/solver/prompts/agentic_coding_solver_free.txt"
+_PC = Path(REPO) / "src/arcagi2/solver/config/qwen3_8_flash_next_free.py"
+for _p in (_PT, _PS, _PA, _PC):
+    assert _p.exists(), f"{_p} not found: run steps 4, 5, 5v and 5z first."
+_RECENT = f"{SINK_JUMP[1] // 1000:,},000"
+
+_P_EDITS = {
+    _PT: [("redefine check",
+           '            if re.search(rf"{protected_variable}\\s*=", code):\n',
+           '            if re.search(rf"(?<![\\w.]){protected_variable}\\s*=(?!=)", code):   # step 5p: not my_puzzle = ..., not puzzle == ...\n'),
+          ("print check",
+           '            if re.search(rf"(?m)^{protected_variable}(?:\\s*\\n|$)", code) or re.search(rf"print\\({protected_variable}", code):\n',
+           '            if re.search(rf"(?m)^{protected_variable}(?:\\s*\\n|$)", code) or re.search(rf"print\\(\\s*{protected_variable}\\s*\\)", code):   # step 5p: only the WHOLE dict\n'),
+          ("print message",
+           'return f"Code is trying to print the {protected_variable} variable, which is not allowed because it will lead to a very large and wasteful print. Please remove the offending line and try again."',
+           'return f"Code is trying to print the whole {protected_variable} variable, which is not allowed because it will lead to a very large and wasteful print. Nothing in this cell was run. Print only the part you need (for example {protected_variable}.keys() or the size of a grid) and try again."')],
+    _PS: [("use loaded",
+           "1. Use the variables and functions already loaded in the Jupyter notebook instead of defining them yourself. The user message will provide a complete list of such variables and functions.\n",
+           "1. While you work, use the variables and functions already loaded in the Jupyter notebook instead of defining them yourself. The user message will provide a complete list of such variables and functions. Your final answer is different: it is run in a fresh Python session where none of them exist, so it must define everything it uses.\n"),
+          ("refused cells",
+           "3. Long tool output is cut off in the middle.\n",
+           "3. Long tool output is cut off in the middle.\n"
+           "4. A cell that prints the whole `puzzle` dict (`print(puzzle)` or a line with only `puzzle`) or assigns to `puzzle` is not run; printing parts of it is fine.\n")],
+    _PA: [("memory",
+           "- The conversation window is about {{WINDOW}} tokens. When the conversation reaches it, the oldest messages are removed automatically until about {{TRIM_TARGET}} tokens remain, so do not rely on remembering earlier steps.\n",
+           "- You always see this first message; older parts of the conversation fade, so do not rely on remembering earlier steps exactly.{{BUDGET_LINE}}\n"),
+          ("thinking",
+           "- Do not think for long before acting. As soon as you have a hypothesis, however rough, test it with code right away and read the result. If the first idea is wrong, the output will teach you more than more thinking would. Keep each thinking step short and move on to a tool call.\n",
+           "- Think carefully, and do the validating with code: as soon as you have a hypothesis, however rough, test it with code right away and read the result. If the first idea is wrong, the output will teach you more than more thinking would.\n"),
+          ("output format",
+           "Your response must contain a single Python code block fenced by ```python ... ```. Must include a `solution` function. Must be self-contained i.e. include all necessary imports and helper functions.",
+           "Your final answer is one reply without a tool call that contains a Python code block fenced by ```python ... ``` (if the reply has several code blocks, the LAST one is used). It must include a `solution` function and be self-contained: it is run in a fresh Python session where nothing from the notebook exists, so include all necessary imports and helper functions (also the code of any notebook helper you used).")],
+    _PC: [("budget line",
+           "    text = text.replace(\"{{WINDOW}}\", f\"{(_env_int('ARC_CTX_WINDOW', 32768) // 1000) * 1000:,}\")\n",
+           "    text = text.replace(\"{{WINDOW}}\", f\"{(_env_int('ARC_CTX_WINDOW', 32768) // 1000) * 1000:,}\")\n"
+           "    _budget = _env_int('ARC_MAX_GEN_TOKENS', 0)       # step 5p: the model is told its real budget (the run stops there)\n"
+           "    _rec = _env_flag('ARC_CHECK_ATTEMPTS', False) and _env_flag('ARC_CHECK_HELPER', True)\n"
+           "    text = text.replace(\"{{BUDGET_LINE}}\", (\" The work may stop before you give a final answer\"\n"
+           "                                           + (\"; then the functions you ran through `check()` are used instead (most training examples \"\n"
+           "                                              \"right first), so run `check()` on every promising `solution`.\" if _rec else \".\")) if _budget else \"\")\n")],
+}
+for _p, _edits in _P_EDITS.items():
+    _t = _p.read_text()
+    if all(_new in _t for _, _, _new in _edits):
+        print("already patched:", _p.name)
+        continue
+    for _name, _old, _new in _edits:
+        assert _t.count(_old) == 1, f"step 5p: unexpected text in {_p.name} ({_name}: found {_t.count(_old)} times)"
+        _t = _t.replace(_old, _new, 1)
+    if _p.suffix == ".py":
+        compile(_t, str(_p), "exec")
+    _p.write_text(_t)
+    print("patched:", _p.name, "|", ", ".join(n for n, _, _ in _edits))
+
+_P_CHECK = r'''
+import asyncio, os
+os.environ.setdefault("ARC_MAX_GEN_TOKENS", "100000"); os.environ.setdefault("ARC_CHECK_ATTEMPTS", "1")
+import arcagi2.solver.config.qwen3_8_flash_next_free as F
+a = F._rendered_prompt("agentic_coding_solver_free.txt").read_text()
+s = F._rendered_prompt("system_prompt_free.txt").read_text()
+for gone in ("Do not think for long", "Keep each thinking step short", "conversation window is about", "removed automatically",
+             "Your response must contain a single Python code block", "{{BUDGET_LINE}}", "{{WINDOW}}",
+             "Your budget", "at least the last", "tokens of your own output"):   # nonum: no token numbers
+    assert gone not in a + s, gone
+for new in ("Think carefully, and do the validating with code", "You always see this first message; older parts of the conversation fade",
+            "The work may stop before you give a final answer; then the functions you ran through `check()` are used instead", "the LAST one is used", "Your final answer is different",
+            "assigns to `puzzle` is not run", "Your very first code execution should be `puzzle.keys()`"):
+    assert (a + s).count(new) == 1, new
+from arcagi2.tools import repl_tool as T
+async def _ran(self, repl, code): return "RAN"
+T.REPLTool.run = _ran
+tool = T.REPLToolWithProtection(name="python", timeout=120, protected_variables=["puzzle"])
+cases = {"print(puzzle.keys())": True, "puzzle.keys()": True, "print(puzzle['train'][0]['input'])": True, "my_puzzle = 1": True,
+         "if puzzle == {}:\n    pass": True, "x = puzzle['test']": True, "print(puzzle)": False, "print( puzzle )": False,
+         "puzzle": False, "a = 1\npuzzle\n": False, "puzzle = {}": False, "puzzle={}": False}
+bad = {c: r for c, ok in cases.items() if ((r := asyncio.run(tool.run(None, c))) == "RAN") != ok}
+assert not bad, bad
+print("prompt and protection check: OK |", len(cases), "cells checked")
+'''
+_r = subprocess.run([ARC_PY, "-c", _P_CHECK], capture_output=True, text=True, cwd=str(REPO), env=ARC_ENV, timeout=300)
+print((_r.stdout + _r.stderr).strip()[-2500:])
+assert _r.returncode == 0, "step 5p: the check failed: paste the WHOLE message above"
+print(f"STEP 5p done: print(puzzle.keys()) etc. allowed (only the whole dict refused) | thinking: careful, validated with code | memory: first "
+      f"message always seen, older parts fade, no token numbers (nonum) | final answer: fresh session, last code block")

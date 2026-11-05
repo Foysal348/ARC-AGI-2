@@ -1,0 +1,363 @@
+import os
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_MARK = "# flashnext state RAM v2 (session 18b)"
+_OLD_MARK = "# flashnext state RAM (session 18b)"
+
+_SINGLE_EDITS = [
+    ("retire: newest state to RAM instead of pinned",
+     """        if _FN_HOLD["mode"] == "pinnew":   # flashnext hold-states switch (session 17): only the newest state stays pinned
+""",
+     """        if _FN_HOLD["mode"] == "pinnew" and getattr(self.block_pool, "_fn_sr", None) is not None:   """ + _MARK + """
+            return _fn_sr_retire(self, request_id, idx, block, aligned, held)
+        if _FN_HOLD["mode"] == "pinnew":   # flashnext hold-states switch (session 17): only the newest state stays pinned
+"""),
+    ("lookup: fine-grained DeltaNet hit may come from RAM",
+     """                if cached_block := block_pool.get_cached_block(
+                    block_hash, kv_cache_group_ids
+                ):
+                    block_idx = fine_idx // scale_factor
+""",
+     """                if cached_block := _fn_sr_cached(block_pool, block_hash, kv_cache_group_ids, True):   """ + _MARK + """
+                    block_idx = fine_idx // scale_factor
+"""),
+    ("lookup: DeltaNet hit may come from RAM",
+     """            if cached_block := block_pool.get_cached_block(
+                block_hashes[i], kv_cache_group_ids
+            ):
+                # When enable Mamba prefix caching, `block_size` will be aligned
+""",
+     """            if cached_block := _fn_sr_cached(block_pool, block_hashes[i], kv_cache_group_ids,   """ + _MARK + """
+                                             block_size == alignment_tokens or (i + 1) * block_size % alignment_tokens == 0):
+                # When enable Mamba prefix caching, `block_size` will be aligned
+"""),
+]
+_SINGLE_TAIL = '''
+
+''' + _MARK + '''
+def _fn_sr_retire(mgr, request_id, idx, block, aligned, held):
+    """pinnew with the newest state in RAM: queue one copy to RAM, then free it as a normal cached block (taken back at the end of the
+    call if the GPU still has it). Older held states of the request were freed already."""
+    from vllm.v1.core.kv_cache_coordinator import _FN_SEG
+
+    pool = mgr.block_pool
+    for h in list(held):
+        held.remove(h)
+        if len(h) > 3:
+            _FN_HOLD["prot"].pop(h[1].block_id, None)
+        else:
+            pool.free_blocks([h[1]])
+        _FN_SEG["states_dropped"] += 1
+    pool._fn_sr._fn_sr_store(request_id, mgr.kv_cache_group_id, block)
+    held.append((idx, block, aligned, block.block_hash))
+    pool.free_blocks([block])
+    _FN_HOLD["freed"] += 1
+    return True
+
+
+def _fn_sr_cached(block_pool, block_hash, kv_cache_group_ids, aligned_ok):
+    """get_cached_block, and for the GPU pool a restore from RAM when the GPU no longer holds the state."""
+    sr = getattr(block_pool, "_fn_sr", None)
+    blocks = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+    if sr is None or not aligned_ok:
+        return blocks
+    if blocks:
+        return sr._fn_sr_force(block_pool, block_hash, kv_cache_group_ids, blocks) if sr._fn_sr_cfg["force"] else blocks
+    return sr._fn_sr_restore(block_pool, block_hash, kv_cache_group_ids)
+'''
+
+_MGR_EDITS = [
+    ("connector: the GPU pool knows the state RAM",
+     """        if self._fn_on:
+            gpu_block_pool._fn_on_evict = self._fn_gpu_evicted
+            self.cpu_block_pool._fn_on_evict = self._fn_ram_evicted
+""",
+     """        if self._fn_on:
+            gpu_block_pool._fn_on_evict = self._fn_gpu_evicted
+            self.cpu_block_pool._fn_on_evict = self._fn_ram_evicted
+        self._fn_sr_init(gpu_block_pool)   """ + _MARK + """
+"""),
+    ("connector: state RAM methods",
+     """    def _fn_gpu_evicted(self, block, hashes) -> None:
+""",
+     """    def _fn_sr_init(self, gpu_block_pool) -> None:   """ + _MARK + """
+        import os as _o
+        import time as _t
+
+        self._fn_sr_cfg = {"on": _o.environ.get("FLASHNEXT_STATE_RAM") == "1", "force": _o.environ.get("FLASHNEXT_STATE_RAM_FORCE") == "1",
+                           "check": _o.environ.get("FLASHNEXT_STATE_RAM_CHECK") == "1",
+                           "reserve": int(_o.environ.get("FLASHNEXT_STATE_RAM_RESERVE", "64"))}
+        self._fn_sr_loads = []        # (gpu blocks, cpu blocks, original gpu blocks or None) restored this step
+        self._fn_sr_last = {}         # (request id, group id) -> hash of its newest RAM copy
+        self._fn_sr_forced = set()    # test: boundary hashes already forced through RAM once
+        self._fn_sr_n = dict.fromkeys(("stored", "already", "ram_full", "no_hash", "ram_dropped", "restored", "no_room",
+                                       "forced"), 0)
+        self._fn_sr_tot = dict(self._fn_sr_n)
+        self._fn_sr_t = _t.time()
+        gpu_block_pool._fn_sr = None
+        if not self._fn_sr_cfg["on"]:
+            return
+        if not self._fn_on:
+            raise RuntimeError("FLASHNEXT_STATE_RAM=1 needs the RAM offload with FLASHNEXT_OFFLOAD_EVICT=1 (KV_OFFLOAD_GIB set)")
+        from vllm.v1.core import single_type_kv_cache_manager as _st
+
+        _h = getattr(_st, "_FN_HOLD", None)
+        if _h is None or _h["mode"] != "pinnew":
+            raise RuntimeError(f"FLASHNEXT_STATE_RAM=1 needs FLASHNEXT_HOLD_STATES=pinnew (got {None if _h is None else _h['mode']!r})")
+        gpu_block_pool._fn_sr = self
+        print(f"flashnext state RAM: the newest DeltaNet state of each running task goes to RAM instead of staying pinned on the GPU "
+              f"(force {self._fn_sr_cfg['force']}, check {self._fn_sr_cfg['check']}, restore reserve {self._fn_sr_cfg['reserve']} blocks)",
+              flush=True)
+
+    def _fn_sr_store(self, request_id, group_id, block) -> None:
+        \"\"\"Queue one GPU -> RAM copy of a retired DeltaNet state (the copy holds a GPU reference until it is done).\"\"\"
+        n, cpu = self._fn_sr_n, self.cpu_block_pool
+        h = block.block_hash
+        if h is None:
+            n["no_hash"] += 1
+            return
+        key = (request_id, group_id)
+        old = self._fn_sr_last.pop(key, None)
+        if old is not None and old != h:
+            ob = cpu.cached_block_hash_to_block.get_one_block(old)
+            if ob is not None and ob.ref_cnt == 0 and cpu._maybe_evict_cached_block(ob):
+                n["ram_dropped"] += 1
+        self._fn_sr_last[key] = h
+        if len(self._fn_sr_last) > 200000:
+            for k in list(self._fn_sr_last)[:100000]:
+                del self._fn_sr_last[k]
+        if cpu.cached_block_hash_to_block.get_one_block(h) is not None:
+            n["already"] += 1
+            return
+        if cpu.get_num_free_blocks() < 1:
+            n["ram_full"] += 1
+            return
+        cb = cpu.get_new_blocks(1)[0]
+        self._gpu_block_pool.touch([block])
+        self._pending_finished_stores.append(TransferMeta([block.block_id], [cb.block_id], None))
+        self._fn_ram_held += 1
+        n["stored"] += 1
+
+    def _fn_sr_restore(self, pool, block_hash, group_ids, originals=None):
+        \"\"\"The state at this boundary is in RAM but not on the GPU: take fresh GPU blocks, register them under the same hashes and
+        queue the RAM -> GPU copy for this step (before its forward). Returns the blocks like get_cached_block, or None.\"\"\"
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id as _mk
+
+        cpu, n = self.cpu_block_pool, self._fn_sr_n
+        cbs = []
+        for g in group_ids:
+            cb = cpu.cached_block_hash_to_block.get_one_block(_mk(block_hash, g))
+            if cb is None:
+                return None
+            cbs.append(cb)
+        if pool.get_num_free_blocks() < len(group_ids) + self._fn_sr_cfg["reserve"]:
+            n["no_room"] += 1
+            return None
+        gbs = pool.get_new_blocks(len(group_ids))          # ref 1 each until build_connector_meta: nobody else takes them this step
+        if originals is not None:
+            pool.touch(originals)                          # check mode: the originals must keep their content until the compare
+        for g, gb, cb in zip(group_ids, gbs, cbs):
+            pool._insert_block_hash(_mk(block_hash, g), gb, num_tokens=cb.block_hash_num_tokens)
+        cpu.touch(cbs)
+        self._fn_sr_loads.append((gbs, cbs, originals))
+        n["restored"] += 1
+        return gbs
+
+    def _fn_sr_force(self, pool, block_hash, group_ids, blocks):
+        \"\"\"TEST ONLY (FLASHNEXT_STATE_RAM_FORCE=1): use the RAM copy although the GPU still has the state.\"\"\"
+        if any(b.ref_cnt != 0 for b in blocks) or block_hash in self._fn_sr_forced:
+            return blocks                                  # in use (running request / pending copy) or forced once already
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id as _mk
+
+        cpu = self.cpu_block_pool
+        if any(cpu.cached_block_hash_to_block.get_one_block(_mk(block_hash, g)) is None for g in group_ids):
+            return blocks
+        if self._fn_sr_cfg["check"]:
+            got = self._fn_sr_restore(pool, block_hash, group_ids, originals=list(blocks))
+        else:
+            pool._fn_dropping = True
+            try:
+                for b in blocks:
+                    pool._maybe_evict_cached_block(b)
+            finally:
+                pool._fn_dropping = False
+            got = self._fn_sr_restore(pool, block_hash, group_ids)
+        if got is None:
+            return blocks if self._fn_sr_cfg["check"] else None
+        self._fn_sr_forced.add(block_hash)
+        self._fn_sr_n["forced"] += 1
+        return got
+
+    def _fn_sr_take(self, scheduler_output):
+        \"\"\"This step's restores: block ids for the worker; release the step's references.\"\"\"
+        gpu, cpu, chk = [], [], []
+        for gbs, cbs, orig in self._fn_sr_loads:
+            gpu += [b.block_id for b in gbs]
+            cpu += [b.block_id for b in cbs]
+            if orig is not None:
+                chk += [(o.block_id, b.block_id) for o, b in zip(orig, gbs)]
+                self._gpu_block_pool.free_blocks(orig)
+            self.cpu_block_pool.free_blocks(cbs)
+            self._gpu_block_pool.free_blocks(gbs)
+        self._fn_sr_loads.clear()
+        if gpu:
+            scheduler_output.has_sync_kv_loads = True      # the worker copies before this step's forward
+        return gpu, cpu, chk
+
+    def _fn_sr_report(self) -> None:
+        import time as _t
+
+        if not self._fn_sr_cfg["on"] or _t.time() - self._fn_sr_t < 60:
+            return
+        self._fn_sr_t = _t.time()
+        n, t = self._fn_sr_n, self._fn_sr_tot
+        for k, v in n.items():
+            t[k] += v
+        from vllm.v1.core import single_type_kv_cache_manager as _st
+
+        h = _st._FN_HOLD
+        print("flashnext state RAM (last 60 s | total): " + ", ".join(f"{k} {n[k]} | {t[k]}" for k in n)
+              + f"; hold freed {h['freed']} taken back {h['back']} not on the GPU at the call end {h['lost']}", flush=True)
+        for k in n:
+            n[k] = 0
+
+    def _fn_gpu_evicted(self, block, hashes) -> None:
+"""),
+    ("connector: this step's restores go to the worker",
+     """            need_flush=bool(scheduler_output.preempted_req_ids),
+        )
+        return result
+""",
+     """            need_flush=bool(scheduler_output.preempted_req_ids),
+        )
+        if self._fn_sr_cfg["on"]:   """ + _MARK + """
+            result.fn_sr_gpu_blocks, result.fn_sr_cpu_blocks, result.fn_sr_check = self._fn_sr_take(scheduler_output)
+            self._fn_sr_report()
+        return result
+"""),
+    ("connector: a state copy whose GPU block lost its hash is released, not cached",
+     """            primary_hash = gpu_block.block_hash
+            assert primary_hash is not None
+""",
+     """            primary_hash = gpu_block.block_hash
+            if primary_hash is None and getattr(self, "_fn_sr_cfg", {}).get("on"):   """ + _MARK + """
+                continue
+            assert primary_hash is not None
+"""),
+]
+
+_META_EDITS = [
+    ("metadata: restore block lists",
+     """    # Whether any requests were preempted this step and need flush pending transfers.
+    need_flush: bool = False
+""",
+     """    # Whether any requests were preempted this step and need flush pending transfers.
+    need_flush: bool = False
+
+    """ + _MARK + """: DeltaNet states copied RAM -> GPU before this step's forward
+    fn_sr_gpu_blocks: list[int] = field(default_factory=list)
+    fn_sr_cpu_blocks: list[int] = field(default_factory=list)
+    fn_sr_check: list[tuple[int, int]] = field(default_factory=list)   # test: (original GPU block, restored GPU block)
+"""),
+]
+
+_WORKER_EDITS = [
+    ("worker: restores at the START of the step (before preprocess_mamba copies a resumed state into the running block)",
+     """        \"\"\"Sync all in-flight transfers before preempted blocks are reused.\"\"\"
+        if not kv_connector_metadata.need_flush:
+            return
+""",
+     """        \"\"\"Sync all in-flight transfers before preempted blocks are reused.\"\"\"
+        if kv_connector_metadata.fn_sr_cpu_blocks and not getattr(kv_connector_metadata, "_fn_sr_done", False):   """ + _MARK + """
+            # session 18b fix: vLLM's execute_model runs preprocess_mamba (align mode copies a resumed state block into the request's
+            # running block) BEFORE the connector's sync loads; the restore must land before that copy -> here, the first connector
+            # call of the step, then a device sync (steps with a restore are rare) so no stream can read the block early.
+            import torch as _fn_t
+
+            self._fn_sr_copy(kv_connector_metadata.fn_sr_cpu_blocks, kv_connector_metadata.fn_sr_gpu_blocks, kv_connector_metadata.fn_sr_check)
+            _fn_t.cuda.synchronize()
+            kv_connector_metadata._fn_sr_done = True
+        if not kv_connector_metadata.need_flush:
+            return
+"""),
+    ("worker: a restore that reaches the loads unseen is an error",
+     """        metadata = self._connector_metadata
+        if metadata is not None and metadata.load_cpu_blocks:
+""",
+     """        metadata = self._connector_metadata
+        if metadata is not None and metadata.fn_sr_cpu_blocks and not getattr(metadata, "_fn_sr_done", False):   """ + _MARK + """
+            raise RuntimeError("flashnext state RAM: restore blocks reached start_load_kv without the early copy in handle_preemptions "
+                               "(vLLM's step order changed?) - the resumed DeltaNet state would be read before it is restored")
+        if metadata is not None and metadata.load_cpu_blocks:
+"""),
+    ("worker: the copy",
+     """    def wait_for_save(self) -> None:
+""",
+     """    def _fn_sr_copy(self, cpu_ids, gpu_ids, check) -> None:   """ + _MARK + """
+        \"\"\"RAM -> GPU copies of whole blocks on the current (compute) stream: ordered before this step's forward. Pinned host rows,
+        so the copies are asynchronous for the host.\"\"\"
+        import torch as _torch
+
+        if self.disk_mode:
+            raise RuntimeError("flashnext state RAM: the disk mode of the offload is not supported")
+        for name, g in self.gpu_kv_caches.items():
+            c = self.cpu_kv_caches[name]
+            for s, d in zip(cpu_ids, gpu_ids):
+                g[d].copy_(c[s], non_blocking=True)
+        if check:
+            bad = [(o, r, name) for o, r in check for name, g in self.gpu_kv_caches.items() if not _torch.equal(g[o], g[r])]
+            if bad:
+                raise RuntimeError(f"flashnext state RAM CHECK: restored block differs from the GPU original: {bad[:4]}")
+            self._fn_sr_checked = getattr(self, "_fn_sr_checked", 0) + len(check)
+            if self._fn_sr_checked % 50 < len(check):
+                print(f"flashnext state RAM CHECK: {self._fn_sr_checked} restored blocks identical to their GPU originals", flush=True)
+
+    def wait_for_save(self) -> None:
+"""),
+]
+
+_RUNNER2_EDITS = [
+    ("V2 model runner: restores before the Mamba align pre-copy",
+     """            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            # Mamba "align" pre-copy: migrate recurrent state across block
+""",
+     """            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            _fn_sr_md = getattr(scheduler_output, "kv_connector_metadata", None)   """ + _MARK + """
+            if _fn_sr_md is not None and getattr(_fn_sr_md, "fn_sr_cpu_blocks", None):
+                # the V2 runner calls the connector (pre_forward -> handle_preemptions) only after preprocess_state below, which
+                # copies a resumed DeltaNet state into the running block: restore it from RAM first (handle_preemptions does it once)
+                from vllm.distributed.kv_transfer import get_kv_transfer_group as _fn_sr_gkt
+
+                _fn_sr_gkt().handle_preemptions(_fn_sr_md)
+            # Mamba "align" pre-copy: migrate recurrent state across block
+"""),
+]
+
+_FILES = {
+    "v1/core/single_type_kv_cache_manager.py": (_SINGLE_EDITS, _SINGLE_TAIL),
+    "v1/worker/gpu/model_runner.py": (_RUNNER2_EDITS, ""),
+    "v1/simple_kv_offload/manager.py": (_MGR_EDITS, ""),
+    "v1/simple_kv_offload/metadata.py": (_META_EDITS, ""),
+    "v1/simple_kv_offload/worker.py": (_WORKER_EDITS, ""),
+}
+_done = []
+for _rel, (_edits, _tail) in _FILES.items():
+    _f = _root / _rel
+    assert _f.exists(), f"{_f} not found: run the earlier steps first"
+    _s = _f.read_text()
+    if _OLD_MARK in _s:
+        raise RuntimeError(f"{_f} has the FIRST state-RAM version (restore too late, session 18b bug): start a fresh runtime / vLLM tree")
+    if _MARK in _s:
+        _done.append(f"{_rel} [already]")
+        continue
+    for _label, _old, _new in _edits:
+        assert _s.count(_old) == 1, f"state RAM edit '{_label}': anchor found {_s.count(_old)} times in {_f} (vLLM or an earlier cell changed?)"
+        _s = _s.replace(_old, _new)
+    _s += _tail
+    compile(_s, str(_f), "exec")
+    _f.write_text(_s)
+    _done.append(f"{_rel} [installed]")
+assert os.environ.get("FLASHNEXT_HOLD_STATES") == "pinnew", "FLASHNEXT_HOLD_STATES must be pinnew (hold-states cell) for the state RAM"
+os.environ["FLASHNEXT_STATE_RAM"] = "1"
+print("state RAM:", " | ".join(_done), "| FLASHNEXT_STATE_RAM =", os.environ["FLASHNEXT_STATE_RAM"])

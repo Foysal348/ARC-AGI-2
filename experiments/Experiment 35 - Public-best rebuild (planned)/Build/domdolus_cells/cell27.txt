@@ -1,0 +1,47 @@
+import glob, os, shutil, tarfile, time
+from concurrent.futures import ThreadPoolExecutor
+_t = time.time()
+_pats = ["startup_caches*.tar.gz", "startup_caches*.tar.gz.bin"]
+_tars = sorted({p for pat in _pats for d in ("/kaggle/input/*", "/kaggle/input/*/*", "/kaggle/input/datasets/*/*", "/kaggle/input/datasets/*/*/*")
+                for p in glob.glob(f"{d}/{pat}")})
+_how = "fixed mount depths"
+if not _tars:
+    _tars = sorted({p for pat in _pats for p in glob.glob(f"/kaggle/input/**/{pat}", recursive=True)}); _how = "full search"
+_done = []
+for _tar in _tars:
+    with tarfile.open(_tar, "r:gz") as tf:
+        tf.extractall("/", filter="tar")
+    _done.append(f"unpacked {_tar} ({os.path.getsize(_tar) / 1e6:.1f} MB, found by {_how})")
+if not _tars:
+    _bases = set()
+    for _marker in ("root/.humming", "root/.triton", "root/.cache"):
+        for _p in glob.glob(f"/kaggle/input/**/{_marker}", recursive=True):
+            _bases.add(_p[: -len(_marker)].rstrip("/"))
+    for _b in sorted(_bases):
+        _src = os.path.join(_b, "root")
+        _files = [os.path.join(d, f) for d, _, fs in os.walk(_src) for f in fs]
+        def _cp(f):
+            dst = "/root/" + os.path.relpath(f, _src)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(f, dst)
+        with ThreadPoolExecutor(32) as ex:
+            list(ex.map(_cp, _files))
+        _done.append(f"copied {_src} -> /root ({len(_files)} files, 32 threads)")
+if not _done:
+    raise RuntimeError("no startup caches under /kaggle/input (no startup_caches*.tar.gz(.bin), no unpacked root/ folder). Attach the fast-startup dataset.")
+print("\n".join("  " + d for d in _done))
+for _f in ("/root/.cache/flashinfer", "/root/.humming", "/root/.triton", "/root/.cache/vllm"):
+    print(f"  {_f}: {sum(len(fs) for _, _, fs in os.walk(_f)) if os.path.isdir(_f) else 'not in the dataset'} files")
+_aot, _n8 = "/tmp/site-vllm/flashinfer/data/aot", 0
+for _so in sorted(glob.glob("/root/.cache/flashinfer/*/*/cached_ops/*/*.so")):
+    _name = os.path.basename(os.path.dirname(_so))
+    if os.path.basename(_so) != _name + ".so":
+        continue
+    os.makedirs(f"{_aot}/{_name}", exist_ok=True)
+    shutil.copy2(_so, f"{_aot}/{_name}/{_name}.so")
+    _n8 += 1
+    print(f"  FlashInfer kernel '{_name}' -> {_aot}/{_name}/{_name}.so (loaded as prebuilt, never rebuilt)")
+if not _n8:
+    print("  no FlashInfer kernels in the restored cache (the sampling kernel will be compiled during the start, ~2 min)")
+print(f"caches restored in {time.time() - _t:.1f} s")
+CACHE_RESTORED_T = time.time()

@@ -1,0 +1,49 @@
+from pathlib import Path
+
+_f = Path("/tmp/site-vllm/vllm/v1/core/kv_cache_utils.py")
+assert _f.exists(), f"{_f} not found: run the earlier steps (step 2 unpacks vLLM to /tmp/site-vllm)"
+_s = _f.read_text()
+_ANCHOR = "    vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency\n"
+_MARK = "# flashnext KV layout diag (session 17)"
+_ADD = _ANCHOR + '''    try:  ''' + _MARK + '''
+        for _gi, _g in enumerate(kv_cache_config.kv_cache_groups):
+            _sp = _g.kv_cache_spec
+            _real = getattr(_sp, "real_page_size_bytes", None)
+            logger.info(
+                "FLASHNEXT KVDIAG group %d | %s | layers %d | block %d tokens | page %d B | real %s B | pages per task at max_len %d | "
+                "mamba_cache_mode %s | prefill ckpt blocks %s | spec blocks %s | tp_replicated %s | host %s | shapes %s | dtypes %s",
+                _gi, type(_sp).__name__, len(_g.layer_names), _sp.block_size, _sp.page_size_bytes, _real,
+                cdiv(_sp.max_memory_usage_bytes(vllm_config), _sp.page_size_bytes), getattr(_sp, "mamba_cache_mode", "-"),
+                getattr(_sp, "num_prefill_checkpoint_blocks", "-"), getattr(_sp, "num_speculative_blocks", "-"),
+                getattr(_sp, "tp_replicated", "-"), getattr(_g, "host_resident", "-"), getattr(_sp, "shapes", "-"), getattr(_sp, "dtypes", "-"))
+        logger.info("FLASHNEXT KVDIAG pool | num_blocks %d | tokens %d | max_len %d | groups %d", kv_cache_config.num_blocks, num_tokens,
+                    vllm_config.model_config.max_model_len, len(kv_cache_config.kv_cache_groups))
+    except Exception as _e:
+        logger.error("FLASHNEXT KVDIAG FAILED: %r", _e)
+'''
+if _MARK in _s:
+    print("KV layout diag: [already] in", _f)
+else:
+    assert _s.count(_ANCHOR) == 1, f"anchor found {_s.count(_ANCHOR)} times in {_f} (vLLM changed?)"
+    _s = _s.replace(_ANCHOR, _ADD)
+    print("KV layout diag: [installed] in", _f, "(server log lines 'FLASHNEXT KVDIAG')")
+_MARK2 = "# flashnext group-size override (session 17)"
+if _MARK2 in _s:
+    print("group-size switch: [already] in", _f)
+else:
+    _A2 = "    def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:\n        if balanced and repeats_per_group is not None:\n"
+    _B2 = ("    import os as _fn_os  " + _MARK2 + "\n"
+           "    _fn_gl = int(_fn_os.environ[\"FLASHNEXT_KV_GROUP_LAYERS\"]) if _fn_os.environ.get(\"FLASHNEXT_KV_GROUP_LAYERS\") else None\n"
+           "    if _fn_gl:\n"
+           "        repeats_per_group = _fn_gl\n"
+           "        logger.info(\"FLASHNEXT group-size override: %d layers per attention group\", _fn_gl)\n\n"
+           "    def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:\n"
+           "        if balanced and repeats_per_group is not None and not (_fn_gl and isinstance(spec.first_spec, (MambaSpec, CircularBufferSpec))):\n")
+    assert _s.count(_A2) == 1, f"group-size anchor found {_s.count(_A2)} times in {_f} (vLLM changed?)"
+    _s = _s.replace(_A2, _B2)
+    print("group-size switch: [installed] in", _f, "(set FLASHNEXT_KV_GROUP_LAYERS before the server starts; unset = unchanged)")
+_f.write_text(_s)
+compile(_s, str(_f), "exec")
+import os
+os.environ["FLASHNEXT_KV_GROUP_LAYERS"] = "4"
+print("FLASHNEXT_KV_GROUP_LAYERS =", os.environ["FLASHNEXT_KV_GROUP_LAYERS"])

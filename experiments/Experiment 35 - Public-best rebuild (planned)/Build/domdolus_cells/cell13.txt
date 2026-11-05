@@ -1,0 +1,43 @@
+from pathlib import Path
+
+_root = Path(globals().get("VROOT") or "/tmp/site-vllm/vllm")
+_fm = _root / "models/qwen4_exp/nvidia/model.py"
+_fa = _root / "engine/arg_utils.py"
+assert _fm.exists() and _fa.exists(), f"{_fm} / {_fa} not found: run the earlier steps first"
+_MARK = "# flashnext batch-sharded sampling (session 17)"
+_EDITS = [
+    (_fm, "Qwen4ExpForCausalLM.compute_logits_local",
+     """    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.lm_head, hidden_states)
+""",
+     """    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.lm_head, hidden_states)
+
+    def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:   """ + _MARK + """
+        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+"""),
+    (_fa, "--enable-batch-sharded-sampling from FLASHNEXT_BATCH_SHARDED_SAMPLING",
+     """            engine_args.enable_cumem_allocator = True
+        return engine_args
+""",
+     """            engine_args.enable_cumem_allocator = True
+        if os.environ.get("FLASHNEXT_BATCH_SHARDED_SAMPLING") == "1":   """ + _MARK + """
+            engine_args.enable_batch_sharded_sampling = True
+            print("flashnext batch-sharded sampling: ON (--enable-batch-sharded-sampling)", flush=True)
+        return engine_args
+"""),
+]
+for _f, _label, _old, _new in _EDITS:
+    _s = _f.read_text()
+    if _MARK in _s:
+        print("batch-sharded sampling: [already]", _label)
+        continue
+    assert _s.count(_old) == 1, f"batch-sharded sampling edit '{_label}': anchor found {_s.count(_old)} times in {_f} (patch cell changed?)"
+    _s = _s.replace(_old, _new)
+    _f.write_text(_s)
+    compile(_s, str(_f), "exec")
+    print("batch-sharded sampling: [installed]", _label)
+print("(FLASHNEXT_BATCH_SHARDED_SAMPLING=1 before the server starts; unset = unchanged)")
+import os
+os.environ["FLASHNEXT_BATCH_SHARDED_SAMPLING"] = "1"
+print("FLASHNEXT_BATCH_SHARDED_SAMPLING =", os.environ["FLASHNEXT_BATCH_SHARDED_SAMPLING"])

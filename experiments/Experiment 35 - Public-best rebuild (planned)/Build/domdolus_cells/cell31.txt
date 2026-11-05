@@ -1,0 +1,126 @@
+from pathlib import Path
+
+_FXC = Path(REPO) / "src/arcagi2/api/clients_v3.py"
+_FXK = Path(REPO) / "src/arcagi2/solver/config/qwen3_8_flash_next_free.py"
+for _p in (_FXC, _FXK):
+    assert _p.exists(), f"{_p} not found: run the harness cell (step 5) first."
+_FX_MARK = "# session 18b: harness fixes (step 5v)"
+
+_FX_CUT_OLD = '''        tail = limit // 3
+        head = limit - tail
+        return f"{text[:head]}\\n... [{len(text) - limit} characters cut from the middle] ...\\n{text[-tail:]}"
+'''
+_FX_CUT_NEW = '''        tail = limit // 3
+        head = limit - tail
+        lines = text.split("\\n")             # session 18b: harness fixes (step 5v): whole lines only, and say which lines are missing
+        h = used_h = 0
+        while h < len(lines) and used_h + len(lines[h]) + 1 <= head:
+            used_h += len(lines[h]) + 1
+            h += 1
+        t = used_t = 0
+        while t < len(lines) - h and used_t + len(lines[-1 - t]) + 1 <= tail:
+            used_t += len(lines[-1 - t]) + 1
+            t += 1
+        if h >= 1 and h + t < len(lines):
+            n = len(lines)
+            return ("\\n".join(lines[:h]) + f"\\n... [output lines {h + 1}-{n - t} of {n} not shown ({n - h - t} lines, "
+                    f"{len(text) - used_h - used_t} characters)] ...\\n" + "\\n".join(lines[n - t:]))
+        return f"{text[:head]}\\n... [{len(text) - limit} characters cut from the middle] ...\\n{text[-tail:]}"
+'''
+
+_BG_DEF = ('def _bg_of(g, bg):\n'
+           '    # bg="auto": the most common colour of the grid (ties: the smallest colour); any other value is used as it is\n'
+           '    if bg != "auto":\n'
+           '        return bg\n'
+           '    counts = {}\n'
+           '    for row in g:\n'
+           '        for v in row:\n'
+           '            counts[v] = counts.get(v, 0) + 1\n'
+           '    return max(counts, key=lambda k: (counts[k], -k)) if counts else 0')
+_BBOX_OLD = ('def bbox(grid, bg=0):\n'
+             '    # (rows, cols) of the smallest box around every cell that is not bg, as (start, stop) pairs: crop(g, *bbox(g)) cuts it out.\n'
+             '    # None when every cell is bg.\n'
+             '    g = _as_grid(grid)\n')
+_BBOX_NEW = ('def bbox(grid, bg="auto"):\n'
+             '    # (rows, cols) of the smallest box around every cell that is not bg, as (start, stop) pairs: crop(g, *bbox(g)) cuts it out.\n'
+             '    # bg="auto" (default): the most common colour of this grid. None when every cell is bg.\n'
+             '    g = _as_grid(grid)\n'
+             '    bg = _bg_of(g, bg)\n')
+_COMP_OLD = ('def components(grid, bg=0, diagonal=False, multicolor=False):\n'
+             '    # the objects of the grid: connected groups of cells that are not bg (bg=None: every colour counts, also 0).\n')
+_COMP_NEW = ('def components(grid, bg="auto", diagonal=False, multicolor=False):\n'
+             '    # the objects of the grid: connected groups of cells that are not bg (bg="auto", the default: the most common colour of this\n'
+             '    # grid; a number: that colour; bg=None: every colour counts).\n')
+_COMP2_OLD = '    g = _as_grid(grid)\n    h, w = len(g), len(g[0])\n    steps = '
+_COMP2_NEW = '    g = _as_grid(grid)\n    bg = _bg_of(g, bg)\n    h, w = len(g), len(g[0])\n    steps = '
+_SPAN_END = '    start, stop = spec\n    return (0 if start is None else start), (n if stop is None else stop)'
+_esc = lambda s: s.replace("\n", "\\n")
+_FX_HELPER_EDITS = [
+    ("bbox (session code)", _BBOX_OLD, _BBOX_NEW), ("bbox (helper_source copy)", _esc(_BBOX_OLD), _esc(_BBOX_NEW)),
+    ("components (session code)", _COMP_OLD, _COMP_NEW), ("components (helper_source copy)", _esc(_COMP_OLD), _esc(_COMP_NEW)),
+    ("components bg (session code)", _COMP2_OLD, _COMP2_NEW), ("components bg (helper_source copy)", _esc(_COMP2_OLD), _esc(_COMP2_NEW)),
+    ("_bg_of (session code)", _SPAN_END + "\n\n\ndef crop(", _SPAN_END + "\n\n\n" + _BG_DEF + "\n\n\ndef crop("),
+    ("_bg_of (helper_source copy)", "'crop': 'def crop(", "'_bg_of': '" + _esc(_BG_DEF) + "', 'crop': 'def crop("),
+    ("helper dependencies", '_GRID_DEPS = {"dihedral": ["rot90", "flip_lr", "flip_ud", "transpose"], "symmetries_between": ["dihedral"], "crop": ["_span_of"]}',
+     '_GRID_DEPS = {"dihedral": ["rot90", "flip_lr", "flip_ud", "transpose"], "symmetries_between": ["dihedral"], "crop": ["_span_of"], '
+     '"bbox": ["_bg_of"], "components": ["_bg_of"]}'),
+]
+_FX_PROMPT_EDITS = [
+    ("prompt: bbox", "`bbox(g, bg=0)` (rows and cols of the part that is not background, so `crop(g, *bbox(g))` cuts it out), ",
+     "`bbox(g, bg='auto')` (rows and cols of the part that is not background, so `crop(g, *bbox(g))` cuts it out), "),
+    ("prompt: components", "`components(g, bg=0, diagonal=False, multicolor=False)` (the objects: a list of dicts with color, colors, cells, size, rows, cols, shape). ",
+     "`components(g, bg='auto', diagonal=False, multicolor=False)` (the objects: a list of dicts with color, colors, cells, size, rows, cols, shape); "
+     "bg='auto' = the most common colour of that grid, or give a colour (bg=None: every colour counts). "),
+]
+
+_FX_REC_OLD = """                        # the failed final answer and the reason are saved in the base prompt (a newer failure replaces the older pair); the working steps are dropped
+                        head = base_head + self._recovery_pair(message, feedback)
+                        entries.clear()
+                        st.rebase = True
+"""
+_FX_REC_NEW = """                        # session 18b (step 5v): the conversation is KEPT after every rejected final answer: the reply and the reason are appended
+                        _ae = self._assistant_entry(st, message, completion_tokens)
+                        if _ae.msg.get("content") is None and not _ae.msg.get("tool_calls"):
+                            _ae.msg["content"] = ""         # an empty reply (only thinking): vLLM refuses content None without tool calls (HTTP 400)
+                        entries.append(_ae)
+                        entries.append(self._user_entry(st, feedback))
+"""
+
+_c, _k = _FXC.read_text(), _FXK.read_text()
+assert "an empty reply keeps the conversation" not in _c, "step 5u was run on this harness: run step 5 (the harness cell) again, then only this cell"
+if _FX_MARK in _c:
+    print("already patched:", _FXC)
+else:
+    for _name, _old, _new in ([("tool output cut", _FX_CUT_OLD, _FX_CUT_NEW)] + _FX_HELPER_EDITS + [("recovery", _FX_REC_OLD, _FX_REC_NEW)]):
+        assert _c.count(_old) == 1, f"harness fixes: unexpected harness source ({_name}: found {_c.count(_old)} times)"
+        _c = _c.replace(_old, _new, 1)
+    compile(_c, str(_FXC), "exec")
+    for _name, _old, _new in _FX_PROMPT_EDITS:
+        assert _k.count(_old) == 1, f"harness fixes: unexpected config source ({_name}: found {_k.count(_old)} times)"
+        _k = _k.replace(_old, _new, 1)
+    compile(_k, str(_FXK), "exec")
+    _FXC.write_text(_c)
+    _FXK.write_text(_k)
+    print("patched:", _FXC, "and", _FXK, "| 1. tool output cut at whole lines | 2. helpers bg='auto' | 3. recovery keeps the conversation")
+_r = subprocess.run([ARC_PY, "-c", """
+import arcagi2.api.clients_v3 as m, inspect
+src = inspect.getsource(m)
+assert "harness fixes (step 5v)" in src and "the conversation is KEPT after every rejected final answer" in src
+ns = {}
+exec(m._GRID_HELPERS_CODE, ns)
+g = [[8, 8, 8, 8], [8, 1, 1, 8], [8, 8, 8, 3]]
+assert ns["bbox"](g) == ((1, 3), (1, 4)) and [o["color"] for o in ns["components"](g)] == [1, 3] and len(ns["components"](g, bg=0)) == 3
+import io, contextlib
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    ns["helper_source"]("components")
+alone = {}
+exec(buf.getvalue(), alone)
+assert [o["color"] for o in alone["components"](g)] == [1, 3], "helper_source copy differs"
+from arcagi2.solver.config import SOLVER_CONFIGS
+c = SOLVER_CONFIGS["qwen3_8_flash_next_free"].call_config
+assert "bg='auto'" in open(c.prompt_path).read()
+print("harness fixes: import ok | helpers bg='auto' ok (session and helper_source copy) | prompt lists bg='auto'")
+"""], capture_output=True, text=True, cwd=str(REPO), env=ARC_ENV)
+print((_r.stdout + _r.stderr).strip()[-1500:])
+assert _r.returncode == 0, "the patched harness does not work: paste the message above"
