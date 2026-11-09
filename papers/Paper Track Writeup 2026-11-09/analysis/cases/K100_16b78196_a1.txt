@@ -1,0 +1,183 @@
+# K100 16b78196 attempt 1 sub=transform2 tokens=69293 src_chars=6544
+# train 2 in [[30, 30], [30, 30]] out [[30, 30], [30, 30]] | test in [[30, 30]] gold [[30, 30]] | new test colours []
+# test 0: 46 wrong cells (r,c,gold,pred): [(1, 4, 6, 0), (1, 5, 8, 0), (1, 6, 8, 0), (1, 7, 8, 0), (1, 8, 8, 0), (2, 4, 6, 0), (2, 5, 6, 0), (2, 6, 8, 0), (2, 7, 8, 0), (2, 8, 8, 0), (2, 9, 8, 0), (3, 4, 6, 0), (3, 5, 6, 0), (3, 6, 6, 0), (3, 7, 8, 0), (3, 8, 8, 0), (3, 9, 8, 0), (3, 10, 8, 0), (4, 4, 6, 0), (4, 5, 6, 0), (4, 6, 6, 0), (4, 7, 6, 0), (4, 8, 8, 0), (16, 23, 0, 6), (16, 24, 0, 8), (16, 25, 0, 8), (16, 26, 0, 8), (16, 27, 0, 8), (17, 23, 0, 6), (17, 24, 0, 6), (17, 25, 0, 8), (17, 26, 0, 8), (17, 27, 0, 8), (17, 28, 0, 8), (18, 23, 0, 6), (18, 24, 0, 6), (18, 25, 0, 6), (18, 26, 0, 8), (18, 27, 0, 8), (18, 28, 0, 8)]
+
+# ---- source closure ----
+def find_wall(objs, H, W):
+    for o in objs:
+        r0,c0,r1,c1 = o['bbox']
+        if c0==0 and c1==W-1 and (r1-r0+1) < H: return o,'H'
+        if r0==0 and r1==H-1 and (c1-c0+1) < W: return o,'V'
+    return None,None
+
+cols=[o['color'] for o in components(test_inputs[0], ignore=0) if o['size']<100]
+
+def pack_placement(cells_rel, h, w, band_fixed, orient, side, wallcells, holecells, placed_cells, H, W, wr0, wr1, wc0, wc1):
+    best=None
+    for R in range(H-h+1):
+        for C in range(W-w+1):
+            if orient=='H':
+                if C != band_fixed: continue
+                if side=='above' and R+h-1 >= wr0: continue
+                if side=='below' and R <= wr1: continue
+                sc = R+h-1 if side=='above' else -R
+            else:
+                if R != band_fixed: continue
+                if side=='left' and C+w-1 >= wc0: continue
+                if side=='right' and C <= wc1: continue
+                sc = C+w-1 if side=='left' else -C
+            abs_cells=[(R+r,C+c) for (r,c) in cells_rel]
+            if any(p in wallcells or p in holecells for p in abs_cells): continue
+            if any(p in placed_cells for p in abs_cells): continue
+            if best is None or sc > best[0]:
+                best=(sc,abs_cells,R,C)
+    return best
+
+H=len(g)
+
+g=test_inputs[0]
+
+W=len(g[0])
+
+def plug_candidates(o, hole, wallcellset, wallbbox, orient, H, W):
+    cells_rel,(h,w) = rel_shape(o['cells'])
+    wr0,wc0,wr1,wc1 = wallbbox
+    res=[]
+    for R in range(H-h+1):
+        for C in range(W-w+1):
+            abs_cells = [(R+r, C+c) for (r,c) in cells_rel]
+            inside = [p for p in abs_cells if wr0<=p[0]<=wr1 and wc0<=p[1]<=wc1]
+            if set(inside) != set(hole): continue
+            outside = [p for p in abs_cells if p not in set(hole)]
+            if any(p in wallcellset for p in outside): continue
+            # one-sided requirement
+            if orient=='H':
+                outs_rows = set(p[0] for p in outside)
+                above = all(r < wr0 for r in outs_rows); below = all(r > wr1 for r in outs_rows)
+                if not (above or below): continue
+                side = 'above' if above else 'below'
+            else:
+                outs_cols = set(p[1] for p in outside)
+                left = all(c < wc0 for c in outs_cols); right = all(c > wc1 for c in outs_cols)
+                if not (left or right): continue
+                side = 'left' if left else 'right'
+            res.append({'R':R,'C':C,'side':side,'abs':abs_cells})
+    return res
+
+def rel_shape(cells):
+    r0,c0,r1,c1 = bbox(cells)
+    return sorted((r-r0, c-c0) for (r,c) in cells), (r1-r0+1, c1-c0+1)
+
+def group_pack(gr, orient, wallcells, wb, hcomps, holeset, H, W):
+    wr0,wc0,wr1,wc1=wb
+    k = (gr[0]['bbox'][3]-gr[0]['bbox'][1]+1) if orient=='H' else (gr[0]['bbox'][2]-gr[0]['bbox'][0]+1)
+    cands=[]
+    for o in gr:
+        for cp in hcomps:
+            rows=set(p[0] for p in cp); cols=set(p[1] for p in cp)
+            span=(max(cols)-min(cols)+1) if orient=='H' else (max(rows)-min(rows)+1)
+            if span != k-2: continue
+            for cnd in plug_candidates(o,cp,wallcells,wb,orient,H,W):
+                cands.append((o,cnd))
+    def attempt(po,pc,order):
+        placed=set(tuple(p) for p in pc['abs'])
+        out_cells={po['color']:sorted(tuple(p) for p in pc['abs'])}
+        band=pc['C'] if orient=='H' else pc['R']
+        res=[(po, sorted(tuple(p) for p in pc['abs']))]
+        for o in order:
+            cr,(hh,ww)=rel_shape(o['cells'])
+            best=pack_placement(cr,hh,ww,band,orient,pc['side'],wallcells,holeset,placed,H,W,wr0,wr1,wc0,wc1)
+            if best is None: return None
+            placed |= set(best[1])
+            res.append((o,best[1]))
+        return res
+    orders=[]
+    rest=[o for o in gr if o is not po] if False else None
+    results=[]
+    for ci,(po,pc) in enumerate(cands):
+        others=[o for o in gr if o is not po]
+        des=sorted(others,key=lambda o:-o['size'])
+        r=attempt(po,pc,des)
+        if r is not None: return (po,pc,r)
+        for perm in itertools.permutations(others):
+            r=attempt(po,pc,list(perm))
+            if r is not None: return (po,pc,r)
+    if cands:
+        # fallback: largest object, descending order, ignore failures
+        best=max(cands,key=lambda t:t[0]['size'])
+        po,pc=best
+        r=attempt(po,pc,sorted([o for o in gr if o is not po],key=lambda o:-o['size']))
+        if r is None:
+            # partial: keep unplaced at original spots
+            res=[(po, sorted(tuple(p) for p in pc['abs']))]
+            placed=set(tuple(p) for p in pc['abs'])
+            band=pc['C'] if orient=='H' else pc['R']
+            for o in sorted([o for o in gr if o is not po],key=lambda o:-o['size']):
+                cr,(hh,ww)=rel_shape(o['cells'])
+                b=pack_placement(cr,hh,ww,band,orient,pc['side'],wallcells,holeset,placed,H,W,wr0,wr1,wc0,wc1)
+                if b is None: res.append((o, list(o['cells'])))
+                else: placed |= set(b[1]); res.append((o,b[1]))
+            return (po,pc,res)
+        return (po,pc,r)
+    return None
+
+groups={}
+
+def conn(cells):
+    s=set(cells); out=[]; seen=set()
+    for cell in cells:
+        if cell in seen: continue
+        stack=[cell]; comp=[]
+        seen.add(cell)
+        while stack:
+            cur=stack.pop(); comp.append(cur)
+            r,c=cur
+            for nb in ((r-1,c),(r+1,c),(r,c-1),(r,c+1)):
+                if nb in s and nb not in seen:
+                    seen.add(nb); stack.append(nb)
+        out.append(comp)
+    return out
+
+hcomps=conn(holes)
+
+holes=[(r,c) for r in range(wr0,wr1+1) for c in range(wc0,wc1+1) if (r,c) not in wallcells]
+
+key=lambda o: o['bbox'][2]-o['bbox'][0]+1
+
+o2=transform2(test_inputs[0])
+
+objs=components(o2, ignore=0)
+
+small=[o for o in objs if o is not wall]
+
+wallcells=set(map(tuple,wall['cells']))
+
+wb=wall['bbox']
+
+def transform2(grid):
+    H=len(grid); W=len(grid[0])
+    objs=components(grid, ignore=0)
+    wall,orient=find_wall(objs,H,W)
+    if wall is None: return [row[:] for row in grid]
+    wallcells=set(map(tuple,wall['cells'])); wb=wall['bbox']
+    wr0,wc0,wr1,wc1=wb
+    small=[o for o in objs if o is not wall]
+    holes=[(r,c) for r in range(wr0,wr1+1) for c in range(wc0,wc1+1) if (r,c) not in wallcells]
+    hcomps=conn(holes); holeset=set(holes)
+    out=[row[:] for row in grid]
+    for o in small:
+        for (r,c) in o['cells']: out[r][c]=0
+    if orient=='H': key=lambda o: o['bbox'][3]-o['bbox'][1]+1
+    else: key=lambda o: o['bbox'][2]-o['bbox'][0]+1
+    groups={}
+    for o in small: groups.setdefault(key(o),[]).append(o)
+    for k,gr in groups.items():
+        pack=group_pack(gr,orient,wallcells,wb,hcomps,holeset,H,W)
+        if pack is None:
+            for o in gr:
+                for (r,c) in o['cells']: out[r][c]=o['color']
+            continue
+        po,pc,res=pack
+        for (o,cells) in res:
+            for (r,c) in cells: out[r][c]=o['color']
+    return out

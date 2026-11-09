@@ -1,0 +1,112 @@
+% Appendix: agent and engine specification of submission 57851995
+% (notebook foysalemonshanto/q27-xhigh-e25-nb6-submit v1; hidden-rerun profile RERUN_PROD).
+% Every item is taken from the notebook code and the agent payload; file:line evidence in appendix_spec_EVIDENCE.md.
+\section{Agent and engine specification}\label{app:spec}
+\sloppy\raggedright
+
+This appendix lists the configuration that the hidden rerun of submission 57851995 executes (profile \texttt{RERUN\_PROD}). The agent is the Duck tool-agent harness of Tufa Labs as forked by D.~Franzen (\texttt{da-fr/arc-agi-3-solution} at commit \texttt{10882e33}, Apache-2.0), vendored byte-identical except for two switched-off-by-default patches, plus our ARC-AGI-2 adapter \texttt{arc2\_duck.py}. Both ship in the payload dataset \texttt{q27-e15b-payload} and are verified by SHA-256 before use. The served model name is \texttt{q27}; the weights are Qwen3.8-Flash-Next.
+
+\subsection{Prompt and task representation}
+The system prompt holds the task; the first user turn is a short opener. Excerpt of the system prompt (elisions marked):
+\begin{quote}\small
+``You are a Python coding agent solving an ARC-AGI-2 grid task. [\dots] The training pairs show one transformation from input grid to output grid. Infer it and implement it as a top-level function \texttt{transform(grid)} that takes and returns a rectangular list of lists of ints 0-9. It is then applied to each test input; the test outputs are unknown to everyone. [\dots] The exact grids are not repeated in this prompt. They are in the python tool as \texttt{train} [\dots] and \texttt{test\_inputs} [\dots]. The facts below were computed from them by the harness: observations, not a rule [\dots]. A train-exact function is not proof that it generalizes. \texttt{submit(transform)} submits your final choice and ends this branch; submit only a function that check shows exact.''
+\end{quote}
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{Grids are not printed in the prompt} (view \texttt{facts} for both attempts). The prompt carries a ``facts'' block computed from the exact grids: per training pair the input/output shape, colour counts, modal colour, changed-cell count and bounding box (same-shape pairs) or the shape change, connected-component counts and the largest components; per test input the shape, colours and components. The block is bounded to 800 tokens and 3{,}600 characters by dropping detail levels, and says what was dropped.
+\item The exact grids are Python lists in the sandbox (\texttt{train}, \texttt{test\_inputs}). \texttt{show(g, r0, c0, r1, c1)} prints an indexed view (\texttt{r03 | 0 0 5 \dots}), at most 900 cells per view and 1{,}000 per call; raw grid-row prints in tool output are cut by the harness.
+\item The prompt also states the token budget of the attempt (``about 104,000 generated tokens, thinking included''), the allowed imports (no numpy), the 30-s tool time limit and the tool-output cap.
+\end{itemize}
+
+\subsection{Tools}
+The model has exactly one tool, \texttt{python} (a persistent sandbox; top-level functions are retained across calls). Inside it the harness provides:
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \texttt{check(transform, verbose=True)}: runs \texttt{transform} on every training pair and once on each test input. It prints \texttt{check(name): k/n train pairs exact; test inputs: ok, \dots} (plus an identity flag), then for each failing pair the error with its line, or the shape mismatch, or the wrong-cell count with up to 6 samples \texttt{(row, col, got, expected)}. It returns a list of per-pair dicts (\texttt{ok}, \texttt{wrong\_cells}, samples, or \texttt{error} / \texttt{shape}). A train-exact result is reported to the host, which re-runs the function in a clean sandbox and, if exact, keeps it as a candidate answer; the attempt continues.
+\item \texttt{check\_many(\{label: f, \dots\})}: the same for several functions.
+\item \texttt{submit(transform)}: needs a named top-level function. The host re-runs it in a clean sandbox, one sandbox per grid, with only the retained sources and one input grid, reads the value from the sandbox's structured result, and compares it with every training output. Accepted (exact on all pairs and valid test outputs) ends the attempt; otherwise the rejection summary is returned and the attempt continues.
+\item Exploration helpers: \texttt{arc\_overview}, \texttt{inspect\_pair}, \texttt{inspect\_test}, \texttt{show}. Grid functions usable inside \texttt{transform}: \texttt{grid\_shape}, \texttt{color\_counts}, \texttt{modal\_color}, \texttt{components}, \texttt{bbox}, \texttt{crop}, \texttt{rot90}, \texttt{flip\_h}, \texttt{flip\_v}, \texttt{transpose}, \texttt{diff\_cells}, \texttt{diff\_summary}, \texttt{object\_diff}.
+\item Auto-check: after a call that defines a one-grid function named \texttt{transform*}, \texttt{solve*}, \texttt{candidate*}, \texttt{trans}, \texttt{trans\_*} or \texttt{*\_alt}, the harness checks it (at most 3 per call, 24 per attempt; at most 24 host verifications of exact \texttt{check} results per attempt). \texttt{submit}/\texttt{check} sent as tool names are run as Python.
+\end{itemize}
+
+\subsection{Sampling and limits}
+{\small
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.36\linewidth}>{\raggedright\arraybackslash}p{0.58\linewidth}@{}}
+\toprule
+Item & Value \\
+\midrule
+Temperature / top-$p$ / top-$k$ & 1.0 / 0.95 / 20 (per request; the server's generation override is the same, with min-$p$ 0, presence 0, repetition 1.0) \\
+Seed & none sent \\
+Thinking & on; \texttt{reasoning\_effort = xhigh} per request and as the server's chat-template default \\
+Attempt budget & 104{,}000 generated tokens (attempt 1 and attempt 2), thinking included; a 60{,}000-token thinking floor is asserted \\
+Output per request & remaining budget $-$ 4{,}096 (reserve); further clamped to $120{,}384 - \text{prompt} - 2{,}048$ (120{,}384 = 8{,}192 prompt + 104{,}000 + 8{,}192 tool allowance) \\
+Commit turn & when $\le$ 5{,}120 tokens remain, the harness asks for one final \texttt{transform} + \texttt{check} call; it is an ordinary thinking-on request (``variant A'') \\
+Context & server max-model-len 131{,}072; agent window 130{,}560; raw reasoning kept in history \\
+Request timeout & 3{,}600 s, clamped to the solve deadline \\
+Tool steps / turns & no step cap (\path{LOCAL_ANALYZER_TOOL_STEPS = 0}); an attempt ends on acceptance, budget, deadline or repeated failures \\
+Sandbox & 30 s per call (CPU limit 31 s), address space 4{,}096 MB (\texttt{RLIMIT\_AS}, read back per child; not verified $\Rightarrow$ solver disabled), file size 1 MB, 32 open files, standard-library subset only \\
+Tool output & capped to about 3{,}072 tokens \\
+\bottomrule
+\end{longtable}}
+
+\subsection{Attempt policy and answer selection}
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item Two independent attempts per task (fresh agent, new conversation each), both 104{,}000 tokens, both with the facts view. No pause or resume, no third attempt (\texttt{extra\_attempts} off); attempt~2 is not skipped when attempt~1 verified, it only needs time left.
+\item Stage 1: attempt~1 of \emph{every} task, in the task order below. Stage 2: attempt~2, queued when attempt~1 of that task ends, ranked by evidence class: 0 = partial progress but no verified program, 1 = nothing, 2 = one distinct verified prediction, 3 = two or more. Accepts made after the commit text (``weak'') do not count toward the class.
+\item End of an attempt without a verified program: (1) functions written only in the reasoning or text are extracted, run and checked (an exact one goes through host verification); (2) the best partial function (most exact training pairs, then changed-cell accuracy) is host-run once on train and test; its test output is kept as a \emph{non-accepted} candidate.
+\item Selection, per test input: each attempt's best (latest accepted \texttt{submit}, else latest accepted \texttt{check}) is grouped by identical output; groups are ordered by (contains a non-weak accept, number of attempts agreeing, explicit submission, earlier attempt, latest). Then other accepted candidates (latest first), then non-accepted partial candidates (most exact pairs, then latest), then outputs of a small CPU rule library (rotations, flips, transposes, crop, scales, tilings, mirrors, a global colour map) that are exact on every training pair. \texttt{attempt\_1} = first grid; \texttt{attempt\_2} = next distinct grid, else the test input.
+\item So an \emph{unverified} answer is submitted when no attempt verifies: the best partial program's output.
+\item Fallback: the test input itself (identity) for both attempts, written for every task at notebook start; a task whose selection fails also falls back to identity.
+\item Tasks with several test inputs: one \texttt{\{attempt\_1, attempt\_2\}} per test input, each selected independently from the same programs.
+\end{itemize}
+
+\subsection{Task order (ORDER2)}
+Tasks are sorted by $-(\,[\#\text{train pairs}\ge 3] + [\#\text{test inputs} = 1]\,)$, then by the total number of cells (train inputs + outputs + test inputs) ascending, then by task id. Attempt~1 of all tasks follows this order.
+
+\subsection{Engine}
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{Merlin} v3.0.0, a public vLLM 0.32.0 fork (\path{github.com/halt95/merlin-engine}, tag \texttt{merlin-v3.0.0}, commit \texttt{ad42e37f}, wheel \path{vllm-0.32.0+merlin.7002f56537}). It is installed offline in the notebook from our Kaggle Model \texttt{e23-merlin-env} (\texttt{install\_merlin\_offline.sh}); the server command comes from Merlin's own \texttt{launch.build("flash-next", "fn-quad-24g-sm89", \dots)}.
+\item \textbf{Weights}: five W4A16 checkpoint parts (Kaggle Models \path{qwen3-8-flash-next-w4a16-merlin-p1..p5}) and an FP8 n-gram embedding table (PLE) overlay, merged by symlink with size checks (the rerun has no SHA gate).
+\item \textbf{Layout}: 4$\times$L4, tensor parallel 2 $\times$ pipeline parallel 2 with expert parallelism; block size 4{,}096; max-num-batched-tokens 1{,}024; GPU memory utilisation 0.96.
+\item \textbf{KV}: FP8 E4M3 with static QSA scales (\texttt{qsa\_kv\_scales\_262k.json}). \textbf{Pin ladder}: \texttt{-{}-kv-cache-memory-bytes} = Merlin's L4 pin 2{,}479{,}838{,}700 B + 1.0 GiB = 3{,}553{,}580{,}524 B first, then +0.75 / +0.5 / +0 GiB. The ladder starts at +1.0 only if the \#60490 patch verified, else at +0.
+\item \textbf{\#60490}: a backport of vLLM PR \#60490 (issue \#60489) into Merlin's \texttt{qsa.py}: during the memory-profiling dummy run the QSA indexer allocates its peak scratch (max of the prefill logits budget and decode tokens $\times$ compressed columns $\times$ 4 B, plus the top-$k$ workspace), so the profiler accounts for it. Applied with pinned pre/post SHA-256.
+\item \textbf{Speculation}: MTP, 3 draft tokens, \path{draft_sample_method = probabilistic}; the boot read-back checks method \texttt{mtp} and $K=3$.
+\item \textbf{Prefix caching} on (\texttt{-{}-enable-prefix-caching}, \texttt{-{}-mamba-cache-mode align}, \texttt{-{}-prefix-match-unit 64}); \texttt{-{}-use-replayssm}.
+\item \textbf{CAPS16}: \path{cudagraph_mode} \path{FULL_AND_PIECEWISE} with capture sizes 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 40, 48, 64 (FULL decode graphs cover 16 $\times$ (1+3) tokens).
+\item \path{MERLIN_SHARE_DRAFT_WORKSPACE=1}: Merlin environment switch, in the plan described as the MTP draft sharing the target's workspace; dropped automatically if an error line names it or every pin step fails with it.
+\item \textbf{Measured F}: $F = \lceil F_{\log} - 0.05\rceil$ with $F_{\log} = \text{pool}/X - \lceil M/B\rceil$ from the server's own ``Maximum concurrency for $M$ tokens per request: $X$x'' line (fixed blocks per request).
+\item \textbf{Concurrency}: workers $=\min\big(\lfloor \text{pool}/(\lceil 65{,}536/B\rceil + F)\rfloor,\ \texttt{max-num-seqs}\big)$, with \texttt{-{}-max-num-seqs} 9 / 8 / 8 / 6 on the four pin steps; the production boot therefore runs up to 9 agent sessions. If the pre-solve isolation check is not PASS, workers drop to 6.
+\item \textbf{Slots admission}: an attempt starts when one of the \emph{workers} slots is free (the engine schedules KV; preemptions are allowed and counted); an attempt whose projected peak exceeds the whole pool never starts. The scheduler's KV gate is set to 1.0. No new attempt starts with less than 300 s to the solve end.
+\end{itemize}
+
+\subsection{Run safety}
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item Clock anchored at kernel start. Budget 12\,h $-$ 3\,min = 717 min; hard stop at 715 min; solving ends 180 s before it (712 min), every request clamped to that deadline, then a 90-s join grace; the engine cell's watchdog kills live servers at 717 min.
+\item No separate drain: the drain and admit deadlines of the time block are defined but not used on this path; the per-attempt budget, the deadline clamp and the 300-s admission cutoff end the work.
+\item Boot ladder: at most 3 engine attempts (30, 15, 15 min ready timeouts); ready = \texttt{/health} answers and the server log shows its KV-cache line; 600 s of log silence = stall; any failure before solving moves to the next pin step; no new try with less than 25 min left.
+\item Server watchdog during solving (10-s poll): a dead process, a silent log with \texttt{/health} failing for 180 s, or 600 s without token progress while requests run triggers a relaunch with the same plan (at most 2 watchdog actions, only with $\ge$ 20 min left, and $\ge$ 35 min before the solve end; ready wait $\le$ 20 min; a sampled check must pass). Attempts wait while the server is down.
+\item Submission: the identity \texttt{submission.json} is written at the start; it is rewritten atomically after every finished attempt (until the solve end) and once more at the end.
+\item The sandbox self-test and the memory-limit test must pass, else the solver does not run and the identity file stays.
+\end{itemize}
+
+\subsection{The 3-bit ``klee100'' build (submission 57896498)}
+Notebook \path{esfersami50/q27-xhigh-e28-k100-eval120-6h}. Its \texttt{RERUN\_PROD} is the profile above plus the E28 levers; everything not listed (12\,h $-$ 3\,min budget, boot ladder, slots admission, measured F, \#60490, shared draft workspace, MTP $K=3$ probabilistic, max-model-len 131{,}072, prompt, tools, sampling) is the same.
+{\small
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.2\linewidth}>{\raggedright\arraybackslash}p{0.36\linewidth}>{\raggedright\arraybackslash}p{0.36\linewidth}@{}}
+\toprule
+ & W4A16 (57851995) & klee100 (57896498) \\
+\midrule
+Routed experts & W4A16 (5 parts) & AutoRound 3bpw-MTP (\path{klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP}): W3 g128 on layers 0--11 and 36--47, W2 g64 on 12--35 (humming kernels); MTP experts W4; main projections W8 \\
+KV scales & W4 checkpoint's QSA sidecar & the same W4 sidecar reused (labelled experimental) \\
+Extra flags & -- & \texttt{-{}-language-model-only}, a read-only worker extension \\
+Pin ladder (KV bytes) & 3.55 / 3.29 / 3.02 / 2.48 GB & 7.93 / 6.86 / 5.27 / 3.55 / 2.48 GB \\
+Workers & up to 9 & 24 on the top rung (\texttt{-{}-max-num-seqs 24}); lower rungs $\min(\text{rule}, 18 / 14 / 9 / 6)$ \\
+CUDA graphs & CAPS16 (to 64) & sizes to 84 \\
+Q-defer & off & on when its patch verifies (\texttt{NB4\_PPDEFER=1}): the pipeline stage-0 receive of sampled tokens is posted after the next forward launch \\
+I8 & off & \texttt{DRAFT\_HEAD=int8} (int8 MTP draft LM head), kept only on read-back \texttt{I8\_ENGAGED} \\
+C12 & off (9 workers) & not applicable (C12 = 12 streams, a W4 lever) \\
+Request timeout & 3{,}600 s & 7{,}200 s (A/B1/C); 9{,}000 s (B2) \\
+Thinking budget & 104{,}000 per attempt & A, B1, C: 104{,}000; B2: 120{,}000 \\
+Order & ORDER2 & plain (sorted task ids) \\
+Scheduler & attempt 1 for all, then attempt 2 & A: attempt 1 for all; B: re-run of attempt-1 failures (B1 = ended on its own without a full train match, same budget; B2 = cut by budget/context, 120k); C: attempt 2, first tasks still without a train match, then the rest by ascending attempt-1 tokens \\
+Answer slots & selection above & \texttt{attempt\_1} = best-train candidate of A/B (a full-match B replaces A, the old A answer becomes the fallback); \texttt{attempt\_2} = C's candidate if different \\
+\bottomrule
+\end{longtable}}

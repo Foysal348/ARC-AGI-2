@@ -1,0 +1,111 @@
+# K100 3dc255db attempt 1 sub=transform2 tokens=101293 src_chars=3929
+# train 3 in [[12, 12], [10, 10], [12, 12]] out [[12, 12], [10, 10], [12, 12]] | test in [[12, 13]] gold [[12, 13]] | new test colours [2, 8]
+# test 0: 3 wrong cells (r,c,gold,pred): [(5, 9, 0, 2), (6, 9, 0, 2), (9, 12, 2, 0)]
+
+# ---- source closure ----
+def cells_of(g, color):
+    return [(r,c) for r,row in enumerate(g) for c,v in enumerate(row) if v==color]
+
+g=test_inputs[0]
+
+D6=[p for p in cells_of(g['input'],6)]
+
+D=[p for p in D6 if 1<=p[0]<=4 and 2<=p[1]<=6]
+
+def bbox_of(cs):
+    r0=min(p[0] for p in cs); r1=max(p[0] for p in cs)
+    c0=min(p[1] for p in cs); c1=max(p[1] for p in cs)
+    return (r0,c0,r1,c1)
+
+groups=[]
+
+def unit(v):
+    # axis-aligned unit vector from vector v (dominant axis)
+    dr,dc=v
+    if abs(dr)>=abs(dc): return (-1 if dr<0 else 1,0) if dr!=0 else (0,0)
+    else: return (0,-1 if dc<0 else 1) if dc!=0 else (0,0)
+
+def transform2(grid):
+    R=len(grid); C=len(grid[0])
+    colors=sorted(set(v for row in grid for v in row if v!=0))
+    cells={col:[(r,c) for r in range(R) for c in range(C) if grid[r][c]==col] for col in colors}
+    def iset(col):
+        S=set(cells[col]); out=set()
+        for (r,c) in S:
+            near=any((r+dr,c+dc) in S for dr in (-1,0,1) for dc in (-1,0,1) if (dr,dc)!=(0,0))
+            if not near: out.add((r,c))
+        return out
+    iso={col:iset(col) for col in colors}
+    bbox={col:bbox_of(cells[col]) for col in colors}
+    dirs=[(-1,0),(1,0),(0,-1),(0,1)]
+    def ray(p,d,col):
+        r,c=p; k=1
+        while True:
+            r2,c2=r+k*d[0],c+k*d[1]
+            if not(0<=r2<R and 0<=c2<C): return False
+            if grid[r2][c2]==col and (r2,c2) not in iso[col]: return True
+            k+=1
+    caps={}
+    for B in colors:
+        for p in cells[B]:
+            best=None
+            for A in colors:
+                if A==B: continue
+                hits=sum(1 for d in dirs if ray(p,d,A))
+                if hits<3: continue
+                if any(ray(p,d,A) and ray(p,(-d[0],-d[1]),A) for d in dirs):
+                    area=(bbox[A][2]-bbox[A][0]+1)*(bbox[A][3]-bbox[A][1]+1)
+                    if best is None or area<best[1]: best=(A,area)
+            if best: caps[p]=best[0]
+    for B in colors:
+        S=set(cells[B]); seen=set()
+        for p in sorted(S):
+            if p in seen: continue
+            stack=[p]; seen.add(p); comp=[]
+            while stack:
+                r,c=stack.pop(); comp.append((r,c))
+                for dr in (-1,0,1):
+                    for dc in (-1,0,1):
+                        if (dr,dc)==(0,0): continue
+                        q=(r+dr,c+dc)
+                        if q in S and q not in seen: seen.add(q); stack.append(q)
+            src=next((caps[x] for x in comp if x in caps), None)
+            if src: 
+                for x in comp: caps.setdefault(x,src)
+    out=[row[:] for row in grid]
+    groups={}
+    for p,A in caps.items(): groups.setdefault((A,grid[p[0]][p[1]]),[]).append(p)
+    for (A,B),D in groups.items():
+        D=sorted(D); S=cells[A]
+        for p in D: out[p[0]][p[1]]=0
+        def nb4(p):
+            r,c=p
+            return [q for d in dirs if (q:=(r+d[0],c+d[1])) in set(S)]
+        T=[p for p in S if len(nb4(p))<=1 and p not in iso[A]]
+        cen=(sum(p[0] for p in D)/len(D), sum(p[1] for p in D)/len(D))
+        def unit(v):
+            dr,dc=v
+            if abs(dr)>=abs(dc): return (-1 if dr<0 else 1,0) if dr!=0 else (0,0)
+            return (0,-1 if dc<0 else 1) if dc!=0 else (0,0)
+        cands=[]
+        for t in T:
+            n=nb4(t)
+            d=unit((t[0]-n[0][0],t[1]-n[0][1])) if n else unit((t[0]-cen[0],t[1]-cen[1]))
+            if d==(0,0): continue
+            if (cen[0]-t[0])*d[0]+(cen[1]-t[1])*d[1] >= 0: continue
+            line=('col',t[1]) if (n and (n[0][0]-t[0])!=0) else ('row',t[0]) if n else (('col',t[1]) if d[0]!=0 else ('row',t[0]))
+            dl=min(abs(p[1]-line[1]) for p in D) if line[0]=='col' else min(abs(p[0]-line[1]) for p in D)
+            md=abs(t[0]-cen[0])+abs(t[1]-cen[1])
+            cands.append((dl,-md,t,d))
+        if not cands: continue
+        cands.sort()
+        dl,emd,t,d=cands[0]
+        r,c=t; occ=set(S)|set(caps.keys())
+        q=[]
+        for k in range(1,len(D)+1):
+            r2,c2=r+k*d[0],c+k*d[1]
+            if not(0<=r2<R and 0<=c2<C): break
+            if (r2,c2) in occ: break
+            q.append((r2,c2))
+        for p in q: out[p[0]][p[1]]=B
+    return out

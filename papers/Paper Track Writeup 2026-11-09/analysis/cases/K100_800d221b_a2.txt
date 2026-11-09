@@ -1,0 +1,302 @@
+# K100 800d221b attempt 2 sub=final_transform tokens=64266 src_chars=3647
+# train 3 in [[16, 16], [10, 10], [20, 20]] out [[16, 16], [10, 10], [20, 20]] | test in [[30, 30]] gold [[30, 30]] | new test colours []
+# test 0: 5 wrong cells (r,c,gold,pred): [(11, 15, 2, 3), (11, 16, 2, 3), (11, 17, 2, 3), (11, 18, 2, 3), (14, 12, 2, 3)]
+
+# ---- source closure ----
+def nf(g, src_order, nbr):
+    C = wire_color2(g); H,W = grid_shape(g)
+    C2,M,regs,srcs = regions_and_sources(g)
+    wire = {(r,c) for r in range(H) for c in range(W) if g[r][c]==C}
+    src_list=[]
+    for w,cols in srcs.items():
+        for col in sorted(cols): src_list.append((w,col))
+    if src_order=='pos': src_list.sort(key=lambda t:(t[0][0],t[0][1],t[1]))
+    elif src_order=='rpos': src_list.sort(key=lambda t:(-t[0][0],-t[0][1],t[1]))
+    elif src_order=='colasc': src_list.sort(key=lambda t:(t[1],t[0]))
+    elif src_order=='coldesc': src_list.sort(key=lambda t:(-t[1],t[0]))
+    elif src_order=='posc': src_list.sort(key=lambda t:(t[0][1],t[0][0],t[1]))
+    dq=deque(src_list); res={w:col for w,col in src_list}
+    while dq:
+        (r,c),col=dq.popleft()
+        for dr,dc in nbr:
+            n=(r+dr,c+dc)
+            if n in wire and n not in res:
+                res[n]=col; dq.append((n,col))
+    out=[[g[r][c] for c in range(W)] for r in range(H)]
+    blocks=wire3x3_blocks(g,C); center=blocks[0] if blocks else None
+    for (r,c) in wire: out[r][c]=res[(r,c)]
+    if center:
+        cr,cc=center
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                if dr==0 and dc==0: continue
+                rr,c2=cr+dr,cc+dc
+                if 0<=rr<H and 0<=c2<W and g[rr][c2]==C: out[rr][c2]=C
+    return out
+
+a = nf(test_inputs[0],'pos',((-1,0),(0,-1),(1,0),(0,1)))
+
+d = rule2(test_inputs[0],'cells')
+
+def dist_maps(g):
+    C = wire_color2(g); H,W = grid_shape(g)
+    C,M,regs,srcs = regions_and_sources(g)
+    wire = {(r,c) for r in range(H) for c in range(W) if g[r][c]==C}
+    colors = sorted({c for s in srcs.values() for c in s})
+    dm = {}
+    for col in colors:
+        dq=deque(); d={}
+        for w,cols in srcs.items():
+            if col in cols: d[w]=0; dq.append(w)
+        while dq:
+            r,c=dq.popleft(); dv=d[(r,c)]
+            for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                n=(r+dr,c+dc)
+                if n in wire and n not in d: d[n]=dv+1; dq.append(n)
+        dm[col]=d
+    return C, wire, dm, srcs
+
+def rule2(g, tiebreak):
+    C,wire,dm,srcs = dist_maps(g)
+    H,W = grid_shape(g)
+    out=[[g[r][c] for c in range(W)] for r in range(H)]
+    blocks=wire3x3_blocks(g,C); center=blocks[0] if blocks else None
+    def count_cells(col): return sum(row.count(col) for row in g)
+    def count_srcs(col): return sum(1 for w,cols in srcs.items() if col in cols)
+    def count_reg(col):
+        t=0
+        for cells,maj,ntie,sc in regions_and_sources(g)[2]:
+            if maj==col: t+=len(cells)
+        return t
+    for (r,c) in wire:
+        ds={col: dm[col][(r,c)] for col in dm if (r,c) in dm[col]}
+        if not ds: v=C
+        else:
+            m=min(ds.values()); best=[col for col,vv in ds.items() if vv==m]
+            if len(best)==1: v=best[0]
+            elif tiebreak=='max': v=max(best)
+            elif tiebreak=='cells': v=max(best,key=count_cells)
+            elif tiebreak=='srcs': v=max(best,key=count_srcs)
+            elif tiebreak=='reg': v=max(best,key=count_reg)
+            else: v=C
+        out[r][c]=v
+    if center:
+        cr,cc=center
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                if dr==0 and dc==0: continue
+                rr,c2=cr+dr,cc+dc
+                if 0<=rr<H and 0<=c2<W and g[rr][c2]==C: out[rr][c2]=C
+    return out
+
+b = rule2(test_inputs[0],'max')
+
+def flood(inp, tie_keep=True):
+    C,M,regs,srcs = regions_and_sources(inp)
+    H,W = grid_shape(inp)
+    wire = {(r,c) for r in range(H) for c in range(W) if inp[r][c]==C}
+    res = {w:C for w in wire}
+    assigned = {}
+    frontier=[]
+    for w,cols in srcs.items():
+        col = sorted(cols)[0]
+        assigned[w]=col
+        frontier.append((w,col))
+    tie=set()
+    while frontier:
+        nxt={}
+        for (r,c),col in frontier:
+            for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                n=(r+dr,c+dc)
+                if n in wire and n not in assigned:
+                    nxt.setdefault(n,set()).add(col)
+        frontier=[]
+        for n,cols in nxt.items():
+            if len(cols)==1:
+                assigned[n]=list(cols)[0]; frontier.append((n,list(cols)[0]))
+            else:
+                tie.add(n)
+    for w,col in assigned.items(): res[w]=col
+    return res, tie, C
+
+def wire3x3_blocks(g, C):
+    H,W = grid_shape(g)
+    blocks=[]
+    for r in range(H-2):
+        for c in range(W-2):
+            if all(g[r+dr][c+dc]==C for dr in range(3) for dc in range(3)):
+                blocks.append((r+1,c+1))
+    return blocks
+
+C=wire_color2(g)
+
+g=test_inputs[0]
+
+def wire_color2(g):
+    C = wire_color(g)
+    if C is None:
+        sh = grid_shape(g); M = modal_color(g)
+        best=None; bs=-1
+        for col in range(10):
+            if col==M or sum(row.count(col) for row in g)==0: continue
+            comps = components(g, color=col)
+            if len(comps)==1 and comps[0]['size']>bs:
+                bs=comps[0]['size']; best=col
+        C=best
+    return C
+
+def transform(grid):
+    H,W = grid_shape(grid)
+    C = wire_color2(grid)
+    res, tie, C2 = flood(grid)
+    out = [[grid[r][c] for c in range(W)] for r in range(H)]
+    blocks = wire3x3_blocks(grid, C)
+    center = blocks[0] if blocks else None
+    for r in range(H):
+        for c in range(W):
+            if grid[r][c]==C:
+                out[r][c] = res[(r,c)]
+    if center is not None:
+        cr,cc = center
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                if dr==0 and dc==0: continue
+                r,c = cr+dr, cc+dc
+                if 0<=r<H and 0<=c<W and grid[r][c]==C:
+                    out[r][c]=C
+    return out
+
+c = transform(test_inputs[0])
+
+def regions_and_sources(inp):
+    C = wire_color(inp)
+    H,W = grid_shape(inp)
+    M = modal_color(inp)
+    mark = {(r,c): inp[r][c] for r in range(H) for c in range(W) if inp[r][c]!=C and inp[r][c]!=M}
+    # 8-connectivity clustering of markers
+    parent = {k:k for k in mark}
+    def find(x):
+        while parent[x]!=x:
+            parent[x]=parent[parent[x]]; x=parent[x]
+        return x
+    def union(a,b):
+        ra,rb=find(a),find(b)
+        if ra!=rb: parent[ra]=rb
+    for (r,c) in mark:
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                n=(r+dr,c+dc)
+                if n in mark: union((r,c),n)
+    regs={}
+    for k in mark: regs.setdefault(find(k),[]).append(k)
+    # majority color per region
+    out=[]
+    for cells in regs.values():
+        cnt={}
+        for k in cells: cnt[mark[k]]=cnt.get(mark[k],0)+1
+        mx=max(cnt.values())
+        best=sorted([col for col,v in cnt.items() if v==mx])
+        out.append((cells,best[0],len(best),sorted(cells)))
+    # sources
+    srcs={}
+    for cells,maj,ntie,sc in out:
+        for (r,c) in cells:
+            for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                n=(r+dr,c+dc)
+                if 0<=n[0]<H and 0<=n[1]<W and inp[n[0]][n[1]]==C:
+                    srcs.setdefault(n,set()).add(maj)
+    return C, M, out, srcs
+
+regs = regions_and_sources(test_inputs[0])[2]
+
+cnt = {col: sum(1 for w,cols in srcs.items() if col in cols) for col in sorted(dm)}
+
+def wire_color(inp):
+    # color with a single component whose bbox covers the whole grid
+    sh = grid_shape(inp)
+    for col in range(10):
+        cnt = sum(row.count(col) for row in inp)
+        if cnt == 0: continue
+        comps = components(inp, color=col)
+        if len(comps)==1 and comps[0]['bbox']==(0,0,sh[0]-1,sh[1]-1):
+            return col
+    return None
+
+def final_transform(grid):
+    H,W = grid_shape(grid)
+    # wire color: single component whose bbox is the whole grid (fallback: largest single-component non-modal color)
+    C = wire_color(grid)
+    if C is None:
+        M = modal_color(grid); best=None; bs=-1
+        for col in range(10):
+            if col==M or sum(row.count(col) for row in grid)==0: continue
+            comps = components(grid, color=col)
+            if len(comps)==1 and comps[0]['size']>bs: bs=comps[0]['size']; best=col
+        C = best
+    M = modal_color(grid)
+    # cluster marker cells (8-connected) into regions; majority color per region
+    mark = {(r,c): grid[r][c] for r in range(H) for c in range(W) if grid[r][c]!=C and grid[r][c]!=M}
+    par = {k:k for k in mark}
+    def find(x):
+        while par[x]!=x: par[x]=par[par[x]]; x=par[x]
+        return x
+    for (r,c) in mark:
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                n=(r+dr,c+dc)
+                if n in mark:
+                    a,b=find((r,c)),find(n)
+                    if a!=b: par[a]=b
+    regs = {}
+    for k in mark: regs.setdefault(find(k), []).append(k)
+    maj = {}
+    for cells in regs.values():
+        cnt={}
+        for k in cells: cnt[mark[k]]=cnt.get(mark[k],0)+1
+        mx=max(cnt.values())
+        maj[tuple(sorted(cells))]=max(col for col,v in cnt.items() if v==mx)
+    # sources: wire cells adjacent to a region take that region's majority colour
+    srcs={}
+    for cells in regs.values():
+        cnt={}
+        for k in cells: cnt[mark[k]]=cnt.get(mark[k],0)+1
+        mx=max(cnt.values())
+        mc=max(col for col,v in cnt.items() if v==mx)
+        for (r,c) in cells:
+            for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                n=(r+dr,c+dc)
+                if 0<=n[0]<H and 0<=n[1]<W and grid[n[0]][n[1]]==C:
+                    srcs.setdefault(n,set()).add(mc)
+    wire = {(r,c) for r in range(H) for c in range(W) if grid[r][c]==C}
+    colors = sorted({col for s in srcs.values() for col in s})
+    dist={}
+    for col in colors:
+        d={}
+        dq=deque()
+        for w,cols in srcs.items():
+            if col in cols: d[w]=0; dq.append(w)
+        while dq:
+            r,c=dq.popleft(); dv=d[(r,c)]
+            for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                n=(r+dr,c+dc)
+                if n in wire and n not in d: d[n]=dv+1; dq.append(n)
+        dist[col]=d
+    out=[[grid[r][c] for c in range(W)] for r in range(H)]
+    for (r,c) in wire:
+        ds={col: dist[col][(r,c)] for col in colors if (r,c) in dist[col]}
+        if not ds: v=C
+        else:
+            m=min(ds.values()); best=[col for col,vv in ds.items() if vv==m]
+            v = best[0] if len(best)==1 else max(best)
+        out[r][c]=v
+    # the unique solid 3x3 block of wire colour: its ring stays wire (its centre is painted)
+    blocks=[(r+1,c+1) for r in range(H-2) for c in range(W-2)
+            if all(grid[r+dr][c+dc]==C for dr in range(3) for dc in range(3))]
+    if blocks:
+        cr,cc=blocks[0]
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                if dr==0 and dc==0: continue
+                rr,c2=cr+dr,cc+dc
+                if 0<=rr<H and 0<=c2<W and grid[rr][c2]==C: out[rr][c2]=C
+    return out

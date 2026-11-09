@@ -1,0 +1,264 @@
+# W4 16b78196 attempt 1 sub=transform_final tokens=86756 src_chars=6449
+# train 2 in [[30, 30], [30, 30]] out [[30, 30], [30, 30]] | test in [[30, 30]] gold [[30, 30]] | new test colours []
+# test 0: 46 wrong cells (r,c,gold,pred): [(1, 4, 6, 0), (1, 5, 8, 0), (1, 6, 8, 0), (1, 7, 8, 0), (1, 8, 8, 0), (2, 4, 6, 0), (2, 5, 6, 0), (2, 6, 8, 0), (2, 7, 8, 0), (2, 8, 8, 0), (2, 9, 8, 0), (3, 4, 6, 0), (3, 5, 6, 0), (3, 6, 6, 0), (3, 7, 8, 0), (3, 8, 8, 0), (3, 9, 8, 0), (3, 10, 8, 0), (4, 4, 6, 0), (4, 5, 6, 0), (4, 6, 6, 0), (4, 7, 6, 0), (4, 8, 8, 0), (16, 23, 0, 6), (16, 24, 0, 8), (16, 25, 0, 8), (16, 26, 0, 8), (16, 27, 0, 8), (17, 23, 0, 6), (17, 24, 0, 6), (17, 25, 0, 8), (17, 26, 0, 8), (17, 27, 0, 8), (17, 28, 0, 8), (18, 23, 0, 6), (18, 24, 0, 6), (18, 25, 0, 6), (18, 26, 0, 8), (18, 27, 0, 8), (18, 28, 0, 8)]
+
+# ---- source closure ----
+def get_wall(g):
+    wall = max(components(g, ignore=0), key=lambda o:o['size'])
+    return wall
+
+r1=solve_h(train[1]['input'], verbose=True)
+
+def solve_h3(grid, verbose=False):
+    H,Wc,wc,wr0,wr1,acc,bboxzero,groups,wcol = analyze_setup(grid)
+    wallonly=set(wc)
+    cav={'above':cavities(H,wr0,wr1,Wc,bboxzero,acc,'above'),'below':cavities(H,wr0,wr1,Wc,bboxzero,acc,'below')}
+    result=[row[:] for row in grid]
+    for r in range(H):
+        for c in range(Wc):
+            if grid[r][c]!=0 and grid[r][c]!=wcol: result[r][c]=0
+    placed=set(wc); plans=[]
+    for w,items in sorted(groups.items()):
+        cands=[]
+        for o,sh in items:
+            for side in ('above','below'):
+                for s in range(Wc-w+1):
+                    t=rest_pos(sh,side,s,wallonly,H,Wc)
+                    if t is None: continue
+                    inb=frozenset(p for p in cells_at(sh,t,s) if wr0<=p[0]<=wr1)
+                    if not inb: continue
+                    for C in cav[side]:
+                        if inb==C: cands.append((len(C),side,s)); break
+        cands=sorted(set(cands), key=lambda x:(-x[0],x[1],x[2]))
+        chosen=None
+        for sc,side,s in cands:
+            bo=best_order(items,side,s,placed,H,Wc)
+            if bo: chosen=(sc,side,s,bo[1]); break
+        if verbose: print('w=%d cands=%s chosen=%s'%(w,[(c[0],c[1],c[2]) for c in cands[:6]], None if not chosen else (chosen[0],chosen[1],chosen[2],[(o['color'],t) for o,_,t in chosen[3]])))
+        if chosen: plans.append(chosen)
+    plans.sort(key=lambda p:(-p[0],p[1],p[2]))
+    for sc,side,s,acc in plans:
+        for o,sh,t in acc:
+            for p in cells_at(sh,t,s):
+                placed.add(p); result[p[0]][p[1]]=o['color']
+    return result
+
+res=solve_h3(tg, verbose=True)
+
+def best_order(items, side, s, obstacles, H, Wc, limit=40000):
+    best=[None]; cnt=[0]
+    def rec(rem, obs, acc):
+        cnt[0]+=1
+        if cnt[0]>limit: return
+        if not rem:
+            rows=[]; depths=[]
+            for (o,sh,t) in acc:
+                cs=cells_at(sh,t,s)
+                rows += [r for r,c in cs]
+                depths.append(t+max(r for r,c in sh) if side=='above' else -t)
+            lead = -max(rows) if side=='above' else min(rows)
+            key=(lead, max(rows)-min(rows), -sum(depths))
+            if best[0] is None or key<best[0][0]: best[0]=(key, list(acc))
+            return
+        for i in range(len(rem)):
+            o,sh=rem[i]
+            t=rest_pos(sh,side,s,obs,H,Wc)
+            if t is None: continue
+            rec(rem[:i]+rem[i+1:], obs|set(cells_at(sh,t,s)), acc+[(o,sh,t)])
+    rec(list(items), set(obstacles), [])
+    return best[0]
+
+r0=solve_h(train[0]['input'], verbose=True)
+
+def norm(cells):
+    r0=min(r for r,c in cells); c0=min(c for r,c in cells)
+    return [(r-r0,c-c0) for r,c in cells]
+
+def analyze_setup(grid):
+    H=len(grid); Wc=len(grid[0])
+    comps=components(grid, ignore=0)
+    wall=max(comps,key=lambda o:o['size'])
+    wcol=wall['color']; wc=set(wall['cells']); wr0,wr1=wall['bbox'][0],wall['bbox'][2]
+    objs=[o for o in comps if o['color']!=wcol]
+    zero=[[grid[r][c]==0 for c in range(Wc)] for r in range(H)]
+    lab=[[-1]*Wc for r in range(H)]
+    acc={'above':set(),'below':set()}
+    for r in range(H):
+        for c in range(Wc):
+            if zero[r][c] and lab[r][c]<0:
+                q=deque([(r,c)]); lab[r][c]=1; mem=[]; touches=set()
+                while q:
+                    x,y=q.popleft(); mem.append((x,y))
+                    if x<wr0: touches.add('above')
+                    if x>wr1: touches.add('below')
+                    for dx,dy in((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<Wc and zero[nx][ny] and lab[nx][ny]<0:
+                            lab[nx][ny]=1; q.append((nx,ny))
+                if 'above' in touches: acc['above']|=set(mem)
+                if 'below' in touches: acc['below']|=set(mem)
+    bboxzero=set((r,c) for r in range(wr0,wr1+1) for c in range(Wc) if (r,c) not in wc)
+    groups={}
+    for o in objs:
+        sh=norm(o['cells']); w=max(c for r,c in sh)+1
+        groups.setdefault(w,[]).append((o,sh))
+    return H,Wc,wc,wr0,wr1,acc,bboxzero,groups,wcol
+
+def cavities(H,wr0,wr1,Wc,bboxzero,acc,side):
+    nodes=bboxzero & acc[side]
+    seen=set(); comps=[]
+    for n in nodes:
+        if n in seen: continue
+        q=deque([n]); seen.add(n); mem=[]
+        while q:
+            x,y=q.popleft(); mem.append((x,y))
+            for dx,dy in((1,0),(-1,0),(0,1),(0,-1)):
+                m=(x+dx,y+dy)
+                if m in nodes and m not in seen: seen.add(m); q.append(m)
+        comps.append(set(mem))
+    return comps
+
+def cells_at(sh, t, s):
+    return [(t+r, s+c) for r,c in sh]
+
+items=groups[4]
+
+def solve_h(grid, verbose=False):
+    H,Wc,wc,wr0,wr1,acc,bboxzero,groups,wcol = analyze_setup(grid)
+    wallonly=set(wc)
+    cav={'above':cavities(H,wr0,wr1,Wc,bboxzero,acc,'above'),'below':cavities(H,wr0,wr1,Wc,bboxzero,acc,'below')}
+    if verbose:
+        for sd in ('above','below'):
+            print(' cav',sd,sorted([(len(c),min(r for r,_ in c),max(r for r,_ in c),min(c[1] for c in c),max(c[1] for c in c)) for c in cav[sd]],reverse=True))
+    result=[row[:] for row in grid]
+    for r in range(H):
+        for c in range(Wc):
+            if grid[r][c]!=0 and grid[r][c]!=wcol: result[r][c]=0
+    placed=set(wc); out_pl=[]; plans=[]
+    for w,items in sorted(groups.items()):
+        cands=[]
+        for idx,(o,sh) in enumerate(items):
+            for side in ('above','below'):
+                for s in range(Wc-w+1):
+                    t=rest_pos(sh,side,s,wallonly,H,Wc)
+                    if t is None: continue
+                    inb=frozenset(p for p in cells_at(sh,t,s) if wr0<=p[0]<=wr1)
+                    hit=None
+                    for C in cav[side]:
+                        if inb and inb<=C:
+                            if inb==C: hit=C
+                            break
+                    cands.append((len(inb) if hit else -1, side, s, idx, t))
+        pos=[c for c in cands if c[0]>=0]
+        if verbose: print(' w=%d best cands:'%w, sorted([(c[0],c[1],c[2],items[c[3]][0]['color']) for c in pos], reverse=True)[:8])
+        if not pos:
+            if verbose: print('  NO EXACT CANDIDATE w=%d'%w); continue
+        pos.sort(key=lambda x:(-x[0], x[1], x[2]))
+        plans.append((pos[0][0], pos[0][1], pos[0][2], items, w))
+    plans.sort(key=lambda p:(-p[0], p[1], p[2]))
+    for score,side,s,items,w in plans:
+        order=[]
+        for o,sh in items:
+            t0=rest_pos(sh,side,s,wallonly,H,Wc)
+            h=max(r for r,c in sh)+1
+            lead=t0+h-1 if side=='above' else t0
+            order.append((t0, -lead if side=='above' else lead, -o['size'], o['color'], sh, o))
+        order.sort()
+        for rec in order:
+            sh=rec[4]; o=rec[5]
+            t=rest_pos(sh,side,s,placed,H,Wc)
+            if t is None:
+                if verbose: print('  FAIL place',o['color']); continue
+            for p in cells_at(sh,t,s): result[p[0]][p[1]]=o['color']
+            placed|=set(cells_at(sh,t,s))
+            out_pl.append((o['color'],side,s,t))
+    if verbose: print(' placements',out_pl)
+    return result
+
+tg=[list(x) for x in zip(*test_inputs[0])]
+
+r=solve_h(tg, verbose=True)
+
+def rest_pos(sh, side, s, obstacles, H, Wc, force_cells=None):
+    """slide sh toward wall from side ('above' -> moving down, 'below' -> moving up) at col s.
+       returns top row t of resting position, or None if impossible/invalid."""
+    h=max(r for r,c in sh)+1
+    cells=sh
+    if side=='above':
+        # deepest possible ignoring grid top: t from 0.. H-h ; find first collision scanning down
+        t=0
+        best=None
+        while t<=H-h:
+            cs=cells_at(cells,t,s)
+            if any((r,c) in obstacles for r,c in cs):
+                break
+            best=t; t+=1
+        else:
+            best=H-h
+        return best if best is not None else None
+    else:
+        t=H-h
+        best=None
+        while t>=0:
+            cs=cells_at(cells,t,s)
+            if any((r,c) in obstacles for r,c in cs):
+                break
+            best=t; t-=1
+        return best if best is not None else None
+
+wallonly=set(wc)
+
+def solve_final(grid, verbose=False):
+    H,Wc,wc,wr0,wr1,acc,bboxzero,groups,wcol = analyze_setup(grid)
+    wallonly=set(wc)
+    cav={'above':cavities(H,wr0,wr1,Wc,bboxzero,acc,'above'),'below':cavities(H,wr0,wr1,Wc,bboxzero,acc,'below')}
+    result=[row[:] for row in grid]
+    for r in range(H):
+        for c in range(Wc):
+            if grid[r][c]!=0 and grid[r][c]!=wcol: result[r][c]=0
+    placed=set(wc)
+    # candidate lists per group
+    gl=[]
+    for w,items in groups.items():
+        pos=[]; allsn=[]
+        for o,sh in items:
+            for side in ('above','below'):
+                for s in range(Wc-w+1):
+                    t=rest_pos(sh,side,s,wallonly,H,Wc)
+                    if t is None: continue
+                    inb=frozenset(p for p in cells_at(sh,t,s) if wr0<=p[0]<=wr1)
+                    for C in cav[side]:
+                        if inb==C:
+                            if inb: pos.append((len(C),side,s))
+                            break
+                    allsn.append((side,s))
+        pos=sorted(set(pos), key=lambda x:(-x[0],x[1],x[2]))
+        seen=set(); zero=[(sd,s) for sd,s in sorted(set(allsn))]
+        gl.append((pos[0][0] if pos else -1, w, items, pos, zero))
+    gl.sort(key=lambda g:(-g[0], g[1]))
+    for bestscore,w,items,pos,zero in gl:
+        chosen=None
+        for sc,side,s in pos:
+            bo=best_order(items,side,s,placed,H,Wc)
+            if bo: chosen=(sc,side,s,bo[1]); break
+        if chosen is None:  # fallback: any window where everything fits, packed tightest
+            cand=[]
+            for side,s in zero:
+                bo=best_order(items,side,s,placed,H,Wc)
+                if bo: cand.append((bo[0],side,s,bo[1]))
+            if cand:
+                cand.sort(key=lambda x:(x[0],x[1],x[2]))
+                chosen=(-1,cand[0][1],cand[0][2],cand[0][3])
+        if verbose: print('w=%d best=%s chosen=%s'%(w,bestscore,None if not chosen else (chosen[0],chosen[1],chosen[2],[(o['color'],t) for o,_,t in chosen[3]])))
+        if chosen:
+            for o,sh,t in chosen[3]:
+                for p in cells_at(sh,t,chosen[2]):
+                    placed.add(p); result[p[0]][p[1]]=o['color']
+    return result
+
+def transform_final(grid):
+    wall=get_wall(grid); r0,c0,r1,c1=wall['bbox']
+    if (r1-r0) > (c1-c0):
+        res=solve_final([list(x) for x in zip(*grid)])
+        return [list(x) for x in zip(*res)]
+    return solve_final(grid)

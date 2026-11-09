@@ -1,0 +1,86 @@
+# W4 247ef758 attempt 1 sub=transform tokens=34549 src_chars=3177
+# train 3 in [[12, 18], [10, 15], [10, 14]] out [[12, 18], [10, 15], [10, 14]] | test in [[15, 20], [12, 18]] gold [[15, 20], [12, 18]] | new test colours [9]
+# test 0: 0 wrong cells (r,c,gold,pred): []
+# test 1: 1 wrong cells (r,c,gold,pred): [(6, 12, 6, 4)]
+
+# ---- source closure ----
+def transform(grid):
+    H, W = len(grid), len(grid[0])
+    best = None
+    for o in components(grid, color=0):
+        if best is None or o['size'] > best['size']:
+            best = o
+    ir0, ic0, ir1, ic1 = best['bbox']
+    fr0, fc0, fr1, fc1 = max(ir0-1, 0), max(ic0-1, 0), min(ir1+1, H-1), min(ic1+1, W-1)
+    per_cells = []
+    for c in range(fc0, fc1+1):
+        per_cells += [(fr0, c), (fr1, c)]
+    for r in range(fr0, fr1+1):
+        per_cells += [(r, fc0), (r, fc1)]
+    cnt = {}
+    for (r, c) in per_cells:
+        v = grid[r][c]
+        cnt[v] = cnt.get(v, 0) + 1
+    frame_color = max(cnt.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+    vlines, hlines = {}, {}
+    for c in range(fc0, fc1+1):
+        for r in (fr0, fr1):
+            v = grid[r][c]
+            if v not in (0, frame_color):
+                vlines.setdefault(v, set()).add(c)
+    for r in range(fr0, fr1+1):
+        for c in (fc0, fc1):
+            v = grid[r][c]
+            if v not in (0, frame_color):
+                hlines.setdefault(v, set()).add(r)
+    wall = None
+    for c in list(range(0, fc0)) + list(range(fc1+1, W)):
+        col = [grid[r][c] for r in range(H)]
+        if len(set(col)) == 1 and col[0] != 0:
+            side = 'left' if c < fc0 else 'right'
+            d = (fc0 - c) if side == 'left' else (c - fc1)
+            if wall is None or d < wall[3]:
+                wall = ('col', c, side, d)
+    if wall is None:
+        for r in list(range(0, fr0)) + list(range(fr1+1, H)):
+            row = [grid[r][c] for c in range(W)]
+            if len(set(row)) == 1 and row[0] != 0:
+                side = 'above' if r < fr0 else 'below'
+                d = (fr0 - r) if side == 'above' else (r - fr1)
+                if wall is None or d < wall[3]:
+                    wall = ('row', r, side, d)
+    mask = [[0]*W for _ in range(H)]
+    if wall is not None:
+        kind, idx, side = wall[0], wall[1], wall[2]
+        if kind == 'col':
+            cols = range(0, idx) if side == 'left' else range(idx+1, W)
+            for r in range(H):
+                for c in cols:
+                    mask[r][c] = grid[r][c]
+        else:
+            rows = range(0, idx) if side == 'above' else range(idx+1, H)
+            for r in rows:
+                for c in range(W):
+                    mask[r][c] = grid[r][c]
+    objs = components(mask, ignore=0, connectivity=8)
+    out = [row[:] for row in grid]
+    placements = []
+    for o in objs:
+        col = o['color']
+        if col in vlines and col in hlines:
+            for (r, c) in o['cells']:
+                out[r][c] = 0
+            r0, c0, r1, c1 = o['bbox']
+            cr = (r0+r1)/2.0
+            cc = (c0+c1)/2.0
+            for rr in sorted(hlines[col]):
+                for ccm in sorted(vlines[col]):
+                    dr = int(round(rr - cr)); dc = int(round(ccm - cc))
+                    for (r, c) in o['cells']:
+                        nr, nc = r+dr, c+dc
+                        if 0 <= nr < H and 0 <= nc < W:
+                            placements.append((nr, nc, -col, col))
+    placements.sort(key=lambda t: (t[0], t[1], t[2]))
+    for (r, c, _, col) in placements:
+        out[r][c] = col
+    return out
