@@ -1,16 +1,29 @@
-# ARC Prize 2026 — ARC-AGI-2 · Qwen3.8-27B workspace
+# ARC Prize 2026: ARC-AGI-2 and Paper Track (Team Hack2Publish)
 
-Kaggle competition **ARC Prize 2026 – ARC-AGI-2** (code competition; 4×NVIDIA L4; no internet; 12-hour hidden-test rerun; deadline **2026-11-02**).
+Workspace of our team for the Kaggle competition **ARC Prize 2026: ARC-AGI-2** (4x NVIDIA L4, no internet, 12-hour hidden rerun) and the **ARC Prize 2026 Paper Track**. Licence: Apache-2.0 (see `LICENSE`).
 
-**Model:** Qwen3.8-27B-FP8 (`foysalemonshanto/qwen3-8-27b-fp8-repacked-v1`) served by vLLM 0.19.0 from an offline wheelhouse.
+**Best submission:** 57851995, public leaderboard **54.17**. It is a Qwen3.8-Flash-Next tool agent served offline with the Merlin engine (vLLM 0.32 fork) on 4x L4, with W4A16 routed experts, an FP8 KV cache and MTP speculation. The submission notebook is public: https://www.kaggle.com/code/foysalemonshanto/q27-xhigh-e25-nb6-submit (version 1).
 
-**Goal:** LB ≈ 60 with this model. Other teams have done it.
+## Papers (ARC Prize 2026 Paper Track)
 
-| Best results so far | Notebook | Public LB |
+| Paper | PDF | LaTeX source |
 |---|---|---|
-| **Q27-XHIGH v1.4.4** (direct reasoning, 49k xhigh thinking per test input) | Experiment 1 | **26.94** (2026-10-12) |
-| Q27-XHIGH v1.4 | Experiment 1 | 18.75 |
-| Team NVARC-style notebook (other model, for reference) | — | 32.64 |
+| Verified-Answer Precision as the Acceptance Test for Speed and Quantization: A Qwen3.8-Flash-Next Tool Agent for ARC-AGI-2 on Four L4 GPUs | [PDF](papers/Paper%20Track%20Writeup%202026-11-09/pdf/Hack2Publish_Verified_Answer_Precision_ARC_AGI_2.pdf) | [paper/](papers/Paper%20Track%20Writeup%202026-11-09/paper/) |
+| Decomposing the Score of an NVARC-Derived Pipeline on ARC-AGI-2: Generation, Selection, and Run-to-Run Noise (companion) | [PDF](papers/Paper%20Track%20Writeup%202026-11-09/pdf/Hack2Publish_Companion_NVARC_Decomposition_ARC_AGI_2.pdf) | [paper/](papers/1%20-%20NVARC%20Solution%202025%20Limitation/paper/) |
+
+Authors: Md. Hamid Hosen, MD. Foysal Emon Shanto, Md Esfer Abdus Sami. The analysis scripts behind the main paper's numbers are in `papers/Paper Track Writeup 2026-11-09/analysis/`; those of the companion paper are in `papers/1 - NVARC Solution 2025 Limitation/scripts/`.
+
+## Leaderboard history by method family (best public LB)
+
+| Method family | Best public LB |
+|---|---|
+| NVARC-lineage test-time training (public-notebook derivatives) | 32.64 |
+| Qwen3.8-27B, code-verifying solver (60k thinking) | 34.58 |
+| Qwen3.8-27B, tool agent | 22.92 |
+| Qwen3.8-Flash-Next 3-bit (klee100), tool agent (57896498) | 49.58 |
+| **Qwen3.8-Flash-Next W4A16, tool agent (57851995)** | **54.17** |
+
+The experiment index below was written during the competition; earlier entries describe the 27B phase.
 
 ## Layout
 
